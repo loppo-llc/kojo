@@ -1,0 +1,29 @@
+@import "tailwindcss";
+@import "@xterm/xterm/css/xterm.css";
+
+html, body, #root {
+  height: 100dvh;
+  margin: 0;
+  background: #0a0a0a;
+  color: #e5e5e5;
+}
+
+/* mobile scrollbar */
+.xterm-viewport::-webkit-scrollbar {
+  width: 12px;
+}
+.xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+.xterm-viewport::-webkit-scrollbar-thumb {
+  background: #525252;
+  border-radius: 6px;
+  border: 2px solid #0a0a0a;
+}
+
+@supports (scrollbar-width: auto) {
+  .xterm-viewport {
+    scrollbar-width: auto;
+    scrollbar-color: #525252 transparent;
+  }
+}

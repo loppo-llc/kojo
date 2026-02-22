@@ -1,0 +1,6 @@
+/kojo
+/tmp
+web/dist
+web/node_modules
+.DS_Store
+.claude/
