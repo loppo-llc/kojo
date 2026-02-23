@@ -1,5 +1,11 @@
 # kojo
 
+[![Release](https://img.shields.io/github/v/release/loppo-llc/kojo)](https://github.com/loppo-llc/kojo/releases)
+[![Go](https://img.shields.io/github/go-mod/go-version/loppo-llc/kojo)](go.mod)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+> [English](README.md)
+
 macOS 上の AI コーディング CLI（Claude Code, Codex, Gemini CLI）をモバイルからリモート操作するツール。
 
 ```
@@ -80,7 +86,7 @@ kojo は [tsnet](https://tailscale.com/kb/1244/tsnet) を使って、`kojo` と�
 ```bash
 $ kojo
 
-  kojo v0.1.0 running at:
+  kojo v0.2.0 running at:
 
     https://kojo.tail1234.ts.net
     https://100.x.y.z:8080
@@ -140,7 +146,7 @@ $ kojo
 
 - 複数セッションの同時管理（新しい順に表示）
 - セッション永続化（`~/.config/kojo/sessions.json`、7日後に自動クリーンアップ）
-- セッション再起動（同一ID維持、`claude` は `--continue` を自動付与）
+- セッション再起動（ツール固有の resume: `claude --resume`, `codex resume`, `gemini --resume`）
 - リアルタイム PTY 出力ストリーミング（xterm.js）
 - テキスト入力（Enter で改行、Shift+Enter で送信）と特殊キー（Esc, Tab, Ctrl, 矢印）
 - 作業ディレクトリのパス補完
@@ -158,6 +164,14 @@ $ kojo
 | Web UI | React 19, Vite, TypeScript, Tailwind CSS, xterm.js |
 | 通知 | Web Push (VAPID) |
 | ネットワーク | Tailscale WireGuard P2P |
+
+## インストール
+
+[Releases](https://github.com/loppo-llc/kojo/releases) からバイナリをダウンロードするか、ソースからビルド:
+
+```bash
+go install github.com/loppo-llc/kojo/cmd/kojo@latest
+```
 
 ## ライセンス
 

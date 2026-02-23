@@ -1,5 +1,11 @@
 # kojo
 
+[![Release](https://img.shields.io/github/v/release/loppo-llc/kojo)](https://github.com/loppo-llc/kojo/releases)
+[![Go](https://img.shields.io/github/go-mod/go-version/loppo-llc/kojo)](go.mod)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+> [日本語](README.ja.md)
+
 Remotely operate AI coding CLIs (Claude Code, Codex, Gemini CLI) on macOS from your mobile device.
 
 ```
@@ -80,7 +86,7 @@ When you run `kojo` (without `--local`):
 ```bash
 $ kojo
 
-  kojo v0.1.0 running at:
+  kojo v0.2.0 running at:
 
     https://kojo.tail1234.ts.net
     https://100.x.y.z:8080
@@ -140,7 +146,7 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 
 - Manage multiple sessions simultaneously (newest first)
 - Session persistence (`~/.config/kojo/sessions.json`, auto-cleanup after 7 days)
-- Session restart (keeps same ID, `claude` auto-adds `--continue`)
+- Session restart with tool-specific resume (`claude --resume`, `codex resume`, `gemini --resume`)
 - Real-time PTY output streaming (xterm.js)
 - Text input (Enter for newline, Shift+Enter to send) and special keys (Esc, Tab, Ctrl, arrows)
 - Working directory path completion
@@ -158,6 +164,14 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 | Web UI | React 19, Vite, TypeScript, Tailwind CSS, xterm.js |
 | Notifications | Web Push (VAPID) |
 | Network | Tailscale WireGuard P2P |
+
+## Install
+
+Download the latest binary from [Releases](https://github.com/loppo-llc/kojo/releases), or build from source:
+
+```bash
+go install github.com/loppo-llc/kojo/cmd/kojo@latest
+```
 
 ## License
 
