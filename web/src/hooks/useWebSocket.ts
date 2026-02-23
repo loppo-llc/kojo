@@ -112,6 +112,8 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
 
   const reconnect = useCallback(() => {
     if (reconnectRef.current) clearTimeout(reconnectRef.current);
+    // Temporarily suppress onclose reconnect while we close the old socket
+    activeRef.current = false;
     wsRef.current?.close();
     activeRef.current = true;
     backoffRef.current = 1000;

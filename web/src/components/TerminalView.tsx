@@ -41,7 +41,12 @@ export function TerminalView() {
   }, []);
 
   const onScrollback = useCallback((data: Uint8Array) => {
-    xtermRef.current?.write(data);
+    const term = xtermRef.current;
+    if (!term) return;
+    // Clear terminal before writing scrollback to prevent
+    // content duplication on WebSocket reconnect
+    term.reset();
+    term.write(data);
   }, []);
 
   const onExit = useCallback((exitCode: number, live: boolean) => {

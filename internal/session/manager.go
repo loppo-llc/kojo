@@ -8,11 +8,13 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/creack/pty/v2"
+	"github.com/google/uuid"
 )
 
 var allowedTools = map[string]bool{
@@ -50,17 +52,18 @@ func (m *Manager) loadPersistedSessions() {
 		done := make(chan struct{})
 		close(done)
 		s := &Session{
-			ID:          info.ID,
-			Tool:        info.Tool,
-			WorkDir:     info.WorkDir,
-			Args:        info.Args,
-			CreatedAt:   t,
-			Status:      StatusExited,
-			ExitCode:    info.ExitCode,
-			YoloMode:    info.YoloMode,
-			scrollback:  NewRingBuffer(defaultRingSize),
-			subscribers: make(map[chan []byte]struct{}),
-			done:        done,
+			ID:              info.ID,
+			Tool:            info.Tool,
+			WorkDir:         info.WorkDir,
+			Args:            info.Args,
+			CreatedAt:       t,
+			Status:          StatusExited,
+			ExitCode:        info.ExitCode,
+			YoloMode:        info.YoloMode,
+			ToolSessionID: info.ToolSessionID,
+			scrollback:      NewRingBuffer(defaultRingSize),
+			subscribers:     make(map[chan []byte]struct{}),
+			done:            done,
 		}
 		m.sessions[info.ID] = s
 	}
@@ -85,7 +88,36 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool) (*S
 
 	id := generateID()
 
-	cmd := exec.Command(toolPath, args...)
+	// For claude, assign a stable session ID so we can --resume later
+	var toolSessionID string
+	runArgs := args
+	if tool == "claude" {
+		hasSessionID := false
+		for i, a := range args {
+			if a == "--session-id" {
+				hasSessionID = true
+				if i+1 < len(args) {
+					toolSessionID = args[i+1]
+				}
+				break
+			}
+			if strings.HasPrefix(a, "--session-id=") {
+				hasSessionID = true
+				toolSessionID = strings.TrimPrefix(a, "--session-id=")
+				break
+			}
+		}
+		if !hasSessionID {
+			toolSessionID = uuid.New().String()
+			runArgs = make([]string, len(args), len(args)+2)
+			copy(runArgs, args)
+			runArgs = append(runArgs, "--session-id", toolSessionID)
+		}
+	}
+	// codex: session ID is captured from PTY output in readLoop
+	// gemini: no session ID mechanism; uses --resume latest on restart
+
+	cmd := exec.Command(toolPath, runArgs...)
 	cmd.Dir = workDir
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 
@@ -95,18 +127,19 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool) (*S
 	}
 
 	s := &Session{
-		ID:          id,
-		Tool:        tool,
-		WorkDir:     workDir,
-		Args:        args,
-		PTY:         ptmx,
-		Cmd:         cmd,
-		CreatedAt:   time.Now(),
-		Status:      StatusRunning,
-		YoloMode:    yoloMode,
-		scrollback:  NewRingBuffer(defaultRingSize),
-		subscribers: make(map[chan []byte]struct{}),
-		done:        make(chan struct{}),
+		ID:              id,
+		Tool:            tool,
+		WorkDir:         workDir,
+		Args:            args,
+		PTY:             ptmx,
+		Cmd:             cmd,
+		CreatedAt:       time.Now(),
+		Status:          StatusRunning,
+		YoloMode:        yoloMode,
+		ToolSessionID: toolSessionID,
+		scrollback:      NewRingBuffer(defaultRingSize),
+		subscribers:     make(map[chan []byte]struct{}),
+		done:            make(chan struct{}),
 	}
 
 	m.mu.Lock()
@@ -138,6 +171,7 @@ func (m *Manager) Restart(id string) (*Session, error) {
 	tool := s.Tool
 	workDir := s.WorkDir
 	args := s.Args
+	toolSessionID := s.ToolSessionID
 	s.mu.Unlock()
 
 	if !allowedTools[tool] {
@@ -149,21 +183,7 @@ func (m *Manager) Restart(id string) (*Session, error) {
 		return nil, fmt.Errorf("tool not found: %s", tool)
 	}
 
-	// add --continue for claude to resume conversation
-	restartArgs := make([]string, len(args))
-	copy(restartArgs, args)
-	if tool == "claude" {
-		hasContinue := false
-		for _, a := range restartArgs {
-			if a == "--continue" || a == "-c" || a == "--resume" || a == "-r" {
-				hasContinue = true
-				break
-			}
-		}
-		if !hasContinue {
-			restartArgs = append(restartArgs, "--continue")
-		}
-	}
+	restartArgs := buildRestartArgs(tool, args, toolSessionID)
 
 	cmd := exec.Command(toolPath, restartArgs...)
 	cmd.Dir = workDir
@@ -177,7 +197,7 @@ func (m *Manager) Restart(id string) (*Session, error) {
 	s.mu.Lock()
 	s.PTY = ptmx
 	s.Cmd = cmd
-	s.Args = restartArgs
+	s.Args = args // Keep original args (without --resume), not restartArgs
 	s.Status = StatusRunning
 	s.ExitCode = nil
 	s.done = make(chan struct{})
@@ -297,6 +317,9 @@ func (m *Manager) readLoop(s *Session) {
 			s.scrollback.Write(data)
 			s.broadcast(data)
 
+			// capture tool session ID from output (e.g. codex)
+			s.CaptureToolSessionID(data)
+
 			// yolo auto-approve check
 			approval, debugTail := s.CheckYolo(data)
 			if debugTail != "" {
@@ -350,6 +373,62 @@ func (m *Manager) waitLoop(s *Session) {
 
 	if m.OnSessionExit != nil {
 		m.OnSessionExit(s)
+	}
+}
+
+// buildRestartArgs produces the command arguments for restarting a session.
+func buildRestartArgs(tool string, origArgs []string, toolSessionID string) []string {
+	switch tool {
+	case "claude":
+		args := make([]string, 0, len(origArgs)+2)
+		skipNext := false
+		for _, a := range origArgs {
+			if skipNext {
+				skipNext = false
+				continue
+			}
+			// Strip any existing continuation/resume flags
+			if a == "--resume" || a == "-r" {
+				skipNext = true
+				continue
+			}
+			if a == "--continue" || a == "-c" {
+				continue
+			}
+			args = append(args, a)
+		}
+		if toolSessionID != "" {
+			return append(args, "--resume", toolSessionID)
+		}
+		return append(args, "--continue")
+
+	case "codex":
+		// codex uses a subcommand: `codex resume <SESSION_ID>`
+		if toolSessionID != "" {
+			return []string{"resume", toolSessionID}
+		}
+		return []string{"resume", "--last"}
+
+	case "gemini":
+		args := make([]string, 0, len(origArgs)+2)
+		skipNext := false
+		for _, a := range origArgs {
+			if skipNext {
+				skipNext = false
+				continue
+			}
+			if a == "--resume" || a == "-r" {
+				skipNext = true // skip the value after the flag
+				continue
+			}
+			args = append(args, a)
+		}
+		return append(args, "--resume", "latest")
+
+	default:
+		out := make([]string, len(origArgs))
+		copy(out, origArgs)
+		return out
 	}
 }
 

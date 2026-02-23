@@ -17,17 +17,18 @@ const (
 )
 
 type Session struct {
-	mu        sync.Mutex
-	ID        string
-	Tool      string
-	WorkDir   string
-	Args      []string
-	PTY       *os.File
-	Cmd       *exec.Cmd
-	CreatedAt time.Time
-	Status    Status
-	ExitCode  *int
-	YoloMode  bool
+	mu              sync.Mutex
+	ID              string
+	Tool            string
+	WorkDir         string
+	Args            []string
+	PTY             *os.File
+	Cmd             *exec.Cmd
+	CreatedAt       time.Time
+	Status          Status
+	ExitCode        *int
+	YoloMode        bool
+	ToolSessionID string // tool-specific session ID for resume
 
 	// ring buffer for scrollback (1MB)
 	scrollback *RingBuffer
@@ -38,6 +39,9 @@ type Session struct {
 
 	// done signal
 	done chan struct{}
+
+	// codex: trailing buffer for session ID capture across chunk boundaries
+	codexCaptureBuf []byte
 
 	// yolo: trailing output buffer for pattern detection
 	yoloTail []byte
@@ -59,29 +63,34 @@ var multiSpaceRe = regexp.MustCompile(`[ \t]{2,}`)
 // "Do you ...? ... 1. Yes" pattern (allow blank lines between question and options)
 var yoloPattern = regexp.MustCompile(`(?i)Do you \S[^\n]*\?[\s\S]{0,200}?1\.\s*Yes`)
 
+// Codex outputs "session id: <UUID>" on startup
+var codexSessionIDRe = regexp.MustCompile(`(?i)session id: ([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})`)
+
 type SessionInfo struct {
-	ID        string   `json:"id"`
-	Tool      string   `json:"tool"`
-	WorkDir   string   `json:"workDir"`
-	Args      []string `json:"args,omitempty"`
-	Status    Status   `json:"status"`
-	ExitCode  *int     `json:"exitCode,omitempty"`
-	YoloMode  bool     `json:"yoloMode"`
-	CreatedAt string   `json:"createdAt"`
+	ID              string   `json:"id"`
+	Tool            string   `json:"tool"`
+	WorkDir         string   `json:"workDir"`
+	Args            []string `json:"args,omitempty"`
+	Status          Status   `json:"status"`
+	ExitCode        *int     `json:"exitCode,omitempty"`
+	YoloMode        bool     `json:"yoloMode"`
+	CreatedAt       string   `json:"createdAt"`
+	ToolSessionID string   `json:"toolSessionId,omitempty"`
 }
 
 func (s *Session) Info() SessionInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return SessionInfo{
-		ID:        s.ID,
-		Tool:      s.Tool,
-		WorkDir:   s.WorkDir,
-		Args:      s.Args,
-		Status:    s.Status,
-		ExitCode:  s.ExitCode,
-		YoloMode:  s.YoloMode,
-		CreatedAt: s.CreatedAt.UTC().Format(time.RFC3339),
+		ID:              s.ID,
+		Tool:            s.Tool,
+		WorkDir:         s.WorkDir,
+		Args:            s.Args,
+		Status:          s.Status,
+		ExitCode:        s.ExitCode,
+		YoloMode:        s.YoloMode,
+		CreatedAt:       s.CreatedAt.UTC().Format(time.RFC3339),
+		ToolSessionID: s.ToolSessionID,
 	}
 }
 
@@ -154,6 +163,35 @@ func (s *Session) Write(data []byte) (int, error) {
 
 func (s *Session) Done() <-chan struct{} {
 	return s.done
+}
+
+// CaptureToolSessionID tries to parse a tool-specific session ID from PTY output.
+// Only captures once (when ToolSessionID is still empty).
+// Accumulates data across chunk boundaries to handle split reads.
+func (s *Session) CaptureToolSessionID(data []byte) {
+	s.mu.Lock()
+	if s.ToolSessionID != "" || s.Tool != "codex" {
+		s.mu.Unlock()
+		return
+	}
+	// accumulate data, keep last 256 bytes
+	s.codexCaptureBuf = append(s.codexCaptureBuf, data...)
+	if len(s.codexCaptureBuf) > 256 {
+		s.codexCaptureBuf = s.codexCaptureBuf[len(s.codexCaptureBuf)-256:]
+	}
+	buf := make([]byte, len(s.codexCaptureBuf))
+	copy(buf, s.codexCaptureBuf)
+	s.mu.Unlock()
+
+	clean := ansiRe.ReplaceAll(buf, []byte(" "))
+	if m := codexSessionIDRe.FindSubmatch(clean); m != nil {
+		s.mu.Lock()
+		if s.ToolSessionID == "" {
+			s.ToolSessionID = string(m[1])
+			s.codexCaptureBuf = nil // done, free buffer
+		}
+		s.mu.Unlock()
+	}
 }
 
 func (s *Session) SetYoloMode(enabled bool) {
