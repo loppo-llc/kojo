@@ -167,8 +167,6 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 
 ## Install
 
-Download the latest binary from [Releases](https://github.com/loppo-llc/kojo/releases), or build from source:
-
 ```bash
 go install github.com/loppo-llc/kojo/cmd/kojo@latest
 ```

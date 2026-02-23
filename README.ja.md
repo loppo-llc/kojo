@@ -167,8 +167,6 @@ $ kojo
 
 ## インストール
 
-[Releases](https://github.com/loppo-llc/kojo/releases) からバイナリをダウンロードするか、ソースからビルド:
-
 ```bash
 go install github.com/loppo-llc/kojo/cmd/kojo@latest
 ```
