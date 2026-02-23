@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/notify"
 	"github.com/loppo-llc/kojo/internal/server"
 	"github.com/loppo-llc/kojo/web"
 	"tailscale.com/tsnet"
@@ -54,12 +55,20 @@ func main() {
 		}
 	}
 
+	var notifyMgr *notify.Manager
+	if nm, err := notify.NewManager(logger); err != nil {
+		logger.Warn("web push notifications disabled", "err", err)
+	} else {
+		notifyMgr = nm
+	}
+
 	srv := server.New(server.Config{
-		Addr:     fmt.Sprintf(":%d", *port),
-		DevMode:  *dev,
-		Logger:   logger,
-		StaticFS: staticFS,
-		Version:  version,
+		Addr:          fmt.Sprintf(":%d", *port),
+		DevMode:       *dev,
+		Logger:        logger,
+		StaticFS:      staticFS,
+		Version:       version,
+		NotifyManager: notifyMgr,
 	})
 
 	// graceful shutdown

@@ -318,6 +318,20 @@ export function TerminalView() {
         <span className="font-mono font-bold">{session?.tool}</span>
         <span className="text-xs text-neutral-500 truncate flex-1">{session?.workDir}</span>
         <button
+          onClick={() => navigate(`/files?path=${encodeURIComponent(session?.workDir ?? '')}`)}
+          className="px-2.5 py-1.5 text-xs bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded min-h-[44px] min-w-[44px] flex items-center justify-center"
+          title="Files"
+        >
+          &#x1F4C1;
+        </button>
+        <button
+          onClick={() => navigate(`/session/${id}/git`)}
+          className="px-2.5 py-1.5 text-xs bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded min-h-[44px] min-w-[44px] flex items-center justify-center font-mono"
+          title="Git"
+        >
+          git
+        </button>
+        <button
           onClick={handleYoloToggle}
           className={`px-2.5 py-1.5 text-xs rounded min-h-[44px] min-w-[44px] flex items-center justify-center ${
             session?.yoloMode

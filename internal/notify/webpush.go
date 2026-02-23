@@ -1,11 +1,6 @@
 package notify
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -51,7 +46,6 @@ func (m *Manager) Subscribe(sub *webpush.Subscription) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// dedupe by endpoint
 	for _, existing := range m.subscriptions {
 		if existing.Endpoint == sub.Endpoint {
 			return
@@ -113,23 +107,16 @@ func (m *Manager) loadOrGenerateVAPID() error {
 		}
 	}
 
-	// generate new keys
-	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	// generate new keys using webpush-go's GenerateVAPIDKeys
+	// which produces raw P-256 scalar (base64url) as expected by the library
+	privKey, pubKey, err := webpush.GenerateVAPIDKeys()
 	if err != nil {
-		return fmt.Errorf("failed to generate VAPID key: %w", err)
+		return fmt.Errorf("failed to generate VAPID keys: %w", err)
 	}
 
-	privBytes, err := x509.MarshalECPrivateKey(privKey)
-	if err != nil {
-		return fmt.Errorf("failed to marshal private key: %w", err)
-	}
+	m.vapidPrivate = privKey
+	m.vapidPublic = pubKey
 
-	pubBytes := elliptic.Marshal(elliptic.P256(), privKey.PublicKey.X, privKey.PublicKey.Y)
-
-	m.vapidPrivate = base64.RawURLEncoding.EncodeToString(privBytes)
-	m.vapidPublic = base64.RawURLEncoding.EncodeToString(pubBytes)
-
-	// save
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("failed to create config dir: %w", err)
 	}

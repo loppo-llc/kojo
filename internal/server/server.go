@@ -16,8 +16,10 @@ import (
 	"strings"
 	"time"
 
+	webpush "github.com/SherClockHolmes/webpush-go"
 	"github.com/loppo-llc/kojo/internal/filebrowser"
 	gitpkg "github.com/loppo-llc/kojo/internal/git"
+	"github.com/loppo-llc/kojo/internal/notify"
 	"github.com/loppo-llc/kojo/internal/session"
 )
 
@@ -25,6 +27,7 @@ type Server struct {
 	sessions *session.Manager
 	files    *filebrowser.Browser
 	git      *gitpkg.Manager
+	notify   *notify.Manager
 	logger   *slog.Logger
 	httpSrv  *http.Server
 	devMode  bool
@@ -32,11 +35,12 @@ type Server struct {
 }
 
 type Config struct {
-	Addr      string
-	DevMode   bool
-	Logger    *slog.Logger
-	StaticFS  fs.FS // embedded web/dist files for production
-	Version   string
+	Addr          string
+	DevMode       bool
+	Logger        *slog.Logger
+	StaticFS      fs.FS // embedded web/dist files for production
+	Version       string
+	NotifyManager *notify.Manager
 }
 
 func New(cfg Config) *Server {
@@ -49,9 +53,25 @@ func New(cfg Config) *Server {
 		sessions: session.NewManager(logger),
 		files:    filebrowser.New(logger),
 		git:      gitpkg.New(logger),
+		notify:   cfg.NotifyManager,
 		logger:   logger,
 		devMode:  cfg.DevMode,
 		version:  cfg.Version,
+	}
+
+	// send push notification when a session exits
+	if s.notify != nil {
+		s.sessions.OnSessionExit = func(sess *session.Session) {
+			info := sess.Info()
+			payload, _ := json.Marshal(map[string]any{
+				"type":      "session_exit",
+				"tool":      info.Tool,
+				"workDir":   info.WorkDir,
+				"exitCode":  info.ExitCode,
+				"sessionId": info.ID,
+			})
+			s.notify.Send(payload)
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -82,6 +102,11 @@ func New(cfg Config) *Server {
 	mux.HandleFunc("GET /api/v1/git/log", s.handleGitLog)
 	mux.HandleFunc("GET /api/v1/git/diff", s.handleGitDiff)
 	mux.HandleFunc("POST /api/v1/git/exec", s.handleGitExec)
+
+	// Web Push notifications
+	mux.HandleFunc("GET /api/v1/push/vapid", s.handleVAPIDKey)
+	mux.HandleFunc("POST /api/v1/push/subscribe", s.handlePushSubscribe)
+	mux.HandleFunc("POST /api/v1/push/unsubscribe", s.handlePushUnsubscribe)
 
 	// Static files / dev proxy
 	if cfg.DevMode {
@@ -464,6 +489,48 @@ func (s *Server) handleGitExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, result)
+}
+
+// --- Web Push Handlers ---
+
+func (s *Server) handleVAPIDKey(w http.ResponseWriter, r *http.Request) {
+	if s.notify == nil {
+		writeError(w, http.StatusServiceUnavailable, "unavailable", "push notifications not configured")
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]string{
+		"publicKey": s.notify.VAPIDPublicKey(),
+	})
+}
+
+func (s *Server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
+	if s.notify == nil {
+		writeError(w, http.StatusServiceUnavailable, "unavailable", "push notifications not configured")
+		return
+	}
+	var sub webpush.Subscription
+	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid subscription")
+		return
+	}
+	s.notify.Subscribe(&sub)
+	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
+	if s.notify == nil {
+		writeError(w, http.StatusServiceUnavailable, "unavailable", "push notifications not configured")
+		return
+	}
+	var req struct {
+		Endpoint string `json:"endpoint"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request")
+		return
+	}
+	s.notify.Unsubscribe(req.Endpoint)
+	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // --- Helpers ---

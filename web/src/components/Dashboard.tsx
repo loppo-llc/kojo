@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router";
 import { api, type SessionInfo } from "../lib/api";
+import { usePushNotifications } from "../hooks/usePushNotifications";
 
 export function Dashboard() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const navigate = useNavigate();
+  const { state: pushState, loading: pushLoading, subscribe: pushSubscribe } = usePushNotifications();
 
   useEffect(() => {
     const load = () => api.sessions.list().then(setSessions).catch(console.error);
@@ -30,6 +32,18 @@ export function Dashboard() {
           + New
         </Link>
       </header>
+      {pushState === "default" && (
+        <div className="mx-4 mt-3 p-3 bg-neutral-900 border border-neutral-800 rounded-lg flex items-center gap-3">
+          <span className="text-sm flex-1">Enable notifications when sessions finish?</span>
+          <button
+            onClick={pushSubscribe}
+            disabled={pushLoading}
+            className="px-3 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-sm whitespace-nowrap disabled:opacity-40"
+          >
+            {pushLoading ? "..." : "Enable"}
+          </button>
+        </div>
+      )}
       <main className="p-4 space-y-3">
         {sessions.length === 0 && (
           <p className="text-neutral-500 text-center py-12">No sessions</p>

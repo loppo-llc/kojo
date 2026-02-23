@@ -127,6 +127,14 @@ export const api = {
       }),
   },
 
+  push: {
+    vapidKey: () => get<{ publicKey: string }>("/api/v1/push/vapid").then((r) => r.publicKey),
+    subscribe: (subscription: PushSubscriptionJSON) =>
+      post<{ ok: boolean }>("/api/v1/push/subscribe", subscription),
+    unsubscribe: (endpoint: string) =>
+      post<{ ok: boolean }>("/api/v1/push/unsubscribe", { endpoint }),
+  },
+
   upload: async (file: File) => {
     const form = new FormData();
     form.append("file", file);
