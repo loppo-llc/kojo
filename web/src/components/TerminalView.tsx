@@ -188,13 +188,21 @@ export function TerminalView() {
       }
     });
 
-    // Detect user wheel scroll to toggle auto-scroll
-    term.attachCustomWheelEventHandler((e: WheelEvent) => {
+    const ro = new ResizeObserver(() => {
+      safeFit();
+    });
+    ro.observe(termRef.current);
+
+    // scroll event listeners (wheel for desktop, touch for mobile)
+    const el = termRef.current;
+
+    // Detect user wheel scroll to toggle auto-scroll.
+    // Use capture-phase listener so it fires before xterm v6's
+    // SmoothScrollableElement can stopPropagation.
+    const onWheel = (e: WheelEvent) => {
       if (e.deltaY < 0) {
-        // Scrolling up — user wants to read history
         autoScrollRef.current = false;
       } else if (e.deltaY > 0) {
-        // Scrolling down — check if close to bottom after xterm processes
         requestAnimationFrame(() => {
           const buf = term.buffer.active;
           if (buf.baseY - buf.viewportY <= 3) {
@@ -202,16 +210,8 @@ export function TerminalView() {
           }
         });
       }
-      return true; // let xterm handle the actual scroll
-    });
-
-    const ro = new ResizeObserver(() => {
-      safeFit();
-    });
-    ro.observe(termRef.current);
-
-    // touch scroll for mobile
-    const el = termRef.current;
+    };
+    el.addEventListener("wheel", onWheel, { capture: true, passive: true });
     let touchStartY = 0;
     let accumDelta = 0;
     const lineHeight = 20;
@@ -252,6 +252,7 @@ export function TerminalView() {
       onWriteParsedDisposable.dispose();
       onRenderDisposable.dispose();
       ro.disconnect();
+      el.removeEventListener("wheel", onWheel, { capture: true } as EventListenerOptions);
       el.removeEventListener("touchstart", onTouchStart, { capture: true } as EventListenerOptions);
       el.removeEventListener("touchmove", onTouchMove, { capture: true } as EventListenerOptions);
       term.dispose();

@@ -81,8 +81,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	ch, scrollback := sess.Subscribe()
 	defer sess.Unsubscribe(ch)
 
-	yoloCh := sess.SubscribeYoloDebug()
-	defer sess.UnsubscribeYoloDebug(yoloCh)
+	var yoloCh chan string
+	if s.devMode {
+		yoloCh = sess.SubscribeYoloDebug()
+		defer sess.UnsubscribeYoloDebug(yoloCh)
+	}
 
 	// send scrollback
 	if len(scrollback) > 0 {
