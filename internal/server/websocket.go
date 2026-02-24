@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/loppo-llc/kojo/internal/session"
@@ -114,8 +115,31 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// read from client
 	go s.wsReadLoop(ctx, cancel, conn, sess)
 
+	// keepalive: ping every 30s to detect dead connections on mobile
+	go s.wsPingLoop(ctx, cancel, conn)
+
 	// write to client
 	s.wsWriteLoop(ctx, conn, sess, ch, yoloCh)
+}
+
+func (s *Server) wsPingLoop(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn) {
+	defer cancel()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pingCtx, pingCancel := context.WithTimeout(ctx, 10*time.Second)
+			err := conn.Ping(pingCtx)
+			pingCancel()
+			if err != nil {
+				s.logger.Debug("websocket ping failed", "err", err)
+				return
+			}
+		}
+	}
 }
 
 func (s *Server) wsReadLoop(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn, sess *session.Session) {

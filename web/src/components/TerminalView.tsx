@@ -43,10 +43,16 @@ export function TerminalView() {
   const onScrollback = useCallback((data: Uint8Array) => {
     const term = xtermRef.current;
     if (!term) return;
-    // Clear terminal before writing scrollback to prevent
-    // content duplication on WebSocket reconnect
+    // Hide terminal during reset+write to prevent visible scroll-to-top flash
+    // on WebSocket reconnect (term.reset() sets ydisp=0 synchronously,
+    // but term.write() is async via WriteBuffer)
+    const el = term.element;
+    if (el) el.style.visibility = "hidden";
     term.reset();
-    term.write(data);
+    term.write(data, () => {
+      term.scrollToBottom();
+      if (el) el.style.visibility = "";
+    });
   }, []);
 
   const onExit = useCallback((exitCode: number, live: boolean) => {
@@ -379,7 +385,7 @@ export function TerminalView() {
       )}
 
       {/* Terminal */}
-      <div ref={termRef} className="flex-1 min-h-0" />
+      <div ref={termRef} className="flex-1 min-h-0" style={{ touchAction: "none" }} />
 
       {/* Auxiliary key bar */}
       <div className="flex gap-1.5 px-2 py-1.5 border-t border-neutral-800 overflow-x-auto shrink-0">
