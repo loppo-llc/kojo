@@ -36,6 +36,10 @@ export function TerminalView() {
   const [yoloTail, setYoloTail] = useState<string | null>(null);
   const yoloTimerRef = useRef<ReturnType<typeof setTimeout>>(null);
 
+  // Auto-scroll: true = follow output to bottom.
+  // Only disabled by explicit user scroll-up (wheel/touch).
+  const autoScrollRef = useRef(true);
+
   const onOutput = useCallback((data: Uint8Array) => {
     xtermRef.current?.write(data);
   }, []);
@@ -43,13 +47,11 @@ export function TerminalView() {
   const onScrollback = useCallback((data: Uint8Array) => {
     const term = xtermRef.current;
     if (!term) return;
-    // Hide terminal during reset+write to prevent visible scroll-to-top flash
-    // on WebSocket reconnect (term.reset() sets ydisp=0 synchronously,
-    // but term.write() is async via WriteBuffer)
     const el = term.element;
     if (el) el.style.visibility = "hidden";
     term.reset();
     term.write(data, () => {
+      autoScrollRef.current = true;
       term.scrollToBottom();
       if (el) el.style.visibility = "";
     });
@@ -63,7 +65,6 @@ export function TerminalView() {
   }, []);
 
   // fit() debounced into a single rAF to avoid repeated reflows
-  const fitStateRef = useRef<{ wasAtBottom: boolean; deltaFromBottom: number } | null>(null);
   const fitRafRef = useRef(0);
   const sendResizeRef = useRef<(cols: number, rows: number) => void>(() => {});
   const safeFit = useCallback(() => {
@@ -71,29 +72,14 @@ export function TerminalView() {
     const fit = fitRef.current;
     if (!term || !fit) return;
 
-    // Capture scroll state only on the first call in a batch
-    if (!fitStateRef.current) {
-      const buf = term.buffer.active;
-      fitStateRef.current = {
-        wasAtBottom: buf.viewportY >= buf.baseY,
-        deltaFromBottom: buf.baseY - buf.viewportY,
-      };
-    }
-
     cancelAnimationFrame(fitRafRef.current);
     fitRafRef.current = requestAnimationFrame(() => {
-      const state = fitStateRef.current;
-      fitStateRef.current = null;
-      if (!state || !xtermRef.current || !fitRef.current) return;
-
+      if (!xtermRef.current || !fitRef.current) return;
       fitRef.current.fit();
       sendResizeRef.current(xtermRef.current.cols, xtermRef.current.rows);
-
-      if (state.wasAtBottom) {
+      // Let autoScrollRef drive scroll position — no stale delta math
+      if (autoScrollRef.current) {
         xtermRef.current.scrollToBottom();
-      } else {
-        const target = xtermRef.current.buffer.active.baseY - state.deltaFromBottom;
-        xtermRef.current.scrollToLine(Math.max(0, target));
       }
     });
   }, []);
@@ -168,9 +154,45 @@ export function TerminalView() {
     xtermRef.current = term;
     fitRef.current = fit;
 
+    autoScrollRef.current = true;
+
     // forward terminal keystrokes to PTY
     const onDataDisposable = term.onData((data) => {
+      autoScrollRef.current = true;
       sendInput(data);
+    });
+
+    // Auto-scroll: after each batch of writes, scroll to bottom if user hasn't scrolled up.
+    // onWriteParsed fires immediately after data is parsed (before render) — fast path.
+    const onWriteParsedDisposable = term.onWriteParsed(() => {
+      if (autoScrollRef.current) {
+        term.scrollToBottom();
+      }
+    });
+
+    // Safety net: onRender fires after ANY rendering (including fit() resize reflow).
+    // Catches viewport jumps that onWriteParsed misses (e.g. fit() without new data).
+    const onRenderDisposable = term.onRender(() => {
+      if (autoScrollRef.current) {
+        term.scrollToBottom();
+      }
+    });
+
+    // Detect user wheel scroll to toggle auto-scroll
+    term.attachCustomWheelEventHandler((e: WheelEvent) => {
+      if (e.deltaY < 0) {
+        // Scrolling up — user wants to read history
+        autoScrollRef.current = false;
+      } else if (e.deltaY > 0) {
+        // Scrolling down — check if close to bottom after xterm processes
+        requestAnimationFrame(() => {
+          const buf = term.buffer.active;
+          if (buf.baseY - buf.viewportY <= 3) {
+            autoScrollRef.current = true;
+          }
+        });
+      }
+      return true; // let xterm handle the actual scroll
     });
 
     const ro = new ResizeObserver(() => {
@@ -193,7 +215,20 @@ export function TerminalView() {
       accumDelta += dy;
       const lines = Math.trunc(accumDelta / lineHeight);
       if (lines !== 0) {
-        term.scrollLines(lines);
+        // dy>0 = finger up = content scrolls down (toward bottom) = lines>0
+        // dy<0 = finger down = content scrolls up (toward history) = lines<0
+        if (lines > 0) {
+          // Scrolling down toward bottom — check if at bottom after scroll
+          term.scrollLines(lines);
+          const buf = term.buffer.active;
+          if (buf.viewportY >= buf.baseY) {
+            autoScrollRef.current = true;
+          }
+        } else {
+          // Scrolling up toward history — disable auto-scroll
+          autoScrollRef.current = false;
+          term.scrollLines(lines);
+        }
         accumDelta -= lines * lineHeight;
       }
       e.preventDefault();
@@ -203,8 +238,9 @@ export function TerminalView() {
 
     return () => {
       cancelAnimationFrame(fitRafRef.current);
-      fitStateRef.current = null;
       onDataDisposable.dispose();
+      onWriteParsedDisposable.dispose();
+      onRenderDisposable.dispose();
       ro.disconnect();
       el.removeEventListener("touchstart", onTouchStart, { capture: true } as EventListenerOptions);
       el.removeEventListener("touchmove", onTouchMove, { capture: true } as EventListenerOptions);
@@ -215,6 +251,7 @@ export function TerminalView() {
   }, [id, sendInput, sendResize]);
 
   const handleSend = () => {
+    autoScrollRef.current = true;
     if (!input || !input.trim()) {
       sendInput("\r");
       return;
@@ -244,6 +281,7 @@ export function TerminalView() {
   };
 
   const handleKeyPress = (code: string) => {
+    autoScrollRef.current = true;
     if (code === "ctrl") {
       clearModifiers();
       setCtrlMode(!ctrlMode);
@@ -369,23 +407,23 @@ export function TerminalView() {
         </div>
       )}
 
-      {/* Yolo debug tail notification */}
-      {yoloTail && (
-        <button
-          onClick={() => {
-            navigator.clipboard.writeText(yoloTail);
-            setYoloTail(null);
-          }}
-          className="px-3 py-2 bg-purple-950 text-purple-300 text-xs text-left font-mono shrink-0 active:bg-purple-900"
-        >
-          <span className="text-purple-500">yolo tail</span>{" "}
-          <span className="truncate block">{yoloTail.slice(-80)}</span>
-          <span className="text-purple-600 text-[10px]">tap to copy</span>
-        </button>
-      )}
-
-      {/* Terminal */}
-      <div ref={termRef} className="flex-1 min-h-0" style={{ touchAction: "none" }} />
+      {/* Terminal (with yolo overlay) */}
+      <div className="relative flex-1 min-h-0">
+        <div ref={termRef} className="absolute inset-0" style={{ touchAction: "none" }} />
+        {yoloTail && (
+          <button
+            onClick={() => {
+              navigator.clipboard.writeText(yoloTail);
+              setYoloTail(null);
+            }}
+            className="absolute top-0 left-0 right-0 z-10 px-3 py-2 bg-purple-950/90 text-purple-300 text-xs text-left font-mono active:bg-purple-900"
+          >
+            <span className="text-purple-500">yolo tail</span>{" "}
+            <span className="truncate block">{yoloTail.slice(-80)}</span>
+            <span className="text-purple-600 text-[10px]">tap to copy</span>
+          </button>
+        )}
+      </div>
 
       {/* Auxiliary key bar */}
       <div className="flex gap-1.5 px-2 py-1.5 border-t border-neutral-800 overflow-x-auto shrink-0">
