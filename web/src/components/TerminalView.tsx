@@ -33,7 +33,8 @@ export function TerminalView() {
   const [cmdMode, setCmdMode] = useState(false);
   const [shiftMode, setShiftMode] = useState(false);
   const [exited, setExited] = useState(false);
-  const [yoloTail, setYoloTail] = useState<string | null>(null);
+  const yoloTailRef = useRef<string | null>(null);
+  const yoloOverlayRef = useRef<HTMLButtonElement>(null);
   const yoloTimerRef = useRef<ReturnType<typeof setTimeout>>(null);
 
   // Auto-scroll: true = follow output to bottom.
@@ -85,9 +86,18 @@ export function TerminalView() {
   }, []);
 
   const onYoloDebug = useCallback((tail: string) => {
-    setYoloTail(tail);
+    yoloTailRef.current = tail;
+    const el = yoloOverlayRef.current;
+    if (el) {
+      el.style.display = "";
+      const textEl = el.querySelector<HTMLSpanElement>("[data-yolo-text]");
+      if (textEl) textEl.textContent = tail.slice(-80);
+    }
     if (yoloTimerRef.current) clearTimeout(yoloTimerRef.current);
-    yoloTimerRef.current = setTimeout(() => setYoloTail(null), 5000);
+    yoloTimerRef.current = setTimeout(() => {
+      yoloTailRef.current = null;
+      if (yoloOverlayRef.current) yoloOverlayRef.current.style.display = "none";
+    }, 5000);
   }, []);
 
   const { connected, sendInput, sendResize, reconnect } = useWebSocket({
@@ -410,19 +420,20 @@ export function TerminalView() {
       {/* Terminal (with yolo overlay) */}
       <div className="relative flex-1 min-h-0">
         <div ref={termRef} className="absolute inset-0" style={{ touchAction: "none" }} />
-        {yoloTail && (
-          <button
-            onClick={() => {
-              navigator.clipboard.writeText(yoloTail);
-              setYoloTail(null);
-            }}
-            className="absolute top-0 left-0 right-0 z-10 px-3 py-2 bg-purple-950/90 text-purple-300 text-xs text-left font-mono active:bg-purple-900"
-          >
-            <span className="text-purple-500">yolo tail</span>{" "}
-            <span className="truncate block">{yoloTail.slice(-80)}</span>
-            <span className="text-purple-600 text-[10px]">tap to copy</span>
-          </button>
-        )}
+        <button
+          ref={yoloOverlayRef}
+          style={{ display: "none" }}
+          onClick={() => {
+            if (yoloTailRef.current) navigator.clipboard.writeText(yoloTailRef.current);
+            yoloTailRef.current = null;
+            if (yoloOverlayRef.current) yoloOverlayRef.current.style.display = "none";
+          }}
+          className="absolute top-0 left-0 right-0 z-10 px-3 py-2 bg-purple-950/90 text-purple-300 text-xs text-left font-mono active:bg-purple-900"
+        >
+          <span className="text-purple-500">yolo tail</span>{" "}
+          <span data-yolo-text className="truncate block" />
+          <span className="text-purple-600 text-[10px]">tap to copy</span>
+        </button>
       </div>
 
       {/* Auxiliary key bar */}
