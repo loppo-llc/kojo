@@ -64,8 +64,11 @@ type YoloApproval struct {
 	Response string `json:"response"`
 }
 
+// yoloTailSize is the trailing output buffer size for yolo pattern detection.
+const yoloTailSize = 4096
+
 // strip ANSI escapes for pattern matching (replace with space to preserve word boundaries)
-var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[()][0-9A-B]`)
+var ansiRe = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[()][0-9A-B]`)
 var multiSpaceRe = regexp.MustCompile(`[ \t]{2,}`)
 
 // "Do you ...? ... 1. Yes" pattern (allow blank lines between question and options)
@@ -231,10 +234,10 @@ func (s *Session) CheckYolo(data []byte) (*YoloApproval, string) {
 		return nil, ""
 	}
 
-	// append to tail, keep last 512 bytes
+	// append to tail, keep last yoloTailSize bytes
 	s.yoloTail = append(s.yoloTail, data...)
-	if len(s.yoloTail) > 512 {
-		s.yoloTail = s.yoloTail[len(s.yoloTail)-512:]
+	if len(s.yoloTail) > yoloTailSize {
+		s.yoloTail = s.yoloTail[len(s.yoloTail)-yoloTailSize:]
 	}
 	tail := make([]byte, len(s.yoloTail))
 	copy(tail, s.yoloTail)
