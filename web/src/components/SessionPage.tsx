@@ -390,8 +390,8 @@ export function SessionPage() {
     const tmuxKey = `tmux_session_${id}`;
     const tmuxId = localStorage.getItem(tmuxKey);
     if (tmuxId) {
-      await api.sessions.delete(tmuxId).catch(() => {});
-      localStorage.removeItem(tmuxKey);
+      const ok = await api.sessions.delete(tmuxId).then(() => true).catch(() => false);
+      if (ok) localStorage.removeItem(tmuxKey);
     }
     await api.sessions.delete(id);
     setExited(true);

@@ -73,7 +73,7 @@ func (m *Manager) loadPersistedSessions() {
 			Status:          StatusExited,
 			ExitCode:        info.ExitCode,
 			YoloMode:        info.YoloMode,
-			Internal:        info.Internal,
+			Internal:        info.Internal || internalTools[info.Tool],
 			ToolSessionID: info.ToolSessionID,
 			scrollback:      NewRingBuffer(defaultRingSize),
 			subscribers:     make(map[chan []byte]struct{}),
@@ -340,6 +340,10 @@ func (m *Manager) readLoop(s *Session) {
 	s.mu.Lock()
 	ptmx := s.PTY
 	s.mu.Unlock()
+
+	if ptmx == nil {
+		return
+	}
 
 	buf := make([]byte, 32*1024)
 	for {
