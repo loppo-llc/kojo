@@ -8,6 +8,7 @@ export interface SessionInfo {
   status: "running" | "exited";
   exitCode?: number;
   yoloMode: boolean;
+  internal?: boolean;
   createdAt: string;
   toolSessionId?: string;
   lastOutput?: string; // base64-encoded last terminal output

@@ -18,11 +18,18 @@ import (
 	"github.com/google/uuid"
 )
 
-var allowedTools = map[string]bool{
+var userTools = map[string]bool{
 	"claude": true,
 	"codex":  true,
 	"gemini": true,
-	"tmux":   true,
+}
+
+var internalTools = map[string]bool{
+	"tmux": true,
+}
+
+func isAllowedTool(name string) bool {
+	return userTools[name] || internalTools[name]
 }
 
 type Manager struct {
@@ -66,6 +73,7 @@ func (m *Manager) loadPersistedSessions() {
 			Status:          StatusExited,
 			ExitCode:        info.ExitCode,
 			YoloMode:        info.YoloMode,
+			Internal:        info.Internal,
 			ToolSessionID: info.ToolSessionID,
 			scrollback:      NewRingBuffer(defaultRingSize),
 			subscribers:     make(map[chan []byte]struct{}),
@@ -80,7 +88,7 @@ func (m *Manager) loadPersistedSessions() {
 }
 
 func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool) (*Session, error) {
-	if !allowedTools[tool] {
+	if !isAllowedTool(tool) {
 		return nil, fmt.Errorf("unsupported tool: %s", tool)
 	}
 
@@ -148,6 +156,7 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool) (*S
 		CreatedAt:       time.Now(),
 		Status:          StatusRunning,
 		YoloMode:        yoloMode,
+		Internal:        internalTools[tool],
 		ToolSessionID: toolSessionID,
 		scrollback:      NewRingBuffer(defaultRingSize),
 		subscribers:     make(map[chan []byte]struct{}),
@@ -187,7 +196,7 @@ func (m *Manager) Restart(id string) (*Session, error) {
 	toolSessionID := s.ToolSessionID
 	s.mu.Unlock()
 
-	if !allowedTools[tool] {
+	if !isAllowedTool(tool) {
 		return nil, fmt.Errorf("unsupported tool: %s", tool)
 	}
 
@@ -483,10 +492,10 @@ func generateID() string {
 	return "s_" + hex.EncodeToString(b)
 }
 
-// ToolAvailability checks which tools are available on this system.
+// ToolAvailability checks which user-facing tools are available on this system.
 func ToolAvailability() map[string]ToolInfo {
 	result := make(map[string]ToolInfo)
-	for tool := range allowedTools {
+	for tool := range userTools {
 		path, err := exec.LookPath(tool)
 		result[tool] = ToolInfo{
 			Available: err == nil,

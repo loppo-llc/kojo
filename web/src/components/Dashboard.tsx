@@ -13,7 +13,7 @@ interface SessionGroup {
 
 function groupSessions(sessions: SessionInfo[]): SessionGroup[] {
   const sorted = [...sessions]
-    .filter((s) => s.tool !== "tmux")
+    .filter((s) => !s.internal)
     .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
   const map = new Map<string, SessionInfo[]>();
@@ -64,7 +64,7 @@ export function Dashboard() {
   }, []);
 
   const groups = groupSessions(sessions);
-  const hasAny = sessions.some((s) => s.tool !== "tmux");
+  const hasAny = sessions.some((s) => !s.internal);
 
   const toggleExpand = (key: string) => {
     setExpanded((prev) => {

@@ -29,6 +29,7 @@ type Session struct {
 	Status          Status
 	ExitCode        *int
 	YoloMode        bool
+	Internal        bool   // internal session (e.g. tmux), not user-facing
 	ToolSessionID string // tool-specific session ID for resume
 
 	// ring buffer for scrollback (1MB)
@@ -81,6 +82,7 @@ type SessionInfo struct {
 	Status          Status   `json:"status"`
 	ExitCode        *int     `json:"exitCode,omitempty"`
 	YoloMode        bool     `json:"yoloMode"`
+	Internal        bool     `json:"internal,omitempty"`
 	CreatedAt       string   `json:"createdAt"`
 	ToolSessionID string   `json:"toolSessionId,omitempty"`
 	LastOutput      string   `json:"lastOutput,omitempty"`
@@ -97,6 +99,7 @@ func (s *Session) Info() SessionInfo {
 		Status:          s.Status,
 		ExitCode:        s.ExitCode,
 		YoloMode:        s.YoloMode,
+		Internal:        s.Internal,
 		CreatedAt:       s.CreatedAt.UTC().Format(time.RFC3339),
 		ToolSessionID: s.ToolSessionID,
 	}
