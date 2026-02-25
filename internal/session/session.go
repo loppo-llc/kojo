@@ -2,6 +2,7 @@ package session
 
 import (
 	"bytes"
+	"encoding/base64"
 	"os"
 	"os/exec"
 	"regexp"
@@ -48,6 +49,12 @@ type Session struct {
 
 	// yolo debug subscribers
 	yoloDebugSubs map[chan string]struct{}
+
+	// last terminal output captured on exit (for persistence)
+	lastOutput []byte
+
+	// readDone is closed when readLoop exits
+	readDone chan struct{}
 }
 
 // YoloApproval is broadcast when yolo auto-approves a prompt.
@@ -76,12 +83,13 @@ type SessionInfo struct {
 	YoloMode        bool     `json:"yoloMode"`
 	CreatedAt       string   `json:"createdAt"`
 	ToolSessionID string   `json:"toolSessionId,omitempty"`
+	LastOutput      string   `json:"lastOutput,omitempty"`
 }
 
 func (s *Session) Info() SessionInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return SessionInfo{
+	info := SessionInfo{
 		ID:              s.ID,
 		Tool:            s.Tool,
 		WorkDir:         s.WorkDir,
@@ -92,6 +100,10 @@ func (s *Session) Info() SessionInfo {
 		CreatedAt:       s.CreatedAt.UTC().Format(time.RFC3339),
 		ToolSessionID: s.ToolSessionID,
 	}
+	if len(s.lastOutput) > 0 {
+		info.LastOutput = base64.StdEncoding.EncodeToString(s.lastOutput)
+	}
+	return info
 }
 
 func (s *Session) Subscribe() (chan []byte, []byte) {

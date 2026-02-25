@@ -1,10 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useParams, useNavigate } from "react-router";
+import { useParams, useNavigate, useLocation } from "react-router";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { api, type SessionInfo } from "../lib/api";
+import { FileBrowser } from "./FileBrowser";
+import { GitPanel } from "./GitPanel";
+import { TerminalTab } from "./TerminalTab";
+
+type SessionTab = "cli" | "terminal" | "files" | "git";
+
+const TABS: { key: SessionTab; label: string }[] = [
+  { key: "cli", label: "CLI" },
+  { key: "terminal", label: "Terminal" },
+  { key: "files", label: "Files" },
+  { key: "git", label: "Git" },
+];
 
 const SPECIAL_KEYS = [
   { label: "Esc", code: "\x1b" },
@@ -20,9 +32,10 @@ const SPECIAL_KEYS = [
   { label: "\u2190", code: "\x1b[D" },
 ];
 
-export function TerminalView() {
+export function SessionPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const termRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<Terminal>(null);
   const fitRef = useRef<FitAddon>(null);
@@ -37,9 +50,25 @@ export function TerminalView() {
   const yoloOverlayRef = useRef<HTMLButtonElement>(null);
   const yoloTimerRef = useRef<ReturnType<typeof setTimeout>>(null);
 
-  // Auto-scroll: true = follow output to bottom.
-  // Only disabled by explicit user scroll-up (wheel/touch).
+  // Tab state — derive from URL and keep in sync
+  const tabFromPath = (pathname: string): SessionTab =>
+    pathname.endsWith("/terminal") ? "terminal" : pathname.endsWith("/files") ? "files" : pathname.endsWith("/git") ? "git" : "cli";
+  const [activeTab, setActiveTab] = useState<SessionTab>(tabFromPath(location.pathname));
+
+  useEffect(() => {
+    setActiveTab(tabFromPath(location.pathname));
+  }, [location.pathname]);
+
+  const switchTab = (tab: SessionTab) => {
+    setActiveTab(tab);
+    const base = `/session/${id}`;
+    const path = tab === "cli" ? base : `${base}/${tab}`;
+    navigate(path, { replace: true });
+  };
+
+  // Auto-scroll
   const autoScrollRef = useRef(true);
+  const gotScrollbackRef = useRef(false);
 
   const onOutput = useCallback((data: Uint8Array) => {
     xtermRef.current?.write(data);
@@ -48,6 +77,7 @@ export function TerminalView() {
   const onScrollback = useCallback((data: Uint8Array) => {
     const term = xtermRef.current;
     if (!term) return;
+    gotScrollbackRef.current = true;
     const el = term.element;
     if (el) el.style.visibility = "hidden";
     term.reset();
@@ -65,20 +95,24 @@ export function TerminalView() {
     }
   }, []);
 
-  // fit() debounced into a single rAF to avoid repeated reflows
+  // fit() debounced into a single rAF
   const fitRafRef = useRef(0);
   const sendResizeRef = useRef<(cols: number, rows: number) => void>(() => {});
   const safeFit = useCallback(() => {
     const term = xtermRef.current;
     const fit = fitRef.current;
-    if (!term || !fit) return;
+    const el = termRef.current;
+    if (!term || !fit || !el) return;
+    // Skip fit when terminal is hidden (display:none makes offsetParent null)
+    if (!el.offsetParent) return;
 
     cancelAnimationFrame(fitRafRef.current);
     fitRafRef.current = requestAnimationFrame(() => {
       if (!xtermRef.current || !fitRef.current) return;
+      const el2 = termRef.current;
+      if (!el2 || !el2.offsetParent) return;
       fitRef.current.fit();
       sendResizeRef.current(xtermRef.current.cols, xtermRef.current.rows);
-      // Let autoScrollRef drive scroll position — no stale delta math
       if (autoScrollRef.current) {
         xtermRef.current.scrollToBottom();
       }
@@ -111,11 +145,24 @@ export function TerminalView() {
 
   useEffect(() => {
     setExited(false);
+    gotScrollbackRef.current = false;
     api.sessions.get(id!).then((s) => {
       setSession(s);
       if (s.status === "exited") setExited(true);
     }).catch(() => navigate("/"));
   }, [id, navigate]);
+
+  // Show persisted lastOutput for exited sessions when no live scrollback arrived
+  useEffect(() => {
+    if (!session?.lastOutput || !exited) return;
+    if (gotScrollbackRef.current) return;
+    const term = xtermRef.current;
+    if (!term) return;
+    const bytes = Uint8Array.from(atob(session.lastOutput), (c) => c.charCodeAt(0));
+    term.write(bytes, () => {
+      term.scrollToBottom();
+    });
+  }, [session, exited]);
 
   // track visual viewport for mobile keyboard
   const containerRef = useRef<HTMLDivElement>(null);
@@ -139,6 +186,13 @@ export function TerminalView() {
       vv.removeEventListener("scroll", updateHeight);
     };
   }, []);
+
+  // Refit terminal when switching back to CLI tab
+  useEffect(() => {
+    if (activeTab === "cli") {
+      requestAnimationFrame(() => safeFit());
+    }
+  }, [activeTab, safeFit]);
 
   useEffect(() => {
     if (!termRef.current) return;
@@ -172,16 +226,12 @@ export function TerminalView() {
       sendInput(data);
     });
 
-    // Auto-scroll: after each batch of writes, scroll to bottom if user hasn't scrolled up.
-    // onWriteParsed fires immediately after data is parsed (before render) — fast path.
     const onWriteParsedDisposable = term.onWriteParsed(() => {
       if (autoScrollRef.current) {
         term.scrollToBottom();
       }
     });
 
-    // Safety net: onRender fires after ANY rendering (including fit() resize reflow).
-    // Catches viewport jumps that onWriteParsed misses (e.g. fit() without new data).
     const onRenderDisposable = term.onRender(() => {
       if (autoScrollRef.current) {
         term.scrollToBottom();
@@ -193,12 +243,9 @@ export function TerminalView() {
     });
     ro.observe(termRef.current);
 
-    // scroll event listeners (wheel for desktop, touch for mobile)
+    // scroll event listeners
     const el = termRef.current;
 
-    // Detect user wheel scroll to toggle auto-scroll.
-    // Use capture-phase listener so it fires before xterm v6's
-    // SmoothScrollableElement can stopPropagation.
     const onWheel = (e: WheelEvent) => {
       if (e.deltaY < 0) {
         autoScrollRef.current = false;
@@ -225,17 +272,13 @@ export function TerminalView() {
       accumDelta += dy;
       const lines = Math.trunc(accumDelta / lineHeight);
       if (lines !== 0) {
-        // dy>0 = finger up = content scrolls down (toward bottom) = lines>0
-        // dy<0 = finger down = content scrolls up (toward history) = lines<0
         if (lines > 0) {
-          // Scrolling down toward bottom — check if at bottom after scroll
           term.scrollLines(lines);
           const buf = term.buffer.active;
           if (buf.viewportY >= buf.baseY) {
             autoScrollRef.current = true;
           }
         } else {
-          // Scrolling up toward history — disable auto-scroll
           autoScrollRef.current = false;
           term.scrollLines(lines);
         }
@@ -248,6 +291,7 @@ export function TerminalView() {
 
     return () => {
       cancelAnimationFrame(fitRafRef.current);
+      if (yoloTimerRef.current) clearTimeout(yoloTimerRef.current);
       onDataDisposable.dispose();
       onWriteParsedDisposable.dispose();
       onRenderDisposable.dispose();
@@ -320,19 +364,17 @@ export function TerminalView() {
       }
       clearModifiers();
     } else if (optMode) {
-      // Option/Alt: send ESC prefix
       sendInput("\x1b" + code);
       clearModifiers();
     } else if (cmdMode) {
-      // Cmd: send ESC prefix (meta)
       sendInput("\x1b" + code);
       clearModifiers();
     } else if (shiftMode) {
       const shiftMap: Record<string, string> = {
-        "\x1b[A": "\x1b[1;2A", // Shift+Up
-        "\x1b[B": "\x1b[1;2B", // Shift+Down
-        "\x1b[C": "\x1b[1;2C", // Shift+Right
-        "\x1b[D": "\x1b[1;2D", // Shift+Left
+        "\x1b[A": "\x1b[1;2A",
+        "\x1b[B": "\x1b[1;2B",
+        "\x1b[C": "\x1b[1;2C",
+        "\x1b[D": "\x1b[1;2D",
         "/": "?",
       };
       sendInput(shiftMap[code] ?? code.toUpperCase());
@@ -343,10 +385,16 @@ export function TerminalView() {
   };
 
   const handleStop = async () => {
-    if (id) {
-      await api.sessions.delete(id);
-      setExited(true);
+    if (!id) return;
+    // Kill associated tmux session
+    const tmuxKey = `tmux_session_${id}`;
+    const tmuxId = localStorage.getItem(tmuxKey);
+    if (tmuxId) {
+      await api.sessions.delete(tmuxId).catch(() => {});
+      localStorage.removeItem(tmuxKey);
     }
+    await api.sessions.delete(id);
+    setExited(true);
   };
 
   const handleYoloToggle = async () => {
@@ -377,118 +425,171 @@ export function TerminalView() {
         </button>
         <span className="font-mono font-bold">{session?.tool}</span>
         <span className="text-xs text-neutral-500 truncate flex-1">{session?.workDir}</span>
-        <button
-          onClick={() => navigate(`/files?path=${encodeURIComponent(session?.workDir ?? '')}`)}
-          className="px-2.5 py-1.5 text-xs bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded min-h-[44px] min-w-[44px] flex items-center justify-center"
-          title="Files"
-        >
-          &#x1F4C1;
-        </button>
-        <button
-          onClick={() => navigate(`/session/${id}/git`)}
-          className="px-2.5 py-1.5 text-xs bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded min-h-[44px] min-w-[44px] flex items-center justify-center font-mono"
-          title="Git"
-        >
-          git
-        </button>
-        <button
-          onClick={handleYoloToggle}
-          className={`px-2.5 py-1.5 text-xs rounded min-h-[44px] min-w-[44px] flex items-center justify-center ${
-            session?.yoloMode
-              ? "bg-yellow-900 text-yellow-300"
-              : "bg-neutral-800 text-neutral-500"
-          }`}
-          title="Yolo Mode"
-        >
-          &#x26A1;
-        </button>
-        <button
-          onClick={handleStop}
-          disabled={exited}
-          className="px-2.5 py-1.5 text-xs bg-neutral-800 hover:bg-red-900 text-neutral-400 hover:text-red-300 rounded min-h-[44px] min-w-[44px] flex items-center justify-center disabled:opacity-30"
-        >
-          &#9632;
-        </button>
+        {exited ? (
+          session?.exitCode !== undefined && (
+            <span className="text-xs text-neutral-600">exit {session.exitCode}</span>
+          )
+        ) : (
+          <>
+            <button
+              onClick={handleYoloToggle}
+              className={`px-2.5 py-1.5 text-xs rounded min-h-[44px] min-w-[44px] flex items-center justify-center ${
+                session?.yoloMode
+                  ? "bg-yellow-900 text-yellow-300"
+                  : "bg-neutral-800 text-neutral-500"
+              }`}
+              title="Yolo Mode"
+            >
+              &#x26A1;
+            </button>
+            <button
+              onClick={handleStop}
+              className="px-2.5 py-1.5 text-xs bg-neutral-800 hover:bg-red-900 text-neutral-400 hover:text-red-300 rounded min-h-[44px] min-w-[44px] flex items-center justify-center"
+            >
+              &#9632;
+            </button>
+          </>
+        )}
       </header>
 
+      {/* Tab bar — hidden when exited */}
+      {!exited && (
+        <div className="flex border-b border-neutral-800 shrink-0">
+          {TABS.map((t) => (
+            <button
+              key={t.key}
+              onClick={() => switchTab(t.key)}
+              className={`flex-1 py-2 text-sm text-center ${
+                activeTab === t.key
+                  ? "text-neutral-200 border-b-2 border-neutral-400"
+                  : "text-neutral-500"
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+      )}
+
       {/* Connection indicator */}
-      {!connected && !exited && (
+      {!exited && !connected && (
         <div className="px-3 py-1 bg-yellow-950 text-yellow-400 text-xs text-center">
           Reconnecting...
         </div>
       )}
 
-      {/* Terminal (with yolo overlay) */}
-      <div className="relative flex-1 min-h-0">
-        <div ref={termRef} className="absolute inset-0" style={{ touchAction: "none" }} />
-        <button
-          ref={yoloOverlayRef}
-          style={{ display: "none" }}
-          onClick={() => {
-            if (yoloTailRef.current) navigator.clipboard.writeText(yoloTailRef.current);
-            yoloTailRef.current = null;
-            if (yoloOverlayRef.current) yoloOverlayRef.current.style.display = "none";
-          }}
-          className="absolute top-0 left-0 right-0 z-10 px-3 py-2 bg-purple-950/90 text-purple-300 text-xs text-left font-mono active:bg-purple-900"
+      {/* Main content */}
+      <div className="flex-1 min-h-0 relative">
+        {/* CLI / exited terminal — visible when cli tab or exited */}
+        <div
+          className="absolute inset-0 flex flex-col"
+          style={{ display: (exited || activeTab === "cli") ? "" : "none" }}
         >
-          <span className="text-purple-500">yolo tail</span>{" "}
-          <span data-yolo-text className="truncate block" />
-          <span className="text-purple-600 text-[10px]">tap to copy</span>
-        </button>
-      </div>
+          <div className="relative flex-1 min-h-0">
+            <div ref={termRef} className="absolute inset-0" style={{ touchAction: "none" }} />
+            {!exited && (
+              <button
+                ref={yoloOverlayRef}
+                style={{ display: "none" }}
+                onClick={() => {
+                  if (yoloTailRef.current) navigator.clipboard.writeText(yoloTailRef.current);
+                  yoloTailRef.current = null;
+                  if (yoloOverlayRef.current) yoloOverlayRef.current.style.display = "none";
+                }}
+                className="absolute top-0 left-0 right-0 z-10 px-3 py-2 bg-purple-950/90 text-purple-300 text-xs text-left font-mono active:bg-purple-900"
+              >
+                <span className="text-purple-500">yolo tail</span>{" "}
+                <span data-yolo-text className="truncate block" />
+                <span className="text-purple-600 text-[10px]">tap to copy</span>
+              </button>
+            )}
+          </div>
 
-      {/* Auxiliary key bar */}
-      <div className="flex gap-1.5 px-2 py-1.5 border-t border-neutral-800 overflow-x-auto shrink-0">
-        {SPECIAL_KEYS.map((key) => (
-          <button
-            key={key.label}
-            onClick={() => handleKeyPress(key.code)}
-            className={`px-4 py-2.5 text-sm rounded font-mono ${
-              (key.code === "ctrl" && ctrlMode) || (key.code === "opt" && optMode) || (key.code === "cmd" && cmdMode) || (key.code === "shift" && shiftMode)
-                ? "bg-blue-900 text-blue-300"
-                : "bg-neutral-800 text-neutral-400 active:bg-neutral-600"
-            }`}
-          >
-            {key.label}
-          </button>
-        ))}
-      </div>
-
-      {/* Input bar */}
-      {!exited ? (
-        <div className="flex items-end gap-2 px-2 py-2 border-t border-neutral-800 shrink-0">
-          <button
-            onClick={handleFileAttach}
-            className="px-2 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 rounded"
-            title="Attach file"
-          >
-            &#x1F4CE;
-          </button>
-          <textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && e.shiftKey) {
-                e.preventDefault();
-                handleSend();
-              }
-            }}
-            placeholder="Type here... (Shift+Enter to send)"
-            rows={Math.min(input.split("\n").length, 5)}
-            className="flex-1 px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500 resize-none"
-          />
-          <button
-            onClick={handleSend}
-            className="px-3 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-sm"
-          >
-            Enter
-          </button>
+          {/* Controls — only when running */}
+          {!exited && (
+            <>
+              <div className="flex gap-1.5 px-2 py-1.5 border-t border-neutral-800 overflow-x-auto shrink-0">
+                {SPECIAL_KEYS.map((key) => (
+                  <button
+                    key={key.label}
+                    onClick={() => handleKeyPress(key.code)}
+                    className={`px-4 py-2.5 text-sm rounded font-mono ${
+                      (key.code === "ctrl" && ctrlMode) || (key.code === "opt" && optMode) || (key.code === "cmd" && cmdMode) || (key.code === "shift" && shiftMode)
+                        ? "bg-blue-900 text-blue-300"
+                        : "bg-neutral-800 text-neutral-400 active:bg-neutral-600"
+                    }`}
+                  >
+                    {key.label}
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-end gap-2 px-2 py-2 border-t border-neutral-800 shrink-0">
+                <button
+                  onClick={handleFileAttach}
+                  className="px-2 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 rounded"
+                  title="Attach file"
+                >
+                  &#x1F4CE;
+                </button>
+                <textarea
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && e.shiftKey) {
+                      e.preventDefault();
+                      handleSend();
+                    }
+                  }}
+                  placeholder="Type here... (Shift+Enter to send)"
+                  rows={Math.min(input.split("\n").length, 5)}
+                  className="flex-1 px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500 resize-none"
+                />
+                <button
+                  onClick={handleSend}
+                  className="px-3 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-sm"
+                >
+                  Enter
+                </button>
+              </div>
+            </>
+          )}
         </div>
-      ) : (
-        <div className="flex items-center justify-center gap-3 px-2 py-3 border-t border-neutral-800 shrink-0">
+
+        {/* Other tab panels — only when running */}
+        {!exited && (
+          <>
+            <div
+              className="absolute inset-0"
+              style={{ display: activeTab === "terminal" ? "" : "none" }}
+            >
+              <TerminalTab
+                parentSessionId={id!}
+                workDir={session?.workDir ?? ""}
+                visible={activeTab === "terminal"}
+              />
+            </div>
+            <div
+              className="absolute inset-0 overflow-y-auto"
+              style={{ display: activeTab === "files" ? "" : "none" }}
+            >
+              <FileBrowser embedded initialPath={session?.workDir} />
+            </div>
+            <div
+              className="absolute inset-0"
+              style={{ display: activeTab === "git" ? "" : "none" }}
+            >
+              <GitPanel embedded workDir={session?.workDir} />
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Exited action buttons */}
+      {exited && (
+        <div className="flex flex-col gap-3 px-4 py-4 border-t border-neutral-800 shrink-0">
           <button
             onClick={handleResume}
-            className="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm font-medium"
+            className="w-full py-3.5 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-base font-medium"
           >
             Resume
           </button>
@@ -496,15 +597,15 @@ export function TerminalView() {
             onClick={async () => {
               if (!session) return;
               const s = await api.sessions.create({ tool: session.tool, workDir: session.workDir });
-              navigate(`/session/${s.id}`);
+              navigate(`/session/${s.id}`, { replace: true });
             }}
-            className="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm font-medium"
+            className="w-full py-3.5 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-base font-medium"
           >
             New Session
           </button>
           <button
             onClick={() => navigate("/")}
-            className="px-4 py-2 bg-neutral-900 hover:bg-neutral-800 rounded-lg text-sm text-neutral-400"
+            className="w-full py-2.5 text-sm text-neutral-500 hover:text-neutral-400"
           >
             Back
           </button>

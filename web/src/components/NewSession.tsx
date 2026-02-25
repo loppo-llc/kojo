@@ -69,7 +69,7 @@ export function NewSession() {
     try {
       const parsedArgs = args.trim() ? args.trim().split(/\s+/) : undefined;
       const session = await api.sessions.create({ tool, workDir, args: parsedArgs, yoloMode });
-      navigate(`/session/${session.id}`);
+      navigate(`/session/${session.id}`, { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setLoading(false);
@@ -80,7 +80,7 @@ export function NewSession() {
     <div className="min-h-full bg-neutral-950 text-neutral-200">
       <header className="flex items-center justify-between px-4 py-3 border-b border-neutral-800">
         <div className="flex items-center gap-2">
-          <button onClick={() => navigate("/")} className="text-neutral-400 hover:text-neutral-200">
+          <button onClick={() => navigate("/", { replace: true })} className="text-neutral-400 hover:text-neutral-200">
             &larr;
           </button>
           <h1 className="text-lg font-bold">New Session</h1>

@@ -2,17 +2,31 @@ import { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { api, type DirEntry, type FileView } from "../lib/api";
 
-export function FileBrowser() {
+interface FileBrowserProps {
+  embedded?: boolean;
+  initialPath?: string;
+}
+
+export function FileBrowser({ embedded, initialPath }: FileBrowserProps = {}) {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [entries, setEntries] = useState<DirEntry[]>([]);
   const [currentPath, setCurrentPath] = useState("");
   const [fileView, setFileView] = useState<FileView | null>(null);
   const [showHidden, setShowHidden] = useState(false);
+  const [internalPath, setInternalPath] = useState(initialPath ?? "");
 
-  const path = searchParams.get("path") || "";
+  const path = embedded ? internalPath : (searchParams.get("path") || "");
+  const setPath = (p: string) => {
+    if (embedded) {
+      setInternalPath(p);
+    } else {
+      setSearchParams({ path: p });
+    }
+  };
 
   useEffect(() => {
+    if (embedded && !initialPath) return;
     api.files
       .list(path || undefined, showHidden)
       .then((result) => {
@@ -20,12 +34,18 @@ export function FileBrowser() {
         setEntries(result.entries);
       })
       .catch(console.error);
-  }, [path, showHidden]);
+  }, [path, showHidden, embedded, initialPath]);
+
+  useEffect(() => {
+    if (embedded && initialPath) {
+      setInternalPath(initialPath);
+    }
+  }, [initialPath]);
 
   const navigateTo = (entry: DirEntry) => {
     const newPath = currentPath + "/" + entry.name;
     if (entry.type === "dir") {
-      setSearchParams({ path: newPath });
+      setPath(newPath);
       setFileView(null);
     } else {
       api.files.view(newPath).then(setFileView).catch(console.error);
@@ -34,7 +54,7 @@ export function FileBrowser() {
 
   const goUp = () => {
     const parent = currentPath.split("/").slice(0, -1).join("/") || "/";
-    setSearchParams({ path: parent });
+    setPath(parent);
     setFileView(null);
   };
 
@@ -68,20 +88,35 @@ export function FileBrowser() {
 
   return (
     <div className="min-h-full bg-neutral-950 text-neutral-200">
-      <header className="flex items-center gap-2 px-4 py-3 border-b border-neutral-800">
-        <button onClick={() => navigate("/")} className="text-neutral-400 hover:text-neutral-200">
-          &larr;
-        </button>
-        <span className="text-sm truncate flex-1">Files &mdash; {currentPath}</span>
-        <button
-          onClick={() => setShowHidden(!showHidden)}
-          className={`px-2 py-0.5 text-xs rounded ${
-            showHidden ? "bg-neutral-700 text-neutral-300" : "bg-neutral-800 text-neutral-500"
-          }`}
-        >
-          .*
-        </button>
-      </header>
+      {!embedded && (
+        <header className="flex items-center gap-2 px-4 py-3 border-b border-neutral-800">
+          <button onClick={() => navigate("/")} className="text-neutral-400 hover:text-neutral-200">
+            &larr;
+          </button>
+          <span className="text-sm truncate flex-1">Files &mdash; {currentPath}</span>
+          <button
+            onClick={() => setShowHidden(!showHidden)}
+            className={`px-2 py-0.5 text-xs rounded ${
+              showHidden ? "bg-neutral-700 text-neutral-300" : "bg-neutral-800 text-neutral-500"
+            }`}
+          >
+            .*
+          </button>
+        </header>
+      )}
+      {embedded && (
+        <div className="flex items-center gap-2 px-4 py-2 border-b border-neutral-800">
+          <span className="text-xs text-neutral-500 truncate flex-1">{currentPath}</span>
+          <button
+            onClick={() => setShowHidden(!showHidden)}
+            className={`px-2 py-0.5 text-xs rounded ${
+              showHidden ? "bg-neutral-700 text-neutral-300" : "bg-neutral-800 text-neutral-500"
+            }`}
+          >
+            .*
+          </button>
+        </div>
+      )}
       <main className="divide-y divide-neutral-800/50">
         <button
           onClick={goUp}

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router";
 import { api, type SessionInfo, type GitStatus, type GitLogEntry } from "../lib/api";
 
@@ -33,7 +33,12 @@ function parseArgs(input: string): string[] {
   return args;
 }
 
-export function GitPanel() {
+interface GitPanelProps {
+  embedded?: boolean;
+  workDir?: string;
+}
+
+export function GitPanel({ embedded, workDir: propWorkDir }: GitPanelProps = {}) {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [session, setSession] = useState<SessionInfo>();
@@ -47,25 +52,29 @@ export function GitPanel() {
   const [cmdRunning, setCmdRunning] = useState(false);
   const [error, setError] = useState("");
 
-  useEffect(() => {
-    api.sessions.get(id!).then(setSession).catch(() => navigate("/"));
-  }, [id, navigate]);
+  const effectiveWorkDir = embedded ? propWorkDir : session?.workDir;
 
   useEffect(() => {
-    if (session) refresh();
-  }, [session]);
+    if (!embedded && id) {
+      api.sessions.get(id).then(setSession).catch(() => navigate("/"));
+    }
+  }, [id, navigate, embedded]);
 
-  const refresh = () => {
-    if (!session) return;
+  const refresh = useCallback(() => {
+    if (!effectiveWorkDir) return;
     setError("");
-    api.git.status(session.workDir).then(setStatus).catch((e) => setError(e.message));
-    api.git.log(session.workDir, 10).then(setCommits).catch(() => {});
-  };
+    api.git.status(effectiveWorkDir).then(setStatus).catch((e) => setError(e.message));
+    api.git.log(effectiveWorkDir, 10).then(setCommits).catch(() => {});
+  }, [effectiveWorkDir]);
+
+  useEffect(() => {
+    if (effectiveWorkDir) refresh();
+  }, [effectiveWorkDir, refresh]);
 
   const showDiff = async (ref?: string, label?: string) => {
-    if (!session) return;
+    if (!effectiveWorkDir) return;
     try {
-      const d = await api.git.diff(session.workDir, ref);
+      const d = await api.git.diff(effectiveWorkDir, ref);
       setDiff(d);
       setDiffLabel(label ?? ref ?? "working tree");
       setTab("diff");
@@ -75,7 +84,7 @@ export function GitPanel() {
   };
 
   const runCmd = async () => {
-    if (!session || !cmdInput.trim()) return;
+    if (!effectiveWorkDir || !cmdInput.trim()) return;
     const args = parseArgs(cmdInput.trim());
     if (DANGEROUS.some((p) => cmdInput.includes(p))) {
       if (!window.confirm(`Destructive operation: git ${cmdInput}. Continue?`)) return;
@@ -83,7 +92,7 @@ export function GitPanel() {
     setCmdRunning(true);
     setCmdResult(null);
     try {
-      const result = await api.git.exec(session.workDir, args);
+      const result = await api.git.exec(effectiveWorkDir, args);
       setCmdResult(result);
       setCmdInput("");
       refresh();
@@ -98,27 +107,49 @@ export function GitPanel() {
 
   return (
     <div className="h-full flex flex-col bg-neutral-950 text-neutral-200">
-      {/* Header */}
-      <header className="flex items-center gap-2 px-3 py-2 border-b border-neutral-800 shrink-0">
-        <button onClick={() => navigate(`/session/${id}`)} className="text-neutral-400 hover:text-neutral-200">
-          &larr;
-        </button>
-        <span className="font-mono font-bold">git</span>
-        {status && <span className="text-xs text-neutral-400 font-mono">{status.branch}</span>}
-        {status && (status.ahead > 0 || status.behind > 0) && (
-          <span className="text-xs text-neutral-500">
-            {status.ahead > 0 && `\u2191${status.ahead}`}
-            {status.behind > 0 && `\u2193${status.behind}`}
-          </span>
-        )}
-        <span className="flex-1" />
-        <button
-          onClick={refresh}
-          className="px-2.5 py-1.5 text-xs bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded min-h-[44px] min-w-[44px] flex items-center justify-center"
-        >
-          Refresh
-        </button>
-      </header>
+      {/* Header (standalone mode only) */}
+      {!embedded && (
+        <header className="flex items-center gap-2 px-3 py-2 border-b border-neutral-800 shrink-0">
+          <button onClick={() => navigate(`/session/${id}`)} className="text-neutral-400 hover:text-neutral-200">
+            &larr;
+          </button>
+          <span className="font-mono font-bold">git</span>
+          {status && <span className="text-xs text-neutral-400 font-mono">{status.branch}</span>}
+          {status && (status.ahead > 0 || status.behind > 0) && (
+            <span className="text-xs text-neutral-500">
+              {status.ahead > 0 && `\u2191${status.ahead}`}
+              {status.behind > 0 && `\u2193${status.behind}`}
+            </span>
+          )}
+          <span className="flex-1" />
+          <button
+            onClick={refresh}
+            className="px-2.5 py-1.5 text-xs bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded min-h-[44px] min-w-[44px] flex items-center justify-center"
+          >
+            Refresh
+          </button>
+        </header>
+      )}
+
+      {/* Embedded header: branch info + refresh */}
+      {embedded && (
+        <div className="flex items-center gap-2 px-3 py-1.5 border-b border-neutral-800 shrink-0">
+          {status && <span className="text-xs text-neutral-400 font-mono">{status.branch}</span>}
+          {status && (status.ahead > 0 || status.behind > 0) && (
+            <span className="text-xs text-neutral-500">
+              {status.ahead > 0 && `\u2191${status.ahead}`}
+              {status.behind > 0 && `\u2193${status.behind}`}
+            </span>
+          )}
+          <span className="flex-1" />
+          <button
+            onClick={refresh}
+            className="px-2 py-1 text-xs bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded"
+          >
+            Refresh
+          </button>
+        </div>
+      )}
 
       {/* Error */}
       {error && (

@@ -2,6 +2,7 @@ package session
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ var allowedTools = map[string]bool{
 	"claude": true,
 	"codex":  true,
 	"gemini": true,
+	"tmux":   true,
 }
 
 type Manager struct {
@@ -51,6 +53,10 @@ func (m *Manager) loadPersistedSessions() {
 		t, _ := time.Parse(time.RFC3339, info.CreatedAt)
 		done := make(chan struct{})
 		close(done)
+		var lastOutput []byte
+		if info.LastOutput != "" {
+			lastOutput, _ = base64.StdEncoding.DecodeString(info.LastOutput)
+		}
 		s := &Session{
 			ID:              info.ID,
 			Tool:            info.Tool,
@@ -64,6 +70,7 @@ func (m *Manager) loadPersistedSessions() {
 			scrollback:      NewRingBuffer(defaultRingSize),
 			subscribers:     make(map[chan []byte]struct{}),
 			done:            done,
+			lastOutput:      lastOutput,
 		}
 		m.sessions[info.ID] = s
 	}
@@ -114,6 +121,11 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool) (*S
 			runArgs = append(runArgs, "--session-id", toolSessionID)
 		}
 	}
+	if tool == "tmux" {
+		toolSessionID = "kojo_" + id
+		runArgs = []string{"new-session", "-A", "-s", toolSessionID, "-c", workDir}
+	}
+
 	// codex: session ID is captured from PTY output in readLoop
 	// gemini: no session ID mechanism; uses --resume latest on restart
 
@@ -140,6 +152,7 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool) (*S
 		scrollback:      NewRingBuffer(defaultRingSize),
 		subscribers:     make(map[chan []byte]struct{}),
 		done:            make(chan struct{}),
+		readDone:        make(chan struct{}),
 	}
 
 	m.mu.Lock()
@@ -200,7 +213,9 @@ func (m *Manager) Restart(id string) (*Session, error) {
 	s.Args = args // Keep original args (without --resume), not restartArgs
 	s.Status = StatusRunning
 	s.ExitCode = nil
+	s.lastOutput = nil
 	s.done = make(chan struct{})
+	s.readDone = make(chan struct{})
 	s.mu.Unlock()
 
 	go m.readLoop(s)
@@ -240,7 +255,14 @@ func (m *Manager) Stop(id string) error {
 		return fmt.Errorf("session not running: %s", id)
 	}
 	cmd := s.Cmd
+	tool := s.Tool
+	toolSessionID := s.ToolSessionID
 	s.mu.Unlock()
+
+	// Kill tmux session to prevent orphaned processes
+	if tool == "tmux" && toolSessionID != "" {
+		_ = exec.Command("tmux", "kill-session", "-t", toolSessionID).Run()
+	}
 
 	if cmd.Process != nil {
 		// SIGTERM to the process; closing PTY also sends SIGHUP
@@ -304,6 +326,8 @@ func (m *Manager) save() {
 }
 
 func (m *Manager) readLoop(s *Session) {
+	defer close(s.readDone)
+
 	s.mu.Lock()
 	ptmx := s.PTY
 	s.mu.Unlock()
@@ -349,8 +373,27 @@ func (m *Manager) readLoop(s *Session) {
 func (m *Manager) waitLoop(s *Session) {
 	err := s.Cmd.Wait()
 
+	// close PTY so readLoop drains remaining data and exits
+	s.mu.Lock()
+	if s.PTY != nil {
+		s.PTY.Close()
+		s.PTY = nil
+	}
+	s.mu.Unlock()
+
+	// wait for readLoop to finish draining
+	<-s.readDone
+
+	// capture last output from scrollback after readLoop is done
+	const maxLastOutput = 8192
+	scrollback := s.scrollback.Bytes()
+	if len(scrollback) > maxLastOutput {
+		scrollback = scrollback[len(scrollback)-maxLastOutput:]
+	}
+
 	s.mu.Lock()
 	s.Status = StatusExited
+	s.lastOutput = scrollback
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			code := exitErr.ExitCode()
@@ -359,10 +402,6 @@ func (m *Manager) waitLoop(s *Session) {
 	} else {
 		code := 0
 		s.ExitCode = &code
-	}
-	if s.PTY != nil {
-		s.PTY.Close()
-		s.PTY = nil
 	}
 	s.mu.Unlock()
 
@@ -424,6 +463,12 @@ func buildRestartArgs(tool string, origArgs []string, toolSessionID string) []st
 			args = append(args, a)
 		}
 		return append(args, "--resume", "latest")
+
+	case "tmux":
+		if toolSessionID != "" {
+			return []string{"new-session", "-A", "-s", toolSessionID}
+		}
+		return origArgs
 
 	default:
 		out := make([]string, len(origArgs))

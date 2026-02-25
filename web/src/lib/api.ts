@@ -9,6 +9,8 @@ export interface SessionInfo {
   exitCode?: number;
   yoloMode: boolean;
   createdAt: string;
+  toolSessionId?: string;
+  lastOutput?: string; // base64-encoded last terminal output
 }
 
 export interface ServerInfo {
