@@ -19,7 +19,7 @@ export function NewSession() {
   useEffect(() => {
     api.info().then((info) => {
       setInfo(info);
-      const available = Object.entries(info.tools).find(([, t]) => t.available);
+      const available = Object.entries(info.tools).find(([name, t]) => name !== "tmux" && t.available);
       if (available) setTool(available[0]);
       if (info.homeDir) setWorkDir(info.homeDir);
     }).catch(console.error);
@@ -93,7 +93,7 @@ export function NewSession() {
           <label className="block text-sm text-neutral-400 mb-2">Tool</label>
           <div className="space-y-2">
             {info &&
-              Object.entries(info.tools).map(([name, t]) => (
+              Object.entries(info.tools).filter(([name]) => name !== "tmux").map(([name, t]) => (
                 <label
                   key={name}
                   className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer ${
