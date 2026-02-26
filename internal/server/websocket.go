@@ -197,6 +197,22 @@ func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, sess *se
 			if !ok {
 				return
 			}
+			// Coalesce: drain pending chunks into a single message to avoid
+			// splitting ANSI escape sequences across WebSocket frames.
+			// Cap at 256KB to prevent unbounded memory growth.
+			const maxCoalesceBytes = 256 * 1024
+		drain:
+			for len(data) < maxCoalesceBytes {
+				select {
+				case more, ok := <-ch:
+					if !ok {
+						break drain
+					}
+					data = append(data, more...)
+				default:
+					break drain
+				}
+			}
 			msg := WSOutputMsg{
 				Type: "output",
 				Data: base64.StdEncoding.EncodeToString(data),

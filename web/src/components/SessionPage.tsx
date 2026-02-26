@@ -18,6 +18,9 @@ const TABS: { key: SessionTab; label: string }[] = [
   { key: "git", label: "Git" },
 ];
 
+// Filter terminal query responses (DA1/DA2/DA3) that xterm.js auto-generates.
+const DA_RESPONSE_RE = /\x1b\[[\?>=]?[\d;]*c/g;
+
 const SPECIAL_KEYS = [
   { label: "Esc", code: "\x1b" },
   { label: "Tab", code: "\t" },
@@ -81,11 +84,17 @@ export function SessionPage() {
     const el = term.element;
     if (el) el.style.visibility = "hidden";
     term.reset();
-    term.write(data, () => {
+    let restored = false;
+    const safetyTimer = setTimeout(() => restore(), 500);
+    const restore = () => {
+      if (restored) return;
+      restored = true;
+      clearTimeout(safetyTimer);
       autoScrollRef.current = true;
       term.scrollToBottom();
       if (el) el.style.visibility = "";
-    });
+    };
+    term.write(data, restore);
   }, []);
 
   const onExit = useCallback((exitCode: number, live: boolean) => {
@@ -222,8 +231,10 @@ export function SessionPage() {
 
     // forward terminal keystrokes to PTY
     const onDataDisposable = term.onData((data) => {
+      const filtered = data.replace(DA_RESPONSE_RE, "");
+      if (!filtered) return;
       autoScrollRef.current = true;
-      sendInput(data);
+      sendInput(filtered);
     });
 
     const onWriteParsedDisposable = term.onWriteParsed(() => {
@@ -386,13 +397,6 @@ export function SessionPage() {
 
   const handleStop = async () => {
     if (!id) return;
-    // Kill associated tmux session
-    const tmuxKey = `tmux_session_${id}`;
-    const tmuxId = localStorage.getItem(tmuxKey);
-    if (tmuxId) {
-      const ok = await api.sessions.delete(tmuxId).then(() => true).catch(() => false);
-      if (ok) localStorage.removeItem(tmuxKey);
-    }
     await api.sessions.delete(id);
     setExited(true);
   };

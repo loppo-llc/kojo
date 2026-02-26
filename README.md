@@ -22,6 +22,7 @@ Remotely operate AI coding CLIs (Claude Code, Codex, Gemini CLI) on macOS from y
 ## Features
 
 - **Single binary** — Built with Go, web UI embedded
+- **tmux-backed sessions** — CLI tools run inside tmux for crash resilience and persistence across kojo restarts
 - **Unified PTY** — All CLIs handled uniformly via PTY. No SDK dependencies
 - **Tailscale P2P** — No central server or database. Encrypted with WireGuard
 - **Zero config** — Just run `kojo` with Tailscale running
@@ -31,6 +32,7 @@ Remotely operate AI coding CLIs (Claude Code, Codex, Gemini CLI) on macOS from y
 - macOS
 - Go 1.25+
 - Node.js 20+
+- tmux
 - [Tailscale](https://tailscale.com/)
 - Supported CLIs: `claude`, `codex`, `gemini` (at least one)
 
@@ -86,7 +88,7 @@ When you run `kojo` (without `--local`):
 ```bash
 $ kojo
 
-  kojo v0.3.1 running at:
+  kojo v0.4.0 running at:
 
     https://kojo.tail1234.ts.net
     https://100.x.y.z:8080
@@ -145,7 +147,7 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 ## What it does
 
 - Manage multiple sessions simultaneously (newest first)
-- Session persistence (`~/.config/kojo/sessions.json`, auto-cleanup after 7 days)
+- Session persistence via tmux (`~/.config/kojo/sessions.json`, auto-cleanup after 7 days). Sessions survive kojo restarts and crashes
 - Session restart with tool-specific resume (`claude --resume`, `codex resume`, `gemini --resume`)
 - Real-time PTY output streaming (xterm.js)
 - Text input (Enter for newline, Shift+Enter to send) and special keys (Esc, Tab, Ctrl, arrows)
@@ -160,7 +162,7 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 
 | Layer | Technology |
 |-------|-----------|
-| Server | Go, `net/http`, `coder/websocket`, `creack/pty`, `tsnet` |
+| Server | Go, `net/http`, `coder/websocket`, `creack/pty`, tmux, `tsnet` |
 | Web UI | React 19, Vite, TypeScript, Tailwind CSS, xterm.js |
 | Notifications | Web Push (VAPID) |
 | Network | Tailscale WireGuard P2P |

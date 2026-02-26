@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -22,7 +23,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-var version = "0.3.1"
+var version = "0.4.0"
 
 func main() {
 	port := flag.Int("port", 8080, "port number (auto-increments if busy)")
@@ -43,6 +44,11 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: logLevel,
 	}))
+
+	// tmux is required for user tool sessions (claude, codex, gemini)
+	if _, err := exec.LookPath("tmux"); err != nil {
+		logger.Warn("tmux not found in PATH; user tool sessions (claude, codex, gemini) will not work")
+	}
 
 	// embed static files (sub to strip "dist/" prefix)
 	var staticFS fs.FS

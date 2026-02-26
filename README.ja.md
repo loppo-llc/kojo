@@ -22,6 +22,7 @@ macOS 上の AI コーディング CLI（Claude Code, Codex, Gemini CLI）をモ
 ## 特徴
 
 - **シングルバイナリ** — Go 製、Web UI を埋め込み
+- **tmux バックドセッション** — CLI ツールを tmux 内で実行。kojo の再起動・クラッシュ後もセッション継続
 - **統一 PTY** — すべての CLI を PTY 経由で統一的に制御。SDK 依存なし
 - **Tailscale P2P** — 中央サーバーやデータベース不要。WireGuard で暗号化
 - **ゼロコンフィグ** — Tailscale を起動した状態で `kojo` を実行するだけ
@@ -31,6 +32,7 @@ macOS 上の AI コーディング CLI（Claude Code, Codex, Gemini CLI）をモ
 - macOS
 - Go 1.25+
 - Node.js 20+
+- tmux
 - [Tailscale](https://tailscale.com/)
 - 対応 CLI: `claude`, `codex`, `gemini`（いずれか1つ以上）
 
@@ -86,7 +88,7 @@ kojo は [tsnet](https://tailscale.com/kb/1244/tsnet) を使って、`kojo` と�
 ```bash
 $ kojo
 
-  kojo v0.3.1 running at:
+  kojo v0.4.0 running at:
 
     https://kojo.tail1234.ts.net
     https://100.x.y.z:8080
@@ -145,7 +147,7 @@ $ kojo
 ## 機能
 
 - 複数セッションの同時管理（新しい順に表示）
-- セッション永続化（`~/.config/kojo/sessions.json`、7日後に自動クリーンアップ）
+- tmux によるセッション永続化（`~/.config/kojo/sessions.json`、7日後に自動クリーンアップ）。kojo の再起動・クラッシュ後もセッション継続
 - セッション再起動（ツール固有の resume: `claude --resume`, `codex resume`, `gemini --resume`）
 - リアルタイム PTY 出力ストリーミング（xterm.js）
 - テキスト入力（Enter で改行、Shift+Enter で送信）と特殊キー（Esc, Tab, Ctrl, 矢印）
@@ -160,7 +162,7 @@ $ kojo
 
 | レイヤー | 技術 |
 |---------|------|
-| サーバー | Go, `net/http`, `coder/websocket`, `creack/pty`, `tsnet` |
+| サーバー | Go, `net/http`, `coder/websocket`, `creack/pty`, tmux, `tsnet` |
 | Web UI | React 19, Vite, TypeScript, Tailwind CSS, xterm.js |
 | 通知 | Web Push (VAPID) |
 | ネットワーク | Tailscale WireGuard P2P |

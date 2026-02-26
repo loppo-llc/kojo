@@ -84,6 +84,7 @@ func New(cfg Config) *Server {
 	mux.HandleFunc("DELETE /api/v1/sessions/{id}", s.handleDeleteSession)
 	mux.HandleFunc("PATCH /api/v1/sessions/{id}", s.handlePatchSession)
 	mux.HandleFunc("POST /api/v1/sessions/{id}/restart", s.handleRestartSession)
+	mux.HandleFunc("GET /api/v1/sessions/{id}/terminal", s.handleTerminalSession)
 	mux.HandleFunc("GET /api/v1/ws", s.handleWebSocket)
 
 	// Directory suggestions
@@ -201,6 +202,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		WorkDir  string   `json:"workDir"`
 		Args     []string `json:"args"`
 		YoloMode bool     `json:"yoloMode"`
+		ParentID string   `json:"parentId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
@@ -215,7 +217,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		req.WorkDir = home
 	}
 
-	sess, err := s.sessions.Create(req.Tool, req.WorkDir, req.Args, req.YoloMode)
+	sess, err := s.sessions.Create(req.Tool, req.WorkDir, req.Args, req.YoloMode, req.ParentID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
@@ -267,6 +269,16 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 		sess.SetYoloMode(*req.YoloMode)
 	}
 
+	writeJSONResponse(w, http.StatusOK, sess.Info())
+}
+
+func (s *Server) handleTerminalSession(w http.ResponseWriter, r *http.Request) {
+	parentID := r.PathValue("id")
+	sess, ok := s.sessions.FindChildSession(parentID, "tmux")
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "no terminal session for parent: "+parentID)
+		return
+	}
 	writeJSONResponse(w, http.StatusOK, sess.Info())
 }
 

@@ -11,6 +11,7 @@ export interface SessionInfo {
   internal?: boolean;
   createdAt: string;
   toolSessionId?: string;
+  parentId?: string;
   lastOutput?: string; // base64-encoded last terminal output
 }
 
@@ -93,8 +94,9 @@ export const api = {
   sessions: {
     list: () => get<{ sessions: SessionInfo[] }>("/api/v1/sessions").then((r) => r.sessions),
     get: (id: string) => get<SessionInfo>(`/api/v1/sessions/${id}`),
-    create: (body: { tool: string; workDir: string; args?: string[]; yoloMode?: boolean }) =>
+    create: (body: { tool: string; workDir: string; args?: string[]; yoloMode?: boolean; parentId?: string }) =>
       post<SessionInfo>("/api/v1/sessions", body),
+    terminal: (parentId: string) => get<SessionInfo>(`/api/v1/sessions/${parentId}/terminal`),
     delete: (id: string) => del<{ ok: boolean }>(`/api/v1/sessions/${id}`),
     patch: (id: string, body: { yoloMode?: boolean }) =>
       patch<SessionInfo>(`/api/v1/sessions/${id}`, body),

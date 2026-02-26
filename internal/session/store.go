@@ -59,22 +59,26 @@ func (st *Store) Save(infos []SessionInfo) {
 }
 
 // Load reads persisted sessions, filtering out entries older than maxAge.
-func (st *Store) Load() []SessionInfo {
+// Returns (nil, nil) when the file does not exist (first run).
+// Returns (nil, err) on read/parse errors so callers can distinguish
+// "no sessions" from "failed to load" (important for orphan cleanup).
+func (st *Store) Load() ([]SessionInfo, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
 	data, err := os.ReadFile(st.path)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			st.logger.Warn("failed to read sessions file", "err", err)
+		if os.IsNotExist(err) {
+			return nil, nil
 		}
-		return nil
+		st.logger.Warn("failed to read sessions file", "err", err)
+		return nil, err
 	}
 
 	var infos []SessionInfo
 	if err := json.Unmarshal(data, &infos); err != nil {
 		st.logger.Warn("failed to parse sessions file", "err", err)
-		return nil
+		return nil, err
 	}
 
 	cutoff := time.Now().Add(-maxAge)
@@ -88,5 +92,5 @@ func (st *Store) Load() []SessionInfo {
 			filtered = append(filtered, info)
 		}
 	}
-	return filtered
+	return filtered, nil
 }

@@ -31,6 +31,17 @@ type Session struct {
 	YoloMode        bool
 	Internal        bool   // internal session (e.g. tmux), not user-facing
 	ToolSessionID string // tool-specific session ID for resume
+	ParentID        string // parent session ID (e.g. tmux child of a CLI session)
+	TmuxSessionName string // tmux session name (kojo_<id>) for tmux-backed sessions
+	restarting      bool   // true while Restart is in progress, prevents concurrent Stop
+
+	// pipe-pane: raw pane output captured via FIFO (bypasses tmux screen-diff batching)
+	rawPipe     *os.File // FIFO reader, nil if pipe-pane is not active
+	rawPipePath string   // FIFO path on disk for cleanup
+
+	// last resize dimensions for deduplication (mobile sends frequent resize events)
+	lastCols uint16
+	lastRows uint16
 
 	// ring buffer for scrollback (1MB)
 	scrollback *RingBuffer
@@ -88,6 +99,8 @@ type SessionInfo struct {
 	Internal        bool     `json:"internal,omitempty"`
 	CreatedAt       string   `json:"createdAt"`
 	ToolSessionID string   `json:"toolSessionId,omitempty"`
+	ParentID        string   `json:"parentId,omitempty"`
+	TmuxSessionName string   `json:"tmuxSessionName,omitempty"`
 	LastOutput      string   `json:"lastOutput,omitempty"`
 }
 
@@ -105,6 +118,8 @@ func (s *Session) Info() SessionInfo {
 		Internal:        s.Internal,
 		CreatedAt:       s.CreatedAt.UTC().Format(time.RFC3339),
 		ToolSessionID: s.ToolSessionID,
+		ParentID:        s.ParentID,
+		TmuxSessionName: s.TmuxSessionName,
 	}
 	if len(s.lastOutput) > 0 {
 		info.LastOutput = base64.StdEncoding.EncodeToString(s.lastOutput)
@@ -113,7 +128,7 @@ func (s *Session) Info() SessionInfo {
 }
 
 func (s *Session) Subscribe() (chan []byte, []byte) {
-	ch := make(chan []byte, 256)
+	ch := make(chan []byte, 1024)
 	s.subMu.Lock()
 	s.subscribers[ch] = struct{}{}
 	scrollback := s.scrollback.Bytes()
@@ -170,13 +185,26 @@ func (s *Session) BroadcastYoloDebug(tail string) {
 }
 
 func (s *Session) Write(data []byte) (int, error) {
-	s.mu.Lock()
-	pty := s.PTY
-	s.mu.Unlock()
-	if pty == nil {
-		return 0, os.ErrClosed
+	// Retry briefly when PTY is nil (e.g. during tmux reattach) to avoid
+	// silently dropping user input during the short reconnection window.
+	// Uses s.done to bail out early if the session exits during the wait.
+	const maxRetries = 5
+	for i := 0; i < maxRetries; i++ {
+		s.mu.Lock()
+		pty := s.PTY
+		s.mu.Unlock()
+		if pty != nil {
+			return pty.Write(data)
+		}
+		if i < maxRetries-1 {
+			select {
+			case <-time.After(50 * time.Millisecond):
+			case <-s.done:
+				return 0, os.ErrClosed
+			}
+		}
 	}
-	return pty.Write(data)
+	return 0, os.ErrClosed
 }
 
 func (s *Session) Done() <-chan struct{} {

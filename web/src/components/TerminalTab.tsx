@@ -20,7 +20,7 @@ const TMUX_SHORTCUTS = [
   { label: "\u2502", seq: TMUX_PREFIX + "%" },
   { label: "Pane", seq: TMUX_PREFIX + "o" },
   { label: "List", seq: TMUX_PREFIX + "w" },
-  { label: "Kill", seq: TMUX_PREFIX + "x" },
+  { label: "Kill", seq: TMUX_PREFIX + ":kill-pane\r" },
 ];
 
 const SPECIAL_KEYS = [
@@ -36,8 +36,6 @@ const SPECIAL_KEYS = [
   { label: "\u2192", code: "\x1b[C" },
   { label: "\u2190", code: "\x1b[D" },
 ];
-
-const STORAGE_KEY_PREFIX = "tmux_session_";
 
 // Filter terminal query responses (DA1/DA2/DA3) that xterm.js auto-generates.
 // Without filtering, these get sent to the PTY as input and appear as garbage text.
@@ -56,6 +54,10 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
   const wsRef = useRef<WebSocket | null>(null);
   const autoScrollRef = useRef(true);
   const fitRafRef = useRef(0);
+  const outputBufRef = useRef<Uint8Array[]>([]);
+  const outputBufSizeRef = useRef(0);
+  const outputRafRef = useRef(0);
+  const maxBufBytes = 256 * 1024;
   const sessionIdRef = useRef<string | null>(null);
   const initRef = useRef(false);
 
@@ -64,8 +66,6 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
   const [optMode, setOptMode] = useState(false);
   const [cmdMode, setCmdMode] = useState(false);
   const [shiftMode, setShiftMode] = useState(false);
-
-  const storageKey = STORAGE_KEY_PREFIX + parentSessionId;
 
   const sendInput = useCallback((data: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -104,12 +104,18 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     const term = xtermRef.current;
     if (!term) return;
 
-    // Close existing connection
+    // Close existing connection and clear pending output buffer
     if (wsRef.current) {
       wsRef.current.onclose = null;
       wsRef.current.close();
       wsRef.current = null;
     }
+    if (outputRafRef.current) {
+      cancelAnimationFrame(outputRafRef.current);
+      outputRafRef.current = 0;
+    }
+    outputBufRef.current = [];
+    outputBufSizeRef.current = 0;
 
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${proto}//${location.host}/api/v1/ws?session=${tmuxSessionId}`;
@@ -126,7 +132,31 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
         case "output":
           if (msg.data) {
             const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
-            term.write(bytes);
+            outputBufRef.current.push(bytes);
+            outputBufSizeRef.current += bytes.length;
+            const flushNow = () => {
+              outputRafRef.current = 0;
+              const chunks = outputBufRef.current;
+              if (chunks.length === 0) return;
+              outputBufRef.current = [];
+              outputBufSizeRef.current = 0;
+              if (chunks.length === 1) {
+                term.write(chunks[0]);
+              } else {
+                let total = 0;
+                for (const c of chunks) total += c.length;
+                const merged = new Uint8Array(total);
+                let off = 0;
+                for (const c of chunks) { merged.set(c, off); off += c.length; }
+                term.write(merged);
+              }
+            };
+            if (outputBufSizeRef.current >= maxBufBytes) {
+              if (outputRafRef.current) cancelAnimationFrame(outputRafRef.current);
+              flushNow();
+            } else if (!outputRafRef.current) {
+              outputRafRef.current = requestAnimationFrame(flushNow);
+            }
           }
           break;
         case "scrollback":
@@ -135,11 +165,17 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
             const el = term.element;
             if (el) el.style.visibility = "hidden";
             term.reset();
-            term.write(bytes, () => {
+            let restored = false;
+            const safetyTimer = setTimeout(() => restoreVis(), 500);
+            const restoreVis = () => {
+              if (restored) return;
+              restored = true;
+              clearTimeout(safetyTimer);
               autoScrollRef.current = true;
               term.scrollToBottom();
               if (el) el.style.visibility = "";
-            });
+            };
+            term.write(bytes, restoreVis);
           }
           break;
         case "exit":
@@ -257,6 +293,12 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
 
     return () => {
       cancelAnimationFrame(fitRafRef.current);
+      if (outputRafRef.current) {
+        cancelAnimationFrame(outputRafRef.current);
+        outputRafRef.current = 0;
+      }
+      outputBufRef.current = [];
+      outputBufSizeRef.current = 0;
       onDataDisposable.dispose();
       onWriteParsedDisposable.dispose();
       onRenderDisposable.dispose();
@@ -316,42 +358,38 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
 
     let cancelled = false;
 
-    // Try to restore from localStorage hint
+    // Find existing tmux session for this parent via server, or create a new one
     const initSession = async () => {
-      const storedId = localStorage.getItem(storageKey);
-
-      if (storedId) {
-        try {
-          const existing = await api.sessions.get(storedId);
-          if (cancelled) return;
-          // Validate it's actually a tmux session
-          if (existing.tool !== "tmux") {
-            localStorage.removeItem(storageKey);
-          } else if (existing.status === "running") {
-            sessionIdRef.current = storedId;
-            connectWs(storedId);
-            return;
-          } else {
-            // Exited — restart it (tmux -A will reattach)
-            const restarted = await api.sessions.restart(storedId);
-            if (cancelled) return;
-            sessionIdRef.current = restarted.id;
-            connectWs(restarted.id);
-            return;
-          }
-        } catch {
-          if (cancelled) return;
-          // 404 or other error — stale hint, create new
-          localStorage.removeItem(storageKey);
+      // Check server for existing tmux child session
+      try {
+        const existing = await api.sessions.terminal(parentSessionId);
+        if (cancelled) return;
+        if (existing.status === "running") {
+          sessionIdRef.current = existing.id;
+          connectWs(existing.id);
+          return;
+        }
+        // Exited — restart it (tmux -A will reattach)
+        const restarted = await api.sessions.restart(existing.id);
+        if (cancelled) return;
+        sessionIdRef.current = restarted.id;
+        connectWs(restarted.id);
+        return;
+      } catch (err) {
+        if (cancelled) return;
+        // Only create new session on 404; other errors (network, 500) should not trigger creation
+        const is404 = err instanceof Error && err.message.startsWith("404");
+        if (!is404) {
+          setError(err instanceof Error ? err.message : String(err));
+          return;
         }
       }
 
-      // Create new tmux session
+      // Create new tmux session linked to parent
       try {
-        const s = await api.sessions.create({ tool: "tmux", workDir });
+        const s = await api.sessions.create({ tool: "tmux", workDir, parentId: parentSessionId });
         if (cancelled) return;
         sessionIdRef.current = s.id;
-        localStorage.setItem(storageKey, s.id);
         connectWs(s.id);
       } catch (err) {
         if (cancelled) return;
@@ -369,7 +407,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     return () => {
       cancelled = true;
     };
-  }, [visible, storageKey, workDir, connectWs, safeFit]);
+  }, [visible, parentSessionId, workDir, connectWs, safeFit]);
 
   const clearModifiers = () => {
     setCtrlMode(false);
