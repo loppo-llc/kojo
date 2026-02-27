@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type SessionInfo } from "../lib/api";
 import { SPECIAL_KEYS } from "../lib/keys";
 import { toBase64, restoreScrollback } from "../lib/utils";
+import { createOutputBuffer, type OutputBuffer } from "../lib/outputBuffer";
 import { useTerminal } from "../hooks/useTerminal";
 import { useSpecialKeys } from "../hooks/useSpecialKeys";
 
@@ -27,10 +28,7 @@ const TMUX_SHORTCUTS = [
 export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabProps) {
   const termContainerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const outputBufRef = useRef<Uint8Array[]>([]);
-  const outputBufSizeRef = useRef(0);
-  const outputRafRef = useRef(0);
-  const maxBufBytes = 256 * 1024;
+  const outputBufRef = useRef<OutputBuffer | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const initRef = useRef(false);
 
@@ -68,12 +66,8 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
       wsRef.current.close();
       wsRef.current = null;
     }
-    if (outputRafRef.current) {
-      cancelAnimationFrame(outputRafRef.current);
-      outputRafRef.current = 0;
-    }
-    outputBufRef.current = [];
-    outputBufSizeRef.current = 0;
+    outputBufRef.current?.clear();
+    outputBufRef.current = createOutputBuffer((data) => term.write(data));
 
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${proto}//${location.host}/api/v1/ws?session=${tmuxSessionId}`;
@@ -90,31 +84,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
         case "output":
           if (msg.data) {
             const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
-            outputBufRef.current.push(bytes);
-            outputBufSizeRef.current += bytes.length;
-            const flushNow = () => {
-              outputRafRef.current = 0;
-              const chunks = outputBufRef.current;
-              if (chunks.length === 0) return;
-              outputBufRef.current = [];
-              outputBufSizeRef.current = 0;
-              if (chunks.length === 1) {
-                term.write(chunks[0]);
-              } else {
-                let total = 0;
-                for (const c of chunks) total += c.length;
-                const merged = new Uint8Array(total);
-                let off = 0;
-                for (const c of chunks) { merged.set(c, off); off += c.length; }
-                term.write(merged);
-              }
-            };
-            if (outputBufSizeRef.current >= maxBufBytes) {
-              if (outputRafRef.current) cancelAnimationFrame(outputRafRef.current);
-              flushNow();
-            } else if (!outputRafRef.current) {
-              outputRafRef.current = requestAnimationFrame(flushNow);
-            }
+            outputBufRef.current!.push(bytes);
           }
           break;
         case "scrollback":
@@ -150,12 +120,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
   // Clean up WebSocket and output buffer on unmount
   useEffect(() => {
     return () => {
-      if (outputRafRef.current) {
-        cancelAnimationFrame(outputRafRef.current);
-        outputRafRef.current = 0;
-      }
-      outputBufRef.current = [];
-      outputBufSizeRef.current = 0;
+      outputBufRef.current?.dispose();
       if (wsRef.current) {
         wsRef.current.onclose = null;
         wsRef.current.close();

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import { toBase64 } from "../lib/utils";
+import { createOutputBuffer, type OutputBuffer } from "../lib/outputBuffer";
 
 interface WSMessage {
   type: string;
@@ -29,35 +30,10 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
   const onConnectedRef = useRef(onConnected);
   onConnectedRef.current = onConnected;
 
-  // Batch output: accumulate chunks within a single animation frame to avoid
-  // feeding split ANSI sequences into xterm.js across separate write() calls.
-  // Force-flush when buffer exceeds 256KB to prevent unbounded growth in
-  // background tabs where rAF is throttled/paused.
-  const outputBufRef = useRef<Uint8Array[]>([]);
-  const outputBufSizeRef = useRef(0);
-  const rafRef = useRef(0);
-  const maxBufBytes = 256 * 1024;
-
-  const flushOutput = useCallback(() => {
-    rafRef.current = 0;
-    const chunks = outputBufRef.current;
-    if (chunks.length === 0) return;
-    outputBufRef.current = [];
-    outputBufSizeRef.current = 0;
-    if (chunks.length === 1) {
-      onOutput(chunks[0]);
-    } else {
-      let total = 0;
-      for (const c of chunks) total += c.length;
-      const merged = new Uint8Array(total);
-      let off = 0;
-      for (const c of chunks) {
-        merged.set(c, off);
-        off += c.length;
-      }
-      onOutput(merged);
-    }
-  }, [onOutput]);
+  const bufRef = useRef<OutputBuffer | null>(null);
+  if (!bufRef.current) {
+    bufRef.current = createOutputBuffer((data) => onOutput(data));
+  }
 
   const connect = useCallback(() => {
     if (!activeRef.current) return;
@@ -85,17 +61,7 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
         case "output":
           if (msg.data) {
             const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
-            outputBufRef.current.push(bytes);
-            outputBufSizeRef.current += bytes.length;
-            if (outputBufSizeRef.current >= maxBufBytes) {
-              // Force-flush: buffer too large (e.g. background tab with rAF paused)
-              if (rafRef.current) {
-                cancelAnimationFrame(rafRef.current);
-              }
-              flushOutput();
-            } else if (!rafRef.current) {
-              rafRef.current = requestAnimationFrame(flushOutput);
-            }
+            bufRef.current!.push(bytes);
           }
           break;
         case "scrollback":
@@ -128,7 +94,7 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
     };
 
     wsRef.current = ws;
-  }, [sessionId, flushOutput, onScrollback, onExit, onYoloDebug]);
+  }, [sessionId, onScrollback, onExit, onYoloDebug]);
 
   useEffect(() => {
     activeRef.current = true;
@@ -136,14 +102,7 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
     return () => {
       activeRef.current = false;
       if (reconnectRef.current) clearTimeout(reconnectRef.current);
-      if (rafRef.current) {
-        cancelAnimationFrame(rafRef.current);
-        rafRef.current = 0;
-      }
-      // Flush any pending output before teardown
-      flushOutput();
-      outputBufRef.current = [];
-      outputBufSizeRef.current = 0;
+      bufRef.current?.dispose();
       wsRef.current?.close();
     };
   }, [connect]);
@@ -162,13 +121,7 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
 
   const reconnect = useCallback(() => {
     if (reconnectRef.current) clearTimeout(reconnectRef.current);
-    // Clear pending output from old connection
-    if (rafRef.current) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = 0;
-    }
-    outputBufRef.current = [];
-    outputBufSizeRef.current = 0;
+    bufRef.current?.clear();
     // Temporarily suppress onclose reconnect while we close the old socket
     activeRef.current = false;
     wsRef.current?.close();
