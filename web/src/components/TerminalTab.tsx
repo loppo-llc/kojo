@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type SessionInfo } from "../lib/api";
 import { SPECIAL_KEYS, resolveKeyPress } from "../lib/keys";
-import { toBase64 } from "../lib/utils";
+import { toBase64, restoreScrollback } from "../lib/utils";
 import { useTerminal } from "../hooks/useTerminal";
 
 interface TerminalTabProps {
@@ -119,20 +119,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
         case "scrollback":
           if (msg.data) {
             const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
-            const el = term.element;
-            if (el) el.style.visibility = "hidden";
-            term.reset();
-            let restored = false;
-            const safetyTimer = setTimeout(() => restoreVis(), 500);
-            const restoreVis = () => {
-              if (restored) return;
-              restored = true;
-              clearTimeout(safetyTimer);
-              autoScrollRef.current = true;
-              term.scrollToBottom();
-              if (el) el.style.visibility = "";
-            };
-            term.write(bytes, restoreVis);
+            restoreScrollback(term, bytes, autoScrollRef);
           }
           break;
         case "exit":

@@ -4,6 +4,7 @@ import { useWebSocket } from "../hooks/useWebSocket";
 import { useTerminal } from "../hooks/useTerminal";
 import { api, type SessionInfo } from "../lib/api";
 import { SPECIAL_KEYS, resolveKeyPress } from "../lib/keys";
+import { restoreScrollback } from "../lib/utils";
 import { FileBrowser } from "./FileBrowser";
 import { GitPanel } from "./GitPanel";
 import { TerminalTab } from "./TerminalTab";
@@ -49,36 +50,36 @@ export function SessionPage() {
 
   const gotScrollbackRef = useRef(false);
 
+  // Bridge refs: useTerminal and useWebSocket have a circular dependency
+  // (callbacks reference terminal, terminal needs sendInput from WS).
+  // We use stable refs to break the cycle.
+  const sendInputRef = useRef<(data: string) => void>(() => {});
+  const sendResizeRef = useRef<(cols: number, rows: number) => void>(() => {});
+
+  const { termRef: xtermRef, autoScrollRef, safeFit } = useTerminal({
+    containerRef: termContainerRef,
+    onInput: useCallback((data: string) => sendInputRef.current(data), []),
+    onResize: useCallback((cols: number, rows: number) => sendResizeRef.current(cols, rows), []),
+    deps: [id],
+  });
+
   const onOutput = useCallback((data: Uint8Array) => {
     xtermRef.current?.write(data);
-  }, []);
+  }, [xtermRef]);
 
   const onScrollback = useCallback((data: Uint8Array) => {
     const term = xtermRef.current;
     if (!term) return;
     gotScrollbackRef.current = true;
-    const el = term.element;
-    if (el) el.style.visibility = "hidden";
-    term.reset();
-    let restored = false;
-    const safetyTimer = setTimeout(() => restore(), 500);
-    const restore = () => {
-      if (restored) return;
-      restored = true;
-      clearTimeout(safetyTimer);
-      autoScrollRef.current = true;
-      term.scrollToBottom();
-      if (el) el.style.visibility = "";
-    };
-    term.write(data, restore);
-  }, []);
+    restoreScrollback(term, data, autoScrollRef);
+  }, [xtermRef, autoScrollRef]);
 
   const onExit = useCallback((exitCode: number, live: boolean) => {
     setExited(true);
     if (live) {
       xtermRef.current?.write(`\r\n\x1b[90m[Process exited with code ${exitCode}]\x1b[0m\r\n`);
     }
-  }, []);
+  }, [xtermRef]);
 
   const onYoloDebug = useCallback((tail: string) => {
     yoloTailRef.current = tail;
@@ -101,20 +102,10 @@ export function SessionPage() {
     onScrollback,
     onExit,
     onYoloDebug,
-    onConnected: () => safeFit(),
+    onConnected: safeFit,
   });
-
-  const sendResizeRef = useRef(sendResize);
+  sendInputRef.current = sendInput;
   sendResizeRef.current = sendResize;
-
-  const { termRef: xtermRef, autoScrollRef, safeFit } = useTerminal({
-    containerRef: termContainerRef,
-    onInput: sendInput,
-    onResize: useCallback((cols: number, rows: number) => {
-      sendResizeRef.current(cols, rows);
-    }, []),
-    deps: [id],
-  });
 
   // Clean up yolo timer on unmount
   useEffect(() => {
