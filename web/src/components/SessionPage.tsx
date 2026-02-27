@@ -107,12 +107,14 @@ export function SessionPage() {
   sendInputRef.current = sendInput;
   sendResizeRef.current = sendResize;
 
-  // Clean up yolo timer on unmount
+  // Clean up yolo timer on unmount and session switch
   useEffect(() => {
     return () => {
       if (yoloTimerRef.current) clearTimeout(yoloTimerRef.current);
+      yoloTailRef.current = null;
+      if (yoloOverlayRef.current) yoloOverlayRef.current.style.display = "none";
     };
-  }, []);
+  }, [id]);
 
   useEffect(() => {
     setExited(false);
