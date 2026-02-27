@@ -3,8 +3,9 @@ import { useParams, useNavigate, useLocation } from "react-router";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { useTerminal } from "../hooks/useTerminal";
 import { api, type SessionInfo } from "../lib/api";
-import { SPECIAL_KEYS, resolveKeyPress } from "../lib/keys";
+import { SPECIAL_KEYS } from "../lib/keys";
 import { restoreScrollback } from "../lib/utils";
+import { useSpecialKeys } from "../hooks/useSpecialKeys";
 import { FileBrowser } from "./FileBrowser";
 import { GitPanel } from "./GitPanel";
 import { TerminalTab } from "./TerminalTab";
@@ -25,8 +26,6 @@ export function SessionPage() {
   const termContainerRef = useRef<HTMLDivElement>(null);
   const [session, setSession] = useState<SessionInfo>();
   const [input, setInput] = useState("");
-  const [ctrlMode, setCtrlMode] = useState(false);
-  const [shiftMode, setShiftMode] = useState(false);
   const [exited, setExited] = useState(false);
   const yoloTailRef = useRef<string | null>(null);
   const yoloOverlayRef = useRef<HTMLButtonElement>(null);
@@ -106,6 +105,8 @@ export function SessionPage() {
   });
   sendInputRef.current = sendInput;
   sendResizeRef.current = sendResize;
+
+  const { ctrlMode, shiftMode, handleKeyPress } = useSpecialKeys(sendInput, autoScrollRef);
 
   // Clean up yolo timer on unmount and session switch
   useEffect(() => {
@@ -188,28 +189,6 @@ export function SessionPage() {
     } catch (err) {
       console.error(err);
     }
-  };
-
-  const clearModifiers = () => {
-    setCtrlMode(false);
-    setShiftMode(false);
-  };
-
-  const handleKeyPress = (code: string) => {
-    autoScrollRef.current = true;
-    if (code === "ctrl") {
-      clearModifiers();
-      setCtrlMode(!ctrlMode);
-      return;
-    }
-    if (code === "shift") {
-      clearModifiers();
-      setShiftMode(!shiftMode);
-      return;
-    }
-    const seq = resolveKeyPress(code, ctrlMode, shiftMode);
-    if (seq) sendInput(seq);
-    clearModifiers();
   };
 
   const handleStop = async () => {

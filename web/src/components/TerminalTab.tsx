@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type SessionInfo } from "../lib/api";
-import { SPECIAL_KEYS, resolveKeyPress } from "../lib/keys";
+import { SPECIAL_KEYS } from "../lib/keys";
 import { toBase64, restoreScrollback } from "../lib/utils";
 import { useTerminal } from "../hooks/useTerminal";
+import { useSpecialKeys } from "../hooks/useSpecialKeys";
 
 interface TerminalTabProps {
   parentSessionId: string;
@@ -34,8 +35,6 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
   const initRef = useRef(false);
 
   const [error, setError] = useState<string | null>(null);
-  const [ctrlMode, setCtrlMode] = useState(false);
-  const [shiftMode, setShiftMode] = useState(false);
 
   const sendInput = useCallback((data: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -55,6 +54,8 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     onResize: sendResize,
     deps: [parentSessionId],
   });
+
+  const { ctrlMode, shiftMode, handleKeyPress } = useSpecialKeys(sendInput, autoScrollRef);
 
   // Connect WebSocket to a tmux session
   const connectWs = useCallback((tmuxSessionId: string) => {
@@ -254,28 +255,6 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
       cancelled = true;
     };
   }, [visible, parentSessionId, workDir, connectWs, safeFit]);
-
-  const clearModifiers = () => {
-    setCtrlMode(false);
-    setShiftMode(false);
-  };
-
-  const handleKeyPress = (code: string) => {
-    autoScrollRef.current = true;
-    if (code === "ctrl") {
-      clearModifiers();
-      setCtrlMode(!ctrlMode);
-      return;
-    }
-    if (code === "shift") {
-      clearModifiers();
-      setShiftMode(!shiftMode);
-      return;
-    }
-    const seq = resolveKeyPress(code, ctrlMode, shiftMode);
-    if (seq) sendInput(seq);
-    clearModifiers();
-  };
 
   if (error) {
     return (
