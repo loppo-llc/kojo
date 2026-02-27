@@ -288,29 +288,11 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 	if userTools[tool] {
 		// User tools: run inside a tmux session for crash resilience
 		tmuxName = tmuxSessionName(id)
-		shellCmd := buildShellCommand(toolPath, runArgs)
-		if err := tmuxNewSession(tmuxName, workDir, shellCmd, true); err != nil {
-			return nil, fmt.Errorf("failed to create tmux session: %w", err)
-		}
-
-		// Set up pipe-pane to capture raw pane output (avoids tmux screen-diff loss)
-		rp, rpPath, pipeErr := tmuxStartPipePane(tmuxName)
-		if pipeErr != nil {
-			m.logger.Warn("pipe-pane setup failed, using attach output", "id", id, "err", pipeErr)
-		} else {
-			rawPipe = rp
-			rawPipePath = rpPath
-		}
-
-		cmd = tmuxAttachCommand(tmuxName)
-		cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-		ws := defaultWinsize(0, 0) // 120x36 to match tmuxNewSession defaults
-		ptmx, err = pty.StartWithSize(cmd, &ws)
+		res, err := m.startTmuxAttach(tmuxName, workDir, toolPath, runArgs, 0, 0)
 		if err != nil {
-			tmuxCleanupPipePane(tmuxName, rawPipe, rawPipePath)
-			_ = tmuxKillSession(tmuxName)
-			return nil, fmt.Errorf("failed to attach to tmux session: %w", err)
+			return nil, err
 		}
+		ptmx, cmd, rawPipe, rawPipePath = res.ptmx, res.cmd, res.rawPipe, res.rawPipePath
 	} else {
 		// Internal tools (tmux): direct PTY as before
 		cmd = exec.Command(toolPath, runArgs...)
@@ -370,18 +352,7 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 	m.sessions[id] = s
 	m.mu.Unlock()
 
-	// read PTY output (from raw pipe-pane FIFO when available, else attach PTY)
-	go m.readLoop(s)
-	if rawPipe != nil {
-		go m.drainLoop(s)
-	}
-
-	// wait for process exit
-	if tmuxName != "" {
-		go m.tmuxWaitLoop(s)
-	} else {
-		go m.waitLoop(s)
-	}
+	m.startLoops(s)
 
 	m.logger.Info("session created", "id", id, "tool", tool, "workDir", workDir)
 	m.save()
@@ -447,33 +418,15 @@ func (m *Manager) Restart(id string) (*Session, error) {
 		if tmuxName == "" {
 			tmuxName = tmuxSessionName(id)
 		}
-		shellCmd := buildShellCommand(toolPath, restartArgs)
-		if err := tmuxNewSession(tmuxName, workDir, shellCmd, true); err != nil {
-			clearRestarting()
-			return nil, fmt.Errorf("failed to create tmux session: %w", err)
-		}
-
-		// Set up pipe-pane for raw output capture
-		rp, rpPath, pipeErr := tmuxStartPipePane(tmuxName)
-		if pipeErr != nil {
-			m.logger.Warn("pipe-pane setup failed on restart", "id", id, "err", pipeErr)
-		} else {
-			rawPipe = rp
-			rawPipePath = rpPath
-		}
-
-		cmd = tmuxAttachCommand(tmuxName)
-		cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 		s.mu.Lock()
-		rws := defaultWinsize(s.lastCols, s.lastRows)
+		cols, rows := s.lastCols, s.lastRows
 		s.mu.Unlock()
-		ptmx, err = pty.StartWithSize(cmd, &rws)
+		res, err := m.startTmuxAttach(tmuxName, workDir, toolPath, restartArgs, cols, rows)
 		if err != nil {
-			tmuxCleanupPipePane(tmuxName, rawPipe, rawPipePath)
-			_ = tmuxKillSession(tmuxName)
 			clearRestarting()
-			return nil, fmt.Errorf("failed to attach to tmux session: %w", err)
+			return nil, err
 		}
+		ptmx, cmd, rawPipe, rawPipePath = res.ptmx, res.cmd, res.rawPipe, res.rawPipePath
 	} else {
 		// Internal tools: direct PTY
 		cmd = exec.Command(toolPath, restartArgs...)
@@ -501,15 +454,7 @@ func (m *Manager) Restart(id string) (*Session, error) {
 	s.readDone = make(chan struct{})
 	s.mu.Unlock()
 
-	go m.readLoop(s)
-	if rawPipe != nil {
-		go m.drainLoop(s)
-	}
-	if tmuxName != "" {
-		go m.tmuxWaitLoop(s)
-	} else {
-		go m.waitLoop(s)
-	}
+	m.startLoops(s)
 
 	m.logger.Info("session restarted", "id", id, "tool", tool)
 	m.save()
@@ -999,6 +944,62 @@ func (m *Manager) finalizeTmuxSession(s *Session, exitCode int, attachExited <-c
 	m.awaitReadDone(s)
 
 	m.completeExit(s, exitCode)
+}
+
+// tmuxAttachResult holds the outputs from startTmuxAttach.
+type tmuxAttachResult struct {
+	ptmx        *os.File
+	cmd         *exec.Cmd
+	rawPipe     *os.File
+	rawPipePath string
+}
+
+// startTmuxAttach creates a tmux session, sets up pipe-pane, and attaches via PTY.
+// Used by Create and Restart to avoid duplicating the tmux startup flow.
+func (m *Manager) startTmuxAttach(tmuxName, workDir, toolPath string, args []string, cols, rows uint16) (*tmuxAttachResult, error) {
+	shellCmd := buildShellCommand(toolPath, args)
+	if err := tmuxNewSession(tmuxName, workDir, shellCmd, true); err != nil {
+		return nil, fmt.Errorf("failed to create tmux session: %w", err)
+	}
+
+	var rawPipe *os.File
+	var rawPipePath string
+	rp, rpPath, pipeErr := tmuxStartPipePane(tmuxName)
+	if pipeErr != nil {
+		m.logger.Warn("pipe-pane setup failed", "tmux", tmuxName, "err", pipeErr)
+	} else {
+		rawPipe = rp
+		rawPipePath = rpPath
+	}
+
+	cmd := tmuxAttachCommand(tmuxName)
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	ws := defaultWinsize(cols, rows)
+	ptmx, err := pty.StartWithSize(cmd, &ws)
+	if err != nil {
+		tmuxCleanupPipePane(tmuxName, rawPipe, rawPipePath)
+		_ = tmuxKillSession(tmuxName)
+		return nil, fmt.Errorf("failed to attach to tmux session: %w", err)
+	}
+
+	return &tmuxAttachResult{ptmx: ptmx, cmd: cmd, rawPipe: rawPipe, rawPipePath: rawPipePath}, nil
+}
+
+// startLoops starts the background goroutines (readLoop, drainLoop, waitLoop) for a session.
+func (m *Manager) startLoops(s *Session) {
+	go m.readLoop(s)
+	s.mu.Lock()
+	hasRawPipe := s.rawPipe != nil
+	hasTmux := s.TmuxSessionName != ""
+	s.mu.Unlock()
+	if hasRawPipe {
+		go m.drainLoop(s)
+	}
+	if hasTmux {
+		go m.tmuxWaitLoop(s)
+	} else {
+		go m.waitLoop(s)
+	}
 }
 
 // reattachTmux creates a new PTY attach to an existing tmux session.
