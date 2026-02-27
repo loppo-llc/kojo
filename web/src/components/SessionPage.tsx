@@ -1,9 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useNavigate, useLocation } from "react-router";
-import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
-import { WebLinksAddon } from "@xterm/addon-web-links";
 import { useWebSocket } from "../hooks/useWebSocket";
+import { useTerminal } from "../hooks/useTerminal";
 import { api, type SessionInfo } from "../lib/api";
 import { SPECIAL_KEYS, resolveKeyPress } from "../lib/keys";
 import { FileBrowser } from "./FileBrowser";
@@ -19,17 +17,11 @@ const TABS: { key: SessionTab; label: string }[] = [
   { key: "git", label: "Git" },
 ];
 
-// Filter terminal query responses (DA1/DA2/DA3) that xterm.js auto-generates.
-const DA_RESPONSE_RE = /\x1b\[[\?>=]?[\d;]*c/g;
-
-
 export function SessionPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const location = useLocation();
-  const termRef = useRef<HTMLDivElement>(null);
-  const xtermRef = useRef<Terminal>(null);
-  const fitRef = useRef<FitAddon>(null);
+  const termContainerRef = useRef<HTMLDivElement>(null);
   const [session, setSession] = useState<SessionInfo>();
   const [input, setInput] = useState("");
   const [ctrlMode, setCtrlMode] = useState(false);
@@ -55,8 +47,6 @@ export function SessionPage() {
     navigate(path, { replace: true });
   };
 
-  // Auto-scroll
-  const autoScrollRef = useRef(true);
   const gotScrollbackRef = useRef(false);
 
   const onOutput = useCallback((data: Uint8Array) => {
@@ -90,30 +80,6 @@ export function SessionPage() {
     }
   }, []);
 
-  // fit() debounced into a single rAF
-  const fitRafRef = useRef(0);
-  const sendResizeRef = useRef<(cols: number, rows: number) => void>(() => {});
-  const safeFit = useCallback(() => {
-    const term = xtermRef.current;
-    const fit = fitRef.current;
-    const el = termRef.current;
-    if (!term || !fit || !el) return;
-    // Skip fit when terminal is hidden (display:none makes offsetParent null)
-    if (!el.offsetParent) return;
-
-    cancelAnimationFrame(fitRafRef.current);
-    fitRafRef.current = requestAnimationFrame(() => {
-      if (!xtermRef.current || !fitRef.current) return;
-      const el2 = termRef.current;
-      if (!el2 || !el2.offsetParent) return;
-      fitRef.current.fit();
-      sendResizeRef.current(xtermRef.current.cols, xtermRef.current.rows);
-      if (autoScrollRef.current) {
-        xtermRef.current.scrollToBottom();
-      }
-    });
-  }, []);
-
   const onYoloDebug = useCallback((tail: string) => {
     yoloTailRef.current = tail;
     const el = yoloOverlayRef.current;
@@ -135,9 +101,27 @@ export function SessionPage() {
     onScrollback,
     onExit,
     onYoloDebug,
-    onConnected: safeFit,
+    onConnected: () => safeFit(),
   });
+
+  const sendResizeRef = useRef(sendResize);
   sendResizeRef.current = sendResize;
+
+  const { termRef: xtermRef, autoScrollRef, safeFit } = useTerminal({
+    containerRef: termContainerRef,
+    onInput: sendInput,
+    onResize: useCallback((cols: number, rows: number) => {
+      sendResizeRef.current(cols, rows);
+    }, []),
+    deps: [id],
+  });
+
+  // Clean up yolo timer on unmount
+  useEffect(() => {
+    return () => {
+      if (yoloTimerRef.current) clearTimeout(yoloTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     setExited(false);
@@ -158,7 +142,7 @@ export function SessionPage() {
     term.write(bytes, () => {
       term.scrollToBottom();
     });
-  }, [session, exited]);
+  }, [session, exited, xtermRef]);
 
   // track visual viewport for mobile keyboard
   const containerRef = useRef<HTMLDivElement>(null);
@@ -181,7 +165,7 @@ export function SessionPage() {
       vv.removeEventListener("resize", onResize);
       vv.removeEventListener("scroll", updateHeight);
     };
-  }, []);
+  }, [safeFit]);
 
   // Refit terminal when switching back to CLI tab
   useEffect(() => {
@@ -189,119 +173,6 @@ export function SessionPage() {
       requestAnimationFrame(() => safeFit());
     }
   }, [activeTab, safeFit]);
-
-  useEffect(() => {
-    if (!termRef.current) return;
-
-    const term = new Terminal({
-      cursorBlink: true,
-      fontSize: 14,
-      fontFamily: "Menlo, Monaco, 'Courier New', monospace",
-      theme: {
-        background: "#0a0a0a",
-        foreground: "#e5e5e5",
-        cursor: "#e5e5e5",
-      },
-    });
-
-    const fit = new FitAddon();
-    term.loadAddon(fit);
-    term.loadAddon(new WebLinksAddon());
-
-    term.open(termRef.current);
-    fit.fit();
-
-    xtermRef.current = term;
-    fitRef.current = fit;
-
-    autoScrollRef.current = true;
-
-    // forward terminal keystrokes to PTY
-    const onDataDisposable = term.onData((data) => {
-      const filtered = data.replace(DA_RESPONSE_RE, "");
-      if (!filtered) return;
-      autoScrollRef.current = true;
-      sendInput(filtered);
-    });
-
-    const onWriteParsedDisposable = term.onWriteParsed(() => {
-      if (autoScrollRef.current) {
-        term.scrollToBottom();
-      }
-    });
-
-    const onRenderDisposable = term.onRender(() => {
-      if (autoScrollRef.current) {
-        term.scrollToBottom();
-      }
-    });
-
-    const ro = new ResizeObserver(() => {
-      safeFit();
-    });
-    ro.observe(termRef.current);
-
-    // scroll event listeners
-    const el = termRef.current;
-
-    const onWheel = (e: WheelEvent) => {
-      if (e.deltaY < 0) {
-        autoScrollRef.current = false;
-      } else if (e.deltaY > 0) {
-        requestAnimationFrame(() => {
-          const buf = term.buffer.active;
-          if (buf.baseY - buf.viewportY <= 3) {
-            autoScrollRef.current = true;
-          }
-        });
-      }
-    };
-    el.addEventListener("wheel", onWheel, { capture: true, passive: true });
-    let touchStartY = 0;
-    let accumDelta = 0;
-    const lineHeight = 20;
-    const onTouchStart = (e: TouchEvent) => {
-      touchStartY = e.touches[0].clientY;
-      accumDelta = 0;
-    };
-    const onTouchMove = (e: TouchEvent) => {
-      const dy = touchStartY - e.touches[0].clientY;
-      touchStartY = e.touches[0].clientY;
-      accumDelta += dy;
-      const lines = Math.trunc(accumDelta / lineHeight);
-      if (lines !== 0) {
-        if (lines > 0) {
-          term.scrollLines(lines);
-          const buf = term.buffer.active;
-          if (buf.viewportY >= buf.baseY) {
-            autoScrollRef.current = true;
-          }
-        } else {
-          autoScrollRef.current = false;
-          term.scrollLines(lines);
-        }
-        accumDelta -= lines * lineHeight;
-      }
-      e.preventDefault();
-    };
-    el.addEventListener("touchstart", onTouchStart, { passive: true, capture: true });
-    el.addEventListener("touchmove", onTouchMove, { passive: false, capture: true });
-
-    return () => {
-      cancelAnimationFrame(fitRafRef.current);
-      if (yoloTimerRef.current) clearTimeout(yoloTimerRef.current);
-      onDataDisposable.dispose();
-      onWriteParsedDisposable.dispose();
-      onRenderDisposable.dispose();
-      ro.disconnect();
-      el.removeEventListener("wheel", onWheel, { capture: true } as EventListenerOptions);
-      el.removeEventListener("touchstart", onTouchStart, { capture: true } as EventListenerOptions);
-      el.removeEventListener("touchmove", onTouchMove, { capture: true } as EventListenerOptions);
-      term.dispose();
-      xtermRef.current = null;
-      fitRef.current = null;
-    };
-  }, [id, sendInput, sendResize]);
 
   const handleSend = () => {
     autoScrollRef.current = true;
@@ -443,7 +314,7 @@ export function SessionPage() {
           style={{ display: (exited || activeTab === "cli") ? "" : "none" }}
         >
           <div className="relative flex-1 min-h-0">
-            <div ref={termRef} className="absolute inset-0" style={{ touchAction: "none" }} />
+            <div ref={termContainerRef} className="absolute inset-0" style={{ touchAction: "none" }} />
             {!exited && (
               <button
                 ref={yoloOverlayRef}

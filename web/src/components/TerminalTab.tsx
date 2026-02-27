@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
-import { WebLinksAddon } from "@xterm/addon-web-links";
 import { api, type SessionInfo } from "../lib/api";
 import { SPECIAL_KEYS, resolveKeyPress } from "../lib/keys";
 import { toBase64 } from "../lib/utils";
+import { useTerminal } from "../hooks/useTerminal";
 
 interface TerminalTabProps {
   parentSessionId: string;
@@ -25,18 +23,9 @@ const TMUX_SHORTCUTS = [
   { label: "Kill", seq: TMUX_PREFIX + ":kill-pane\r" },
 ];
 
-
-// Filter terminal query responses (DA1/DA2/DA3) that xterm.js auto-generates.
-// Without filtering, these get sent to the PTY as input and appear as garbage text.
-const DA_RESPONSE_RE = /\x1b\[[\?>=]?[\d;]*c/g;
-
 export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabProps) {
-  const termRef = useRef<HTMLDivElement>(null);
-  const xtermRef = useRef<Terminal>(null);
-  const fitRef = useRef<FitAddon>(null);
+  const termContainerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const autoScrollRef = useRef(true);
-  const fitRafRef = useRef(0);
   const outputBufRef = useRef<Uint8Array[]>([]);
   const outputBufSizeRef = useRef(0);
   const outputRafRef = useRef(0);
@@ -60,25 +49,12 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     }
   }, []);
 
-  const safeFit = useCallback(() => {
-    const term = xtermRef.current;
-    const fit = fitRef.current;
-    const el = termRef.current;
-    if (!term || !fit || !el) return;
-    if (!el.offsetParent) return;
-
-    cancelAnimationFrame(fitRafRef.current);
-    fitRafRef.current = requestAnimationFrame(() => {
-      if (!xtermRef.current || !fitRef.current) return;
-      const el2 = termRef.current;
-      if (!el2 || !el2.offsetParent) return;
-      fitRef.current.fit();
-      sendResize(xtermRef.current.cols, xtermRef.current.rows);
-      if (autoScrollRef.current) {
-        xtermRef.current.scrollToBottom();
-      }
-    });
-  }, [sendResize]);
+  const { termRef: xtermRef, autoScrollRef, safeFit } = useTerminal({
+    containerRef: termContainerRef,
+    onInput: sendInput,
+    onResize: sendResize,
+    deps: [parentSessionId],
+  });
 
   // Connect WebSocket to a tmux session
   const connectWs = useCallback((tmuxSessionId: string) => {
@@ -181,121 +157,23 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     };
 
     wsRef.current = ws;
-  }, [safeFit]);
+  }, [xtermRef, autoScrollRef, safeFit]);
 
-  // Initialize xterm (once, persistent across visibility changes)
+  // Clean up WebSocket and output buffer on unmount
   useEffect(() => {
-    if (!termRef.current) return;
-
-    const term = new Terminal({
-      cursorBlink: true,
-      fontSize: 14,
-      fontFamily: "Menlo, Monaco, 'Courier New', monospace",
-      theme: {
-        background: "#0a0a0a",
-        foreground: "#e5e5e5",
-        cursor: "#e5e5e5",
-      },
-    });
-
-    const fit = new FitAddon();
-    term.loadAddon(fit);
-    term.loadAddon(new WebLinksAddon());
-
-    term.open(termRef.current);
-    fit.fit();
-
-    xtermRef.current = term;
-    fitRef.current = fit;
-    autoScrollRef.current = true;
-
-    const onDataDisposable = term.onData((data) => {
-      const filtered = data.replace(DA_RESPONSE_RE, "");
-      if (!filtered) return;
-      autoScrollRef.current = true;
-      sendInput(filtered);
-    });
-
-    const onWriteParsedDisposable = term.onWriteParsed(() => {
-      if (autoScrollRef.current) term.scrollToBottom();
-    });
-
-    const onRenderDisposable = term.onRender(() => {
-      if (autoScrollRef.current) term.scrollToBottom();
-    });
-
-    const ro = new ResizeObserver(() => safeFit());
-    ro.observe(termRef.current);
-
-    // Scroll event listeners
-    const el = termRef.current;
-
-    const onWheel = (e: WheelEvent) => {
-      if (e.deltaY < 0) {
-        autoScrollRef.current = false;
-      } else if (e.deltaY > 0) {
-        requestAnimationFrame(() => {
-          const buf = term.buffer.active;
-          if (buf.baseY - buf.viewportY <= 3) {
-            autoScrollRef.current = true;
-          }
-        });
-      }
-    };
-    el.addEventListener("wheel", onWheel, { capture: true, passive: true });
-
-    let touchStartY = 0;
-    let accumDelta = 0;
-    const lineHeight = 20;
-    const onTouchStart = (e: TouchEvent) => {
-      touchStartY = e.touches[0].clientY;
-      accumDelta = 0;
-    };
-    const onTouchMove = (e: TouchEvent) => {
-      const dy = touchStartY - e.touches[0].clientY;
-      touchStartY = e.touches[0].clientY;
-      accumDelta += dy;
-      const lines = Math.trunc(accumDelta / lineHeight);
-      if (lines !== 0) {
-        if (lines > 0) {
-          term.scrollLines(lines);
-          const buf = term.buffer.active;
-          if (buf.viewportY >= buf.baseY) autoScrollRef.current = true;
-        } else {
-          autoScrollRef.current = false;
-          term.scrollLines(lines);
-        }
-        accumDelta -= lines * lineHeight;
-      }
-      e.preventDefault();
-    };
-    el.addEventListener("touchstart", onTouchStart, { passive: true, capture: true });
-    el.addEventListener("touchmove", onTouchMove, { passive: false, capture: true });
-
     return () => {
-      cancelAnimationFrame(fitRafRef.current);
       if (outputRafRef.current) {
         cancelAnimationFrame(outputRafRef.current);
         outputRafRef.current = 0;
       }
       outputBufRef.current = [];
       outputBufSizeRef.current = 0;
-      onDataDisposable.dispose();
-      onWriteParsedDisposable.dispose();
-      onRenderDisposable.dispose();
-      ro.disconnect();
-      el.removeEventListener("wheel", onWheel, { capture: true } as EventListenerOptions);
-      el.removeEventListener("touchstart", onTouchStart, { capture: true } as EventListenerOptions);
-      el.removeEventListener("touchmove", onTouchMove, { capture: true } as EventListenerOptions);
       if (wsRef.current) {
         wsRef.current.onclose = null;
         wsRef.current.close();
       }
-      term.dispose();
-      xtermRef.current = null;
-      fitRef.current = null;
     };
-  }, [parentSessionId, sendInput, safeFit]);
+  }, []);
 
   // Reset refs when parentSessionId changes (prevents cross-session contamination)
   useEffect(() => {
@@ -428,7 +306,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     <div className="flex flex-col h-full">
       {/* Terminal */}
       <div className="flex-1 min-h-0 relative">
-        <div ref={termRef} className="absolute inset-0" style={{ touchAction: "none" }} />
+        <div ref={termContainerRef} className="absolute inset-0" style={{ touchAction: "none" }} />
       </div>
 
       {/* tmux shortcuts */}
