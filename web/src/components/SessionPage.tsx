@@ -149,6 +149,7 @@ export function SessionPage() {
     onScrollback,
     onExit,
     onYoloDebug,
+    onConnected: safeFit,
   });
   sendResizeRef.current = sendResize;
 

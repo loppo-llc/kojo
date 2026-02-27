@@ -7,6 +7,16 @@ import (
 	"github.com/creack/pty/v2"
 )
 
+// defaultWinsize returns a pty.Winsize using the given dimensions,
+// falling back to 120x36 when either value is zero (e.g. first launch).
+func defaultWinsize(cols, rows uint16) pty.Winsize {
+	if cols == 0 || rows == 0 {
+		cols = 120
+		rows = 36
+	}
+	return pty.Winsize{Cols: cols, Rows: rows}
+}
+
 func (s *Session) Resize(cols, rows uint16) error {
 	s.mu.Lock()
 	ptmx := s.PTY

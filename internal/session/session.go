@@ -102,6 +102,8 @@ type SessionInfo struct {
 	ParentID        string   `json:"parentId,omitempty"`
 	TmuxSessionName string   `json:"tmuxSessionName,omitempty"`
 	LastOutput      string   `json:"lastOutput,omitempty"`
+	LastCols        uint16   `json:"lastCols,omitempty"`
+	LastRows        uint16   `json:"lastRows,omitempty"`
 }
 
 func (s *Session) Info() SessionInfo {
@@ -124,6 +126,8 @@ func (s *Session) Info() SessionInfo {
 	if len(s.lastOutput) > 0 {
 		info.LastOutput = base64.StdEncoding.EncodeToString(s.lastOutput)
 	}
+	info.LastCols = s.lastCols
+	info.LastRows = s.lastRows
 	return info
 }
 

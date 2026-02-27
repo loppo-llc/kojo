@@ -104,6 +104,8 @@ func (m *Manager) loadPersistedSessions() bool {
 			ToolSessionID:   info.ToolSessionID,
 			ParentID:        info.ParentID,
 			TmuxSessionName: info.TmuxSessionName,
+			lastCols:        info.LastCols,
+			lastRows:        info.LastRows,
 			scrollback:      NewRingBuffer(defaultRingSize),
 			subscribers:     make(map[chan []byte]struct{}),
 			done:            make(chan struct{}),
@@ -127,7 +129,8 @@ func (m *Manager) loadPersistedSessions() bool {
 
 				cmd := tmuxAttachCommand(info.TmuxSessionName)
 				cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-				ptmx, err := pty.Start(cmd)
+				ws := defaultWinsize(info.LastCols, info.LastRows)
+				ptmx, err := pty.StartWithSize(cmd, &ws)
 				if err == nil {
 					s.PTY = ptmx
 					s.Cmd = cmd
@@ -301,7 +304,8 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 
 		cmd = tmuxAttachCommand(tmuxName)
 		cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-		ptmx, err = pty.Start(cmd)
+		ws := defaultWinsize(0, 0) // 120x36 to match tmuxNewSession defaults
+		ptmx, err = pty.StartWithSize(cmd, &ws)
 		if err != nil {
 			tmuxCleanupPipePane(tmuxName, rawPipe, rawPipePath)
 			_ = tmuxKillSession(tmuxName)
@@ -464,7 +468,10 @@ func (m *Manager) Restart(id string) (*Session, error) {
 
 		cmd = tmuxAttachCommand(tmuxName)
 		cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-		ptmx, err = pty.Start(cmd)
+		s.mu.Lock()
+		rws := defaultWinsize(s.lastCols, s.lastRows)
+		s.mu.Unlock()
+		ptmx, err = pty.StartWithSize(cmd, &rws)
 		if err != nil {
 			tmuxCleanupPipePane(tmuxName, rawPipe, rawPipePath)
 			_ = tmuxKillSession(tmuxName)
@@ -1058,7 +1065,10 @@ func (m *Manager) reattachTmux(s *Session) error {
 
 	cmd := tmuxAttachCommand(tmuxName)
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-	ptmx, err := pty.Start(cmd)
+	s.mu.Lock()
+	ws := defaultWinsize(s.lastCols, s.lastRows)
+	s.mu.Unlock()
+	ptmx, err := pty.StartWithSize(cmd, &ws)
 	if err != nil {
 		if rawPipe != nil {
 			tmuxCleanupPipePane(tmuxName, rawPipe, rawPipePath)

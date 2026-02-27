@@ -16,6 +16,7 @@ interface UseWebSocketOptions {
   onScrollback: (data: Uint8Array) => void;
   onExit: (exitCode: number, live: boolean) => void;
   onYoloDebug?: (tail: string) => void;
+  onConnected?: () => void;
 }
 
 function toBase64(str: string): string {
@@ -24,12 +25,14 @@ function toBase64(str: string): string {
   );
 }
 
-export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYoloDebug }: UseWebSocketOptions) {
+export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYoloDebug, onConnected }: UseWebSocketOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const [connected, setConnected] = useState(false);
   const reconnectRef = useRef<ReturnType<typeof setTimeout>>(null);
   const backoffRef = useRef(1000);
   const activeRef = useRef(true);
+  const onConnectedRef = useRef(onConnected);
+  onConnectedRef.current = onConnected;
 
   // Batch output: accumulate chunks within a single animation frame to avoid
   // feeding split ANSI sequences into xterm.js across separate write() calls.
@@ -72,6 +75,7 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
       if (wsRef.current !== ws) return; // stale connection
       setConnected(true);
       backoffRef.current = 1000;
+      onConnectedRef.current?.();
     };
 
     ws.onmessage = (evt) => {
