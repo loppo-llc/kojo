@@ -767,17 +767,7 @@ func (m *Manager) waitLoop(s *Session) {
 // tmuxWaitLoop monitors a tmux-backed session by polling pane status
 // and watching the attach process.
 func (m *Manager) tmuxWaitLoop(s *Session) {
-	// Goroutine to reap the attach process
-	attachExited := make(chan struct{})
-	go func() {
-		s.mu.Lock()
-		cmd := s.Cmd
-		s.mu.Unlock()
-		if cmd != nil {
-			_ = cmd.Wait()
-		}
-		close(attachExited)
-	}()
+	attachExited := m.startAttachReaper(s)
 
 	ticker := time.NewTicker(paneStatusPollInterval)
 	defer ticker.Stop()
@@ -787,156 +777,181 @@ func (m *Manager) tmuxWaitLoop(s *Session) {
 	for {
 		select {
 		case <-ticker.C:
-			m.mu.Lock()
-			shuttingDown := m.shuttingDown
-			m.mu.Unlock()
-			if shuttingDown {
+			action := m.handlePanePoll(s, &consecutiveErrors, attachExited)
+			switch action {
+			case pollDone:
 				return
-			}
-
-			s.mu.Lock()
-			tmuxName := s.TmuxSessionName
-			s.mu.Unlock()
-
-			if !tmuxHasSession(tmuxName) {
-				// tmux session gone entirely
-				m.finalizeTmuxSession(s, 1, attachExited)
-				return
-			}
-
-			dead, exitCode, err := tmuxPaneDead(tmuxName)
-			if err != nil {
-				consecutiveErrors++
-				if consecutiveErrors >= maxPaneCheckErrors {
-					m.logger.Error("tmux pane check failed repeatedly, finalizing session", "id", s.ID, "err", err)
-					_ = tmuxKillSession(tmuxName)
-					m.finalizeTmuxSession(s, 1, attachExited)
-					return
-				}
+			case pollRetry:
 				continue
-			}
-			consecutiveErrors = 0
-			if dead {
-				_ = tmuxKillSession(tmuxName)
-				m.finalizeTmuxSession(s, exitCode, attachExited)
-				return
-			}
-
-			// Check if readLoop exited unexpectedly (FIFO failure).
-			// If pipe-pane died but the pane is still running, force a
-			// reattach by killing the attach process. The attachExited
-			// handler will create a new pipe-pane and readLoop.
-			s.mu.Lock()
-			readDone := s.readDone
-			hasRawPipe := s.rawPipe != nil
-			s.mu.Unlock()
-			if hasRawPipe {
-				select {
-				case <-readDone:
-					m.logger.Warn("pipe-pane FIFO lost, forcing reattach", "id", s.ID)
-					// Stop the stale pipe-pane command, close fd, remove FIFO
-					s.mu.Lock()
-					s.cleanupPipePane()
-					cmd := s.Cmd
-					s.mu.Unlock()
-					// Kill attach → triggers attachExited → reattach with new pipe-pane
-					if cmd != nil && cmd.Process != nil {
-						_ = cmd.Process.Kill()
-					}
-				default:
-					// readLoop still running, all good
-				}
 			}
 
 		case <-attachExited:
-			// Attach process exited. Check if we're shutting down.
-			m.mu.Lock()
-			shuttingDown := m.shuttingDown
-			m.mu.Unlock()
-			if shuttingDown {
+			newCh, done := m.handleAttachExit(s)
+			if done {
 				return
 			}
-
-			// Close only the attach PTY (drainLoop exits naturally).
-			// Keep pipe-pane/FIFO alive so readLoop continues capturing output.
-			s.mu.Lock()
-			if s.PTY != nil {
-				s.PTY.Close()
-				s.PTY = nil
-			}
-			tmuxName := s.TmuxSessionName
-			hasRawPipe := s.rawPipe != nil
-			s.mu.Unlock()
-
-			// If no pipe-pane, readLoop was using the PTY — wait for it.
-			// If pipe-pane is active but readLoop died concurrently (FIFO
-			// failure just before attach exit), clean up so reattach does
-			// a full pipe-pane recreation instead of assuming it's healthy.
-			if !hasRawPipe {
-				m.awaitReadDone(s)
-			} else {
-				select {
-				case <-s.readDone:
-					// readLoop died — clean up stale pipe-pane
-					s.mu.Lock()
-					s.cleanupPipePane()
-					s.mu.Unlock()
-					hasRawPipe = false
-				default:
-					// readLoop still healthy
-				}
-			}
-
-			if !tmuxHasSession(tmuxName) {
-				if hasRawPipe {
-					s.mu.Lock()
-					s.cleanupPipePane()
-					s.mu.Unlock()
-					m.awaitReadDone(s)
-				}
-				m.completeExit(s, 1)
-				return
-			}
-
-			dead, exitCode, _ := tmuxPaneDead(tmuxName)
-			if dead {
-				_ = tmuxKillSession(tmuxName)
-				if hasRawPipe {
-					s.mu.Lock()
-					s.cleanupPipePane()
-					s.mu.Unlock()
-					m.awaitReadDone(s)
-				}
-				m.completeExit(s, exitCode)
-				return
-			}
-
-			// tmux session still alive with running pane → reattach
-			if err := m.reattachTmux(s); err != nil {
-				m.logger.Error("failed to reattach tmux", "id", s.ID, "err", err)
-				if hasRawPipe {
-					s.mu.Lock()
-					s.cleanupPipePane()
-					s.mu.Unlock()
-					m.awaitReadDone(s)
-				}
-				m.completeExit(s, 1)
-				return
-			}
-
-			// Start new reaper for the new attach process
-			attachExited = make(chan struct{})
-			go func() {
-				s.mu.Lock()
-				cmd := s.Cmd
-				s.mu.Unlock()
-				if cmd != nil {
-					_ = cmd.Wait()
-				}
-				close(attachExited)
-			}()
+			attachExited = newCh
 		}
 	}
+}
+
+// pollAction represents the outcome of a pane status poll.
+type pollAction int
+
+const (
+	pollOK    pollAction = iota // continue normally
+	pollDone                    // session finalized, return from loop
+	pollRetry                   // transient error, skip to next tick
+)
+
+// handlePanePoll checks tmux pane status on each tick.
+// Returns a pollAction indicating how the caller should proceed.
+func (m *Manager) handlePanePoll(s *Session, consecutiveErrors *int, attachExited <-chan struct{}) pollAction {
+	m.mu.Lock()
+	shuttingDown := m.shuttingDown
+	m.mu.Unlock()
+	if shuttingDown {
+		return pollDone
+	}
+
+	s.mu.Lock()
+	tmuxName := s.TmuxSessionName
+	s.mu.Unlock()
+
+	if !tmuxHasSession(tmuxName) {
+		m.finalizeTmuxSession(s, 1, attachExited)
+		return pollDone
+	}
+
+	dead, exitCode, err := tmuxPaneDead(tmuxName)
+	if err != nil {
+		*consecutiveErrors++
+		if *consecutiveErrors >= maxPaneCheckErrors {
+			m.logger.Error("tmux pane check failed repeatedly, finalizing session", "id", s.ID, "err", err)
+			_ = tmuxKillSession(tmuxName)
+			m.finalizeTmuxSession(s, 1, attachExited)
+			return pollDone
+		}
+		return pollRetry
+	}
+	*consecutiveErrors = 0
+	if dead {
+		_ = tmuxKillSession(tmuxName)
+		m.finalizeTmuxSession(s, exitCode, attachExited)
+		return pollDone
+	}
+
+	// Check if readLoop exited unexpectedly (FIFO failure).
+	// If pipe-pane died but the pane is still running, force a
+	// reattach by killing the attach process. The attachExited
+	// handler will create a new pipe-pane and readLoop.
+	s.mu.Lock()
+	readDone := s.readDone
+	hasRawPipe := s.rawPipe != nil
+	s.mu.Unlock()
+	if hasRawPipe {
+		select {
+		case <-readDone:
+			m.logger.Warn("pipe-pane FIFO lost, forcing reattach", "id", s.ID)
+			s.mu.Lock()
+			s.cleanupPipePane()
+			cmd := s.Cmd
+			s.mu.Unlock()
+			if cmd != nil && cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		default:
+		}
+	}
+
+	return pollOK
+}
+
+// handleAttachExit handles the case when the tmux attach process exits.
+// It determines whether to finalize the session or reattach.
+// Returns (newAttachExited, done). If done is true the caller should return.
+func (m *Manager) handleAttachExit(s *Session) (chan struct{}, bool) {
+	m.mu.Lock()
+	shuttingDown := m.shuttingDown
+	m.mu.Unlock()
+	if shuttingDown {
+		return nil, true
+	}
+
+	// Close only the attach PTY (drainLoop exits naturally).
+	// Keep pipe-pane/FIFO alive so readLoop continues capturing output.
+	s.mu.Lock()
+	if s.PTY != nil {
+		s.PTY.Close()
+		s.PTY = nil
+	}
+	tmuxName := s.TmuxSessionName
+	hasRawPipe := s.rawPipe != nil
+	s.mu.Unlock()
+
+	// If no pipe-pane, readLoop was using the PTY — wait for it.
+	// If pipe-pane is active but readLoop died concurrently (FIFO
+	// failure just before attach exit), clean up so reattach does
+	// a full pipe-pane recreation instead of assuming it's healthy.
+	if !hasRawPipe {
+		m.awaitReadDone(s)
+	} else {
+		select {
+		case <-s.readDone:
+			s.mu.Lock()
+			s.cleanupPipePane()
+			s.mu.Unlock()
+			hasRawPipe = false
+		default:
+		}
+	}
+
+	if !tmuxHasSession(tmuxName) {
+		m.cleanupPipeAndExit(s, hasRawPipe, 1)
+		return nil, true
+	}
+
+	dead, exitCode, _ := tmuxPaneDead(tmuxName)
+	if dead {
+		_ = tmuxKillSession(tmuxName)
+		m.cleanupPipeAndExit(s, hasRawPipe, exitCode)
+		return nil, true
+	}
+
+	// tmux session still alive with running pane → reattach
+	if err := m.reattachTmux(s); err != nil {
+		m.logger.Error("failed to reattach tmux", "id", s.ID, "err", err)
+		m.cleanupPipeAndExit(s, hasRawPipe, 1)
+		return nil, true
+	}
+
+	return m.startAttachReaper(s), false
+}
+
+// cleanupPipeAndExit cleans up pipe-pane if active and completes session exit.
+func (m *Manager) cleanupPipeAndExit(s *Session, hasRawPipe bool, exitCode int) {
+	if hasRawPipe {
+		s.mu.Lock()
+		s.cleanupPipePane()
+		s.mu.Unlock()
+		m.awaitReadDone(s)
+	}
+	m.completeExit(s, exitCode)
+}
+
+// startAttachReaper starts a goroutine that waits for the attach process to exit.
+func (m *Manager) startAttachReaper(s *Session) chan struct{} {
+	ch := make(chan struct{})
+	go func() {
+		s.mu.Lock()
+		cmd := s.Cmd
+		s.mu.Unlock()
+		if cmd != nil {
+			_ = cmd.Wait()
+		}
+		close(ch)
+	}()
+	return ch
 }
 
 // finalizeTmuxSession handles the case where the tmux pane is dead or gone,
