@@ -22,17 +22,30 @@ const TABS: { key: SessionTab; label: string }[] = [
 const DA_RESPONSE_RE = /\x1b\[[\?>=]?[\d;]*c/g;
 
 const SPECIAL_KEYS = [
-  { label: "Esc", code: "\x1b" },
-  { label: "Tab", code: "\t" },
   { label: "Ctrl", code: "ctrl" },
-  { label: "Opt", code: "opt" },
-  { label: "Cmd", code: "cmd" },
+  { label: "Esc", code: "\x1b" },
   { label: "Shift", code: "shift" },
-  { label: "/", code: "/" },
+  { label: "Tab", code: "\t" },
   { label: "\u2191", code: "\x1b[A" },
   { label: "\u2193", code: "\x1b[B" },
   { label: "\u2192", code: "\x1b[C" },
   { label: "\u2190", code: "\x1b[D" },
+  { label: "Home", code: "\x1b[H" },
+  { label: "End", code: "\x1b[F" },
+  { label: "PgUp", code: "\x1b[5~" },
+  { label: "PgDn", code: "\x1b[6~" },
+  { label: "F1", code: "\x1bOP" },
+  { label: "F2", code: "\x1bOQ" },
+  { label: "F3", code: "\x1bOR" },
+  { label: "F4", code: "\x1bOS" },
+  { label: "F5", code: "\x1b[15~" },
+  { label: "F6", code: "\x1b[17~" },
+  { label: "F7", code: "\x1b[18~" },
+  { label: "F8", code: "\x1b[19~" },
+  { label: "F9", code: "\x1b[20~" },
+  { label: "F10", code: "\x1b[21~" },
+  { label: "F11", code: "\x1b[23~" },
+  { label: "F12", code: "\x1b[24~" },
 ];
 
 export function SessionPage() {
@@ -45,8 +58,6 @@ export function SessionPage() {
   const [session, setSession] = useState<SessionInfo>();
   const [input, setInput] = useState("");
   const [ctrlMode, setCtrlMode] = useState(false);
-  const [optMode, setOptMode] = useState(false);
-  const [cmdMode, setCmdMode] = useState(false);
   const [shiftMode, setShiftMode] = useState(false);
   const [exited, setExited] = useState(false);
   const yoloTailRef = useRef<string | null>(null);
@@ -342,8 +353,6 @@ export function SessionPage() {
 
   const clearModifiers = () => {
     setCtrlMode(false);
-    setOptMode(false);
-    setCmdMode(false);
     setShiftMode(false);
   };
 
@@ -352,16 +361,6 @@ export function SessionPage() {
     if (code === "ctrl") {
       clearModifiers();
       setCtrlMode(!ctrlMode);
-      return;
-    }
-    if (code === "opt") {
-      clearModifiers();
-      setOptMode(!optMode);
-      return;
-    }
-    if (code === "cmd") {
-      clearModifiers();
-      setCmdMode(!cmdMode);
       return;
     }
     if (code === "shift") {
@@ -375,19 +374,29 @@ export function SessionPage() {
         sendInput(String.fromCharCode(char - 96));
       }
       clearModifiers();
-    } else if (optMode) {
-      sendInput("\x1b" + code);
-      clearModifiers();
-    } else if (cmdMode) {
-      sendInput("\x1b" + code);
-      clearModifiers();
     } else if (shiftMode) {
       const shiftMap: Record<string, string> = {
+        "\t": "\x1b[Z",
         "\x1b[A": "\x1b[1;2A",
         "\x1b[B": "\x1b[1;2B",
         "\x1b[C": "\x1b[1;2C",
         "\x1b[D": "\x1b[1;2D",
-        "/": "?",
+        "\x1b[H": "\x1b[1;2H",
+        "\x1b[F": "\x1b[1;2F",
+        "\x1b[5~": "\x1b[5;2~",
+        "\x1b[6~": "\x1b[6;2~",
+        "\x1bOP": "\x1b[1;2P",
+        "\x1bOQ": "\x1b[1;2Q",
+        "\x1bOR": "\x1b[1;2R",
+        "\x1bOS": "\x1b[1;2S",
+        "\x1b[15~": "\x1b[15;2~",
+        "\x1b[17~": "\x1b[17;2~",
+        "\x1b[18~": "\x1b[18;2~",
+        "\x1b[19~": "\x1b[19;2~",
+        "\x1b[20~": "\x1b[20;2~",
+        "\x1b[21~": "\x1b[21;2~",
+        "\x1b[23~": "\x1b[23;2~",
+        "\x1b[24~": "\x1b[24;2~",
       };
       sendInput(shiftMap[code] ?? code.toUpperCase());
       clearModifiers();
@@ -517,9 +526,10 @@ export function SessionPage() {
                 {SPECIAL_KEYS.map((key) => (
                   <button
                     key={key.label}
+                    onPointerDown={(e) => e.preventDefault()}
                     onClick={() => handleKeyPress(key.code)}
-                    className={`px-4 py-2.5 text-sm rounded font-mono ${
-                      (key.code === "ctrl" && ctrlMode) || (key.code === "opt" && optMode) || (key.code === "cmd" && cmdMode) || (key.code === "shift" && shiftMode)
+                    className={`px-4 py-2.5 text-sm rounded font-mono whitespace-nowrap ${
+                      (key.code === "ctrl" && ctrlMode) || (key.code === "shift" && shiftMode)
                         ? "bg-blue-900 text-blue-300"
                         : "bg-neutral-800 text-neutral-400 active:bg-neutral-600"
                     }`}
@@ -550,6 +560,7 @@ export function SessionPage() {
                   className="flex-1 px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500 resize-none"
                 />
                 <button
+                  onPointerDown={(e) => e.preventDefault()}
                   onClick={handleSend}
                   className="px-3 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-sm"
                 >
