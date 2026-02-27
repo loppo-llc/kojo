@@ -427,11 +427,7 @@ func (m *Manager) Restart(id string) (*Session, error) {
 
 	// Clean up old pipe-pane FIFO if it exists
 	s.mu.Lock()
-	if s.rawPipePath != "" {
-		tmuxCleanupPipePane(s.TmuxSessionName, s.rawPipe, s.rawPipePath)
-		s.rawPipe = nil
-		s.rawPipePath = ""
-	}
+	s.cleanupPipePane()
 	s.mu.Unlock()
 
 	// Clean up old tmux session if it still exists
@@ -670,11 +666,7 @@ func (m *Manager) StopAll() {
 	for _, s := range tmuxSessions {
 		s.mu.Lock()
 		// Stop pipe-pane to avoid orphaned cat processes
-		if s.rawPipePath != "" {
-			tmuxCleanupPipePane(s.TmuxSessionName, s.rawPipe, s.rawPipePath)
-			s.rawPipe = nil
-			s.rawPipePath = ""
-		}
+		s.cleanupPipePane()
 		if s.Cmd != nil && s.Cmd.Process != nil {
 			_ = s.Cmd.Process.Kill()
 		}
@@ -874,9 +866,7 @@ func (m *Manager) tmuxWaitLoop(s *Session) {
 					m.logger.Warn("pipe-pane FIFO lost, forcing reattach", "id", s.ID)
 					// Stop the stale pipe-pane command, close fd, remove FIFO
 					s.mu.Lock()
-					tmuxCleanupPipePane(s.TmuxSessionName, s.rawPipe, s.rawPipePath)
-					s.rawPipe = nil
-					s.rawPipePath = ""
+					s.cleanupPipePane()
 					cmd := s.Cmd
 					s.mu.Unlock()
 					// Kill attach → triggers attachExited → reattach with new pipe-pane
@@ -919,9 +909,7 @@ func (m *Manager) tmuxWaitLoop(s *Session) {
 				case <-s.readDone:
 					// readLoop died — clean up stale pipe-pane
 					s.mu.Lock()
-					tmuxCleanupPipePane(s.TmuxSessionName, s.rawPipe, s.rawPipePath)
-					s.rawPipe = nil
-					s.rawPipePath = ""
+					s.cleanupPipePane()
 					s.mu.Unlock()
 					hasRawPipe = false
 				default:
@@ -932,9 +920,7 @@ func (m *Manager) tmuxWaitLoop(s *Session) {
 			if !tmuxHasSession(tmuxName) {
 				if hasRawPipe {
 					s.mu.Lock()
-					tmuxCleanupPipePane(s.TmuxSessionName, s.rawPipe, s.rawPipePath)
-					s.rawPipe = nil
-					s.rawPipePath = ""
+					s.cleanupPipePane()
 					s.mu.Unlock()
 					m.awaitReadDone(s)
 				}
@@ -947,9 +933,7 @@ func (m *Manager) tmuxWaitLoop(s *Session) {
 				_ = tmuxKillSession(tmuxName)
 				if hasRawPipe {
 					s.mu.Lock()
-					tmuxCleanupPipePane(s.TmuxSessionName, s.rawPipe, s.rawPipePath)
-					s.rawPipe = nil
-					s.rawPipePath = ""
+					s.cleanupPipePane()
 					s.mu.Unlock()
 					m.awaitReadDone(s)
 				}
@@ -962,9 +946,7 @@ func (m *Manager) tmuxWaitLoop(s *Session) {
 				m.logger.Error("failed to reattach tmux", "id", s.ID, "err", err)
 				if hasRawPipe {
 					s.mu.Lock()
-					tmuxCleanupPipePane(s.TmuxSessionName, s.rawPipe, s.rawPipePath)
-					s.rawPipe = nil
-					s.rawPipePath = ""
+					s.cleanupPipePane()
 					s.mu.Unlock()
 					m.awaitReadDone(s)
 				}
@@ -1006,11 +988,7 @@ func (m *Manager) finalizeTmuxSession(s *Session, exitCode int, attachExited <-c
 
 	// Clean up pipe-pane and close PTY so readLoop/drainLoop exit
 	s.mu.Lock()
-	if s.rawPipePath != "" {
-		tmuxCleanupPipePane(s.TmuxSessionName, s.rawPipe, s.rawPipePath)
-		s.rawPipe = nil
-		s.rawPipePath = ""
-	}
+	s.cleanupPipePane()
 	if s.PTY != nil {
 		s.PTY.Close()
 		s.PTY = nil
@@ -1039,9 +1017,7 @@ func (m *Manager) reattachTmux(s *Session) error {
 		select {
 		case <-readDone:
 			s.mu.Lock()
-			tmuxCleanupPipePane(s.TmuxSessionName, s.rawPipe, s.rawPipePath)
-			s.rawPipe = nil
-			s.rawPipePath = ""
+			s.cleanupPipePane()
 			s.mu.Unlock()
 			pipeAlreadyActive = false
 		default:

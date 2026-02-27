@@ -244,6 +244,17 @@ func (s *Session) CaptureToolSessionID(data []byte) {
 	}
 }
 
+// cleanupPipePane stops pipe-pane and cleans up the FIFO, clearing Session fields.
+// Caller must hold s.mu.
+func (s *Session) cleanupPipePane() {
+	if s.rawPipePath == "" && s.rawPipe == nil {
+		return
+	}
+	tmuxCleanupPipePane(s.TmuxSessionName, s.rawPipe, s.rawPipePath)
+	s.rawPipe = nil
+	s.rawPipePath = ""
+}
+
 func (s *Session) SetYoloMode(enabled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
