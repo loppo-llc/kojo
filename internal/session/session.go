@@ -192,17 +192,16 @@ func (s *Session) Write(data []byte) (int, error) {
 	// Retry briefly when PTY is nil (e.g. during tmux reattach) to avoid
 	// silently dropping user input during the short reconnection window.
 	// Uses s.done to bail out early if the session exits during the wait.
-	const maxRetries = 5
-	for i := 0; i < maxRetries; i++ {
+	for i := 0; i < maxWriteRetries; i++ {
 		s.mu.Lock()
 		pty := s.PTY
 		s.mu.Unlock()
 		if pty != nil {
 			return pty.Write(data)
 		}
-		if i < maxRetries-1 {
+		if i < maxWriteRetries-1 {
 			select {
-			case <-time.After(50 * time.Millisecond):
+			case <-time.After(writeRetryDelay):
 			case <-s.done:
 				return 0, os.ErrClosed
 			}

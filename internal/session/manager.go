@@ -31,6 +31,34 @@ const (
 	// exitKillTimeout is the maximum time to wait for the attach process
 	// to exit after being killed.
 	exitKillTimeout = 5 * time.Second
+
+	// stopKillTimeout is the grace period before SIGKILL after SIGTERM in Stop().
+	stopKillTimeout = 5 * time.Second
+
+	// shutdownTimeout is the maximum time to wait for non-tmux sessions to exit on shutdown.
+	shutdownTimeout = 10 * time.Second
+
+	// paneStatusPollInterval is how often tmuxWaitLoop checks the tmux pane status.
+	paneStatusPollInterval = 500 * time.Millisecond
+
+	// maxPaneCheckErrors is the number of consecutive tmux pane check errors
+	// before the session is forcibly finalized.
+	maxPaneCheckErrors = 10
+
+	// readBufSize is the buffer size for PTY/FIFO reads.
+	readBufSize = 32 * 1024
+
+	// maxLastOutput is the maximum bytes of scrollback captured on session exit.
+	maxLastOutput = 8192
+
+	// yoloApproveDelay is the delay before sending an auto-approve response.
+	yoloApproveDelay = 100 * time.Millisecond
+
+	// writeRetryDelay is the delay between retries when PTY is nil during reattach.
+	writeRetryDelay = 50 * time.Millisecond
+
+	// maxWriteRetries is the number of retries for PTY write during reattach.
+	maxWriteRetries = 5
 )
 
 var userTools = map[string]bool{
@@ -555,12 +583,11 @@ func (m *Manager) Stop(id string) error {
 		// SIGTERM to the attach/direct process
 		_ = cmd.Process.Signal(syscall.SIGTERM)
 
-		// give 5 seconds then SIGKILL
 		go func() {
 			select {
 			case <-s.done:
 				return
-			case <-time.After(5 * time.Second):
+			case <-time.After(stopKillTimeout):
 				_ = cmd.Process.Kill()
 			}
 		}()
@@ -602,7 +629,7 @@ func (m *Manager) StopAll() {
 		if s, ok := m.Get(id); ok {
 			select {
 			case <-s.done:
-			case <-time.After(10 * time.Second):
+			case <-time.After(shutdownTimeout):
 			}
 		}
 	}
@@ -656,7 +683,7 @@ func (m *Manager) readLoop(s *Session) {
 		return
 	}
 
-	buf := make([]byte, 32*1024)
+	buf := make([]byte, readBufSize)
 	for {
 		n, err := reader.Read(buf)
 		if n > 0 {
@@ -675,7 +702,7 @@ func (m *Manager) readLoop(s *Session) {
 			}
 			if approval != nil {
 				m.logger.Info("yolo auto-approve", "id", s.ID, "matched", approval.Matched)
-				time.AfterFunc(100*time.Millisecond, func() {
+				time.AfterFunc(yoloApproveDelay, func() {
 					if !s.IsYoloMode() {
 						return
 					}
@@ -704,7 +731,7 @@ func (m *Manager) drainLoop(s *Session) {
 	if ptmx == nil {
 		return
 	}
-	buf := make([]byte, 32*1024)
+	buf := make([]byte, readBufSize)
 	for {
 		if _, err := ptmx.Read(buf); err != nil {
 			return
@@ -740,8 +767,6 @@ func (m *Manager) waitLoop(s *Session) {
 // tmuxWaitLoop monitors a tmux-backed session by polling pane status
 // and watching the attach process.
 func (m *Manager) tmuxWaitLoop(s *Session) {
-	const maxConsecutiveErrors = 10
-
 	// Goroutine to reap the attach process
 	attachExited := make(chan struct{})
 	go func() {
@@ -754,7 +779,7 @@ func (m *Manager) tmuxWaitLoop(s *Session) {
 		close(attachExited)
 	}()
 
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(paneStatusPollInterval)
 	defer ticker.Stop()
 
 	consecutiveErrors := 0
@@ -782,7 +807,7 @@ func (m *Manager) tmuxWaitLoop(s *Session) {
 			dead, exitCode, err := tmuxPaneDead(tmuxName)
 			if err != nil {
 				consecutiveErrors++
-				if consecutiveErrors >= maxConsecutiveErrors {
+				if consecutiveErrors >= maxPaneCheckErrors {
 					m.logger.Error("tmux pane check failed repeatedly, finalizing session", "id", s.ID, "err", err)
 					_ = tmuxKillSession(tmuxName)
 					m.finalizeTmuxSession(s, 1, attachExited)
@@ -1095,7 +1120,6 @@ func (m *Manager) awaitReadDone(s *Session) {
 // Shared by waitLoop (internal tools) and tmux exit paths.
 func (m *Manager) completeExit(s *Session, exitCode int) {
 	// capture last output from scrollback
-	const maxLastOutput = 8192
 	scrollback := s.scrollback.Bytes()
 	if len(scrollback) > maxLastOutput {
 		scrollback = scrollback[len(scrollback)-maxLastOutput:]
