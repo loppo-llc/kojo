@@ -4,6 +4,7 @@ tmp_dir = "tmp"
 [build]
   bin = "./tmp/kojo"
   cmd = "go build -o ./tmp/kojo ./cmd/kojo"
+  args_bin = ["--dev"]
   delay = 500
   exclude_dir = ["tmp", "web", "vendor", ".git"]
   exclude_regex = ["_test\\.go$"]

@@ -126,11 +126,25 @@ func New(cfg Config) *Server {
 			} else {
 				path = strings.TrimPrefix(path, "/")
 			}
+
 			if _, err := fs.Stat(cfg.StaticFS, path); err == nil {
+				// Cache-Control: hashed assets can be cached forever,
+				// everything else must revalidate every time.
+				if strings.HasPrefix(r.URL.Path, "/assets/") {
+					w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+				} else {
+					w.Header().Set("Cache-Control", "no-cache")
+				}
 				fileServer.ServeHTTP(w, r)
 				return
 			}
-			// SPA fallback: serve index.html for non-file routes
+			// SPA fallback: serve index.html for non-file routes.
+			// /assets/* never falls back — return 404 for missing hashed assets.
+			if strings.HasPrefix(r.URL.Path, "/assets/") {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Cache-Control", "no-cache")
 			r.URL.Path = "/"
 			fileServer.ServeHTTP(w, r)
 		})
