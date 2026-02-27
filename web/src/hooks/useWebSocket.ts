@@ -1,4 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from "react";
+import { toBase64 } from "../lib/utils";
 
 interface WSMessage {
   type: string;
@@ -17,12 +18,6 @@ interface UseWebSocketOptions {
   onExit: (exitCode: number, live: boolean) => void;
   onYoloDebug?: (tail: string) => void;
   onConnected?: () => void;
-}
-
-function toBase64(str: string): string {
-  return btoa(
-    Array.from(new TextEncoder().encode(str), (b) => String.fromCharCode(b)).join(""),
-  );
 }
 
 export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYoloDebug, onConnected }: UseWebSocketOptions) {

@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { api, type SessionInfo } from "../lib/api";
+import { toBase64 } from "../lib/utils";
 
 interface TerminalTabProps {
   parentSessionId: string;
@@ -53,12 +54,6 @@ const SPECIAL_KEYS = [
 // Filter terminal query responses (DA1/DA2/DA3) that xterm.js auto-generates.
 // Without filtering, these get sent to the PTY as input and appear as garbage text.
 const DA_RESPONSE_RE = /\x1b\[[\?>=]?[\d;]*c/g;
-
-function toBase64(str: string): string {
-  return btoa(
-    Array.from(new TextEncoder().encode(str), (b) => String.fromCharCode(b)).join(""),
-  );
-}
 
 export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabProps) {
   const termRef = useRef<HTMLDivElement>(null);
