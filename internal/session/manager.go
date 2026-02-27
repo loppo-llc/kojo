@@ -114,104 +114,113 @@ func (m *Manager) loadPersistedSessions() bool {
 		return false
 	}
 	for _, info := range infos {
-		t, _ := time.Parse(time.RFC3339, info.CreatedAt)
-		var lastOutput []byte
-		if info.LastOutput != "" {
-			lastOutput, _ = base64.StdEncoding.DecodeString(info.LastOutput)
-		}
-		s := &Session{
-			ID:              info.ID,
-			Tool:            info.Tool,
-			WorkDir:         info.WorkDir,
-			Args:            info.Args,
-			CreatedAt:       t,
-			Status:          StatusExited,
-			ExitCode:        info.ExitCode,
-			YoloMode:        info.YoloMode,
-			Internal:        info.Internal || internalTools[info.Tool],
-			ToolSessionID:   info.ToolSessionID,
-			ParentID:        info.ParentID,
-			TmuxSessionName: info.TmuxSessionName,
-			lastCols:        info.LastCols,
-			lastRows:        info.LastRows,
-			scrollback:      NewRingBuffer(defaultRingSize),
-			subscribers:     make(map[chan []byte]struct{}),
-			done:            make(chan struct{}),
-			lastOutput:      lastOutput,
-		}
-
-		restored := false
-
-		// Check if tmux session is still alive and try to reattach
-		if info.TmuxSessionName != "" && tmuxHasSession(info.TmuxSessionName) {
-			dead, exitCode, err := tmuxPaneDead(info.TmuxSessionName)
-			if err == nil && !dead {
-				// Pane is running → reattach
-				tmuxEnsureServerConfig()
-
-				// Set up pipe-pane for raw output capture
-				rawPipe, rawPipePath, pipeErr := tmuxStartPipePane(info.TmuxSessionName)
-				if pipeErr != nil {
-					m.logger.Warn("pipe-pane setup failed on restore", "id", info.ID, "err", pipeErr)
-				}
-
-				cmd := tmuxAttachCommand(info.TmuxSessionName)
-				cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-				ws := defaultWinsize(info.LastCols, info.LastRows)
-				ptmx, err := pty.StartWithSize(cmd, &ws)
-				if err == nil {
-					s.PTY = ptmx
-					s.Cmd = cmd
-					s.rawPipe = rawPipe
-					s.rawPipePath = rawPipePath
-					s.Status = StatusRunning
-					s.ExitCode = nil
-					s.lastOutput = nil
-					s.readDone = make(chan struct{})
-					restored = true
-
-					// Capture current pane content so the terminal isn't blank
-					// after server restart. pipe-pane only captures new output;
-					// this seeds the scrollback with the existing screen state.
-					// Only needed when rawPipe is active — in fallback mode the
-					// attach PTY itself sends the initial screen redraw.
-					if rawPipe != nil {
-						if content := tmuxCapturePaneContent(info.TmuxSessionName); len(content) > 0 {
-							s.scrollback.Write(content)
-						}
-					}
-
-					go m.readLoop(s)
-					if rawPipe != nil {
-						go m.drainLoop(s)
-					}
-					go m.tmuxWaitLoop(s)
-
-					m.logger.Info("reattached to persisted tmux session", "id", info.ID, "tmux", info.TmuxSessionName)
-				} else {
-					tmuxCleanupPipePane(info.TmuxSessionName, rawPipe, rawPipePath)
-					m.logger.Error("failed to reattach persisted tmux session", "id", info.ID, "err", err)
-					_ = tmuxKillSession(info.TmuxSessionName)
-				}
-			} else if dead {
-				s.ExitCode = &exitCode
-				_ = tmuxKillSession(info.TmuxSessionName)
-			} else {
-				// tmuxPaneDead returned error → can't determine state, kill to avoid orphan
-				m.logger.Warn("failed to check tmux pane state, killing session", "id", info.ID, "tmux", info.TmuxSessionName, "err", err)
-				_ = tmuxKillSession(info.TmuxSessionName)
-			}
-		}
-
-		if !restored {
-			close(s.done)
-		}
-
+		s := m.restoreSession(info)
 		m.sessions[info.ID] = s
 	}
 	if len(infos) > 0 {
 		m.logger.Info("restored persisted sessions", "count", len(infos))
 	}
+	return true
+}
+
+// restoreSession creates a Session from persisted info, reattaching to a live tmux session if possible.
+func (m *Manager) restoreSession(info SessionInfo) *Session {
+	t, _ := time.Parse(time.RFC3339, info.CreatedAt)
+	var lastOutput []byte
+	if info.LastOutput != "" {
+		lastOutput, _ = base64.StdEncoding.DecodeString(info.LastOutput)
+	}
+	s := &Session{
+		ID:              info.ID,
+		Tool:            info.Tool,
+		WorkDir:         info.WorkDir,
+		Args:            info.Args,
+		CreatedAt:       t,
+		Status:          StatusExited,
+		ExitCode:        info.ExitCode,
+		YoloMode:        info.YoloMode,
+		Internal:        info.Internal || internalTools[info.Tool],
+		ToolSessionID:   info.ToolSessionID,
+		ParentID:        info.ParentID,
+		TmuxSessionName: info.TmuxSessionName,
+		lastCols:        info.LastCols,
+		lastRows:        info.LastRows,
+		scrollback:      NewRingBuffer(defaultRingSize),
+		subscribers:     make(map[chan []byte]struct{}),
+		done:            make(chan struct{}),
+		lastOutput:      lastOutput,
+	}
+
+	restored := false
+	if info.TmuxSessionName != "" && tmuxHasSession(info.TmuxSessionName) {
+		restored = m.tryReattachPersistedTmux(s, info)
+	}
+
+	if !restored {
+		close(s.done)
+	}
+	return s
+}
+
+// tryReattachPersistedTmux attempts to reattach to a persisted tmux session.
+// Returns true if the session was successfully reattached and is now running.
+func (m *Manager) tryReattachPersistedTmux(s *Session, info SessionInfo) bool {
+	dead, exitCode, err := tmuxPaneDead(info.TmuxSessionName)
+	if err != nil {
+		m.logger.Warn("failed to check tmux pane state, killing session", "id", info.ID, "tmux", info.TmuxSessionName, "err", err)
+		_ = tmuxKillSession(info.TmuxSessionName)
+		return false
+	}
+	if dead {
+		s.ExitCode = &exitCode
+		_ = tmuxKillSession(info.TmuxSessionName)
+		return false
+	}
+
+	// Pane is running → reattach
+	tmuxEnsureServerConfig()
+
+	rawPipe, rawPipePath, pipeErr := tmuxStartPipePane(info.TmuxSessionName)
+	if pipeErr != nil {
+		m.logger.Warn("pipe-pane setup failed on restore", "id", info.ID, "err", pipeErr)
+	}
+
+	cmd := tmuxAttachCommand(info.TmuxSessionName)
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	ws := defaultWinsize(info.LastCols, info.LastRows)
+	ptmx, err := pty.StartWithSize(cmd, &ws)
+	if err != nil {
+		tmuxCleanupPipePane(info.TmuxSessionName, rawPipe, rawPipePath)
+		m.logger.Error("failed to reattach persisted tmux session", "id", info.ID, "err", err)
+		_ = tmuxKillSession(info.TmuxSessionName)
+		return false
+	}
+
+	s.PTY = ptmx
+	s.Cmd = cmd
+	s.rawPipe = rawPipe
+	s.rawPipePath = rawPipePath
+	s.Status = StatusRunning
+	s.ExitCode = nil
+	s.lastOutput = nil
+	s.readDone = make(chan struct{})
+
+	// Capture current pane content so the terminal isn't blank
+	// after server restart. pipe-pane only captures new output;
+	// this seeds the scrollback with the existing screen state.
+	if rawPipe != nil {
+		if content := tmuxCapturePaneContent(info.TmuxSessionName); len(content) > 0 {
+			s.scrollback.Write(content)
+		}
+	}
+
+	go m.readLoop(s)
+	if rawPipe != nil {
+		go m.drainLoop(s)
+	}
+	go m.tmuxWaitLoop(s)
+
+	m.logger.Info("reattached to persisted tmux session", "id", info.ID, "tmux", info.TmuxSessionName)
 	return true
 }
 
