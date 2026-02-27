@@ -69,11 +69,13 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
     const ws = new WebSocket(url);
 
     ws.onopen = () => {
+      if (wsRef.current !== ws) return; // stale connection
       setConnected(true);
       backoffRef.current = 1000;
     };
 
     ws.onmessage = (evt) => {
+      if (wsRef.current !== ws) return; // stale connection
       let msg: WSMessage;
       try {
         msg = JSON.parse(evt.data);
@@ -114,6 +116,7 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
     };
 
     ws.onclose = () => {
+      if (wsRef.current !== ws) return; // superseded by new connection
       setConnected(false);
       if (!activeRef.current) return; // don't reconnect after unmount or exit
       const delay = Math.min(backoffRef.current, 30000);
