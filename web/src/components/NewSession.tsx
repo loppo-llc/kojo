@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router";
+import { useNavigate, useSearchParams } from "react-router";
 import { api, type ServerInfo } from "../lib/api";
 
 export function NewSession() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const [info, setInfo] = useState<ServerInfo>();
   const [tool, setTool] = useState("claude");
   const [workDir, setWorkDir] = useState("");
@@ -19,11 +20,17 @@ export function NewSession() {
   useEffect(() => {
     api.info().then((info) => {
       setInfo(info);
-      const available = Object.entries(info.tools).find(([, t]) => t.available);
-      if (available) setTool(available[0]);
-      if (info.homeDir) setWorkDir(info.homeDir);
+      const paramTool = searchParams.get("tool");
+      const paramDir = searchParams.get("workDir");
+      if (paramTool && info.tools[paramTool]?.available) {
+        setTool(paramTool);
+      } else {
+        const available = Object.entries(info.tools).find(([, t]) => t.available);
+        if (available) setTool(available[0]);
+      }
+      setWorkDir(paramDir || info.homeDir || "");
     }).catch(console.error);
-  }, []);
+  }, [searchParams]);
 
   // close suggestions on outside click
   useEffect(() => {

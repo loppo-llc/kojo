@@ -76,6 +76,17 @@ export function Dashboard() {
     });
   };
 
+  const deleteGroup = async (g: SessionGroup, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const all = [g.primary, ...g.others];
+    const results = await Promise.allSettled(all.map((s) => api.sessions.delete(s.id)));
+    const deletedIds = new Set<string>();
+    results.forEach((r, i) => { if (r.status === "fulfilled") deletedIds.add(all[i].id); });
+    if (deletedIds.size > 0) {
+      setSessions((prev) => prev.filter((s) => !deletedIds.has(s.id)));
+    }
+  };
+
   return (
     <div className="min-h-full bg-neutral-950 text-neutral-200">
       <header className="flex items-center justify-between px-4 py-3 border-b border-neutral-800">
@@ -103,8 +114,12 @@ export function Dashboard() {
         {!hasAny && (
           <p className="text-neutral-500 text-center py-12">No sessions</p>
         )}
-        {groups.map((g) => (
-          <div key={g.key} className="bg-neutral-900 rounded-lg border border-neutral-800">
+        {groups.map((g) => {
+          const runningOthers = g.others.filter((s) => s.status === "running");
+          const stoppedOthers = g.others.filter((s) => s.status !== "running");
+          const allExited = g.primary.status !== "running" && runningOthers.length === 0;
+          return (
+          <div key={g.key} className="bg-neutral-900 rounded-lg border border-neutral-800 relative">
             <button
               onClick={() => navigate(`/session/${g.primary.id}`)}
               className="w-full text-left p-4 hover:bg-neutral-800 rounded-lg"
@@ -127,25 +142,57 @@ export function Dashboard() {
                 <span className="ml-auto">{timeAgo(g.primary.createdAt)}</span>
               </div>
             </button>
-            {g.others.length > 0 && (
+            <div className="absolute top-3 right-3 flex items-center gap-1">
+              <button
+                onClick={() => navigate(`/new?tool=${encodeURIComponent(g.tool)}&workDir=${encodeURIComponent(g.workDir)}`)}
+                className="p-2 text-neutral-600 hover:text-neutral-300 rounded"
+                title="New session"
+                aria-label="New session"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
+                  <path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" />
+                </svg>
+              </button>
+              {allExited && (
+                <button
+                  onClick={(e) => deleteGroup(g, e)}
+                  className="p-2 text-neutral-600 hover:text-red-400 rounded"
+                  title="Remove"
+                  aria-label="Remove"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
+                    <path fillRule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.519.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" clipRule="evenodd" />
+                  </svg>
+                </button>
+              )}
+            </div>
+            {runningOthers.map((s) => (
+              <button
+                key={s.id}
+                onClick={() => navigate(`/session/${s.id}`)}
+                className="w-full text-left px-4 py-2.5 hover:bg-neutral-800 border-t border-neutral-800 flex items-center gap-2 text-xs text-neutral-500"
+              >
+                <span className="inline-block w-1.5 h-1.5 rounded-full shrink-0 bg-green-500" />
+                <span>{s.status}</span>
+                {s.toolSessionId && <span className="font-mono text-neutral-600">{s.toolSessionId.slice(0, 8)}</span>}
+                <span className="ml-auto">{timeAgo(s.createdAt)}</span>
+              </button>
+            ))}
+            {stoppedOthers.length > 0 && (
               <>
                 <button
                   onClick={() => toggleExpand(g.key)}
                   className="w-full px-4 py-2 text-xs text-neutral-500 hover:text-neutral-400 border-t border-neutral-800 text-left"
                 >
-                  {expanded.has(g.key) ? "Hide" : `+${g.others.length} more`}
+                  {expanded.has(g.key) ? "Hide" : `+${stoppedOthers.length} more`}
                 </button>
-                {expanded.has(g.key) && g.others.map((s) => (
+                {expanded.has(g.key) && stoppedOthers.map((s) => (
                   <button
                     key={s.id}
                     onClick={() => navigate(`/session/${s.id}`)}
                     className="w-full text-left px-4 py-2.5 hover:bg-neutral-800 border-t border-neutral-800 flex items-center gap-2 text-xs text-neutral-500"
                   >
-                    <span
-                      className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${
-                        s.status === "running" ? "bg-green-500" : "bg-neutral-600"
-                      }`}
-                    />
+                    <span className="inline-block w-1.5 h-1.5 rounded-full shrink-0 bg-neutral-600" />
                     <span>{s.status}</span>
                     {s.toolSessionId && <span className="font-mono text-neutral-600">{s.toolSessionId.slice(0, 8)}</span>}
                     {s.exitCode !== undefined && <span>(exit {s.exitCode})</span>}
@@ -155,7 +202,9 @@ export function Dashboard() {
               </>
             )}
           </div>
-        ))}
+          );
+        }
+        )}
       </main>
     </div>
   );

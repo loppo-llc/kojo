@@ -430,6 +430,15 @@ func (m *Manager) Restart(id string) (*Session, error) {
 		s.mu.Unlock()
 	}
 
+	// Verify session wasn't removed between Get and setting restarting flag
+	m.mu.Lock()
+	_, stillExists := m.sessions[id]
+	m.mu.Unlock()
+	if !stillExists {
+		clearRestarting()
+		return nil, fmt.Errorf("session not found: %s", id)
+	}
+
 	if !isAllowedTool(tool) {
 		clearRestarting()
 		return nil, fmt.Errorf("unsupported tool: %s", tool)
@@ -561,6 +570,47 @@ func (m *Manager) findChildSessions(parentID, tool string) []*Session {
 		}
 	}
 	return result
+}
+
+// Remove removes an exited session and its internal children from memory and persists the change.
+func (m *Manager) Remove(id string) error {
+	m.mu.Lock()
+	s, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("session not found: %s", id)
+	}
+	// Check for running children first to avoid orphans
+	for _, cs := range m.sessions {
+		if cs.ParentID == id {
+			cs.mu.Lock()
+			cStatus := cs.Status
+			cs.mu.Unlock()
+			if cStatus == StatusRunning {
+				m.mu.Unlock()
+				return fmt.Errorf("cannot remove session with running children: %s", id)
+			}
+		}
+	}
+	// Hold s.mu through delete to prevent Restart from setting restarting=true
+	// between our check and the map removal (Restart acquires s.mu to set the flag).
+	s.mu.Lock()
+	if s.Status == StatusRunning || s.restarting {
+		s.mu.Unlock()
+		m.mu.Unlock()
+		return fmt.Errorf("cannot remove running session: %s", id)
+	}
+	delete(m.sessions, id)
+	s.mu.Unlock()
+	// Remove exited internal children (e.g. tmux terminal tabs)
+	for cid, cs := range m.sessions {
+		if cs.ParentID == id {
+			delete(m.sessions, cid)
+		}
+	}
+	m.mu.Unlock()
+	m.save()
+	return nil
 }
 
 func (m *Manager) Stop(id string) error {

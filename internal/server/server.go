@@ -253,7 +253,18 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := s.sessions.Stop(id); err != nil {
+	sess, ok := s.sessions.Get(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "session not found: "+id)
+		return
+	}
+	var err error
+	if sess.Info().Status == session.StatusRunning {
+		err = s.sessions.Stop(id)
+	} else {
+		err = s.sessions.Remove(id)
+	}
+	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
 		} else {
