@@ -13,6 +13,13 @@ interface UseTerminalOptions {
   onInput: (data: string) => void;
   /** Called when terminal is resized */
   onResize: (cols: number, rows: number) => void;
+  /**
+   * Touch scroll behaviour.
+   * - "scroll" (default): scroll the xterm.js scrollback buffer (for CLI tab)
+   * - "mouse": convert touch scroll to SGR mouse-wheel escape sequences
+   *   sent via onInput so tmux can handle per-pane scrolling (for Terminal tab)
+   */
+  touchMode?: "scroll" | "mouse";
   /** Dependency array for recreating the terminal (e.g. [sessionId]) */
   deps?: React.DependencyList;
 }
@@ -31,6 +38,7 @@ export function useTerminal({
   containerRef,
   onInput,
   onResize,
+  touchMode = "scroll",
   deps = [],
 }: UseTerminalOptions): UseTerminalReturn {
   const termRef = useRef<Terminal>(null);
@@ -110,6 +118,18 @@ export function useTerminal({
       onInput(filtered);
     });
 
+    // Copy selected text to clipboard when selection stabilises (debounced)
+    let selectionTimer = 0;
+    const onSelectionDisposable = term.onSelectionChange(() => {
+      clearTimeout(selectionTimer);
+      selectionTimer = window.setTimeout(() => {
+        const sel = term.getSelection();
+        if (sel && navigator.clipboard?.writeText) {
+          navigator.clipboard.writeText(sel).catch(() => {});
+        }
+      }, 150);
+    });
+
     const onWriteParsedDisposable = term.onWriteParsed(() => {
       if (autoScrollRef.current) term.scrollToBottom();
     });
@@ -140,24 +160,56 @@ export function useTerminal({
 
     let touchStartY = 0;
     let accumDelta = 0;
+    let touchDirty = false; // set after multi-touch; resets baseline on next single-touch
     const lineHeight = 20;
     const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length !== 1) { touchDirty = true; return; }
       touchStartY = e.touches[0].clientY;
       accumDelta = 0;
+      touchDirty = false;
     };
     const onTouchMove = (e: TouchEvent) => {
+      if (e.touches.length !== 1) { touchDirty = true; accumDelta = 0; return; }
+      if (touchDirty) {
+        // Resuming from multi-touch: reset baseline to avoid jump
+        touchStartY = e.touches[0].clientY;
+        accumDelta = 0;
+        touchDirty = false;
+        e.preventDefault();
+        return;
+      }
       const dy = touchStartY - e.touches[0].clientY;
       touchStartY = e.touches[0].clientY;
       accumDelta += dy;
       const lines = Math.trunc(accumDelta / lineHeight);
       if (lines !== 0) {
-        if (lines > 0) {
-          term.scrollLines(lines);
-          const buf = term.buffer.active;
-          if (buf.viewportY >= buf.baseY) autoScrollRef.current = true;
+        if (touchMode === "mouse") {
+          // Convert touch scroll to SGR mouse-wheel escape sequences.
+          // tmux intercepts these and scrolls the pane under the cursor.
+          const rect = el.getBoundingClientRect();
+          if (term.cols > 0 && term.rows > 0 && rect.width > 0 && rect.height > 0) {
+            const touch = e.touches[0];
+            const cellW = rect.width / term.cols;
+            const cellH = rect.height / term.rows;
+            const col = Math.min(term.cols, Math.max(1, Math.floor((touch.clientX - rect.left) / cellW) + 1));
+            const row = Math.min(term.rows, Math.max(1, Math.floor((touch.clientY - rect.top) / cellH) + 1));
+            // SGR encoding: button 64 = scroll up, 65 = scroll down
+            const btn = lines > 0 ? 65 : 64;
+            const count = Math.abs(lines);
+            const seq = `\x1b[<${btn};${col};${row}M`;
+            for (let i = 0; i < count; i++) {
+              onInput(seq);
+            }
+          }
         } else {
-          autoScrollRef.current = false;
-          term.scrollLines(lines);
+          if (lines > 0) {
+            term.scrollLines(lines);
+            const buf = term.buffer.active;
+            if (buf.viewportY >= buf.baseY) autoScrollRef.current = true;
+          } else {
+            autoScrollRef.current = false;
+            term.scrollLines(lines);
+          }
         }
         accumDelta -= lines * lineHeight;
       }
@@ -168,7 +220,9 @@ export function useTerminal({
 
     return () => {
       cancelAnimationFrame(fitRafRef.current);
+      clearTimeout(selectionTimer);
       onDataDisposable.dispose();
+      onSelectionDisposable.dispose();
       onWriteParsedDisposable.dispose();
       onRenderDisposable.dispose();
       ro.disconnect();
@@ -180,7 +234,7 @@ export function useTerminal({
       fitRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [containerRef, onInput, safeFit, ...deps]);
+  }, [containerRef, onInput, safeFit, touchMode, ...deps]);
 
   return { termRef, fitRef, autoScrollRef, safeFit, immediateFit };
 }

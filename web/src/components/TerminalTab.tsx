@@ -12,17 +12,17 @@ interface TerminalTabProps {
   visible: boolean;
 }
 
-const TMUX_PREFIX = "\x02"; // Ctrl+b
-
 const TMUX_SHORTCUTS = [
-  { label: "+Win", seq: TMUX_PREFIX + "c" },
-  { label: "\u2190Win", seq: TMUX_PREFIX + "p" },
-  { label: "Win\u2192", seq: TMUX_PREFIX + "n" },
-  { label: "\u2500", seq: TMUX_PREFIX + '"' },
-  { label: "\u2502", seq: TMUX_PREFIX + "%" },
-  { label: "Pane", seq: TMUX_PREFIX + "o" },
-  { label: "List", seq: TMUX_PREFIX + "w" },
-  { label: "Kill", seq: TMUX_PREFIX + ":kill-pane\r" },
+  { label: "+Win", action: "new-window" },
+  { label: "\u2190Win", action: "prev-window" },
+  { label: "Win\u2192", action: "next-window" },
+  { label: "\u2500", action: "split-h" },
+  { label: "\u2502", action: "split-v" },
+  { label: "Pane", action: "select-pane" },
+  { label: "Zoom", action: "resize-pane-z" },
+  { label: "List", action: "choose-tree" },
+  { label: "Copy", action: "copy-mode" },
+  { label: "Kill", action: "kill-pane" },
 ];
 
 export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabProps) {
@@ -53,6 +53,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     containerRef: termContainerRef,
     onInput: useCallback((data: string) => sendInput(wrapInputRef.current(data)), [sendInput]),
     onResize: sendResize,
+    touchMode: "mouse",
     deps: [parentSessionId],
   });
 
@@ -248,9 +249,13 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
       <div className="flex gap-1.5 px-2 py-1.5 border-t border-neutral-800 overflow-x-auto shrink-0">
         {TMUX_SHORTCUTS.map((s) => (
           <button
-            key={s.label}
+            key={s.action}
             onPointerDown={(e) => e.preventDefault()}
-            onClick={() => sendInput(s.seq)}
+            onClick={() => {
+              if (sessionIdRef.current) {
+                api.sessions.tmux(sessionIdRef.current, { action: s.action }).catch(() => {});
+              }
+            }}
             className="px-3 py-2.5 text-xs rounded font-mono bg-neutral-800 text-neutral-400 active:bg-neutral-600 whitespace-nowrap"
           >
             {s.label}

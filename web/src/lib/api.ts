@@ -101,6 +101,8 @@ export const api = {
     patch: (id: string, body: { yoloMode?: boolean }) =>
       patch<SessionInfo>(`/api/v1/sessions/${id}`, body),
     restart: (id: string) => post<SessionInfo>(`/api/v1/sessions/${id}/restart`),
+    tmux: (id: string, body: { action: string }) =>
+      post<{ ok: boolean }>(`/api/v1/sessions/${id}/tmux`, body),
   },
 
   files: {

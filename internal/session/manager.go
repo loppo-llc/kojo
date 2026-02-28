@@ -309,7 +309,9 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 	}
 	if tool == "tmux" {
 		toolSessionID = "kojo_" + id
-		runArgs = []string{"new-session", "-A", "-s", toolSessionID, "-c", workDir}
+		// Start a login shell so PATH matches the user's standard terminal
+		loginCmd := tmuxLoginShellCmd()
+		runArgs = []string{"new-session", "-A", "-s", toolSessionID, "-c", workDir, loginCmd}
 	}
 
 	// codex: session ID is captured from PTY output in readLoop
@@ -338,6 +340,12 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 		ptmx, err = pty.Start(cmd)
 		if err != nil {
 			return nil, fmt.Errorf("failed to start pty: %w", err)
+		}
+		if tool == "tmux" && toolSessionID != "" {
+			// Enable mouse mode so the web UI can send per-pane scroll events
+			tmuxEnableMouse(toolSessionID)
+			// Use login shell for new windows so PATH matches the user's terminal
+			tmuxSetLoginShell(toolSessionID)
 		}
 	}
 
@@ -474,6 +482,10 @@ func (m *Manager) Restart(id string) (*Session, error) {
 			clearRestarting()
 			return nil, fmt.Errorf("failed to start pty: %w", err)
 		}
+		if tool == "tmux" && toolSessionID != "" {
+			tmuxEnableMouse(toolSessionID)
+			tmuxSetLoginShell(toolSessionID)
+		}
 	}
 
 	s.mu.Lock()
@@ -603,6 +615,32 @@ func (m *Manager) Stop(id string) error {
 	}
 
 	return nil
+}
+
+// TmuxAction executes a whitelisted tmux action on a terminal session.
+func (m *Manager) TmuxAction(id, action string) error {
+	s, ok := m.Get(id)
+	if !ok {
+		return fmt.Errorf("session not found: %s", id)
+	}
+
+	s.mu.Lock()
+	tool := s.Tool
+	status := s.Status
+	toolSessionID := s.ToolSessionID
+	s.mu.Unlock()
+
+	if tool != "tmux" {
+		return fmt.Errorf("not a terminal session: %s", id)
+	}
+	if status != StatusRunning {
+		return fmt.Errorf("session not running: %s", id)
+	}
+	if toolSessionID == "" {
+		return fmt.Errorf("session has no tmux ID: %s", id)
+	}
+
+	return tmuxRunAction(toolSessionID, action)
 }
 
 func (m *Manager) StopAll() {
@@ -1226,7 +1264,7 @@ func buildRestartArgs(tool string, origArgs []string, toolSessionID string) []st
 
 	case "tmux":
 		if toolSessionID != "" {
-			return []string{"new-session", "-A", "-s", toolSessionID}
+			return []string{"new-session", "-A", "-s", toolSessionID, tmuxLoginShellCmd()}
 		}
 		return origArgs
 

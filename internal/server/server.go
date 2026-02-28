@@ -85,6 +85,7 @@ func New(cfg Config) *Server {
 	mux.HandleFunc("PATCH /api/v1/sessions/{id}", s.handlePatchSession)
 	mux.HandleFunc("POST /api/v1/sessions/{id}/restart", s.handleRestartSession)
 	mux.HandleFunc("GET /api/v1/sessions/{id}/terminal", s.handleTerminalSession)
+	mux.HandleFunc("POST /api/v1/sessions/{id}/tmux", s.handleTmuxAction)
 	mux.HandleFunc("GET /api/v1/ws", s.handleWebSocket)
 
 	// Directory suggestions
@@ -308,6 +309,34 @@ func (s *Server) handleRestartSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, sess.Info())
+}
+
+func (s *Server) handleTmuxAction(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	if req.Action == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "action is required")
+		return
+	}
+	if err := s.sessions.TmuxAction(id, req.Action); err != nil {
+		msg := err.Error()
+		switch {
+		case strings.Contains(msg, "not found"):
+			writeError(w, http.StatusNotFound, "not_found", msg)
+		case strings.Contains(msg, "not running"), strings.Contains(msg, "not a terminal"):
+			writeError(w, http.StatusConflict, "conflict", msg)
+		default:
+			writeError(w, http.StatusBadRequest, "bad_request", msg)
+		}
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // --- Directory Suggestion Handler ---

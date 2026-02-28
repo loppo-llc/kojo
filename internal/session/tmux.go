@@ -55,17 +55,49 @@ func buildShellCommand(toolPath string, args []string) string {
 	return strings.Join(parts, " ")
 }
 
+// tmuxLoginShellCmd returns a shell command string that launches the user's
+// login shell. Used as tmux shell-command to ensure PATH matches the standard
+// macOS terminal. The shell path is properly quoted to handle spaces/metacharacters.
+// loginShellPath returns the user's login shell path from $SHELL,
+// falling back to /bin/zsh on macOS.
+func loginShellPath() string {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/zsh"
+	}
+	return shell
+}
+
+func tmuxLoginShellCmd() string {
+	// Unset PATH so the login shell rebuilds it from scratch via
+	// /etc/zprofile (path_helper) + user profile, matching Terminal.app.
+	return "unset PATH; exec " + shellQuote(loginShellPath()) + " -l"
+}
+
+// tmuxSetLoginShell configures the named tmux session to use a login shell
+// for new windows/panes.
+func tmuxSetLoginShell(name string) {
+	cmd := "unset PATH; exec " + shellQuote(loginShellPath()) + " -l"
+	_ = exec.Command("tmux", "set-option", "-t", name, "default-command", cmd).Run()
+}
+
 // tmuxNewSession creates a detached tmux session with remain-on-exit enabled.
 // If disablePrefix is true, it also disables prefix keys, status bar, and mouse
 // to make tmux transparent for user-facing tools.
 func tmuxNewSession(name, workDir, shellCmd string, disablePrefix bool) error {
+	// Wrap in login shell so PATH, SSH agent, credential helpers etc.
+	// match the user's standard terminal environment.
+	// Unset PATH first so the login shell rebuilds it from scratch.
+	shell := loginShellPath()
+	wrappedCmd := "unset PATH; " + shellQuote(shell) + " -lc " + shellQuote(shellCmd)
+
 	// Create a detached session running the shell command
 	args := []string{
 		"new-session", "-d",
 		"-s", name,
 		"-c", workDir,
 		"-x", "120", "-y", "36",
-		shellCmd,
+		wrappedCmd,
 	}
 	if err := exec.Command("tmux", args...).Run(); err != nil {
 		return fmt.Errorf("tmux new-session: %w", err)
@@ -131,6 +163,40 @@ func tmuxPaneDead(name string) (dead bool, exitCode int, err error) {
 		return true, 1, nil // dead but can't parse exit code
 	}
 	return true, code, nil
+}
+
+// tmuxEnableMouse enables mouse mode on the named tmux session so it receives
+// mouse-wheel escape sequences from the web UI for per-pane scrolling.
+func tmuxEnableMouse(name string) {
+	_ = exec.Command("tmux", "set-option", "-t", name, "mouse", "on").Run()
+}
+
+// tmuxActions is the whitelist of tmux actions that can be executed server-side.
+// Each entry maps an action name to a function that returns tmux CLI arguments.
+var tmuxActions = map[string]func(string) []string{
+	"kill-pane":     func(s string) []string { return []string{"kill-pane", "-t", s} },
+	"new-window":    func(s string) []string { return []string{"new-window", "-t", s} },
+	"prev-window":   func(s string) []string { return []string{"previous-window", "-t", s} },
+	"next-window":   func(s string) []string { return []string{"next-window", "-t", s} },
+	"split-h":       func(s string) []string { return []string{"split-window", "-v", "-t", s} },
+	"split-v":       func(s string) []string { return []string{"split-window", "-h", "-t", s} },
+	"select-pane":   func(s string) []string { return []string{"select-pane", "-t", s + ":.+"} },
+	"resize-pane-z": func(s string) []string { return []string{"resize-pane", "-t", s, "-Z"} },
+	"choose-tree":   func(s string) []string { return []string{"choose-tree", "-t", s} },
+	"copy-mode":     func(s string) []string { return []string{"copy-mode", "-t", s} },
+}
+
+// tmuxRunAction executes a whitelisted tmux action targeting the named session.
+func tmuxRunAction(sessionName, action string) error {
+	fn, ok := tmuxActions[action]
+	if !ok {
+		return fmt.Errorf("unknown tmux action: %s", action)
+	}
+	out, err := exec.Command("tmux", fn(sessionName)...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("tmux %s: %w (%s)", action, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // tmuxResizePane resizes the window of the named tmux session.
