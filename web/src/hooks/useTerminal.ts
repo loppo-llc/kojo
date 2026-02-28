@@ -23,6 +23,8 @@ interface UseTerminalReturn {
   autoScrollRef: React.RefObject<boolean>;
   /** Debounced fit that also sends resize and scrolls to bottom */
   safeFit: () => void;
+  /** Immediate (synchronous) fit + resize — no rAF delay */
+  immediateFit: () => void;
 }
 
 export function useTerminal({
@@ -37,6 +39,23 @@ export function useTerminal({
   const fitRafRef = useRef(0);
   const onResizeRef = useRef(onResize);
   onResizeRef.current = onResize;
+
+  const immediateFit = useCallback(() => {
+    const term = termRef.current;
+    const fit = fitRef.current;
+    const el = containerRef.current;
+    if (!term || !fit || !el) return;
+    // fit() needs the element visible to measure; skip if hidden
+    if (el.offsetParent) {
+      fit.fit();
+    }
+    // Always send current dimensions so the server gets a resize on connect,
+    // even if the terminal tab is hidden (uses last known cols/rows).
+    onResizeRef.current(term.cols, term.rows);
+    if (autoScrollRef.current) {
+      term.scrollToBottom();
+    }
+  }, [containerRef]);
 
   const safeFit = useCallback(() => {
     const term = termRef.current;
@@ -163,5 +182,5 @@ export function useTerminal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [containerRef, onInput, safeFit, ...deps]);
 
-  return { termRef, fitRef, autoScrollRef, safeFit };
+  return { termRef, fitRef, autoScrollRef, safeFit, immediateFit };
 }

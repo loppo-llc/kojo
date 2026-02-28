@@ -54,10 +54,11 @@ export function SessionPage() {
   // We use stable refs to break the cycle.
   const sendInputRef = useRef<(data: string) => void>(() => {});
   const sendResizeRef = useRef<(cols: number, rows: number) => void>(() => {});
+  const wrapInputRef = useRef<(data: string) => string>((d) => d);
 
-  const { termRef: xtermRef, autoScrollRef, safeFit } = useTerminal({
+  const { termRef: xtermRef, autoScrollRef, safeFit, immediateFit } = useTerminal({
     containerRef: termContainerRef,
-    onInput: useCallback((data: string) => sendInputRef.current(data), []),
+    onInput: useCallback((data: string) => sendInputRef.current(wrapInputRef.current(data)), []),
     onResize: useCallback((cols: number, rows: number) => sendResizeRef.current(cols, rows), []),
     deps: [id],
   });
@@ -101,12 +102,13 @@ export function SessionPage() {
     onScrollback,
     onExit,
     onYoloDebug,
-    onConnected: safeFit,
+    onConnected: immediateFit,
   });
   sendInputRef.current = sendInput;
   sendResizeRef.current = sendResize;
 
-  const { ctrlMode, shiftMode, handleKeyPress } = useSpecialKeys(sendInput, autoScrollRef);
+  const { ctrlMode, shiftMode, handleKeyPress, wrapInput } = useSpecialKeys(sendInput, autoScrollRef);
+  wrapInputRef.current = wrapInput;
 
   // Clean up yolo timer on unmount and session switch
   useEffect(() => {

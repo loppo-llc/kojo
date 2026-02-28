@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { resolveKeyPress } from "../lib/keys";
 
 /**
@@ -11,6 +11,8 @@ export function useSpecialKeys(
 ) {
   const [ctrlMode, setCtrlMode] = useState(false);
   const [shiftMode, setShiftMode] = useState(false);
+  const ctrlModeRef = useRef(false);
+  ctrlModeRef.current = ctrlMode;
 
   const clearModifiers = useCallback(() => {
     setCtrlMode(false);
@@ -42,5 +44,24 @@ export function useSpecialKeys(
     [sendInput, autoScrollRef, ctrlMode, shiftMode],
   );
 
-  return { ctrlMode, shiftMode, handleKeyPress, clearModifiers };
+  /** Wraps a raw input handler to apply ctrlMode conversion for xterm onData. */
+  const wrapInput = useCallback(
+    (data: string): string => {
+      if (!ctrlModeRef.current) return data;
+      // Only convert single-character input; paste/IME compositions pass through
+      if (data.length === 1) {
+        const ch = data.toLowerCase().charCodeAt(0);
+        if (ch >= 97 && ch <= 122) {
+          clearModifiers();
+          return String.fromCharCode(ch - 96);
+        }
+      }
+      // Any input clears ctrlMode (one-shot modifier)
+      clearModifiers();
+      return data;
+    },
+    [clearModifiers],
+  );
+
+  return { ctrlMode, shiftMode, handleKeyPress, clearModifiers, wrapInput };
 }

@@ -46,14 +46,18 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     }
   }, []);
 
-  const { termRef: xtermRef, autoScrollRef, safeFit } = useTerminal({
+  // wrapInput ref to avoid recreating terminal when ctrlMode changes
+  const wrapInputRef = useRef<(data: string) => string>((d) => d);
+
+  const { termRef: xtermRef, autoScrollRef, safeFit, immediateFit } = useTerminal({
     containerRef: termContainerRef,
-    onInput: sendInput,
+    onInput: useCallback((data: string) => sendInput(wrapInputRef.current(data)), [sendInput]),
     onResize: sendResize,
     deps: [parentSessionId],
   });
 
-  const { ctrlMode, shiftMode, handleKeyPress } = useSpecialKeys(sendInput, autoScrollRef);
+  const { ctrlMode, shiftMode, handleKeyPress, wrapInput } = useSpecialKeys(sendInput, autoScrollRef);
+  wrapInputRef.current = wrapInput;
 
   // Connect WebSocket to a tmux session
   const connectWs = useCallback((tmuxSessionId: string) => {
@@ -102,8 +106,8 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     };
 
     ws.onopen = () => {
-      // Fit after connection to send initial size
-      requestAnimationFrame(() => safeFit());
+      // Send resize immediately — before server sends scrollback
+      immediateFit();
     };
 
     ws.onclose = () => {
@@ -115,7 +119,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     };
 
     wsRef.current = ws;
-  }, [xtermRef, autoScrollRef, safeFit]);
+  }, [xtermRef, autoScrollRef, immediateFit]);
 
   // Clean up WebSocket and output buffer on unmount
   useEffect(() => {

@@ -30,6 +30,20 @@ export const SPECIAL_KEYS: SpecialKey[] = [
   { label: "F12", code: "\x1b[24~" },
 ];
 
+/** Common Ctrl+letter shortcuts shown as buttons when ctrlMode is active. */
+export const CTRL_LETTERS: SpecialKey[] = [
+  { label: "C", code: "c" },
+  { label: "D", code: "d" },
+  { label: "Z", code: "z" },
+  { label: "A", code: "a" },
+  { label: "E", code: "e" },
+  { label: "L", code: "l" },
+  { label: "R", code: "r" },
+  { label: "U", code: "u" },
+  { label: "K", code: "k" },
+  { label: "W", code: "w" },
+];
+
 const SHIFT_MAP: Record<string, string> = {
   "\t": "\x1b[Z",
   "\x1b[A": "\x1b[1;2A",
