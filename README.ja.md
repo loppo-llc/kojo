@@ -88,7 +88,7 @@ kojo は [tsnet](https://tailscale.com/kb/1244/tsnet) を使って、`kojo` と�
 ```bash
 $ kojo
 
-  kojo v0.4.3 running at:
+  kojo v0.4.4 running at:
 
     https://kojo.tail1234.ts.net
     https://100.x.y.z:8080
