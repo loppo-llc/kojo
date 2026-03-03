@@ -48,6 +48,7 @@ export function GitPanel({ embedded, workDir: propWorkDir }: GitPanelProps = {})
   const [diff, setDiff] = useState<string | null>(null);
   const [diffLabel, setDiffLabel] = useState("");
   const [tab, setTab] = useState<Tab>("status");
+  const [prevTab, setPrevTab] = useState<Tab>("status");
   const [cmdInput, setCmdInput] = useState("");
   const [cmdResult, setCmdResult] = useState<{ exitCode: number; stdout: string; stderr: string } | null>(null);
   const [cmdRunning, setCmdRunning] = useState(false);
@@ -78,6 +79,7 @@ export function GitPanel({ embedded, workDir: propWorkDir }: GitPanelProps = {})
       const d = await api.git.diff(effectiveWorkDir, ref);
       setDiff(d);
       setDiffLabel(label ?? ref ?? "working tree");
+      setPrevTab(tab);
       setTab("diff");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -210,7 +212,15 @@ export function GitPanel({ embedded, workDir: propWorkDir }: GitPanelProps = {})
 
         {tab === "diff" && (
           <div className="p-3">
-            {diffLabel && <div className="text-xs text-neutral-500 mb-2 font-mono">{diffLabel}</div>}
+            <div className="flex items-center gap-2 mb-2">
+              <button
+                onClick={() => setTab(prevTab)}
+                className="text-neutral-400 hover:text-neutral-200 text-sm"
+              >
+                &larr;
+              </button>
+              {diffLabel && <span className="text-xs text-neutral-500 font-mono truncate">{diffLabel}</span>}
+            </div>
             {diff ? (
               <pre className="text-xs font-mono whitespace-pre-wrap break-all leading-relaxed">
                 {diff.split("\n").map((line, i) => (

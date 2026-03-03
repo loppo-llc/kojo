@@ -128,12 +128,21 @@ func (m *Manager) Diff(workDir, ref string) (*DiffResult, error) {
 		return nil, fmt.Errorf("workDir is required")
 	}
 
-	args := []string{"diff"}
-	if ref != "" {
-		if strings.HasPrefix(ref, "-") {
-			return nil, fmt.Errorf("invalid ref: %s", ref)
-		}
-		args = append(args, ref, "--")
+	if ref != "" && strings.HasPrefix(ref, "-") {
+		return nil, fmt.Errorf("invalid ref: %s", ref)
+	}
+
+	var args []string
+	switch {
+	case ref == "":
+		// Working tree changes
+		args = []string{"diff"}
+	case isHexString(ref):
+		// Commit hash — show that commit's changes
+		args = []string{"show", "--format=", ref, "--"}
+	default:
+		// File path — show working tree diff for that file
+		args = []string{"diff", "--", ref}
 	}
 
 	out, err := m.run(workDir, args...)
@@ -141,6 +150,19 @@ func (m *Manager) Diff(workDir, ref string) (*DiffResult, error) {
 		return nil, err
 	}
 	return &DiffResult{Diff: out}, nil
+}
+
+// isHexString returns true if s looks like a commit hash (7-40 hex chars).
+func isHexString(s string) bool {
+	if len(s) < 7 || len(s) > 40 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 type ExecResult struct {
