@@ -215,9 +215,9 @@ export function GitPanel({ embedded, workDir: propWorkDir }: GitPanelProps = {})
             <div className="flex items-center gap-2 mb-2">
               <button
                 onClick={() => setTab(prevTab)}
-                className="text-neutral-400 hover:text-neutral-200 text-sm"
+                className="px-2 py-1 text-sm bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded"
               >
-                &larr;
+                &larr; Back
               </button>
               {diffLabel && <span className="text-xs text-neutral-500 font-mono truncate">{diffLabel}</span>}
             </div>

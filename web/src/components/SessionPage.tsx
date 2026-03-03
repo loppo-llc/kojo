@@ -25,6 +25,8 @@ const TABS: { key: SessionTab; label: string }[] = [
 export function SessionPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const navigateRef = useRef(navigate);
+  navigateRef.current = navigate;
   const location = useLocation();
   const termContainerRef = useRef<HTMLDivElement>(null);
   const [session, setSession] = useState<SessionInfo>();
@@ -154,9 +156,9 @@ export function SessionPage() {
     api.sessions.get(id!).then((s) => {
       setSession(s);
       if (s.status === "exited") setExited(true);
-    }).catch(() => navigate("/"));
+    }).catch(() => navigateRef.current("/"));
     api.sessions.attachments(id!).then(mergeAttachments).catch(() => {});
-  }, [id, navigate]);
+  }, [id]);
 
   // Show persisted lastOutput for exited sessions when no live scrollback arrived
   useEffect(() => {
