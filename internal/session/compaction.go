@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
 	"os"
@@ -115,17 +116,10 @@ func (o *CompactionOrchestrator) Run() {
 		workDir := s.WorkDir
 		s.mu.Unlock()
 		if s.Tool == "claude" && newSessionID != "" {
-			// Stop old monitor
-			s.context.mu.Lock()
-			if s.context.transcript != nil {
-				s.context.transcript.Stop()
-			}
-			s.context.mu.Unlock()
-			// Start new monitor with updated session ID
 			tm := NewTranscriptMonitor(o.logger, workDir, newSessionID, s.context, func(info *ContextInfo) {
 				s.BroadcastContext(info)
 			})
-			s.context.SetTranscript(tm)
+			s.context.ReplaceTranscript(tm)
 		}
 	}
 	s.scrollback.ResetTotalWritten()
@@ -134,6 +128,11 @@ func (o *CompactionOrchestrator) Run() {
 	if info := s.ContextInfo(); info != nil {
 		s.BroadcastContext(info)
 	}
+
+	// Free capture buffer
+	s.captureMu.Lock()
+	s.captureBuf = nil
+	s.captureMu.Unlock()
 
 	o.logger.Info("compaction completed", "id", s.ID)
 }
@@ -188,8 +187,16 @@ func (o *CompactionOrchestrator) flushAndCaptureSummary() string {
 	}
 }
 
+// summaryCloseTag is checked before doing expensive ANSI stripping.
+var summaryCloseTag = []byte("</kojo-summary>")
+
 func (o *CompactionOrchestrator) extractSummary() string {
 	o.session.captureMu.Lock()
+	// Quick check: closing tag must be present before copying + regex
+	if !bytes.Contains(o.session.captureBuf, summaryCloseTag) {
+		o.session.captureMu.Unlock()
+		return ""
+	}
 	buf := make([]byte, len(o.session.captureBuf))
 	copy(buf, o.session.captureBuf)
 	o.session.captureMu.Unlock()
@@ -349,10 +356,7 @@ func (o *CompactionOrchestrator) injectSummary(summary string) {
 	// Build the injection prompt
 	prompt := fmt.Sprintf("Here is a summary of our previous conversation before context compaction. Use this to maintain continuity:\n\n%s\n\nPlease acknowledge this context and continue from where we left off.", summary)
 
-	// Sanitize: remove ESC and control characters (except \n \r \t)
-	prompt = sanitizeForPaste(prompt)
-
-	// Send via bracketed paste
+	// Send via bracketed paste (safePaste handles sanitization)
 	safePaste(s, prompt)
 }
 

@@ -2,6 +2,7 @@ package session
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"log/slog"
 	"os"
@@ -21,28 +22,41 @@ const (
 type TranscriptMonitor struct {
 	mu             sync.Mutex
 	logger         *slog.Logger
-	workDir        string
-	claudeSessionID string
+	transcriptPath string // computed once at construction
 	estimator      *ContextEstimator
 	broadcaster    func(*ContextInfo)
 	stopCh         chan struct{}
 	stopped        bool
 	lastOffset     int64
-	lastPath       string
+	scanBuf        []byte // reusable scanner buffer
 }
 
 // NewTranscriptMonitor creates a monitor for the given Claude session.
 func NewTranscriptMonitor(logger *slog.Logger, workDir, claudeSessionID string, estimator *ContextEstimator, broadcaster func(*ContextInfo)) *TranscriptMonitor {
 	t := &TranscriptMonitor{
-		logger:          logger,
-		workDir:         workDir,
-		claudeSessionID: claudeSessionID,
-		estimator:       estimator,
-		broadcaster:     broadcaster,
-		stopCh:          make(chan struct{}),
+		logger:         logger,
+		transcriptPath: buildTranscriptPath(workDir, claudeSessionID),
+		estimator:      estimator,
+		broadcaster:    broadcaster,
+		stopCh:         make(chan struct{}),
+		scanBuf:        make([]byte, 256*1024),
 	}
 	go t.pollLoop()
 	return t
+}
+
+// buildTranscriptPath computes the transcript file path once.
+// Claude Code stores transcripts at ~/.claude/projects/<projectDir>/<sessionId>/transcript.jsonl
+func buildTranscriptPath(workDir, claudeSessionID string) string {
+	if claudeSessionID == "" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	projectDir := strings.ReplaceAll(filepath.ToSlash(workDir), "/", "-")
+	return filepath.Join(home, ".claude", "projects", projectDir, claudeSessionID, "transcript.jsonl")
 }
 
 // Stop halts the polling loop.
@@ -82,49 +96,21 @@ func (t *TranscriptMonitor) pollLoop() {
 }
 
 func (t *TranscriptMonitor) poll() {
-	path := t.findTranscriptPath()
-	if path == "" {
+	if t.transcriptPath == "" {
 		return
 	}
 
 	t.mu.Lock()
-	if path != t.lastPath {
-		t.lastOffset = 0
-		t.lastPath = path
-	}
 	offset := t.lastOffset
 	t.mu.Unlock()
 
-	tokens := t.scanUsage(path, offset)
+	tokens := t.scanUsage(t.transcriptPath, offset)
 	if tokens > 0 {
 		info := t.estimator.UpdateTranscriptTokens(tokens)
 		if info != nil && t.broadcaster != nil {
 			t.broadcaster(info)
 		}
 	}
-}
-
-// findTranscriptPath locates the Claude Code transcript JSONL for this session.
-// Claude Code stores transcripts at ~/.claude/projects/<projectDir>/<sessionId>/transcript.jsonl
-func (t *TranscriptMonitor) findTranscriptPath() string {
-	if t.claudeSessionID == "" {
-		return ""
-	}
-
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-
-	// Convert workDir to Claude's project path format:
-	// /Users/foo/bar → -Users-foo-bar
-	projectDir := strings.ReplaceAll(filepath.ToSlash(t.workDir), "/", "-")
-
-	path := filepath.Join(home, ".claude", "projects", projectDir, t.claudeSessionID, "transcript.jsonl")
-	if _, err := os.Stat(path); err == nil {
-		return path
-	}
-	return ""
 }
 
 // transcriptEntry is the minimal structure of a Claude transcript JSONL entry.
@@ -142,6 +128,9 @@ type transcriptEntry struct {
 	} `json:"message,omitempty"`
 }
 
+// usagePrefix is used to skip JSONL lines that don't contain usage data.
+var usagePrefix = []byte(`"usage"`)
+
 // scanUsage reads the transcript file from the given offset and extracts the latest token usage.
 func (t *TranscriptMonitor) scanUsage(path string, offset int64) int64 {
 	f, err := os.Open(path)
@@ -158,11 +147,18 @@ func (t *TranscriptMonitor) scanUsage(path string, offset int64) int64 {
 
 	var lastTokens int64
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	if t.scanBuf != nil {
+		scanner.Buffer(t.scanBuf, len(t.scanBuf))
+	}
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
+			continue
+		}
+
+		// Skip lines that don't contain usage data at all
+		if !bytes.Contains(line, usagePrefix) {
 			continue
 		}
 

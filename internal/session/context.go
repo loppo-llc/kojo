@@ -64,6 +64,16 @@ func (e *ContextEstimator) SetTranscript(t *TranscriptMonitor) {
 	e.transcript = t
 }
 
+// ReplaceTranscript stops the current TranscriptMonitor (if any) and sets a new one.
+func (e *ContextEstimator) ReplaceTranscript(t *TranscriptMonitor) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.transcript != nil {
+		e.transcript.Stop()
+	}
+	e.transcript = t
+}
+
 // Track adds PTY output bytes and returns a ContextInfo if a broadcast is warranted.
 func (e *ContextEstimator) Track(data []byte) *ContextInfo {
 	e.mu.Lock()
@@ -74,6 +84,23 @@ func (e *ContextEstimator) Track(data []byte) *ContextInfo {
 	}
 
 	e.totalBytes += int64(len(data))
+	return e.checkAndBroadcastLocked()
+}
+
+// UpdateTranscriptTokens sets the token count from transcript monitoring.
+func (e *ContextEstimator) UpdateTranscriptTokens(tokens int64) *ContextInfo {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.stopped {
+		return nil
+	}
+	e.transcriptTokens = tokens
+	return e.checkAndBroadcastLocked()
+}
+
+// checkAndBroadcastLocked checks the threshold and returns a ContextInfo
+// copy if a broadcast is warranted. Must be called with e.mu held.
+func (e *ContextEstimator) checkAndBroadcastLocked() *ContextInfo {
 	info := e.infoLocked()
 
 	// Check threshold
@@ -85,36 +112,6 @@ func (e *ContextEstimator) Track(data []byte) *ContextInfo {
 	}
 
 	// Broadcast if usage changed by >= broadcastPctDelta
-	delta := info.UsagePercent - e.lastBroadcastPct
-	if delta < 0 {
-		delta = -delta
-	}
-	if delta >= broadcastPctDelta {
-		e.lastBroadcastPct = info.UsagePercent
-		cp := *info
-		return &cp
-	}
-	return nil
-}
-
-// UpdateTranscriptTokens sets the token count from transcript monitoring.
-func (e *ContextEstimator) UpdateTranscriptTokens(tokens int64) *ContextInfo {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.stopped {
-		return nil
-	}
-	e.transcriptTokens = tokens
-	info := e.infoLocked()
-
-	// Check threshold
-	if !e.thresholdFired && info.UsagePercent >= e.config.flushThreshold*100 {
-		e.thresholdFired = true
-		if e.onThreshold != nil {
-			go e.onThreshold()
-		}
-	}
-
 	delta := info.UsagePercent - e.lastBroadcastPct
 	if delta < 0 {
 		delta = -delta
@@ -159,15 +156,20 @@ func (e *ContextEstimator) infoLocked() *ContextInfo {
 	}
 }
 
+// clearCountersLocked resets tracking counters. Must be called with e.mu held.
+func (e *ContextEstimator) clearCountersLocked() {
+	e.totalBytes = 0
+	e.transcriptTokens = 0
+	e.lastBroadcastPct = 0
+	e.thresholdFired = false
+}
+
 // Reset clears the estimator after a compaction.
 func (e *ContextEstimator) Reset() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.compactionCount++
-	e.totalBytes = 0
-	e.transcriptTokens = 0
-	e.lastBroadcastPct = 0
-	e.thresholdFired = false
+	e.clearCountersLocked()
 }
 
 // Restart re-enables a stopped estimator (e.g. after session Restart).
@@ -175,10 +177,7 @@ func (e *ContextEstimator) Restart() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.stopped = false
-	e.totalBytes = 0
-	e.transcriptTokens = 0
-	e.lastBroadcastPct = 0
-	e.thresholdFired = false
+	e.clearCountersLocked()
 }
 
 // CompactionCount returns the current compaction count.

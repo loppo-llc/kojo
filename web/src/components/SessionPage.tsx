@@ -97,9 +97,7 @@ export function SessionPage() {
 
   const onAttachment = mergeAttachments;
 
-  const onContext = useCallback((ctx: ContextInfo) => {
-    setContextInfo(ctx);
-  }, []);
+  const onContext = setContextInfo;
 
   const onYoloDebug = useCallback((tail: string) => {
     yoloTailRef.current = tail;

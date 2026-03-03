@@ -316,12 +316,13 @@ func (m *Manager) Restart(id string) (*Session, error) {
 	// Re-enable context tracking after restart
 	if s.context != nil {
 		s.context.Restart()
-		// Recreate transcript monitor for Claude with current session ID
+		// Recreate transcript monitor for Claude with current session ID.
+		// ReplaceTranscript stops the old monitor's goroutine.
 		if tool == "claude" && toolSessionID != "" {
 			tm := NewTranscriptMonitor(m.logger, workDir, toolSessionID, s.context, func(info *ContextInfo) {
 				s.BroadcastContext(info)
 			})
-			s.context.SetTranscript(tm)
+			s.context.ReplaceTranscript(tm)
 		}
 	}
 
@@ -650,12 +651,10 @@ func (m *Manager) completeExit(s *Session, exitCode int) {
 	s.doneOnce.Do(func() { close(s.done) })
 	m.save()
 
-	// Stop context estimator
-	s.mu.Lock()
+	// Stop context estimator (s.context is immutable after creation)
 	if s.context != nil {
 		s.context.Stop()
 	}
-	s.mu.Unlock()
 
 	// Stop child sessions when parent exits
 	shellTool := ShellToolName()
