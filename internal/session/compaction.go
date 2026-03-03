@@ -21,11 +21,28 @@ const (
 	readyMaxTimeout  = 15 * time.Second
 	readySilenceDur  = 3 * time.Second
 	injectPasteDelay = 100 * time.Millisecond
+
+	// Shorter silence detection for paste echo (echo completes fast,
+	// so we switch to Normal quickly to avoid suppressing CLI response)
+	pasteEchoMaxTimeout = 5 * time.Second
+	pasteEchoSilenceDur = 1 * time.Second
 )
 
 // CLI-specific flush commands
 var flushCommands = map[string]string{
-	"claude": "Before this session ends, save ALL important context to memory files. Then output a brief summary of current task state wrapped in <kojo-summary> tags.\n",
+	"claude": "This session is about to be compacted due to context limits. Do these two things:\n\n" +
+		"1. MEMORY FLUSH: Save ALL important context to your memory files (create if needed, append if exists). Include file paths, decisions, patterns discovered, and current task state.\n\n" +
+		"2. SUMMARY: Output a comprehensive summary wrapped in kojo-summary XML tags (opening tag, then content, then closing tag). The summary MUST include:\n" +
+		"   - Current task and status (in progress / waiting for input / completed)\n" +
+		"   - What was completed (specific files changed, functions written, tests passed)\n" +
+		"   - What remains to be done (concrete next steps, not vague descriptions)\n" +
+		"   - Decisions made, approaches chosen, and open questions\n" +
+		"   - TODOs and constraints discovered during this session\n" +
+		"   - Critical file paths and code locations involved\n" +
+		"   - The EXACT next action to take when resuming\n\n" +
+		"IMPORTANT: Preserve all identifiers exactly as written — UUIDs, hashes, file paths, URLs, " +
+		"function names, variable names, branch names, and error messages. Do not shorten or paraphrase them.\n\n" +
+		"This summary will be injected into a fresh session to continue your work seamlessly.\n",
 }
 
 var summaryTagRe = regexp.MustCompile(`(?s)<kojo-summary>(.*?)</kojo-summary>`)
@@ -97,11 +114,8 @@ func (o *CompactionOrchestrator) Run() {
 	// 6. Inject summary (paste is suppressed, then switch to normal)
 	o.injectSummary(summary)
 
-	// 7. Finalize — clear terminal and show ready banner via same output channel
-	// to guarantee ordering (lifecycle channel is separate, so clear must not
-	// depend on it).
-	s.InjectOutput([]byte("\x1b[2J\x1b[3J\x1b[H")) // clear screen + scrollback + cursor home
-	s.InjectOutput([]byte("\x1b[90m── Ready ──\x1b[0m\r\n"))
+	// 7. Finalize — show separator (preserve scrollback so previous conversation remains visible)
+	s.InjectOutput([]byte("\r\n\x1b[90m── Context compacted ──\x1b[0m\r\n\r\n"))
 	s.lifecycle.Store(int32(LifecycleRunning))
 	s.BroadcastLifecycle("running")
 
@@ -208,10 +222,13 @@ func (o *CompactionOrchestrator) extractSummary() string {
 	copy(buf, o.session.captureBuf)
 	o.session.captureMu.Unlock()
 
-	// Strip ANSI for tag matching
+	// Strip ANSI for tag matching.
+	// Use FindAllSubmatch and take the LAST match to avoid contamination
+	// from the flush prompt echo which may contain tag references.
 	clean := AnsiRe.ReplaceAll(buf, nil)
-	if m := summaryTagRe.FindSubmatch(clean); m != nil {
-		return strings.TrimSpace(string(m[1]))
+	matches := summaryTagRe.FindAllSubmatch(clean, -1)
+	if len(matches) > 0 {
+		return strings.TrimSpace(string(matches[len(matches)-1][1]))
 	}
 	return ""
 }
@@ -331,7 +348,13 @@ func (o *CompactionOrchestrator) waitForReady() {
 
 // WaitForReady blocks until the session's CLI appears ready (silence-based detection).
 func WaitForReady(s *Session, logger *slog.Logger) {
-	deadline := time.After(readyMaxTimeout)
+	waitForSilence(s, logger, readySilenceDur, readyMaxTimeout)
+}
+
+// waitForSilence blocks until no output has been received for silenceDur,
+// or maxTimeout is reached.
+func waitForSilence(s *Session, logger *slog.Logger, silenceDur, maxTimeout time.Duration) {
+	deadline := time.After(maxTimeout)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -339,14 +362,14 @@ func WaitForReady(s *Session, logger *slog.Logger) {
 		select {
 		case <-deadline:
 			if logger != nil {
-				logger.Warn("ready detection timeout", "id", s.ID)
+				logger.Warn("silence detection timeout", "id", s.ID, "maxTimeout", maxTimeout)
 			}
 			return
 		case <-ticker.C:
 			lastMs := s.lastOutputAt.Load()
 			if lastMs > 0 {
 				elapsed := time.Since(time.UnixMilli(lastMs))
-				if elapsed >= readySilenceDur {
+				if elapsed >= silenceDur {
 					return
 				}
 			}
@@ -358,14 +381,13 @@ func (o *CompactionOrchestrator) injectSummary(summary string) {
 	s := o.session
 
 	if summary == "" {
-		s.scrollback.Reset()
 		s.outputMode.Store(int32(OutputNormal))
 		return
 	}
 
 	// Keep OutputSuppressing during paste so the injected text is hidden.
 	// Build the injection prompt
-	prompt := fmt.Sprintf("Here is a summary of our previous conversation before context compaction. Use this to maintain continuity:\n\n%s\n\nPlease acknowledge this context and continue from where we left off.", summary)
+	prompt := fmt.Sprintf("Here is a summary of our previous conversation before context compaction. Use this to maintain continuity:\n\n%s\n\nContinue working on the task described above. If you were in the middle of implementation, proceed immediately without waiting for confirmation. If you were waiting for user input, briefly state what you need.", summary)
 
 	// Reset timestamp so WaitForReady doesn't return immediately from stale values
 	// left over by the previous waitForReady (step 5).
@@ -376,13 +398,12 @@ func (o *CompactionOrchestrator) injectSummary(summary string) {
 	// Send via bracketed paste (outputMode is still Suppressing — echo is discarded)
 	SafePaste(s, prompt)
 
-	// Wait for paste echo to be fully consumed by readLoop
-	WaitForReady(s, o.logger)
+	// Wait for paste echo only (short timeout to minimize suppression of CLI response).
+	// Paste echo completes fast; 1s silence is enough to detect it's done.
+	// Pass nil logger — timeout here is expected and not worth warning about.
+	waitForSilence(s, nil, pasteEchoSilenceDur, pasteEchoMaxTimeout)
 
-	// Clear scrollback (old session output + captured flush output)
-	// so reconnecting clients start clean.
-	s.scrollback.Reset()
-
+	// Preserve scrollback — old conversation stays visible for continuity.
 	// Switch to normal — CLI response from here is visible
 	s.outputMode.Store(int32(OutputNormal))
 }
