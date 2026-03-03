@@ -1,5 +1,7 @@
 /kojo
+/kojo.exe
 /tmp
+CLAUDE.local.md
 web/dist
 web/node_modules
 .DS_Store
