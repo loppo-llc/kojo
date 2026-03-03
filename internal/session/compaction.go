@@ -64,13 +64,16 @@ func (o *CompactionOrchestrator) Run() {
 		}
 		if restartFailed {
 			// freshRestart killed old process but failed to start new one.
-			// Force proper session exit.
+			// Don't broadcast "running" — session is about to exit.
 			o.logger.Error("compaction failed, finalizing session", "id", s.ID)
 			o.manager.completeExit(s, 1)
+			return
 		}
+		s.BroadcastLifecycle("running")
 	}()
 
 	o.logger.Info("compaction started", "id", s.ID)
+	s.BroadcastLifecycle("compacting")
 
 	// 1. Banner
 	s.InjectOutput([]byte("\r\n\x1b[90m── Compacting context ──\x1b[0m\r\n"))
@@ -91,12 +94,16 @@ func (o *CompactionOrchestrator) Run() {
 	// 5. Wait for CLI ready
 	o.waitForReady()
 
-	// 6. Inject summary
+	// 6. Inject summary (paste is suppressed, then switch to normal)
 	o.injectSummary(summary)
 
-	// 7. Finalize
+	// 7. Finalize — clear terminal and show ready banner via same output channel
+	// to guarantee ordering (lifecycle channel is separate, so clear must not
+	// depend on it).
+	s.InjectOutput([]byte("\x1b[2J\x1b[3J\x1b[H")) // clear screen + scrollback + cursor home
 	s.InjectOutput([]byte("\x1b[90m── Ready ──\x1b[0m\r\n"))
 	s.lifecycle.Store(int32(LifecycleRunning))
+	s.BroadcastLifecycle("running")
 
 	// If the new process died during compaction finalization (steps 5-7),
 	// its waitLoop called completeExit which saw Compacting and only signaled
@@ -350,18 +357,34 @@ func WaitForReady(s *Session, logger *slog.Logger) {
 func (o *CompactionOrchestrator) injectSummary(summary string) {
 	s := o.session
 
-	// Switch to normal mode
-	s.outputMode.Store(int32(OutputNormal))
-
 	if summary == "" {
+		s.scrollback.Reset()
+		s.outputMode.Store(int32(OutputNormal))
 		return
 	}
 
+	// Keep OutputSuppressing during paste so the injected text is hidden.
 	// Build the injection prompt
 	prompt := fmt.Sprintf("Here is a summary of our previous conversation before context compaction. Use this to maintain continuity:\n\n%s\n\nPlease acknowledge this context and continue from where we left off.", summary)
 
-	// Send via bracketed paste (safePaste handles sanitization)
+	// Reset timestamp so WaitForReady doesn't return immediately from stale values
+	// left over by the previous waitForReady (step 5).
+	// Use current time (not 0) so WaitForReady enters silence detection immediately
+	// rather than waiting for the first output.
+	s.lastOutputAt.Store(time.Now().UnixMilli())
+
+	// Send via bracketed paste (outputMode is still Suppressing — echo is discarded)
 	SafePaste(s, prompt)
+
+	// Wait for paste echo to be fully consumed by readLoop
+	WaitForReady(s, o.logger)
+
+	// Clear scrollback (old session output + captured flush output)
+	// so reconnecting clients start clean.
+	s.scrollback.Reset()
+
+	// Switch to normal — CLI response from here is visible
+	s.outputMode.Store(int32(OutputNormal))
 }
 
 // sanitizeForPaste removes ESC sequences and control characters from text.

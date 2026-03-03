@@ -13,6 +13,7 @@ interface WSMessage {
   live?: boolean;
   attachments?: Attachment[];
   context?: ContextInfo;
+  state?: string;
 }
 
 interface UseWebSocketOptions {
@@ -23,10 +24,11 @@ interface UseWebSocketOptions {
   onYoloDebug?: (tail: string) => void;
   onAttachment?: (attachments: Attachment[]) => void;
   onContext?: (ctx: ContextInfo) => void;
+  onLifecycle?: (state: string) => void;
   onConnected?: () => void;
 }
 
-export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYoloDebug, onAttachment, onContext, onConnected }: UseWebSocketOptions) {
+export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYoloDebug, onAttachment, onContext, onLifecycle, onConnected }: UseWebSocketOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const [connected, setConnected] = useState(false);
   const reconnectRef = useRef<ReturnType<typeof setTimeout>>(null);
@@ -88,6 +90,9 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
         case "context":
           if (msg.context && onContext) onContext(msg.context);
           break;
+        case "lifecycle":
+          if (msg.state && onLifecycle) onLifecycle(msg.state);
+          break;
       }
     };
 
@@ -105,7 +110,7 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
     };
 
     wsRef.current = ws;
-  }, [sessionId, onScrollback, onExit, onYoloDebug, onAttachment, onContext]);
+  }, [sessionId, onScrollback, onExit, onYoloDebug, onAttachment, onContext, onLifecycle]);
 
   useEffect(() => {
     activeRef.current = true;

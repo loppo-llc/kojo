@@ -96,6 +96,9 @@ type Session struct {
 	context     *ContextEstimator
 	contextSubs map[chan *ContextInfo]struct{}
 
+	// lifecycle broadcast (compacting/running)
+	lifecycleSubs map[chan string]struct{}
+
 	// last output timestamp for ready detection during suppressing mode
 	lastOutputAt atomic.Int64
 
@@ -332,6 +335,38 @@ func (s *Session) BroadcastContext(info *ContextInfo) {
 	for ch := range s.contextSubs {
 		select {
 		case ch <- info:
+		default:
+		}
+	}
+}
+
+// SubscribeLifecycle returns a channel that receives lifecycle state changes.
+func (s *Session) SubscribeLifecycle() chan string {
+	ch := make(chan string, 4)
+	s.subMu.Lock()
+	if s.lifecycleSubs == nil {
+		s.lifecycleSubs = make(map[chan string]struct{})
+	}
+	s.lifecycleSubs[ch] = struct{}{}
+	s.subMu.Unlock()
+	return ch
+}
+
+// UnsubscribeLifecycle removes a lifecycle subscriber.
+func (s *Session) UnsubscribeLifecycle(ch chan string) {
+	s.subMu.Lock()
+	delete(s.lifecycleSubs, ch)
+	s.subMu.Unlock()
+	close(ch)
+}
+
+// BroadcastLifecycle sends lifecycle state to all subscribers.
+func (s *Session) BroadcastLifecycle(state string) {
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	for ch := range s.lifecycleSubs {
+		select {
+		case ch <- state:
 		default:
 		}
 	}

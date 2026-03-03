@@ -59,6 +59,11 @@ type WSContextMsg struct {
 	Context *session.ContextInfo `json:"context"`
 }
 
+type WSLifecycleMsg struct {
+	Type  string `json:"type"`
+	State string `json:"state"`
+}
+
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.URL.Query().Get("session")
 	if sessionID == "" {
@@ -103,6 +108,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	contextCh := sess.SubscribeContext()
 	defer sess.UnsubscribeContext(contextCh)
 
+	lifecycleCh := sess.SubscribeLifecycle()
+	defer sess.UnsubscribeLifecycle(lifecycleCh)
+
 	// send scrollback
 	if len(scrollback) > 0 {
 		msg := WSScrollbackMsg{
@@ -133,6 +141,17 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// send initial lifecycle state (always, so reconnecting clients reset stale state)
+	{
+		state := "running"
+		if sess.GetLifecycle() == session.LifecycleCompacting {
+			state = "compacting"
+		}
+		if err := writeJSON(ctx, conn, WSLifecycleMsg{Type: "lifecycle", State: state}); err != nil {
+			return
+		}
+	}
+
 	// if session already exited, send non-live exit and return
 	select {
 	case <-sess.Done():
@@ -157,7 +176,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	go s.wsPingLoop(ctx, cancel, conn)
 
 	// write to client
-	s.wsWriteLoop(ctx, conn, sess, ch, yoloCh, attachCh, contextCh)
+	s.wsWriteLoop(ctx, conn, sess, ch, yoloCh, attachCh, contextCh, lifecycleCh)
 }
 
 func (s *Server) wsPingLoop(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn) {
@@ -223,7 +242,7 @@ func (s *Server) wsReadLoop(ctx context.Context, cancel context.CancelFunc, conn
 	}
 }
 
-func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, sess *session.Session, ch chan []byte, yoloCh chan string, attachCh chan []*session.Attachment, contextCh chan *session.ContextInfo) {
+func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, sess *session.Session, ch chan []byte, yoloCh chan string, attachCh chan []*session.Attachment, contextCh chan *session.ContextInfo, lifecycleCh chan string) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -275,6 +294,14 @@ func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, sess *se
 			msg := WSContextMsg{
 				Type:    "context",
 				Context: ctxInfo,
+			}
+			if err := writeJSON(ctx, conn, msg); err != nil {
+				return
+			}
+		case state := <-lifecycleCh:
+			msg := WSLifecycleMsg{
+				Type:  "lifecycle",
+				State: state,
 			}
 			if err := writeJSON(ctx, conn, msg); err != nil {
 				return

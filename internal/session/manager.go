@@ -559,7 +559,6 @@ func (m *Manager) readLoop(s *Session) {
 				s.TrackContext(data)
 
 			case OutputCapturing:
-				s.scrollback.Write(data)
 				s.appendCapture(data)
 
 			case OutputSuppressing:

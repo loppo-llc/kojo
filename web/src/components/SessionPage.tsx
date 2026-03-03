@@ -86,6 +86,7 @@ export function SessionPage() {
 
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [contextInfo, setContextInfo] = useState<ContextInfo | null>(null);
+  const [compacting, setCompacting] = useState(false);
 
   const mergeAttachments = useCallback((incoming: Attachment[]) => {
     setAttachments((prev) => {
@@ -98,6 +99,10 @@ export function SessionPage() {
   const onAttachment = mergeAttachments;
 
   const onContext = setContextInfo;
+
+  const onLifecycle = useCallback((state: string) => {
+    setCompacting(state === "compacting");
+  }, []);
 
   const onYoloDebug = useCallback((tail: string) => {
     yoloTailRef.current = tail;
@@ -122,6 +127,7 @@ export function SessionPage() {
     onYoloDebug,
     onAttachment,
     onContext,
+    onLifecycle,
     onConnected: immediateFit,
   });
   sendInputRef.current = sendInput;
@@ -143,6 +149,7 @@ export function SessionPage() {
     setExited(false);
     setAttachments([]);
     setContextInfo(null);
+    setCompacting(false);
     gotScrollbackRef.current = false;
     api.sessions.get(id!).then((s) => {
       setSession(s);
@@ -210,6 +217,7 @@ export function SessionPage() {
       const updated = await api.sessions.restart(id);
       setSession(updated);
       setExited(false);
+      setCompacting(false);
       reconnect();
     } catch (err) {
       console.error(err);
@@ -313,6 +321,17 @@ export function SessionPage() {
         >
           <div className="relative flex-1 min-h-0">
             <div ref={termContainerRef} className="absolute inset-0" style={{ touchAction: "none" }} />
+            {compacting && !exited && (
+              <div className="absolute inset-0 z-20 flex items-center justify-center bg-neutral-950/95">
+                <div className="flex items-center gap-3 text-neutral-400">
+                  <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                  <span className="text-sm">Compacting context...</span>
+                </div>
+              </div>
+            )}
             {!exited && (
               <button
                 ref={yoloOverlayRef}

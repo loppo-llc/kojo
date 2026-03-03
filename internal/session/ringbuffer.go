@@ -47,6 +47,15 @@ func (r *RingBuffer) ResetTotalWritten() {
 	r.totalWritten = 0
 }
 
+// Reset clears all data in the ring buffer.
+func (r *RingBuffer) Reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.w = 0
+	r.full = false
+	r.totalWritten = 0
+}
+
 func (r *RingBuffer) Bytes() []byte {
 	r.mu.Lock()
 	defer r.mu.Unlock()
