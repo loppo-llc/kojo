@@ -8,17 +8,16 @@ import (
 )
 
 // defaultShell returns the default shell on Windows.
-// Checks ComSpec env, then looks for powershell.exe, falls back to cmd.exe.
+// Priority: pwsh.exe (PowerShell 7+) > powershell.exe > ComSpec > cmd.exe.
 func defaultShell() string {
-	if comspec := os.Getenv("ComSpec"); comspec != "" {
-		// Prefer PowerShell over cmd.exe if available
-		if ps, err := exec.LookPath("powershell.exe"); err == nil {
-			return ps
-		}
-		return comspec
+	if ps, err := exec.LookPath("pwsh.exe"); err == nil {
+		return ps
 	}
 	if ps, err := exec.LookPath("powershell.exe"); err == nil {
 		return ps
+	}
+	if comspec := os.Getenv("ComSpec"); comspec != "" {
+		return comspec
 	}
 	return "cmd.exe"
 }
