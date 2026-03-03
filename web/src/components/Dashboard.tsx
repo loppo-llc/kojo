@@ -91,12 +91,20 @@ export function Dashboard() {
     <div className="min-h-full bg-neutral-950 text-neutral-200">
       <header className="flex items-center justify-between px-4 py-3 border-b border-neutral-800">
         <h1 className="text-lg font-bold">kojo</h1>
-        <Link
-          to="/new"
-          className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-sm"
-        >
-          + New
-        </Link>
+        <div className="flex items-center gap-2">
+          <Link
+            to="/agents"
+            className="px-3 py-1.5 text-neutral-400 hover:text-neutral-200 text-sm"
+          >
+            Agents
+          </Link>
+          <Link
+            to="/new"
+            className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-sm"
+          >
+            + New
+          </Link>
+        </div>
       </header>
       {pushState === "default" && (
         <div className="mx-4 mt-3 p-3 bg-neutral-900 border border-neutral-800 rounded-lg flex items-center gap-3">

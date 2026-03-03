@@ -46,7 +46,7 @@ func NewTranscriptMonitor(logger *slog.Logger, workDir, claudeSessionID string, 
 }
 
 // buildTranscriptPath computes the transcript file path once.
-// Claude Code stores transcripts at ~/.claude/projects/<projectDir>/<sessionId>/transcript.jsonl
+// Claude Code stores transcripts at ~/.claude/projects/<projectDir>/<sessionId>.jsonl
 func buildTranscriptPath(workDir, claudeSessionID string) string {
 	if claudeSessionID == "" {
 		return ""
@@ -56,7 +56,7 @@ func buildTranscriptPath(workDir, claudeSessionID string) string {
 		return ""
 	}
 	projectDir := strings.ReplaceAll(filepath.ToSlash(workDir), "/", "-")
-	return filepath.Join(home, ".claude", "projects", projectDir, claudeSessionID, "transcript.jsonl")
+	return filepath.Join(home, ".claude", "projects", projectDir, claudeSessionID+".jsonl")
 }
 
 // Stop halts the polling loop.
@@ -113,18 +113,25 @@ func (t *TranscriptMonitor) poll() {
 	}
 }
 
+// transcriptUsage holds token counts including cache tokens.
+type transcriptUsage struct {
+	InputTokens              int64 `json:"input_tokens"`
+	OutputTokens             int64 `json:"output_tokens"`
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+}
+
+// Total returns the sum of all token fields.
+func (u *transcriptUsage) Total() int64 {
+	return u.InputTokens + u.OutputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+}
+
 // transcriptEntry is the minimal structure of a Claude transcript JSONL entry.
 type transcriptEntry struct {
-	Type  string `json:"type"`
-	Usage *struct {
-		InputTokens  int64 `json:"input_tokens"`
-		OutputTokens int64 `json:"output_tokens"`
-	} `json:"usage,omitempty"`
+	Type    string           `json:"type"`
+	Usage   *transcriptUsage `json:"usage,omitempty"`
 	Message *struct {
-		Usage *struct {
-			InputTokens  int64 `json:"input_tokens"`
-			OutputTokens int64 `json:"output_tokens"`
-		} `json:"usage,omitempty"`
+		Usage *transcriptUsage `json:"usage,omitempty"`
 	} `json:"message,omitempty"`
 }
 
@@ -167,16 +174,14 @@ func (t *TranscriptMonitor) scanUsage(path string, offset int64) int64 {
 			continue
 		}
 
-		// Extract token counts from usage fields
+		// Extract token counts from usage fields (including cache tokens)
 		if entry.Usage != nil {
-			total := entry.Usage.InputTokens + entry.Usage.OutputTokens
-			if total > lastTokens {
+			if total := entry.Usage.Total(); total > lastTokens {
 				lastTokens = total
 			}
 		}
 		if entry.Message != nil && entry.Message.Usage != nil {
-			total := entry.Message.Usage.InputTokens + entry.Message.Usage.OutputTokens
-			if total > lastTokens {
+			if total := entry.Message.Usage.Total(); total > lastTokens {
 				lastTokens = total
 			}
 		}

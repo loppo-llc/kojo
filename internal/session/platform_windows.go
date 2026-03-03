@@ -53,6 +53,7 @@ func (m *Manager) restoreSession(info SessionInfo) *Session {
 		ExitCode:        info.ExitCode,
 		YoloMode:        info.YoloMode,
 		Internal:        info.Internal || internalTools[info.Tool],
+		AgentID:         info.AgentID,
 		ToolSessionID:   info.ToolSessionID,
 		ParentID:        info.ParentID,
 		TmuxSessionName: info.TmuxSessionName,

@@ -23,7 +23,7 @@ type Store struct {
 
 func newStore(logger *slog.Logger) *Store {
 	return &Store{
-		path:   filepath.Join(configDirPath(), sessionsFile),
+		path:   filepath.Join(ConfigDirPath(), sessionsFile),
 		logger: logger,
 	}
 }

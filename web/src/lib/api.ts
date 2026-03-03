@@ -9,10 +9,31 @@ export interface SessionInfo {
   exitCode?: number;
   yoloMode: boolean;
   internal?: boolean;
+  agentId?: string;
   createdAt: string;
   toolSessionId?: string;
   parentId?: string;
   lastOutput?: string; // base64-encoded last terminal output
+}
+
+export interface AgentInfo {
+  id: string;
+  name: string;
+  tool: string;
+  workDir: string;
+  args?: string[];
+  yoloMode: boolean;
+  schedule: string;
+  enabled: boolean;
+  createdAt: string;
+  lastRunAt?: string;
+  lastRunId?: string;
+}
+
+export interface MemorySearchResult {
+  source: string;
+  content: string;
+  rank: number;
 }
 
 export interface ServerInfo {
@@ -94,6 +115,16 @@ async function del<T>(path: string): Promise<T> {
   return res.json();
 }
 
+async function put<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(BASE + path, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
 async function patch<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(BASE + path, {
     method: "PATCH",
@@ -162,6 +193,28 @@ export const api = {
       post<{ ok: boolean }>("/api/v1/push/subscribe", subscription),
     unsubscribe: (endpoint: string) =>
       post<{ ok: boolean }>("/api/v1/push/unsubscribe", { endpoint }),
+  },
+
+  agents: {
+    list: () => get<{ agents: AgentInfo[] }>("/api/v1/agents").then((r) => r.agents),
+    get: (id: string) => get<AgentInfo>(`/api/v1/agents/${id}`),
+    create: (body: { name: string; tool: string; workDir: string; args?: string[]; yoloMode?: boolean; schedule?: string }) =>
+      post<AgentInfo>("/api/v1/agents", body),
+    update: (id: string, body: Partial<AgentInfo>) =>
+      patch<AgentInfo>(`/api/v1/agents/${id}`, body),
+    delete: (id: string) => del<{ ok: boolean }>(`/api/v1/agents/${id}`),
+    run: (id: string) => post<SessionInfo>(`/api/v1/agents/${id}/run`),
+    memory: (id: string) => get<{ content: string }>(`/api/v1/agents/${id}/memory`).then((r) => r.content),
+    setMemory: (id: string, content: string) => put<{ ok: boolean }>(`/api/v1/agents/${id}/memory`, { content }),
+    soul: (id: string) => get<{ content: string }>(`/api/v1/agents/${id}/soul`).then((r) => r.content),
+    setSoul: (id: string, content: string) => put<{ ok: boolean }>(`/api/v1/agents/${id}/soul`, { content }),
+    goals: (id: string) => get<{ content: string }>(`/api/v1/agents/${id}/goals`).then((r) => r.content),
+    setGoals: (id: string, content: string) => put<{ ok: boolean }>(`/api/v1/agents/${id}/goals`, { content }),
+    sessions: (id: string) => get<{ sessions: SessionInfo[] }>(`/api/v1/agents/${id}/sessions`).then((r) => r.sessions),
+    logs: (id: string) => get<{ logs: string[] }>(`/api/v1/agents/${id}/logs`).then((r) => r.logs),
+    log: (id: string, name: string) => get<{ content: string }>(`/api/v1/agents/${id}/logs/${name}`).then((r) => r.content),
+    search: (id: string, query: string) =>
+      get<{ results: MemorySearchResult[] }>(`/api/v1/agents/${id}/search?q=${encodeURIComponent(query)}`).then((r) => r.results),
   },
 
   upload: async (file: File) => {

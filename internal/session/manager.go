@@ -528,6 +528,7 @@ func (m *Manager) readLoop(s *Session) {
 			case OutputNormal:
 				s.scrollback.Write(data)
 				s.broadcast(data)
+				s.noteOutputTime()
 
 				// capture tool session ID from output (e.g. codex)
 				s.CaptureToolSessionID(data)

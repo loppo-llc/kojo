@@ -94,7 +94,7 @@ func (s *Session) CheckAttachments(data []byte) []*Attachment {
 	s.mu.Unlock()
 
 	// strip ANSI
-	clean := ansiRe.ReplaceAll(tail, []byte(" "))
+	clean := AnsiRe.ReplaceAll(tail, []byte(" "))
 
 	// collect candidate paths
 	candidates := make(map[string]struct{})

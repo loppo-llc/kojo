@@ -9,12 +9,12 @@ import (
 func TestContextEstimator_ByteTracking(t *testing.T) {
 	e := NewContextEstimator("claude", nil)
 
-	// Track 700 bytes at 3.5 bytes/token = 200 tokens
+	// Track 700 bytes at 2.5 bytes/token = 280 tokens
 	e.Track(make([]byte, 700))
 
 	info := e.Info()
-	if info.EstimatedTokens != 200 {
-		t.Errorf("expected 200 tokens, got %d", info.EstimatedTokens)
+	if info.EstimatedTokens != 280 {
+		t.Errorf("expected 280 tokens, got %d", info.EstimatedTokens)
 	}
 	if info.Source != "pty_bytes" {
 		t.Errorf("expected source pty_bytes, got %s", info.Source)
@@ -51,10 +51,10 @@ func TestContextEstimator_ThresholdCallback(t *testing.T) {
 		}
 	})
 
-	// Claude: 200K window, 3.5 bytes/token, threshold 0.80 = 160K tokens = 560K bytes
+	// Claude: 200K window, 2.5 bytes/token, threshold 0.80 = 160K tokens = 400K bytes
 	// Send enough data to cross threshold
 	chunk := make([]byte, 100_000)
-	for i := 0; i < 6; i++ {
+	for i := 0; i < 5; i++ {
 		e.Track(chunk)
 	}
 
@@ -96,9 +96,9 @@ func TestContextEstimator_BroadcastThreshold(t *testing.T) {
 	e := NewContextEstimator("claude", nil)
 
 	// First call should broadcast (from 0% to > 5%)
-	// Claude: 200K window, 3.5 bytes/token
-	// 35000 bytes = 10000 tokens = 5% of 200K
-	info := e.Track(make([]byte, 35000))
+	// Claude: 200K window, 2.5 bytes/token
+	// 25000 bytes = 10000 tokens = 5% of 200K
+	info := e.Track(make([]byte, 25000))
 	if info == nil {
 		t.Error("expected broadcast on first significant change")
 	}
@@ -128,9 +128,9 @@ func TestContextEstimator_Reset(t *testing.T) {
 func TestContextEstimator_UsagePercent(t *testing.T) {
 	e := NewContextEstimator("claude", nil)
 
-	// 200K window, 3.5 bytes/token
-	// 70000 bytes = 20000 tokens = 10% of 200K
-	e.Track(make([]byte, 70000))
+	// 200K window, 2.5 bytes/token
+	// 50000 bytes = 20000 tokens = 10% of 200K
+	e.Track(make([]byte, 50000))
 
 	info := e.Info()
 	if info.UsagePercent < 9.9 || info.UsagePercent > 10.1 {

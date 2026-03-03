@@ -5,6 +5,9 @@ import { Dashboard } from "./components/Dashboard";
 import { SessionPage } from "./components/SessionPage";
 import { NewSession } from "./components/NewSession";
 import { FileBrowser } from "./components/FileBrowser";
+import { AgentList } from "./components/AgentList";
+import { AgentCreate } from "./components/AgentCreate";
+import { AgentPage } from "./components/AgentPage";
 import "./index.css";
 
 createRoot(document.getElementById("root")!).render(
@@ -18,6 +21,9 @@ createRoot(document.getElementById("root")!).render(
         <Route path="/session/:id/git" element={<SessionPage />} />
         <Route path="/session/:id/attachments" element={<SessionPage />} />
         <Route path="/new" element={<NewSession />} />
+        <Route path="/agents" element={<AgentList />} />
+        <Route path="/agents/new" element={<AgentCreate />} />
+        <Route path="/agents/:id" element={<AgentPage />} />
         <Route path="/files" element={<FileBrowser />} />
       </Routes>
     </BrowserRouter>

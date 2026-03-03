@@ -54,6 +54,7 @@ type Session struct {
 	ExitCode        *int
 	YoloMode        bool
 	Internal        bool   // internal session (e.g. tmux), not user-facing
+	AgentID         string // owning agent ID (empty for manual sessions)
 	ToolSessionID string // tool-specific session ID for resume
 	ParentID        string // parent session ID (e.g. tmux child of a CLI session)
 	TmuxSessionName string // tmux session name (kojo_<id>) for tmux-backed sessions
@@ -128,8 +129,13 @@ type YoloApproval struct {
 // yoloTailSize is the trailing output buffer size for yolo pattern detection.
 const yoloTailSize = 4096
 
-// strip ANSI escapes for pattern matching (replace with space to preserve word boundaries)
-var ansiRe = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[()][0-9A-B]`)
+// AnsiRe strips ANSI escapes for pattern matching.
+var AnsiRe = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[()][0-9A-B]`)
+
+// StripANSI removes all ANSI escape sequences from data.
+func StripANSI(data []byte) []byte {
+	return AnsiRe.ReplaceAll(data, nil)
+}
 var multiSpaceRe = regexp.MustCompile(`[ \t]{2,}`)
 
 // "Do you ...? ... 1. Yes" pattern (allow blank lines between question and options)
@@ -147,6 +153,7 @@ type SessionInfo struct {
 	ExitCode        *int     `json:"exitCode,omitempty"`
 	YoloMode        bool     `json:"yoloMode"`
 	Internal        bool     `json:"internal,omitempty"`
+	AgentID         string   `json:"agentId,omitempty"`
 	CreatedAt       string   `json:"createdAt"`
 	ToolSessionID string   `json:"toolSessionId,omitempty"`
 	ParentID        string   `json:"parentId,omitempty"`
@@ -169,6 +176,7 @@ func (s *Session) Info() SessionInfo {
 		ExitCode:        s.ExitCode,
 		YoloMode:        s.YoloMode,
 		Internal:        s.Internal,
+		AgentID:         s.AgentID,
 		CreatedAt:       s.CreatedAt.UTC().Format(time.RFC3339),
 		ToolSessionID: s.ToolSessionID,
 		ParentID:        s.ParentID,
@@ -281,6 +289,11 @@ func (s *Session) BroadcastAttachments(attachments []*Attachment) {
 		default:
 		}
 	}
+}
+
+// ScrollbackBytes returns the current scrollback buffer contents.
+func (s *Session) ScrollbackBytes() []byte {
+	return s.scrollback.Bytes()
 }
 
 // InjectOutput writes synthetic data directly to scrollback and broadcast,
@@ -410,7 +423,7 @@ func (s *Session) CaptureToolSessionID(data []byte) {
 	copy(buf, s.codexCaptureBuf)
 	s.mu.Unlock()
 
-	clean := ansiRe.ReplaceAll(buf, []byte(" "))
+	clean := AnsiRe.ReplaceAll(buf, []byte(" "))
 	if m := codexSessionIDRe.FindSubmatch(clean); m != nil {
 		s.mu.Lock()
 		if s.ToolSessionID == "" {
@@ -419,6 +432,18 @@ func (s *Session) CaptureToolSessionID(data []byte) {
 		}
 		s.mu.Unlock()
 	}
+}
+
+func (s *Session) SetAgentID(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.AgentID = id
+}
+
+func (s *Session) GetAgentID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.AgentID
 }
 
 func (s *Session) SetYoloMode(enabled bool) {
@@ -453,7 +478,7 @@ func (s *Session) CheckYolo(data []byte) (*YoloApproval, string) {
 	s.mu.Unlock()
 
 	// strip ANSI for matching (replace with space to keep word boundaries)
-	clean := ansiRe.ReplaceAll(tail, []byte(" "))
+	clean := AnsiRe.ReplaceAll(tail, []byte(" "))
 	clean = bytes.ReplaceAll(clean, []byte("\r\n"), []byte("\n"))
 	clean = bytes.ReplaceAll(clean, []byte("\r"), []byte("\n"))
 	clean = multiSpaceRe.ReplaceAll(clean, []byte(" "))

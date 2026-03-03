@@ -21,8 +21,8 @@ type contextConfig struct {
 }
 
 var contextConfigs = map[string]contextConfig{
-	"claude": {contextWindow: 200_000, bytesPerToken: 3.5, flushThreshold: 0.80},
-	"codex":  {contextWindow: 200_000, bytesPerToken: 3.5, flushThreshold: 0.80},
+	"claude": {contextWindow: 200_000, bytesPerToken: 2.5, flushThreshold: 0.80},
+	"codex":  {contextWindow: 200_000, bytesPerToken: 2.5, flushThreshold: 0.80},
 	"gemini": {contextWindow: 1_000_000, bytesPerToken: 4.0, flushThreshold: 0.80},
 }
 
@@ -48,7 +48,7 @@ type ContextEstimator struct {
 func NewContextEstimator(tool string, onThreshold func()) *ContextEstimator {
 	cfg, ok := contextConfigs[tool]
 	if !ok {
-		cfg = contextConfig{contextWindow: 200_000, bytesPerToken: 3.5, flushThreshold: 0.80}
+		cfg = contextConfig{contextWindow: 200_000, bytesPerToken: 2.5, flushThreshold: 0.80}
 	}
 	return &ContextEstimator{
 		tool:        tool,

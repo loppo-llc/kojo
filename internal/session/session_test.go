@@ -137,7 +137,7 @@ func TestCheckYolo_Disabled(t *testing.T) {
 
 func TestAnsiRe_StripsDECPrivateMode(t *testing.T) {
 	input := "\x1b[?25hvisible\x1b[?25l"
-	clean := ansiRe.ReplaceAll([]byte(input), []byte(""))
+	clean := AnsiRe.ReplaceAll([]byte(input), []byte(""))
 	if string(clean) != "visible" {
 		t.Fatalf("expected 'visible', got %q", string(clean))
 	}
@@ -146,7 +146,7 @@ func TestAnsiRe_StripsDECPrivateMode(t *testing.T) {
 func TestAnsiRe_StripsTildeTerminated(t *testing.T) {
 	// Function key sequences like F5 (\x1b[15~) should be stripped.
 	input := "\x1b[15~visible\x1b[2~"
-	clean := ansiRe.ReplaceAll([]byte(input), []byte(""))
+	clean := AnsiRe.ReplaceAll([]byte(input), []byte(""))
 	if string(clean) != "visible" {
 		t.Fatalf("expected 'visible', got %q", string(clean))
 	}

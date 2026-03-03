@@ -17,6 +17,7 @@ import (
 	"time"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
+	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/filebrowser"
 	gitpkg "github.com/loppo-llc/kojo/internal/git"
 	"github.com/loppo-llc/kojo/internal/notify"
@@ -25,6 +26,7 @@ import (
 
 type Server struct {
 	sessions *session.Manager
+	agents   *agent.Manager
 	files    *filebrowser.Browser
 	git      *gitpkg.Manager
 	notify   *notify.Manager
@@ -49,8 +51,10 @@ func New(cfg Config) *Server {
 		logger = slog.Default()
 	}
 
+	sessionMgr := session.NewManager(logger)
 	s := &Server{
-		sessions: session.NewManager(logger),
+		sessions: sessionMgr,
+		agents:   agent.NewManager(logger, sessionMgr),
 		files:    filebrowser.New(logger),
 		git:      gitpkg.New(logger),
 		notify:   cfg.NotifyManager,
@@ -89,6 +93,24 @@ func New(cfg Config) *Server {
 	mux.HandleFunc("GET /api/v1/sessions/{id}/attachments", s.handleListAttachments)
 	mux.HandleFunc("DELETE /api/v1/sessions/{id}/attachments", s.handleDeleteAttachment)
 	mux.HandleFunc("GET /api/v1/ws", s.handleWebSocket)
+
+	// Agents
+	mux.HandleFunc("GET /api/v1/agents", s.handleListAgents)
+	mux.HandleFunc("POST /api/v1/agents", s.handleCreateAgent)
+	mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGetAgent)
+	mux.HandleFunc("PATCH /api/v1/agents/{id}", s.handleUpdateAgent)
+	mux.HandleFunc("DELETE /api/v1/agents/{id}", s.handleDeleteAgent)
+	mux.HandleFunc("POST /api/v1/agents/{id}/run", s.handleRunAgent)
+	mux.HandleFunc("GET /api/v1/agents/{id}/memory", s.handleAgentMemory)
+	mux.HandleFunc("PUT /api/v1/agents/{id}/memory", s.handleAgentMemory)
+	mux.HandleFunc("GET /api/v1/agents/{id}/soul", s.handleAgentSoul)
+	mux.HandleFunc("PUT /api/v1/agents/{id}/soul", s.handleAgentSoul)
+	mux.HandleFunc("GET /api/v1/agents/{id}/goals", s.handleAgentGoals)
+	mux.HandleFunc("PUT /api/v1/agents/{id}/goals", s.handleAgentGoals)
+	mux.HandleFunc("GET /api/v1/agents/{id}/sessions", s.handleAgentSessions)
+	mux.HandleFunc("GET /api/v1/agents/{id}/logs", s.handleAgentLogs)
+	mux.HandleFunc("GET /api/v1/agents/{id}/logs/{name}", s.handleAgentLog)
+	mux.HandleFunc("GET /api/v1/agents/{id}/search", s.handleAgentSearch)
 
 	// Directory suggestions
 	mux.HandleFunc("GET /api/v1/dirs", s.handleDirSuggest)
@@ -184,6 +206,7 @@ func (s *Server) SetTLSConfig(tlsCfg *tls.Config) {
 
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("shutting down...")
+	s.agents.Stop()
 	s.sessions.StopAll()
 	s.sessions.SaveAll()
 	cleanupUploads()

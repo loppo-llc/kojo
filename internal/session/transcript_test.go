@@ -7,7 +7,6 @@ import (
 )
 
 func TestTranscript_ProjectDirConversion(t *testing.T) {
-	// Test the workDir → projectDir path conversion
 	tests := []struct {
 		workDir string
 		want    string
@@ -25,8 +24,27 @@ func TestTranscript_ProjectDirConversion(t *testing.T) {
 	}
 }
 
+func TestTranscript_BuildPath(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("cannot get home dir")
+	}
+
+	got := buildTranscriptPath("/Users/foo/project", "abc-123")
+	want := filepath.Join(home, ".claude", "projects", "-Users-foo-project", "abc-123.jsonl")
+	if got != want {
+		t.Errorf("buildTranscriptPath:\n got  %s\n want %s", got, want)
+	}
+}
+
+func TestTranscript_BuildPathEmpty(t *testing.T) {
+	got := buildTranscriptPath("/any", "")
+	if got != "" {
+		t.Errorf("expected empty path for empty sessionID, got %q", got)
+	}
+}
+
 func TestTranscript_ScanUsage(t *testing.T) {
-	// Create a temp JSONL file
 	dir := t.TempDir()
 	path := filepath.Join(dir, "transcript.jsonl")
 
@@ -48,11 +66,49 @@ func TestTranscript_ScanUsage(t *testing.T) {
 	}
 }
 
+func TestTranscript_ScanUsageCacheTokens(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+
+	// Realistic Claude usage with cache tokens
+	content := `{"type":"assistant","message":{"usage":{"input_tokens":1,"cache_creation_input_tokens":462,"cache_read_input_tokens":61917,"output_tokens":361}}}
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tm := &TranscriptMonitor{}
+	tokens := tm.scanUsage(path, 0)
+
+	// 1 + 462 + 61917 + 361 = 62741
+	if tokens != 62741 {
+		t.Errorf("expected 62741 tokens (including cache), got %d", tokens)
+	}
+}
+
+func TestTranscript_ScanUsageTopLevelUsage(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+
+	content := `{"type":"result","usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":200,"cache_read_input_tokens":3000}}
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tm := &TranscriptMonitor{}
+	tokens := tm.scanUsage(path, 0)
+
+	// 100 + 50 + 200 + 3000 = 3350
+	if tokens != 3350 {
+		t.Errorf("expected 3350 tokens, got %d", tokens)
+	}
+}
+
 func TestTranscript_IncrementalRead(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "transcript.jsonl")
 
-	// Write initial content
 	initial := `{"type":"assistant","message":{"usage":{"input_tokens":1000,"output_tokens":500}}}
 `
 	if err := os.WriteFile(path, []byte(initial), 0o644); err != nil {
@@ -65,7 +121,6 @@ func TestTranscript_IncrementalRead(t *testing.T) {
 		t.Errorf("first scan: expected 1500 tokens, got %d", tokens)
 	}
 
-	// Check offset was updated
 	tm.mu.Lock()
 	offset := tm.lastOffset
 	tm.mu.Unlock()
@@ -73,7 +128,6 @@ func TestTranscript_IncrementalRead(t *testing.T) {
 		t.Error("expected non-zero offset after first scan")
 	}
 
-	// Append more content
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		t.Fatal(err)
@@ -82,15 +136,25 @@ func TestTranscript_IncrementalRead(t *testing.T) {
 `)
 	f.Close()
 
-	// Scan from offset — should only see new entry
 	tokens = tm.scanUsage(path, offset)
 	if tokens != 4000 {
 		t.Errorf("incremental scan: expected 4000 tokens, got %d", tokens)
 	}
 }
 
+func TestTranscriptUsage_Total(t *testing.T) {
+	u := &transcriptUsage{
+		InputTokens:              1,
+		OutputTokens:             361,
+		CacheCreationInputTokens: 462,
+		CacheReadInputTokens:     61917,
+	}
+	if got := u.Total(); got != 62741 {
+		t.Errorf("Total() = %d, want 62741", got)
+	}
+}
+
 // pathToProjectDir converts a workDir to Claude's project dir format.
-// This is the same logic used in TranscriptMonitor.findTranscriptPath.
 func pathToProjectDir(workDir string) string {
 	return replaceSlashes(filepath.ToSlash(workDir))
 }

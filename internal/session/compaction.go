@@ -154,7 +154,7 @@ func (o *CompactionOrchestrator) flushAndCaptureSummary() string {
 	s.outputMode.Store(int32(OutputCapturing))
 
 	// Send flush command via bracketed paste
-	safePaste(s, flushCmd)
+	SafePaste(s, flushCmd)
 
 	// Wait for summary tag or timeout (poll-based)
 	timer := time.NewTimer(flushTimeout)
@@ -178,7 +178,7 @@ func (o *CompactionOrchestrator) flushAndCaptureSummary() string {
 			s.captureMu.Lock()
 			buf := string(s.captureBuf)
 			s.captureMu.Unlock()
-			clean := ansiRe.ReplaceAllString(buf, "")
+			clean := AnsiRe.ReplaceAllString(buf, "")
 			if len(clean) > 2000 {
 				clean = clean[len(clean)-2000:]
 			}
@@ -202,7 +202,7 @@ func (o *CompactionOrchestrator) extractSummary() string {
 	o.session.captureMu.Unlock()
 
 	// Strip ANSI for tag matching
-	clean := ansiRe.ReplaceAll(buf, nil)
+	clean := AnsiRe.ReplaceAll(buf, nil)
 	if m := summaryTagRe.FindSubmatch(clean); m != nil {
 		return strings.TrimSpace(string(m[1]))
 	}
@@ -220,7 +220,7 @@ func (o *CompactionOrchestrator) saveSummary(summary string) {
 		count = s.context.CompactionCount()
 	}
 
-	dir := filepath.Join(configDirPath(), "compactions")
+	dir := filepath.Join(ConfigDirPath(), "compactions")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		o.logger.Error("failed to create compaction dir", "err", err)
 		return
@@ -319,8 +319,11 @@ func (o *CompactionOrchestrator) freshRestart() error {
 }
 
 func (o *CompactionOrchestrator) waitForReady() {
-	s := o.session
+	WaitForReady(o.session, o.logger)
+}
 
+// WaitForReady blocks until the session's CLI appears ready (silence-based detection).
+func WaitForReady(s *Session, logger *slog.Logger) {
 	deadline := time.After(readyMaxTimeout)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
@@ -328,10 +331,11 @@ func (o *CompactionOrchestrator) waitForReady() {
 	for {
 		select {
 		case <-deadline:
-			o.logger.Warn("ready detection timeout", "id", s.ID)
+			if logger != nil {
+				logger.Warn("ready detection timeout", "id", s.ID)
+			}
 			return
 		case <-ticker.C:
-			// Silence-based detection: if no output for readySilenceDur, CLI is ready.
 			lastMs := s.lastOutputAt.Load()
 			if lastMs > 0 {
 				elapsed := time.Since(time.UnixMilli(lastMs))
@@ -357,7 +361,7 @@ func (o *CompactionOrchestrator) injectSummary(summary string) {
 	prompt := fmt.Sprintf("Here is a summary of our previous conversation before context compaction. Use this to maintain continuity:\n\n%s\n\nPlease acknowledge this context and continue from where we left off.", summary)
 
 	// Send via bracketed paste (safePaste handles sanitization)
-	safePaste(s, prompt)
+	SafePaste(s, prompt)
 }
 
 // sanitizeForPaste removes ESC sequences and control characters from text.
@@ -376,9 +380,9 @@ func sanitizeForPaste(s string) string {
 	return b.String()
 }
 
-// safePaste sends text to a session using bracketed paste mode.
+// SafePaste sends text to a session using bracketed paste mode.
 // Uses writePTY to bypass lifecycle-based input blocking during compaction.
-func safePaste(s *Session, text string) {
+func SafePaste(s *Session, text string) {
 	sanitized := sanitizeForPaste(text)
 	paste := fmt.Sprintf("\x1b[200~%s\x1b[201~", sanitized)
 	if _, err := s.writePTY([]byte(paste)); err != nil {

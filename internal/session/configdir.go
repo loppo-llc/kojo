@@ -6,10 +6,10 @@ import (
 	"runtime"
 )
 
-// configDirPath returns the platform-appropriate configuration directory for kojo.
+// ConfigDirPath returns the platform-appropriate configuration directory for kojo.
 //   - Windows: %APPDATA%\kojo
 //   - Others:  ~/.config/kojo
-func configDirPath() string {
+func ConfigDirPath() string {
 	if runtime.GOOS == "windows" {
 		if appData := os.Getenv("APPDATA"); appData != "" {
 			return filepath.Join(appData, "kojo")
