@@ -53,7 +53,10 @@ export function FileBrowser({ embedded, initialPath }: FileBrowserProps = {}) {
     }
   };
 
+  const isAtRoot = embedded && initialPath ? currentPath === initialPath : false;
+
   const goUp = () => {
+    if (isAtRoot) return;
     const parent = currentPath.split("/").slice(0, -1).join("/") || "/";
     setPath(parent);
     setFileView(null);
@@ -119,13 +122,15 @@ export function FileBrowser({ embedded, initialPath }: FileBrowserProps = {}) {
         </div>
       )}
       <main className="divide-y divide-neutral-800/50">
-        <button
-          onClick={goUp}
-          className="w-full text-left px-4 py-3 hover:bg-neutral-900 text-sm flex items-center gap-2"
-        >
-          <span>&#x1F4C1;</span>
-          <span>..</span>
-        </button>
+        {!isAtRoot && (
+          <button
+            onClick={goUp}
+            className="w-full text-left px-4 py-3 hover:bg-neutral-900 text-sm flex items-center gap-2"
+          >
+            <span>&#x1F4C1;</span>
+            <span>..</span>
+          </button>
+        )}
         {entries.map((entry) => (
           <button
             key={entry.name}
