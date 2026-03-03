@@ -353,6 +353,19 @@ func (m *Manager) tryReattachPersistedTmux(s *Session, info SessionInfo) bool {
 		}
 	}
 
+	// Restore context estimator and transcript monitor for user-facing tools
+	if userTools[info.Tool] {
+		s.context = NewContextEstimator(info.Tool, func() {
+			(&CompactionOrchestrator{manager: m, session: s, logger: m.logger}).Run()
+		})
+		if info.Tool == "claude" && info.ToolSessionID != "" {
+			tm := NewTranscriptMonitor(m.logger, info.WorkDir, info.ToolSessionID, s.context, func(ci *ContextInfo) {
+				s.BroadcastContext(ci)
+			})
+			s.context.SetTranscript(tm)
+		}
+	}
+
 	go m.readLoop(s)
 	if rawPipe != nil {
 		go m.drainLoop(s)
