@@ -174,9 +174,23 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 		rawPipePath:     res.rawPipePath,
 		scrollback:      NewRingBuffer(defaultRingSize),
 		subscribers:     make(map[chan []byte]struct{}),
-		done:            make(chan struct{}),
-		readDone:        make(chan struct{}),
+		done:     make(chan struct{}),
+		readDone: make(chan struct{}),
 		attachments:     make(map[string]*Attachment),
+	}
+
+	// Initialize context estimator for user-facing tools
+	if userTools[tool] {
+		s.context = NewContextEstimator(tool, func() {
+			(&CompactionOrchestrator{manager: m, session: s, logger: m.logger}).Run()
+		})
+		// Start transcript monitor for Claude (more accurate token tracking)
+		if tool == "claude" && toolSessionID != "" {
+			tm := NewTranscriptMonitor(m.logger, workDir, toolSessionID, s.context, func(info *ContextInfo) {
+				s.BroadcastContext(info)
+			})
+			s.context.SetTranscript(tm)
+		}
 	}
 
 	m.mu.Lock()
@@ -211,22 +225,31 @@ func (m *Manager) Restart(id string) (*Session, error) {
 		return nil, fmt.Errorf("session not found: %s", id)
 	}
 
+	lc := Lifecycle(s.lifecycle.Load())
+	if lc == LifecycleCompacting || lc == LifecycleRestarting {
+		return nil, fmt.Errorf("session busy (lifecycle=%d): %s", lc, id)
+	}
+
 	s.mu.Lock()
-	if s.Status == StatusRunning || s.restarting {
+	if s.Status == StatusRunning {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("session is still running: %s", id)
 	}
-	s.restarting = true
+	s.mu.Unlock()
+
+	if !s.lifecycle.CompareAndSwap(int32(lc), int32(LifecycleRestarting)) {
+		return nil, fmt.Errorf("session busy: %s", id)
+	}
+
 	tool := s.Tool
 	workDir := s.WorkDir
+	s.mu.Lock()
 	args := s.Args
 	toolSessionID := s.ToolSessionID
 	s.mu.Unlock()
 
 	clearRestarting := func() {
-		s.mu.Lock()
-		s.restarting = false
-		s.mu.Unlock()
+		s.lifecycle.Store(int32(LifecycleRunning))
 	}
 
 	// Verify session wasn't removed between Get and setting restarting flag
@@ -284,10 +307,23 @@ func (m *Manager) Restart(id string) (*Session, error) {
 	s.Status = StatusRunning
 	s.ExitCode = nil
 	s.lastOutput = nil
-	s.restarting = false
 	s.done = make(chan struct{})
+	s.doneOnce = sync.Once{}
 	s.readDone = make(chan struct{})
 	s.mu.Unlock()
+	s.lifecycle.Store(int32(LifecycleRunning))
+
+	// Re-enable context tracking after restart
+	if s.context != nil {
+		s.context.Restart()
+		// Recreate transcript monitor for Claude with current session ID
+		if tool == "claude" && toolSessionID != "" {
+			tm := NewTranscriptMonitor(m.logger, workDir, toolSessionID, s.context, func(info *ContextInfo) {
+				s.BroadcastContext(info)
+			})
+			s.context.SetTranscript(tm)
+		}
+	}
 
 	m.platformStartLoops(s)
 
@@ -368,8 +404,13 @@ func (m *Manager) Remove(id string) error {
 			}
 		}
 	}
+	lc := Lifecycle(s.lifecycle.Load())
+	if lc == LifecycleCompacting || lc == LifecycleRestarting {
+		m.mu.Unlock()
+		return fmt.Errorf("cannot remove busy session (lifecycle=%d): %s", lc, id)
+	}
 	s.mu.Lock()
-	if s.Status == StatusRunning || s.restarting {
+	if s.Status == StatusRunning {
 		s.mu.Unlock()
 		m.mu.Unlock()
 		return fmt.Errorf("cannot remove running session: %s", id)
@@ -392,8 +433,13 @@ func (m *Manager) Stop(id string) error {
 		return fmt.Errorf("session not found: %s", id)
 	}
 
+	lc := Lifecycle(s.lifecycle.Load())
+	if lc != LifecycleRunning {
+		return fmt.Errorf("session not stoppable (lifecycle=%d): %s", lc, id)
+	}
+
 	s.mu.Lock()
-	if s.Status != StatusRunning || s.restarting {
+	if s.Status != StatusRunning {
 		s.mu.Unlock()
 		return fmt.Errorf("session not running: %s", id)
 	}
@@ -475,32 +521,51 @@ func (m *Manager) readLoop(s *Session) {
 		if n > 0 {
 			data := make([]byte, n)
 			copy(data, buf[:n])
-			s.scrollback.Write(data)
-			s.broadcast(data)
 
-			// capture tool session ID from output (e.g. codex)
-			s.CaptureToolSessionID(data)
+			mode := OutputMode(s.outputMode.Load())
+			switch mode {
+			case OutputNormal:
+				s.scrollback.Write(data)
+				s.broadcast(data)
 
-			// yolo auto-approve check
-			approval, debugTail := s.CheckYolo(data)
-			if debugTail != "" {
-				s.BroadcastYoloDebug(debugTail)
-			}
-			if approval != nil {
-				m.logger.Info("yolo auto-approve", "id", s.ID, "matched", approval.Matched)
-				time.AfterFunc(yoloApproveDelay, func() {
-					if !s.IsYoloMode() {
-						return
-					}
-					if _, err := s.Write([]byte("\r")); err != nil {
-						m.logger.Debug("yolo write error", "id", s.ID, "err", err)
-					}
-				})
-			}
+				// capture tool session ID from output (e.g. codex)
+				s.CaptureToolSessionID(data)
 
-			// attachment detection
-			if newAttachments := s.CheckAttachments(data); len(newAttachments) > 0 {
-				s.BroadcastAttachments(newAttachments)
+				// yolo auto-approve check
+				approval, debugTail := s.CheckYolo(data)
+				if debugTail != "" {
+					s.BroadcastYoloDebug(debugTail)
+				}
+				if approval != nil {
+					m.logger.Info("yolo auto-approve", "id", s.ID, "matched", approval.Matched)
+					time.AfterFunc(yoloApproveDelay, func() {
+						if !s.IsYoloMode() {
+							return
+						}
+						if _, err := s.Write([]byte("\r")); err != nil {
+							m.logger.Debug("yolo write error", "id", s.ID, "err", err)
+						}
+					})
+				}
+
+				// attachment detection
+				if newAttachments := s.CheckAttachments(data); len(newAttachments) > 0 {
+					s.BroadcastAttachments(newAttachments)
+				}
+
+				// context tracking
+				s.TrackContext(data)
+
+			case OutputCapturing:
+				s.scrollback.Write(data)
+				s.appendCapture(data)
+
+			case OutputSuppressing:
+				// Don't write to scrollback or broadcast — prevents leaking
+				// startup output on reconnect.
+				s.noteOutputTime()
+				// Still capture tool session IDs during suppression (codex)
+				s.CaptureToolSessionID(data)
 			}
 		}
 		if err != nil {
@@ -547,7 +612,29 @@ func (m *Manager) awaitReadDone(s *Session) {
 }
 
 // completeExit captures final output, updates session state, and notifies.
+// Safe to call multiple times; only the first non-compacting call takes effect.
 func (m *Manager) completeExit(s *Session, exitCode int) {
+	lc := Lifecycle(s.lifecycle.Load())
+
+	if lc == LifecycleCompacting {
+		// Compaction in progress: signal compactReady but don't close done.
+		// WebSocket connections stay alive.
+		// Hold s.mu to ensure compactReady is initialized (see Run()).
+		s.mu.Lock()
+		s.compactOnce.Do(func() { close(s.compactReady) })
+		s.mu.Unlock()
+		return
+	}
+
+	if lc == LifecycleExited {
+		return // already exited
+	}
+
+	// Atomically claim the exit transition; bail if another goroutine won.
+	if !s.lifecycle.CompareAndSwap(int32(lc), int32(LifecycleExited)) {
+		return
+	}
+
 	// capture last output from scrollback
 	scrollback := s.scrollback.Bytes()
 	if len(scrollback) > maxLastOutput {
@@ -560,8 +647,15 @@ func (m *Manager) completeExit(s *Session, exitCode int) {
 	s.ExitCode = &exitCode
 	s.mu.Unlock()
 
-	close(s.done)
+	s.doneOnce.Do(func() { close(s.done) })
 	m.save()
+
+	// Stop context estimator
+	s.mu.Lock()
+	if s.context != nil {
+		s.context.Stop()
+	}
+	s.mu.Unlock()
 
 	// Stop child sessions when parent exits
 	shellTool := ShellToolName()

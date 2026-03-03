@@ -200,6 +200,11 @@ func buildInternalToolRestartArgs(origArgs []string, toolSessionID string) []str
 	return nil // shell sessions restart from scratch
 }
 
+// checkTmuxPaneDead is a no-op on Windows (no tmux).
+func checkTmuxPaneDead(_ string) (bool, int) {
+	return false, 0
+}
+
 // tmuxRunAction is not available on Windows.
 func tmuxRunAction(sessionName, action string) error {
 	return fmt.Errorf("tmux actions are not supported on Windows")

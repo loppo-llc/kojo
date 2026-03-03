@@ -48,6 +48,14 @@ export interface Attachment {
   createdAt: string;
 }
 
+export interface ContextInfo {
+  estimatedTokens: number;
+  contextWindow: number;
+  usagePercent: number;
+  source: "pty_bytes" | "transcript";
+  compactionCount: number;
+}
+
 export interface GitStatus {
   branch: string;
   ahead: number;

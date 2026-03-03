@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,6 +18,28 @@ const (
 	StatusRunning Status = "running"
 	StatusExited  Status = "exited"
 )
+
+// Lifecycle represents the session's lifecycle state.
+type Lifecycle int32
+
+const (
+	LifecycleRunning    Lifecycle = iota
+	LifecycleCompacting           // compaction in progress, blocks Stop/Restart/Remove
+	LifecycleRestarting           // restart in progress
+	LifecycleExited
+)
+
+// OutputMode controls how readLoop handles PTY output.
+type OutputMode int32
+
+const (
+	OutputNormal      OutputMode = iota
+	OutputCapturing              // accumulate output for summary extraction
+	OutputSuppressing            // discard output (startup suppression after compaction)
+)
+
+// maxCaptureSize is the maximum bytes to accumulate in capture mode.
+const maxCaptureSize = 1024 * 1024
 
 type Session struct {
 	mu              sync.Mutex
@@ -34,7 +57,7 @@ type Session struct {
 	ToolSessionID string // tool-specific session ID for resume
 	ParentID        string // parent session ID (e.g. tmux child of a CLI session)
 	TmuxSessionName string // tmux session name (kojo_<id>) for tmux-backed sessions
-	restarting      bool   // true while Restart is in progress, prevents concurrent Stop
+	lifecycle atomic.Int32 // Lifecycle enum; replaces restarting bool
 
 	// pipe-pane: raw pane output captured via FIFO (bypasses tmux screen-diff batching)
 	rawPipe     *os.File // FIFO reader, nil if pipe-pane is not active
@@ -51,8 +74,29 @@ type Session struct {
 	subscribers map[chan []byte]struct{}
 	subMu       sync.Mutex
 
-	// done signal
-	done chan struct{}
+	// done is the session-wide lifecycle signal.
+	// Only closed when the session fully exits (not during compaction).
+	// Recreated on Restart (exited→running transition; WS has already received exit).
+	done     chan struct{}
+	doneOnce sync.Once // protects close(done) from double-close panic
+
+	// outputMode controls readLoop behavior (atomic for hot path)
+	outputMode atomic.Int32
+
+	// capture buffer for compaction summary extraction
+	captureMu  sync.Mutex
+	captureBuf []byte
+
+	// compaction synchronization
+	compactReady chan struct{} // closed by completeExit when lifecycle==compacting
+	compactOnce  sync.Once
+
+	// context estimation
+	context     *ContextEstimator
+	contextSubs map[chan *ContextInfo]struct{}
+
+	// last output timestamp for ready detection during suppressing mode
+	lastOutputAt atomic.Int64
 
 	// codex: trailing buffer for session ID capture across chunk boundaries
 	codexCaptureBuf []byte
@@ -239,7 +283,90 @@ func (s *Session) BroadcastAttachments(attachments []*Attachment) {
 	}
 }
 
+// InjectOutput writes synthetic data directly to scrollback and broadcast,
+// bypassing the PTY. Used for compaction banners.
+func (s *Session) InjectOutput(data []byte) {
+	out := make([]byte, len(data))
+	copy(out, data)
+	s.scrollback.Write(out)
+	s.broadcast(out)
+}
+
+// SubscribeContext returns a channel that receives context info updates.
+func (s *Session) SubscribeContext() chan *ContextInfo {
+	ch := make(chan *ContextInfo, 16)
+	s.subMu.Lock()
+	if s.contextSubs == nil {
+		s.contextSubs = make(map[chan *ContextInfo]struct{})
+	}
+	s.contextSubs[ch] = struct{}{}
+	s.subMu.Unlock()
+	return ch
+}
+
+// UnsubscribeContext removes a context subscriber.
+func (s *Session) UnsubscribeContext(ch chan *ContextInfo) {
+	s.subMu.Lock()
+	delete(s.contextSubs, ch)
+	s.subMu.Unlock()
+	close(ch)
+}
+
+// BroadcastContext sends context info to all subscribers.
+func (s *Session) BroadcastContext(info *ContextInfo) {
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	for ch := range s.contextSubs {
+		select {
+		case ch <- info:
+		default:
+		}
+	}
+}
+
+// ContextInfo returns the current context estimation, or nil if unavailable.
+// context is set once at creation and never changed, so no mutex needed.
+func (s *Session) ContextInfo() *ContextInfo {
+	if s.context == nil {
+		return nil
+	}
+	return s.context.Info()
+}
+
+// appendCapture adds data to the capture buffer (capped at maxCaptureSize).
+func (s *Session) appendCapture(data []byte) {
+	s.captureMu.Lock()
+	defer s.captureMu.Unlock()
+	remaining := maxCaptureSize - len(s.captureBuf)
+	if remaining <= 0 {
+		return
+	}
+	if len(data) > remaining {
+		data = data[:remaining]
+	}
+	s.captureBuf = append(s.captureBuf, data...)
+}
+
+// noteOutputTime records the current time for silence-based ready detection.
+func (s *Session) noteOutputTime() {
+	s.lastOutputAt.Store(time.Now().UnixMilli())
+}
+
+// GetLifecycle returns the current lifecycle state.
+func (s *Session) GetLifecycle() Lifecycle {
+	return Lifecycle(s.lifecycle.Load())
+}
+
 func (s *Session) Write(data []byte) (int, error) {
+	// Block user input during compaction to avoid corrupting flush/inject flow.
+	if Lifecycle(s.lifecycle.Load()) == LifecycleCompacting {
+		return len(data), nil // silently discard
+	}
+	return s.writePTY(data)
+}
+
+// writePTY writes to PTY, bypassing lifecycle checks. Used by compaction orchestrator.
+func (s *Session) writePTY(data []byte) (int, error) {
 	// Retry briefly when PTY is nil (e.g. during tmux reattach) to avoid
 	// silently dropping user input during the short reconnection window.
 	// Uses s.done to bail out early if the session exits during the wait.
@@ -348,4 +475,16 @@ func (s *Session) CheckYolo(data []byte) (*YoloApproval, string) {
 		Matched:  matched,
 		Response: "",
 	}, cleanStr
+}
+
+// TrackContext feeds output data to the context estimator.
+// context is set once at creation and never changed, so no mutex needed.
+func (s *Session) TrackContext(data []byte) {
+	if s.context == nil {
+		return
+	}
+	info := s.context.Track(data)
+	if info != nil {
+		s.BroadcastContext(info)
+	}
 }

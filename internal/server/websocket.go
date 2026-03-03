@@ -54,6 +54,11 @@ type WSAttachmentMsg struct {
 	Attachments []*session.Attachment `json:"attachments"`
 }
 
+type WSContextMsg struct {
+	Type    string                `json:"type"`
+	Context *session.ContextInfo `json:"context"`
+}
+
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.URL.Query().Get("session")
 	if sessionID == "" {
@@ -95,6 +100,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	attachCh := sess.SubscribeAttachments()
 	defer sess.UnsubscribeAttachments(attachCh)
 
+	contextCh := sess.SubscribeContext()
+	defer sess.UnsubscribeContext(contextCh)
+
 	// send scrollback
 	if len(scrollback) > 0 {
 		msg := WSScrollbackMsg{
@@ -112,6 +120,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			Type:        "attachment",
 			Attachments: atts,
 		}
+		if err := writeJSON(ctx, conn, msg); err != nil {
+			return
+		}
+	}
+
+	// send initial context info
+	if ctxInfo := sess.ContextInfo(); ctxInfo != nil {
+		msg := WSContextMsg{Type: "context", Context: ctxInfo}
 		if err := writeJSON(ctx, conn, msg); err != nil {
 			return
 		}
@@ -141,7 +157,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	go s.wsPingLoop(ctx, cancel, conn)
 
 	// write to client
-	s.wsWriteLoop(ctx, conn, sess, ch, yoloCh, attachCh)
+	s.wsWriteLoop(ctx, conn, sess, ch, yoloCh, attachCh, contextCh)
 }
 
 func (s *Server) wsPingLoop(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn) {
@@ -207,7 +223,7 @@ func (s *Server) wsReadLoop(ctx context.Context, cancel context.CancelFunc, conn
 	}
 }
 
-func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, sess *session.Session, ch chan []byte, yoloCh chan string, attachCh chan []*session.Attachment) {
+func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, sess *session.Session, ch chan []byte, yoloCh chan string, attachCh chan []*session.Attachment, contextCh chan *session.ContextInfo) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -251,6 +267,14 @@ func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, sess *se
 			msg := WSAttachmentMsg{
 				Type:        "attachment",
 				Attachments: attachments,
+			}
+			if err := writeJSON(ctx, conn, msg); err != nil {
+				return
+			}
+		case ctxInfo := <-contextCh:
+			msg := WSContextMsg{
+				Type:    "context",
+				Context: ctxInfo,
 			}
 			if err := writeJSON(ctx, conn, msg); err != nil {
 				return

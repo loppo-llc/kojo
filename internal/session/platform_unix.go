@@ -622,6 +622,16 @@ func (m *Manager) finalizeTmuxSession(s *Session, exitCode int, attachExited <-c
 	m.completeExit(s, exitCode)
 }
 
+// checkTmuxPaneDead checks if a tmux pane is dead, treating errors
+// (e.g. session already killed) as dead.
+func checkTmuxPaneDead(tmuxName string) (bool, int) {
+	dead, exitCode, err := tmuxPaneDead(tmuxName)
+	if err != nil {
+		return true, 1
+	}
+	return dead, exitCode
+}
+
 // tmuxAttachResult holds the outputs from startTmuxAttach.
 type tmuxAttachResult struct {
 	ptmx        *os.File

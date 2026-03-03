@@ -5,11 +5,12 @@ import "sync"
 const defaultRingSize = 1024 * 1024 // 1MB
 
 type RingBuffer struct {
-	mu   sync.Mutex
-	buf  []byte
-	size int
-	w    int
-	full bool
+	mu           sync.Mutex
+	buf          []byte
+	size         int
+	w            int
+	full         bool
+	totalWritten int64
 }
 
 func NewRingBuffer(size int) *RingBuffer {
@@ -23,6 +24,7 @@ func (r *RingBuffer) Write(p []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	r.totalWritten += int64(len(p))
 	for _, b := range p {
 		r.buf[r.w] = b
 		r.w++
@@ -31,6 +33,18 @@ func (r *RingBuffer) Write(p []byte) {
 			r.full = true
 		}
 	}
+}
+
+func (r *RingBuffer) TotalWritten() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.totalWritten
+}
+
+func (r *RingBuffer) ResetTotalWritten() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.totalWritten = 0
 }
 
 func (r *RingBuffer) Bytes() []byte {

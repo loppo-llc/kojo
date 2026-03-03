@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useNavigate, useLocation } from "react-router";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { useTerminal } from "../hooks/useTerminal";
-import { api, type SessionInfo, type Attachment } from "../lib/api";
+import { api, type SessionInfo, type Attachment, type ContextInfo } from "../lib/api";
 import { restoreScrollback } from "../lib/utils";
 import { useSpecialKeys } from "../hooks/useSpecialKeys";
 import { FileBrowser } from "./FileBrowser";
@@ -10,6 +10,7 @@ import { GitPanel } from "./GitPanel";
 import { SpecialKeysBar } from "./SpecialKeysBar";
 import { TerminalTab } from "./TerminalTab";
 import { AttachmentsTab } from "./AttachmentsTab";
+import { ContextBar } from "./ContextBar";
 
 type SessionTab = "cli" | "terminal" | "files" | "git" | "attachments";
 
@@ -84,6 +85,7 @@ export function SessionPage() {
   }, [xtermRef]);
 
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [contextInfo, setContextInfo] = useState<ContextInfo | null>(null);
 
   const mergeAttachments = useCallback((incoming: Attachment[]) => {
     setAttachments((prev) => {
@@ -94,6 +96,10 @@ export function SessionPage() {
   }, []);
 
   const onAttachment = mergeAttachments;
+
+  const onContext = useCallback((ctx: ContextInfo) => {
+    setContextInfo(ctx);
+  }, []);
 
   const onYoloDebug = useCallback((tail: string) => {
     yoloTailRef.current = tail;
@@ -117,6 +123,7 @@ export function SessionPage() {
     onExit,
     onYoloDebug,
     onAttachment,
+    onContext,
     onConnected: immediateFit,
   });
   sendInputRef.current = sendInput;
@@ -137,6 +144,7 @@ export function SessionPage() {
   useEffect(() => {
     setExited(false);
     setAttachments([]);
+    setContextInfo(null);
     gotScrollbackRef.current = false;
     api.sessions.get(id!).then((s) => {
       setSession(s);
@@ -244,6 +252,7 @@ export function SessionPage() {
         </button>
         <span className="font-mono font-bold">{session?.tool}</span>
         <span className="text-xs text-neutral-500 truncate flex-1">{session?.workDir}</span>
+        {contextInfo && !exited && <ContextBar context={contextInfo} />}
         {exited ? (
           session?.exitCode !== undefined && (
             <span className="text-xs text-neutral-600">exit {session.exitCode}</span>
