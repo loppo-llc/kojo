@@ -87,7 +87,7 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), cronTimeout)
 	defer cancel()
 
-	events, err := cs.mgr.Chat(ctx, agentID, cronPrompt)
+	events, err := cs.mgr.Chat(ctx, agentID, cronPrompt, "system")
 	if err != nil {
 		cs.logger.Warn("cron chat failed", "agent", agentID, "err", err)
 		return

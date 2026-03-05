@@ -3,6 +3,7 @@ import { useParams, useNavigate } from "react-router";
 import { agentApi, type AgentInfo, type AgentMessage, type ChatEvent } from "../../lib/agentApi";
 import { useAgentWebSocket } from "../../hooks/useAgentWebSocket";
 import { ChatMessage, StreamingMessage } from "./ChatMessage";
+import { AgentAvatar } from "./AgentAvatar";
 
 export function AgentChat() {
   const { id } = useParams<{ id: string }>();
@@ -30,13 +31,23 @@ export function AgentChat() {
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages, streamText, scrollToBottom]);
+  }, [messages, scrollToBottom]);
+
+  const resetStream = useCallback(() => {
+    setStreaming(false);
+    setStreamText("");
+    setStreamTools([]);
+    setStreamStatus("");
+  }, []);
 
   const onEvent = useCallback(
     (event: ChatEvent) => {
       switch (event.type) {
         case "status":
           setStreamStatus(event.status ?? "");
+          if (event.status === "thinking") {
+            setStreaming(true);
+          }
           break;
         case "text":
           setStreamText((prev) => prev + (event.delta ?? ""));
@@ -63,30 +74,40 @@ export function AgentChat() {
           break;
         case "done":
           if (event.message) {
-            setMessages((prev) => [...prev, event.message!]);
+            // Deduplicate by message ID (bgDone may overlap with initial load)
+            setMessages((prev) =>
+              prev.some((m) => m.id === event.message!.id)
+                ? prev
+                : [...prev, event.message!],
+            );
+          } else if (id) {
+            // Background chat finished — reload messages from transcript
+            agentApi.messages(id, 100).then(setMessages).catch(console.error);
           }
-          setStreaming(false);
-          setStreamText("");
-          setStreamTools([]);
-          setStreamStatus("");
+          resetStream();
           break;
-        case "error":
-          setStreaming(false);
-          setStreamText("");
-          setStreamTools([]);
-          setStreamStatus("");
+        case "error": {
+          const errorMsg = event.errorMessage || "An error occurred";
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: "error_" + Date.now(),
+              role: "system",
+              content: `⚠️ Error: ${errorMsg}`,
+              timestamp: new Date().toISOString(),
+            },
+          ]);
+          resetStream();
           break;
+        }
       }
     },
-    [],
+    [id, resetStream],
   );
 
   const onDisconnect = useCallback(() => {
-    setStreaming(false);
-    setStreamText("");
-    setStreamTools([]);
-    setStreamStatus("");
-  }, []);
+    resetStream();
+  }, [resetStream]);
 
   const { connected, sendMessage, abort } = useAgentWebSocket({
     agentId: id!,
@@ -147,11 +168,7 @@ export function AgentChat() {
         >
           &larr;
         </button>
-        <img
-          src={agentApi.avatarUrl(agent.id)}
-          alt={agent.name}
-          className="w-8 h-8 rounded-full object-cover bg-neutral-800"
-        />
+        <AgentAvatar agentId={agent.id} name={agent.name} size="md" />
         <div className="flex-1 min-w-0">
           <div className="font-medium text-sm truncate">{agent.name}</div>
           <div className="text-xs text-neutral-500">

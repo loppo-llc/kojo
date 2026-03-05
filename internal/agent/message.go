@@ -58,6 +58,15 @@ func newUserMessage(content string) *Message {
 	}
 }
 
+func newSystemMessage(content string) *Message {
+	return &Message{
+		ID:        generateMessageID(),
+		Role:      "system",
+		Content:   content,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
 func newAssistantMessage() *Message {
 	return &Message{
 		ID:        generateMessageID(),

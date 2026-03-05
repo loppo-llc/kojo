@@ -43,6 +43,43 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.Info("agent websocket connected", "agent", agentID)
 
+	// If the agent has a chat running in the background (e.g. user navigated
+	// away and came back), notify the client and monitor completion.
+	var bgDone <-chan agent.ChatEvent
+	if s.agents.IsBusy(agentID) {
+		_ = writeJSON(ctx, conn, map[string]string{
+			"type":   "status",
+			"status": "thinking",
+		})
+		ch := make(chan agent.ChatEvent, 1)
+		bgDone = ch
+		go func() {
+			defer close(ch)
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if !s.agents.IsBusy(agentID) {
+						// Chat finished — send the latest assistant message
+						msgs, _ := s.agents.Messages(agentID, 1)
+						if len(msgs) > 0 && msgs[len(msgs)-1].Role == "assistant" {
+							ch <- agent.ChatEvent{
+								Type:    "done",
+								Message: msgs[len(msgs)-1],
+							}
+						} else {
+							ch <- agent.ChatEvent{Type: "done"}
+						}
+						return
+					}
+				}
+			}
+		}()
+	}
+
 	// Channel for client messages (read goroutine → main loop)
 	clientMsgs := make(chan agentWSClientMsg, 8)
 
@@ -94,6 +131,11 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-ctx.Done():
 			return
+		case event, ok := <-bgDone:
+			if ok {
+				_ = writeJSON(ctx, conn, event)
+			}
+			bgDone = nil // stop selecting on this channel
 		case msg := <-clientMsgs:
 			switch msg.Type {
 			case "message":
@@ -116,8 +158,9 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 					"status": "thinking",
 				})
 
-				// Start chat
-				events, err := s.agents.Chat(ctx, agentID, msg.Content)
+				// Use background context for chat so it survives WebSocket disconnects.
+				// The response is saved to transcript even if the client navigates away.
+				events, err := s.agents.Chat(context.Background(), agentID, msg.Content, "user")
 				if err != nil {
 					_ = writeJSON(ctx, conn, map[string]string{
 						"type":         "error",
@@ -148,14 +191,15 @@ func (s *Server) streamAgentEvents(
 	for {
 		select {
 		case <-ctx.Done():
-			s.agents.Abort(agentID)
+			// WebSocket disconnected — let chat continue in background.
+			// Don't abort: the response will be saved to transcript.
 			return
 		case event, ok := <-events:
 			if !ok {
 				return // channel closed
 			}
 			if err := writeJSON(ctx, conn, event); err != nil {
-				s.agents.Abort(agentID)
+				// Write failed (WS disconnected) — let chat continue.
 				return
 			}
 		case msg := <-clientMsgs:

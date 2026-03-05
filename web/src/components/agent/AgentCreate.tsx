@@ -245,7 +245,7 @@ export function AgentCreate() {
               type="button"
               onClick={handleAvatarClick}
               disabled={isGenerating}
-              className="w-16 h-16 rounded-full bg-neutral-800 border border-neutral-700 overflow-hidden flex items-center justify-center hover:border-neutral-500 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+              className="w-24 h-24 rounded-full bg-neutral-800 border border-neutral-700 overflow-hidden flex items-center justify-center hover:border-neutral-500 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
               title="Click to upload avatar"
             >
               {avatarPreviewUrl ? (

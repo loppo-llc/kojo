@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -49,10 +51,18 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		args = append(args, "--model", agent.Model)
 	}
 
-	// Use session-id for conversation continuity.
-	// Claude CLI requires UUID format, so derive one from agent ID.
-	sessionID := agentIDToUUID(agent.ID)
-	args = append(args, "--session-id", sessionID)
+	// Use --continue for conversation continuity when a session already exists
+	// in the agent's working directory. Otherwise use --session-id to create
+	// a new session with a deterministic UUID derived from the agent ID.
+	dir := agentDir(agent.ID)
+	os.MkdirAll(dir, 0o755)
+
+	if hasExistingSession(dir) {
+		args = append(args, "--continue")
+	} else {
+		sessionID := agentIDToUUID(agent.ID)
+		args = append(args, "--session-id", sessionID)
+	}
 
 	cmd := exec.CommandContext(ctx, claudePath, args...)
 
@@ -66,11 +76,11 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		filtered = append(filtered, e)
 	}
 	cmd.Env = filtered
-
-	// Set working directory to agent's data directory
-	dir := agentDir(agent.ID)
-	os.MkdirAll(dir, 0o755)
 	cmd.Dir = dir
+
+	// Capture stderr for error diagnostics (limit to 4KB to prevent memory issues)
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &limitedWriter{w: &stderrBuf, limit: 4096}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -195,9 +205,13 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 		// Check process exit status
 		if err := cmd.Wait(); err != nil {
-			b.logger.Warn("claude process exited with error", "err", err)
+			b.logger.Warn("claude process exited with error", "err", err, "stderr", stderrBuf.String())
 			if fullText.Len() == 0 && len(toolUses) == 0 {
-				send(ChatEvent{Type: "error", ErrorMessage: fmt.Sprintf("claude exited with error: %v", err)})
+				errMsg := strings.TrimSpace(stderrBuf.String())
+				if errMsg == "" {
+					errMsg = err.Error()
+				}
+				send(ChatEvent{Type: "error", ErrorMessage: errMsg})
 				return
 			}
 		}
@@ -253,11 +267,71 @@ type claudeStreamEvent struct {
 	Content string `json:"content,omitempty"`
 }
 
+// limitedWriter wraps a bytes.Buffer and stops writing after limit bytes.
+type limitedWriter struct {
+	w     *bytes.Buffer
+	limit int
+}
+
+func (lw *limitedWriter) Write(p []byte) (int, error) {
+	remaining := lw.limit - lw.w.Len()
+	if remaining <= 0 {
+		return len(p), nil // discard silently
+	}
+	toWrite := p
+	if len(toWrite) > remaining {
+		toWrite = toWrite[:remaining]
+	}
+	lw.w.Write(toWrite)
+	// Always report full len(p) to avoid io.ErrShortWrite from callers.
+	return len(p), nil
+}
+
 func truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// claudeConfigDir returns the Claude configuration root, respecting
+// CLAUDE_CONFIG_DIR if set, otherwise falling back to ~/.claude.
+func claudeConfigDir() string {
+	if d := os.Getenv("CLAUDE_CONFIG_DIR"); d != "" {
+		return d
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = os.Getenv("HOME")
+	}
+	return filepath.Join(home, ".claude")
+}
+
+// hasExistingSession checks whether a Claude session JSONL file already exists
+// for the given agent working directory by looking at Claude's project data.
+func hasExistingSession(agentDir string) bool {
+	absDir, err := filepath.Abs(agentDir)
+	if err != nil {
+		return false
+	}
+	// Claude stores sessions in <config>/projects/<encoded-path>/
+	// The path encoding replaces "/", ".", and "_" with "-".
+	encoded := strings.NewReplacer(
+		string(filepath.Separator), "-",
+		".", "-",
+		"_", "-",
+	).Replace(absDir)
+	projectDir := filepath.Join(claudeConfigDir(), "projects", encoded)
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
+			return true
+		}
+	}
+	return false
 }
 
 // agentIDToUUID converts an agent ID (e.g. "ag_8cf247118ad856e8") to a

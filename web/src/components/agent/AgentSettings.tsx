@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router";
 import { agentApi, type AgentInfo } from "../../lib/agentApi";
+import { AgentAvatar } from "./AgentAvatar";
 
 export function AgentSettings() {
   const { id } = useParams<{ id: string }>();
@@ -110,11 +111,7 @@ export function AgentSettings() {
       <main className="p-4 space-y-5 max-w-md mx-auto">
         {/* Avatar */}
         <div className="flex items-center gap-4">
-          <img
-            src={agentApi.avatarUrl(agent.id) + "?t=" + avatarToken}
-            alt={agent.name}
-            className="w-16 h-16 rounded-full object-cover bg-neutral-800"
-          />
+          <AgentAvatar agentId={agent.id} name={agent.name} size="xl" cacheBust={avatarToken} />
           <div className="flex gap-2">
             <button
               onClick={() => fileRef.current?.click()}

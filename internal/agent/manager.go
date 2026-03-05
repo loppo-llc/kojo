@@ -201,7 +201,9 @@ func (m *Manager) Delete(id string) error {
 }
 
 // Chat sends a message to an agent and returns a channel of streaming events.
-func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string) (<-chan ChatEvent, error) {
+// The role parameter controls how the input message is stored in the transcript
+// ("user" for interactive chat, "system" for cron-triggered messages).
+func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, role string) (<-chan ChatEvent, error) {
 	m.mu.Lock()
 	a, ok := m.agents[agentID]
 	if !ok {
@@ -230,10 +232,15 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string) 
 		return nil, fmt.Errorf("unsupported tool: %s", agentCopy.Tool)
 	}
 
-	// Save user message to transcript
-	userMsg := newUserMessage(userMessage)
-	if err := appendMessage(agentID, userMsg); err != nil {
-		m.logger.Warn("failed to save user message", "err", err)
+	// Save input message to transcript
+	var inputMsg *Message
+	if role == "system" {
+		inputMsg = newSystemMessage(userMessage)
+	} else {
+		inputMsg = newUserMessage(userMessage)
+	}
+	if err := appendMessage(agentID, inputMsg); err != nil {
+		m.logger.Warn("failed to save input message", "err", err)
 	}
 
 	// Build system prompt
@@ -254,31 +261,50 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string) 
 		defer m.clearBusy(agentID)
 		defer cancel()
 
-		for event := range backendCh {
+		for {
 			select {
-			case outCh <- event:
+			case event, ok := <-backendCh:
+				if !ok {
+					return
+				}
+				// Terminal events (done/error) use blocking send so the
+			// client always receives them. Streaming events use
+			// non-blocking send — if no reader (WS disconnected),
+			// they are dropped but processing continues.
+				if event.Type == "done" || event.Type == "error" {
+					select {
+					case outCh <- event:
+					case <-chatCtx.Done():
+						return
+					}
+				} else {
+					select {
+					case outCh <- event:
+					default:
+					}
+				}
+
+				// Save assistant message to transcript and update last message
+				if event.Type == "done" && event.Message != nil {
+					if err := appendMessage(agentID, event.Message); err != nil {
+						m.logger.Warn("failed to save assistant message", "err", err)
+					}
+
+					// Update last message preview
+					m.mu.Lock()
+					if ag, ok := m.agents[agentID]; ok {
+						ag.LastMessage = &MessagePreview{
+							Content:   truncatePreview(event.Message.Content, 100),
+							Role:      event.Message.Role,
+							Timestamp: event.Message.Timestamp,
+						}
+						ag.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+					}
+					m.mu.Unlock()
+					m.save()
+				}
 			case <-chatCtx.Done():
 				return
-			}
-
-			// On "done", save assistant message to transcript and update last message
-			if event.Type == "done" && event.Message != nil {
-				if err := appendMessage(agentID, event.Message); err != nil {
-					m.logger.Warn("failed to save assistant message", "err", err)
-				}
-
-				// Update last message preview
-				m.mu.Lock()
-				if ag, ok := m.agents[agentID]; ok {
-					ag.LastMessage = &MessagePreview{
-						Content:   truncatePreview(event.Message.Content, 100),
-						Role:      event.Message.Role,
-						Timestamp: event.Message.Timestamp,
-					}
-					ag.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-				}
-				m.mu.Unlock()
-				m.save()
 			}
 		}
 	}()
