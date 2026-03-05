@@ -159,6 +159,28 @@ func (s *Server) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 
 // --- Generate Handlers ---
 
+func (s *Server) handleGeneratePersona(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CurrentPersona string `json:"currentPersona"`
+		Prompt         string `json:"prompt"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	if req.Prompt == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "prompt is required")
+		return
+	}
+
+	persona, err := agent.GeneratePersona(req.CurrentPersona, req.Prompt)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]string{"persona": persona})
+}
+
 func (s *Server) handleGenerateName(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Persona string `json:"persona"`

@@ -118,6 +118,9 @@ export const agentApi = {
       `/api/v1/agents/${id}/messages?limit=${limit}`,
     ).then((r) => r.messages ?? []),
 
+  generatePersona: (currentPersona: string, prompt: string) =>
+    post<{ persona: string }>("/api/v1/agents/generate-persona", { currentPersona, prompt }),
+
   generateName: (persona: string, prompt?: string) =>
     post<{ name: string }>("/api/v1/agents/generate-name", { persona, prompt }),
 

@@ -3,7 +3,7 @@ import { useNavigate } from "react-router";
 import { agentApi } from "../../lib/agentApi";
 import { api, type ServerInfo } from "../../lib/api";
 
-type GenPhase = "idle" | "name" | "avatar" | "all-name" | "all-avatar";
+type GenPhase = "idle" | "persona" | "name" | "avatar" | "all-name" | "all-avatar";
 
 export function AgentCreate() {
   const navigate = useNavigate();
@@ -14,6 +14,7 @@ export function AgentCreate() {
   const [tool, setTool] = useState("claude");
   const [cronExpr, setCronExpr] = useState("*/30 * * * *");
   const [genPrompt, setGenPrompt] = useState("");
+  const [personaPrompt, setPersonaPrompt] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -44,6 +45,27 @@ export function AgentCreate() {
     if (blobUrlRef.current) {
       URL.revokeObjectURL(blobUrlRef.current);
       blobUrlRef.current = "";
+    }
+  };
+
+  const handleGeneratePersona = async () => {
+    if (!personaPrompt.trim()) {
+      setError("Enter a prompt to generate persona");
+      return;
+    }
+    setGenPhase("persona");
+    setError("");
+    try {
+      const result = await agentApi.generatePersona(
+        persona.trim(),
+        personaPrompt.trim(),
+      );
+      setPersona(result.persona);
+      setPersonaPrompt("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setGenPhase("idle");
     }
   };
 
@@ -204,11 +226,13 @@ export function AgentCreate() {
   };
 
   const genStatusText =
-    genPhase === "all-name" || genPhase === "name"
-      ? "Generating name..."
-      : genPhase === "all-avatar" || genPhase === "avatar"
-        ? "Generating avatar..."
-        : "";
+    genPhase === "persona"
+      ? "Generating persona..."
+      : genPhase === "all-name" || genPhase === "name"
+        ? "Generating name..."
+        : genPhase === "all-avatar" || genPhase === "avatar"
+          ? "Generating avatar..."
+          : "";
 
   return (
     <div className="min-h-full bg-neutral-950 text-neutral-200">
@@ -235,6 +259,32 @@ export function AgentCreate() {
             rows={5}
             className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm resize-none focus:outline-none focus:border-neutral-500"
           />
+          <div className="flex gap-2 mt-2">
+            <input
+              type="text"
+              value={personaPrompt}
+              onChange={(e) => setPersonaPrompt(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey && !isGenerating) {
+                  e.preventDefault();
+                  handleGeneratePersona();
+                }
+              }}
+              placeholder="e.g. ツンデレな女の子にして"
+              className="flex-1 px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-xs focus:outline-none focus:border-neutral-500"
+            />
+            <button
+              onClick={handleGeneratePersona}
+              disabled={isGenerating || !personaPrompt.trim()}
+              className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-xs disabled:opacity-40 flex items-center gap-1"
+            >
+              {genPhase === "persona" ? (
+                <span className="animate-spin">↻</span>
+              ) : (
+                "✨ AI"
+              )}
+            </button>
+          </div>
         </div>
 
         {/* Avatar + Name + Hint */}

@@ -18,6 +18,8 @@ export function AgentSettings() {
   const [success, setSuccess] = useState(false);
   const [avatarToken, setAvatarToken] = useState(() => Date.now());
   const [generatingAvatar, setGeneratingAvatar] = useState(false);
+  const [personaPrompt, setPersonaPrompt] = useState("");
+  const [generatingPersona, setGeneratingPersona] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -75,6 +77,21 @@ export function AgentSettings() {
       setAgent((a) => (a ? { ...a, hasAvatar: true } : a));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleGeneratePersona = async () => {
+    if (!personaPrompt.trim()) return;
+    setGeneratingPersona(true);
+    setError("");
+    try {
+      const result = await agentApi.generatePersona(persona.trim(), personaPrompt.trim());
+      setPersona(result.persona);
+      setPersonaPrompt("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setGeneratingPersona(false);
     }
   };
 
@@ -162,6 +179,32 @@ export function AgentSettings() {
             rows={6}
             className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm resize-none focus:outline-none focus:border-neutral-500"
           />
+          <div className="flex gap-2 mt-2">
+            <input
+              type="text"
+              value={personaPrompt}
+              onChange={(e) => setPersonaPrompt(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey && !generatingPersona) {
+                  e.preventDefault();
+                  handleGeneratePersona();
+                }
+              }}
+              placeholder="e.g. もっと毒舌にして"
+              className="flex-1 px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-xs focus:outline-none focus:border-neutral-500"
+            />
+            <button
+              onClick={handleGeneratePersona}
+              disabled={generatingPersona || !personaPrompt.trim()}
+              className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-xs disabled:opacity-40 flex items-center gap-1"
+            >
+              {generatingPersona ? (
+                <span className="animate-spin">↻</span>
+              ) : (
+                "✨ AI"
+              )}
+            </button>
+          </div>
         </div>
 
         {/* Model */}

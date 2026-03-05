@@ -127,6 +127,7 @@ func New(cfg Config) *Server {
 		mux.HandleFunc("POST /api/v1/agents/{id}/avatar", s.handleUploadAvatar)
 		mux.HandleFunc("GET /api/v1/agents/{id}/messages", s.handleGetMessages)
 		mux.HandleFunc("POST /api/v1/agents/{id}/avatar/generated", s.handleUploadGeneratedAvatar)
+		mux.HandleFunc("POST /api/v1/agents/generate-persona", s.handleGeneratePersona)
 		mux.HandleFunc("POST /api/v1/agents/generate-name", s.handleGenerateName)
 		mux.HandleFunc("POST /api/v1/agents/generate-avatar", s.handleGenerateAvatar)
 		mux.HandleFunc("GET /api/v1/agents/preview-avatar", s.handlePreviewAvatar)

@@ -13,6 +13,32 @@ import (
 const geminiModel = "gemini-2.5-flash"
 const geminiAPI = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s"
 
+// GeneratePersona elaborates or refines a persona description using Gemini API.
+// currentPersona may be empty (generate from scratch) or non-empty (refine existing).
+func GeneratePersona(currentPersona string, userPrompt string) (string, error) {
+	apiKey, err := loadGeminiAPIKey()
+	if err != nil {
+		return "", err
+	}
+
+	var prompt string
+	if currentPersona == "" {
+		prompt = "以下の要望に基づいて、AIエージェントの人格設定（ペルソナ）を具体的に作成して。" +
+			"性格、口調、一人称、語尾、行動パターン、好み等を含めて。マークダウン形式で出力。ペルソナ設定のみ出力し、余計な説明は不要。\n\n要望: " + userPrompt
+	} else {
+		prompt = "以下の既存ペルソナ設定を、追加の要望に基づいて編集・具体化して。" +
+			"マークダウン形式で出力。編集後のペルソナ設定のみ出力し、余計な説明は不要。\n\n" +
+			"既存ペルソナ:\n" + currentPersona + "\n\n追加要望: " + userPrompt
+	}
+
+	result, err := callGemini(apiKey, prompt)
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(result), nil
+}
+
 // GenerateName generates a character name using Gemini API based on persona description.
 func GenerateName(persona string, userPrompt string) (string, error) {
 	apiKey, err := loadGeminiAPIKey()
