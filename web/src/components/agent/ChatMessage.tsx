@@ -1,4 +1,4 @@
-import { memo, useState, useCallback, useMemo } from "react";
+import { memo, useState, useCallback, useMemo, useEffect, useRef } from "react";
 import type { AgentMessage } from "../../lib/agentApi";
 import { ToolUseCard } from "./ToolUseCard";
 import { AgentAvatar } from "./AgentAvatar";
@@ -361,7 +361,7 @@ function splitMediaPaths(text: string): Array<{ type: "text" | "media"; value: s
 /** Streaming bubble for assistant response in progress */
 interface StreamingMessageProps {
   text: string;
-  toolUses: Array<{ name: string; input: string; output: string }>;
+  toolUses: Array<{ name: string; input: string; output: string | null }>;
   agentName: string;
   agentId: string;
   status: string;
@@ -376,6 +376,16 @@ export function StreamingMessage({
   status,
   avatarHash,
 }: StreamingMessageProps) {
+  const startTimeRef = useRef(Date.now());
+
+  let activeTool: string | null = null;
+  for (let i = toolUses.length - 1; i >= 0; i--) {
+    if (toolUses[i].output === null) {
+      activeTool = toolUses[i].name;
+      break;
+    }
+  }
+
   return (
     <div className="flex gap-3 flex-row">
       <AgentAvatar agentId={agentId} name={agentName} size="sm" className="mt-1" cacheBust={avatarHash} />
@@ -385,6 +395,7 @@ export function StreamingMessage({
             <span className="w-1.5 h-1.5 bg-neutral-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
             <span className="w-1.5 h-1.5 bg-neutral-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
             <span className="w-1.5 h-1.5 bg-neutral-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+            <ElapsedTimer startTime={startTimeRef.current} threshold={3} className="text-xs text-neutral-500 ml-2" />
           </div>
         )}
         {text && (
@@ -396,13 +407,47 @@ export function StreamingMessage({
         {toolUses.length > 0 && (
           <div className="mt-2">
             {toolUses.map((tu, i) => (
-              <ToolUseCard key={i} toolUse={tu} />
+              <ToolUseCard key={i} toolUse={{ ...tu, output: tu.output ?? "" }} />
             ))}
+          </div>
+        )}
+        {/* Status bar: elapsed time + active tool */}
+        {(text || toolUses.length > 0) && (
+          <div className="flex items-center gap-2 mt-1.5 text-[10px] text-neutral-500">
+            <ElapsedTimer startTime={startTimeRef.current} className="" />
+            {activeTool && (
+              <span className="flex items-center gap-1">
+                <span className="w-1 h-1 bg-blue-400 rounded-full animate-pulse" />
+                {activeTool}
+              </span>
+            )}
           </div>
         )}
       </div>
     </div>
   );
+}
+
+/** Self-contained ticking elapsed timer. Only this component re-renders each second. */
+function ElapsedTimer({ startTime, threshold = 0, className }: { startTime: number; threshold?: number; className?: string }) {
+  const [elapsed, setElapsed] = useState(() => Math.floor((Date.now() - startTime) / 1000));
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startTime) / 1000));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [startTime]);
+
+  if (elapsed < threshold) return null;
+  return <span className={className}>{formatElapsed(elapsed)}</span>;
+}
+
+function formatElapsed(s: number): string {
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return `${m}m${sec > 0 ? `${sec}s` : ""}`;
 }
 
 function formatTime(timestamp: string): string {

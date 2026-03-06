@@ -15,7 +15,7 @@ export function AgentChat() {
   const [input, setInput] = useState(() => sessionStorage.getItem(`agent-draft:${id}`) ?? "");
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
-  const [streamTools, setStreamTools] = useState<Array<{ name: string; input: string; output: string }>>([]);
+  const [streamTools, setStreamTools] = useState<Array<{ name: string; input: string; output: string | null }>>([]);
   const [streamStatus, setStreamStatus] = useState("");
   const [hasMore, setHasMore] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -110,7 +110,7 @@ export function AgentChat() {
           if (event.toolName) {
             setStreamTools((prev) => [
               ...prev,
-              { name: event.toolName!, input: event.toolInput ?? "", output: "" },
+              { name: event.toolName!, input: event.toolInput ?? "", output: null },
             ]);
           }
           break;
@@ -118,7 +118,7 @@ export function AgentChat() {
           setStreamTools((prev) => {
             const copy = [...prev];
             for (let i = copy.length - 1; i >= 0; i--) {
-              if (copy[i].name === event.toolName && !copy[i].output) {
+              if (copy[i].name === event.toolName && copy[i].output === null) {
                 copy[i] = { ...copy[i], output: event.toolOutput ?? "" };
                 break;
               }
