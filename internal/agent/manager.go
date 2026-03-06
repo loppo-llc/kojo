@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -344,6 +345,12 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 				if !ok {
 					return
 				}
+				// Convert rate-limit notices to system messages before
+				// sending, so both UI and transcript see the same role.
+				if event.Type == "done" && event.Message != nil && isRateLimitMessage(event.Message) {
+					event.Message.Role = "system"
+				}
+
 				// Terminal events (done/error) use blocking send so the
 			// client always receives them. Streaming events use
 			// non-blocking send — if no reader (WS disconnected),
@@ -456,6 +463,35 @@ func copyAgent(a *Agent) *Agent {
 		cp.LastMessage = &lm
 	}
 	return &cp
+}
+
+// isRateLimitMessage detects CLI rate-limit notices that should be shown
+// as system messages rather than assistant chat bubbles.
+// Only matches short messages with no tool uses to avoid false positives
+// (e.g. an assistant explaining how rate limits work).
+func isRateLimitMessage(msg *Message) bool {
+	if msg == nil || msg.Content == "" || len(msg.ToolUses) > 0 {
+		return false
+	}
+	// Rate limit notices are typically 1-2 lines
+	if len([]rune(msg.Content)) > 300 {
+		return false
+	}
+	lower := strings.ToLower(msg.Content)
+	// Specific phrases from known CLIs; intentionally narrow to reduce FP.
+	patterns := []string{
+		"hit your limit",      // Claude CLI
+		"rate limit exceeded",  // generic API error
+		"resource exhausted",  // Google/Gemini
+		"exceeded your current quota", // OpenAI
+		"usage limit exceeded",
+	}
+	for _, p := range patterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func truncatePreview(s string, maxLen int) string {
