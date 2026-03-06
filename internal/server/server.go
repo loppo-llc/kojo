@@ -600,7 +600,16 @@ func (s *Server) handleGitLog(w http.ResponseWriter, r *http.Request) {
 			limit = 20
 		}
 	}
-	result, err := s.git.Log(workDir, limit)
+	if limit < 1 {
+		limit = 1
+	}
+	skip := 0
+	if sk := r.URL.Query().Get("skip"); sk != "" {
+		if n, err := fmt.Sscanf(sk, "%d", &skip); n != 1 || err != nil || skip < 0 {
+			skip = 0
+		}
+	}
+	result, err := s.git.Log(workDir, limit, skip)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return

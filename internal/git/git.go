@@ -91,15 +91,24 @@ type LogEntry struct {
 
 type LogResult struct {
 	Commits []LogEntry `json:"commits"`
+	HasMore bool       `json:"hasMore"`
 }
 
-func (m *Manager) Log(workDir string, limit int) (*LogResult, error) {
+func (m *Manager) Log(workDir string, limit, skip int) (*LogResult, error) {
 	if workDir == "" {
 		return nil, fmt.Errorf("workDir is required")
 	}
+	if limit < 1 {
+		limit = 1
+	}
 
 	format := "%H%n%s%n%an%n%aI"
-	out, err := m.run(workDir, "log", fmt.Sprintf("--max-count=%d", limit), fmt.Sprintf("--format=%s", format))
+	// Fetch limit+1 to determine if more commits exist
+	args := []string{"log", fmt.Sprintf("--max-count=%d", limit+1), fmt.Sprintf("--format=%s", format)}
+	if skip > 0 {
+		args = append(args, fmt.Sprintf("--skip=%d", skip))
+	}
+	out, err := m.run(workDir, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -109,11 +118,16 @@ func (m *Manager) Log(workDir string, limit int) (*LogResult, error) {
 
 	for i := 0; i+3 < len(lines); i += 4 {
 		result.Commits = append(result.Commits, LogEntry{
-			Hash:    lines[i][:7],
+			Hash:    lines[i],
 			Message: lines[i+1],
 			Author:  lines[i+2],
 			Date:    lines[i+3],
 		})
+	}
+
+	if len(result.Commits) > limit {
+		result.Commits = result.Commits[:limit]
+		result.HasMore = true
 	}
 
 	return result, nil

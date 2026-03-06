@@ -132,10 +132,10 @@ export const api = {
   git: {
     status: (workDir: string) =>
       get<GitStatus>(`/api/v1/git/status?workDir=${encodeURIComponent(workDir)}`),
-    log: (workDir: string, limit = 20) =>
-      get<{ commits: GitLogEntry[] }>(
-        `/api/v1/git/log?workDir=${encodeURIComponent(workDir)}&limit=${limit}`,
-      ).then((r) => r.commits),
+    log: (workDir: string, limit = 20, skip = 0) =>
+      get<{ commits: GitLogEntry[]; hasMore: boolean }>(
+        `/api/v1/git/log?workDir=${encodeURIComponent(workDir)}&limit=${limit}&skip=${skip}`,
+      ),
     diff: (workDir: string, ref?: string) => {
       const params = new URLSearchParams({ workDir });
       if (ref) params.set("ref", ref);

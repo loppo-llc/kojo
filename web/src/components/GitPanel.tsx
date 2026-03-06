@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router";
 import { api, type SessionInfo, type GitStatus, type GitLogEntry } from "../lib/api";
 import { timeAgo } from "../lib/utils";
@@ -45,6 +45,8 @@ export function GitPanel({ embedded, workDir: propWorkDir }: GitPanelProps = {})
   const [session, setSession] = useState<SessionInfo>();
   const [status, setStatus] = useState<GitStatus | null>(null);
   const [commits, setCommits] = useState<GitLogEntry[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [diff, setDiff] = useState<string | null>(null);
   const [diffLabel, setDiffLabel] = useState("");
   const [tab, setTab] = useState<Tab>("status");
@@ -62,11 +64,19 @@ export function GitPanel({ embedded, workDir: propWorkDir }: GitPanelProps = {})
     }
   }, [id, navigate, embedded]);
 
+  const LOG_LIMIT = 10;
+  const refreshIdRef = useRef(0);
+
   const refresh = useCallback(() => {
     if (!effectiveWorkDir) return;
+    const rid = ++refreshIdRef.current;
     setError("");
     api.git.status(effectiveWorkDir).then(setStatus).catch((e) => setError(e.message));
-    api.git.log(effectiveWorkDir, 10).then(setCommits).catch(() => {});
+    api.git.log(effectiveWorkDir, LOG_LIMIT).then((r) => {
+      if (rid !== refreshIdRef.current) return;
+      setCommits(r.commits);
+      setHasMore(r.hasMore);
+    }).catch(() => {});
   }, [effectiveWorkDir]);
 
   useEffect(() => {
@@ -103,6 +113,26 @@ export function GitPanel({ embedded, workDir: propWorkDir }: GitPanelProps = {})
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setCmdRunning(false);
+    }
+  };
+
+  const loadMoreCommits = async () => {
+    if (!effectiveWorkDir || loadingMore) return;
+    const rid = refreshIdRef.current;
+    setLoadingMore(true);
+    try {
+      const r = await api.git.log(effectiveWorkDir, LOG_LIMIT, commits.length);
+      if (rid !== refreshIdRef.current) return;
+      setCommits((prev) => {
+        const seen = new Set(prev.map((c) => c.hash));
+        const unique = r.commits.filter((c) => !seen.has(c.hash));
+        return [...prev, ...unique];
+      });
+      setHasMore(r.hasMore);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoadingMore(false);
     }
   };
 
@@ -206,6 +236,15 @@ export function GitPanel({ embedded, workDir: propWorkDir }: GitPanelProps = {})
             ))}
             {commits.length === 0 && (
               <p className="text-neutral-500 text-sm text-center py-4">No commits</p>
+            )}
+            {hasMore && (
+              <button
+                onClick={loadMoreCommits}
+                disabled={loadingMore}
+                className="w-full py-3 text-sm text-neutral-400 hover:text-neutral-200 hover:bg-neutral-900 active:bg-neutral-800 disabled:opacity-40"
+              >
+                {loadingMore ? "Loading..." : "Load More"}
+              </button>
             )}
           </div>
         )}
