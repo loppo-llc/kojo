@@ -14,7 +14,7 @@ import (
 const cronTimeout = 10 * time.Minute
 const cronMinInterval = 50 * time.Second // minimum interval between runs for same agent
 const cronLockFile = ".cron_last"
-const cronPrompt = "定期チェックの時間です。最近の記憶を振り返り、気づいたことや考えたことがあれば記録してください。"
+const cronPrompt = "定期チェックの時間です。最近の記憶を振り返り、気づいたことや考えたことがあれば記録してください。必要なら、記録の整理や関連ファイルの更新など、短時間で安全に完了する作業があれば実行に移してください。"
 
 // cronScheduler manages periodic agent executions.
 type cronScheduler struct {
