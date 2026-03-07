@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -36,6 +37,9 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	dir := agentDir(agent.ID)
 	os.MkdirAll(dir, 0o755)
 
+	// Prevent user's persona autoload hook from overriding the agent's persona.
+	disableGeminiPersonaHook(dir, b.logger)
+
 	// gemini -p triggers headless mode and appends to stdin content.
 	// Pass system prompt via stdin to avoid exposing it in process args (visible in ps).
 	// The user message goes in -p (short, safe to expose).
@@ -43,6 +47,11 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		"-p", userMessage,
 		"-o", "stream-json",
 		"-y", // auto-approve all tool calls
+	}
+
+	// Resume previous session for conversation continuity and faster startup
+	if hasGeminiSession(dir) {
+		args = append(args, "--resume", "latest")
 	}
 
 	var stdinContent string
@@ -197,6 +206,74 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	}()
 
 	return ch, nil
+}
+
+// disableGeminiPersonaHook creates local .gemini/settings.json and a dummy
+// persona file in the agent directory so the user's global persona-autoload
+// hook does not override the agent's persona injected via system prompt.
+func disableGeminiPersonaHook(dir string, logger *slog.Logger) {
+	geminiDir := filepath.Join(dir, ".gemini")
+	personasDir := filepath.Join(geminiDir, "personas")
+	if err := os.MkdirAll(personasDir, 0o755); err != nil {
+		logger.Warn("failed to create .gemini/personas in agent dir", "dir", dir, "err", err)
+		return
+	}
+
+	settingsPath := filepath.Join(geminiDir, "settings.json")
+	if err := os.WriteFile(settingsPath, []byte("{\"persona\":\"kojo-managed\"}\n"), 0o644); err != nil {
+		logger.Warn("failed to write .gemini/settings.json", "dir", dir, "err", err)
+	}
+
+	personaPath := filepath.Join(personasDir, "kojo-managed.md")
+	if err := os.WriteFile(personaPath, []byte("Follow the persona defined in the system prompt.\n"), 0o644); err != nil {
+		logger.Warn("failed to write kojo-managed persona", "dir", dir, "err", err)
+	}
+}
+
+// hasGeminiSession checks whether a Gemini session exists for the agent directory.
+// Gemini stores sessions in ~/.gemini/tmp/<project>/chats/*.json.
+func hasGeminiSession(dir string) bool {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+
+	// Read Gemini's projects.json to find the project name for this directory
+	projectsPath := filepath.Join(home, ".gemini", "projects.json")
+	data, err := os.ReadFile(projectsPath)
+	if err != nil {
+		return false
+	}
+
+	var projects struct {
+		Projects map[string]string `json:"projects"`
+	}
+	if err := json.Unmarshal(data, &projects); err != nil {
+		return false
+	}
+
+	projectName, ok := projects.Projects[absDir]
+	if !ok {
+		return false
+	}
+
+	// Gemini stores resumable sessions in ~/.gemini/tmp/<project>/chats/
+	chatsDir := filepath.Join(home, ".gemini", "tmp", projectName, "chats")
+	entries, err := os.ReadDir(chatsDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+			return true
+		}
+	}
+	return false
 }
 
 // geminiStreamEvent represents a Gemini CLI stream-json event.
