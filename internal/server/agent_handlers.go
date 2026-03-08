@@ -309,7 +309,14 @@ func (s *Server) handlePreviewAvatar(w http.ResponseWriter, r *http.Request) {
 
 	absPath, err := agent.ValidateTempAvatarPath(avatarPath)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		switch {
+		case errors.Is(err, agent.ErrAvatarInternal):
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		case errors.Is(err, agent.ErrAvatarNotFound):
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		default:
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		}
 		return
 	}
 
@@ -603,7 +610,12 @@ func (s *Server) handleUploadGeneratedAvatar(w http.ResponseWriter, r *http.Requ
 
 	absPath, err := agent.ValidateTempAvatarPath(req.AvatarPath)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		switch {
+		case errors.Is(err, agent.ErrAvatarInternal):
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		default:
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		}
 		return
 	}
 

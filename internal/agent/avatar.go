@@ -2,6 +2,7 @@ package agent
 
 import (
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,6 +11,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+)
+
+// Sentinel errors for ValidateTempAvatarPath, allowing callers to map to
+// appropriate HTTP status codes.
+var (
+	ErrAvatarInternal         = errors.New("cannot resolve temp dir")
+	ErrAvatarNotFound         = errors.New("file not found")
+	ErrAvatarUnsupportedImage = errors.New("unsupported image format")
 )
 
 // allowedImageExts is the set of image extensions accepted for avatars.
@@ -93,7 +102,7 @@ func ValidateTempAvatarPath(avatarPath string) (string, error) {
 	}
 	tempDir, err := filepath.EvalSymlinks(os.TempDir())
 	if err != nil {
-		return "", fmt.Errorf("cannot resolve temp dir")
+		return "", ErrAvatarInternal
 	}
 	if !strings.HasPrefix(absPath, tempDir+string(filepath.Separator)) {
 		return "", fmt.Errorf("avatar path must be in temp directory")
@@ -105,11 +114,11 @@ func ValidateTempAvatarPath(avatarPath string) (string, error) {
 	}
 	ext := strings.ToLower(filepath.Ext(absPath))
 	if !IsAllowedImageExt(ext) {
-		return "", fmt.Errorf("unsupported image format")
+		return "", ErrAvatarUnsupportedImage
 	}
 	fi, err := os.Stat(absPath)
 	if err != nil || !fi.Mode().IsRegular() {
-		return "", fmt.Errorf("file not found")
+		return "", ErrAvatarNotFound
 	}
 	return absPath, nil
 }
