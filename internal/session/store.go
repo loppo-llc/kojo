@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/atomicfile"
+	"github.com/loppo-llc/kojo/internal/configdir"
 )
 
 const (
@@ -25,7 +26,7 @@ type Store struct {
 
 func newStore(logger *slog.Logger) *Store {
 	return &Store{
-		path:   filepath.Join(configDirPath(), sessionsFile),
+		path:   filepath.Join(configdir.Path(), sessionsFile),
 		logger: logger,
 	}
 }

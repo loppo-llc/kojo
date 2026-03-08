@@ -17,7 +17,7 @@ func Path() string {
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		return filepath.Join(os.TempDir(), "kojo", "config")
+		return filepath.Join(os.TempDir(), "kojo")
 	}
 	return filepath.Join(home, ".config", "kojo")
 }

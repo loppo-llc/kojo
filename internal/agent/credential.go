@@ -199,9 +199,7 @@ func (s *CredentialStore) decrypt(cipherHex string) (string, error) {
 }
 
 func generateCredID() string {
-	b := make([]byte, 8)
-	rand.Read(b)
-	return "cred_" + hex.EncodeToString(b)
+	return generatePrefixedID("cred_")
 }
 
 // Close closes the database connection.

@@ -9,6 +9,8 @@ import (
 	"sync"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
+
+	"github.com/loppo-llc/kojo/internal/configdir"
 )
 
 const vapidFile = "vapid.json"
@@ -91,7 +93,7 @@ func (m *Manager) Send(payload []byte) {
 }
 
 func (m *Manager) loadOrGenerateVAPID() error {
-	dir := configDirPath()
+	dir := configdir.Path()
 	path := filepath.Join(dir, vapidFile)
 
 	data, err := os.ReadFile(path)
