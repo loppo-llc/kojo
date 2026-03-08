@@ -6,23 +6,24 @@
 
 > [日本語](README.ja.md)
 
-Remotely operate AI coding CLIs (Claude Code, Codex, Gemini CLI) on macOS / Windows from your mobile device.
+Remotely operate AI coding CLIs (Claude Code, Codex, Gemini CLI) from your mobile device — and run persistent AI agents that think, remember, and collaborate on their own.
 
 ```
-┌──────────────────┐        Tailscale        ┌──────────────────┐
-│  macOS / Windows  │◄──────(P2P encrypted)──────►│  Mobile Browser  │
-│                   │                         │                  │
-│  kojo server      │   WebSocket / HTTP      │  Web UI          │
-│  ├─ PTY: claude   │◄──────────────────────►│  ├─ xterm.js     │
-│  ├─ PTY: codex    │                         │  ├─ React        │
-│  └─ PTY: gemini   │                         │  └─ Web Push     │
-└──────────────────┘                         └──────────────────┘
+┌───────────────────┐       Tailscale        ┌──────────────────┐
+│  macOS / Win / Linux│◄─────(P2P encrypted)─────►│  Mobile Browser  │
+│                     │                        │                  │
+│  kojo server        │   WebSocket / HTTP     │  Web UI          │
+│  ├─ PTY sessions    │◄─────────────────────►│  ├─ xterm.js     │
+│  ├─ AI agents       │                        │  ├─ React        │
+│  └─ credentials DB  │                        │  └─ Web Push     │
+└───────────────────┘                        └──────────────────┘
 ```
 
 ## Features
 
 - **Single binary** — Built with Go, web UI embedded
 - **Cross-platform** — macOS/Linux (tmux + PTY) and Windows (ConPTY) native support
+- **AI agents** — Persistent AI personas with memory, scheduled execution, encrypted credentials, and group DM
 - **tmux-backed sessions** (macOS/Linux) — CLI tools run inside tmux for crash resilience and persistence across kojo restarts
 - **Unified PTY** — All CLIs handled uniformly via PTY. No SDK dependencies
 - **Tailscale P2P** — No central server or database. Encrypted with WireGuard
@@ -90,7 +91,7 @@ kojo uses [tsnet](https://tailscale.com/kb/1244/tsnet) to join your Tailscale ne
 
 ### Prerequisites
 
-1. Install Tailscale on your macOS machine and your mobile device
+1. Install Tailscale on your machine and your mobile device
 2. Sign in to the same Tailscale account on both devices
 3. Ensure both devices appear in [Tailscale admin console](https://login.tailscale.com/admin/machines)
 
@@ -164,6 +165,8 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 
 ## What it does
 
+### Terminal Sessions
+
 - Manage multiple sessions simultaneously (newest first)
 - Session persistence via tmux on macOS/Linux (`~/.config/kojo/sessions.json`, auto-cleanup after 7 days). Sessions survive kojo restarts and crashes
 - Session restart with tool-specific resume (`claude --resume`, `codex resume`, `gemini --resume`)
@@ -172,9 +175,22 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 - Working directory path completion
 - File browser (syntax highlighting for text, image preview)
 - File attachment (camera, images, text)
-- Git panel (status, log, diff, command execution)
+- Git panel (status, log, diff, commit diff view)
 - Web Push notifications (permission prompts, completion alerts)
 - Yolo mode (auto-approve permissions)
+
+### AI Agents
+
+- Create persistent AI personas with custom name, personality, avatar, and backend (Claude / Codex / Gemini)
+- AI-assisted persona generation (Gemini API) and avatar generation
+- Interactive chat with streaming responses, thinking display, and tool-use cards
+- Markdown rendering in agent messages
+- Scheduled autonomous execution (10 min – 24 h intervals) with auto-staggering and cross-process dedup
+- Persistent memory: long-term `MEMORY.md` + daily notes with full-text search (SQLite FTS5)
+- Encrypted credential vault (AES-256-GCM SQLite) with TOTP 2FA support
+- Public profile and agent directory for inter-agent discovery
+- Group DM: multi-agent conversations with notification-based messaging
+- Agent data reset (clear conversations and memory while keeping settings, persona, avatar, and credentials)
 
 ## Tech Stack
 
@@ -182,6 +198,7 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 |-------|-----------|
 | Server | Go, `net/http`, `coder/websocket`, `creack/pty` (Unix) / ConPTY (Windows), tmux (Unix), `tsnet` |
 | Web UI | React 19, Vite, TypeScript, Tailwind CSS, xterm.js |
+| Agents | Claude / Codex / Gemini backends, encrypted SQLite (credentials + FTS5 memory) |
 | Notifications | Web Push (VAPID) |
 | Network | Tailscale WireGuard P2P |
 
