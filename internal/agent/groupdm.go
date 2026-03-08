@@ -1,8 +1,6 @@
 package agent
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"os"
 	"path/filepath"
 	"time"
@@ -33,15 +31,11 @@ type GroupMessage struct {
 }
 
 func generateGroupID() string {
-	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return "gd_" + hex.EncodeToString(b)
+	return generatePrefixedID("gd_")
 }
 
 func generateGroupMessageID() string {
-	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return "gm_" + hex.EncodeToString(b)
+	return generatePrefixedID("gm_")
 }
 
 // groupdmsDir returns the base directory for group DM data.

@@ -1,8 +1,6 @@
 package agent
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"time"
 )
 
@@ -45,9 +43,7 @@ type ChatEvent struct {
 }
 
 func generateMessageID() string {
-	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return "m_" + hex.EncodeToString(b)
+	return generatePrefixedID("m_")
 }
 
 func newUserMessage(content string) *Message {

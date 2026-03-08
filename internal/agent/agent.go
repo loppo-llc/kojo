@@ -1,8 +1,6 @@
 package agent
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"hash/fnv"
 	"strings"
@@ -136,9 +134,7 @@ type AgentUpdateConfig struct {
 }
 
 func generateID() string {
-	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return "ag_" + hex.EncodeToString(b)
+	return generatePrefixedID("ag_")
 }
 
 func newAgent(cfg AgentConfig) (*Agent, error) {
