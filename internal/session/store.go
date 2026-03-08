@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/atomicfile"
 )
 
 const (
@@ -33,26 +35,14 @@ func (st *Store) Save(infos []SessionInfo) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	data, err := json.MarshalIndent(infos, "", "  ")
-	if err != nil {
-		st.logger.Warn("failed to marshal sessions", "err", err)
-		return
-	}
-
 	dir := filepath.Dir(st.path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		st.logger.Warn("failed to create config dir", "err", err)
 		return
 	}
 
-	tmp := st.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		st.logger.Warn("failed to write tmp sessions file", "err", err)
-		return
-	}
-	if err := os.Rename(tmp, st.path); err != nil {
-		st.logger.Warn("failed to rename sessions file", "err", err)
-		os.Remove(tmp)
+	if err := atomicfile.WriteJSON(st.path, infos, 0o644); err != nil {
+		st.logger.Warn("failed to save sessions", "err", err)
 	}
 }
 

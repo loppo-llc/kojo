@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/atomicfile"
 )
 
 const groupdmsFile = "groups.json"
@@ -382,21 +384,8 @@ func (m *GroupDMManager) save() {
 		return
 	}
 
-	data, err := json.MarshalIndent(groups, "", "  ")
-	if err != nil {
-		m.logger.Warn("failed to marshal groups", "err", err)
-		return
-	}
-
-	path := filepath.Join(dir, groupdmsFile)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		m.logger.Warn("failed to write tmp groups file", "err", err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		m.logger.Warn("failed to rename groups file", "err", err)
-		os.Remove(tmp)
+	if err := atomicfile.WriteJSON(filepath.Join(dir, groupdmsFile), groups, 0o644); err != nil {
+		m.logger.Warn("failed to save groups", "err", err)
 	}
 }
 

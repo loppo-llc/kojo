@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/loppo-llc/kojo/internal/atomicfile"
 	"github.com/loppo-llc/kojo/internal/configdir"
 )
 
@@ -39,21 +40,8 @@ func (st *store) Save(agents []*Agent) {
 		return
 	}
 
-	data, err := json.MarshalIndent(agents, "", "  ")
-	if err != nil {
-		st.logger.Warn("failed to marshal agents", "err", err)
-		return
-	}
-
-	path := filepath.Join(st.dir, agentsFile)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		st.logger.Warn("failed to write tmp agents file", "err", err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		st.logger.Warn("failed to rename agents file", "err", err)
-		os.Remove(tmp)
+	if err := atomicfile.WriteJSON(filepath.Join(st.dir, agentsFile), agents, 0o644); err != nil {
+		st.logger.Warn("failed to save agents", "err", err)
 	}
 }
 
