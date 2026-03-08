@@ -82,8 +82,21 @@ func New(cfg Config) *Server {
 	}
 
 	mux := http.NewServeMux()
+	s.registerRoutes(mux, cfg)
 
-	// API routes
+	s.httpSrv = &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1MB
+	}
+
+	return s
+}
+
+func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
+	// Session routes
 	mux.HandleFunc("GET /api/v1/info", s.handleInfo)
 	mux.HandleFunc("GET /api/v1/sessions", s.handleListSessions)
 	mux.HandleFunc("POST /api/v1/sessions", s.handleCreateSession)
@@ -121,95 +134,85 @@ func New(cfg Config) *Server {
 
 	// Agent routes
 	if s.agents != nil {
-		mux.HandleFunc("GET /api/v1/agents/cron-paused", s.handleGetCronPaused)
-		mux.HandleFunc("PUT /api/v1/agents/cron-paused", s.handleSetCronPaused)
-		mux.HandleFunc("GET /api/v1/agents/directory", s.handleAgentDirectory)
-		mux.HandleFunc("GET /api/v1/agents", s.handleListAgents)
-		mux.HandleFunc("POST /api/v1/agents", s.handleCreateAgent)
-		mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGetAgent)
-		mux.HandleFunc("PATCH /api/v1/agents/{id}", s.handleUpdateAgent)
-		mux.HandleFunc("POST /api/v1/agents/{id}/reset", s.handleResetAgentData)
-		mux.HandleFunc("DELETE /api/v1/agents/{id}", s.handleDeleteAgent)
-		mux.HandleFunc("GET /api/v1/agents/{id}/avatar", s.handleGetAvatar)
-		mux.HandleFunc("POST /api/v1/agents/{id}/avatar", s.handleUploadAvatar)
-		mux.HandleFunc("GET /api/v1/agents/{id}/messages", s.handleGetMessages)
-		mux.HandleFunc("POST /api/v1/agents/{id}/avatar/generated", s.handleUploadGeneratedAvatar)
-		mux.HandleFunc("POST /api/v1/agents/generate-persona", s.handleGeneratePersona)
-		mux.HandleFunc("POST /api/v1/agents/generate-name", s.handleGenerateName)
-		mux.HandleFunc("POST /api/v1/agents/generate-avatar", s.handleGenerateAvatar)
-		mux.HandleFunc("GET /api/v1/agents/preview-avatar", s.handlePreviewAvatar)
-		mux.HandleFunc("GET /api/v1/agents/{id}/credentials", s.handleListCredentials)
-		mux.HandleFunc("POST /api/v1/agents/{id}/credentials", s.handleAddCredential)
-		mux.HandleFunc("PATCH /api/v1/agents/{id}/credentials/{credId}", s.handleUpdateCredential)
-		mux.HandleFunc("DELETE /api/v1/agents/{id}/credentials/{credId}", s.handleDeleteCredential)
-		mux.HandleFunc("GET /api/v1/agents/{id}/credentials/{credId}/password", s.handleRevealCredentialPassword)
-		mux.HandleFunc("GET /api/v1/agents/{id}/credentials/{credId}/totp", s.handleGetTOTPCode)
-		mux.HandleFunc("POST /api/v1/agents/{id}/credentials/parse-qr", s.handleParseQR)
-		mux.HandleFunc("POST /api/v1/agents/{id}/credentials/parse-uri", s.handleParseOTPURI)
-		mux.HandleFunc("GET /api/v1/agents/{id}/ws", s.handleAgentWebSocket)
-
-		// Group DM routes
-		if s.groupdms != nil {
-			mux.HandleFunc("GET /api/v1/groupdms", s.handleListGroupDMs)
-			mux.HandleFunc("POST /api/v1/groupdms", s.handleCreateGroupDM)
-			mux.HandleFunc("GET /api/v1/groupdms/{id}", s.handleGetGroupDM)
-			mux.HandleFunc("DELETE /api/v1/groupdms/{id}", s.handleDeleteGroupDM)
-			mux.HandleFunc("GET /api/v1/groupdms/{id}/messages", s.handleGetGroupMessages)
-			mux.HandleFunc("POST /api/v1/groupdms/{id}/messages", s.handlePostGroupMessage)
-			mux.HandleFunc("GET /api/v1/agents/{id}/groups", s.handleListAgentGroups)
-		}
+		s.registerAgentRoutes(mux)
 	}
 
 	// Static files / dev proxy
 	if cfg.DevMode {
-		// proxy to Vite dev server
 		viteURL, _ := url.Parse("http://localhost:5173")
 		proxy := httputil.NewSingleHostReverseProxy(viteURL)
 		mux.Handle("/", proxy)
 	} else if cfg.StaticFS != nil {
-		// serve embedded static files with SPA fallback
-		fileServer := http.FileServer(http.FS(cfg.StaticFS))
-		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			// try serving the file directly
-			path := r.URL.Path
-			if path == "/" {
-				path = "index.html"
-			} else {
-				path = strings.TrimPrefix(path, "/")
-			}
+		s.registerStaticFiles(mux, cfg.StaticFS)
+	}
+}
 
-			if _, err := fs.Stat(cfg.StaticFS, path); err == nil {
-				// Cache-Control: hashed assets can be cached forever,
-				// everything else must revalidate every time.
-				if strings.HasPrefix(r.URL.Path, "/assets/") {
-					w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-				} else {
-					w.Header().Set("Cache-Control", "no-cache")
-				}
-				fileServer.ServeHTTP(w, r)
-				return
-			}
-			// SPA fallback: serve index.html for non-file routes.
-			// /assets/* never falls back — return 404 for missing hashed assets.
+func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/v1/agents/cron-paused", s.handleGetCronPaused)
+	mux.HandleFunc("PUT /api/v1/agents/cron-paused", s.handleSetCronPaused)
+	mux.HandleFunc("GET /api/v1/agents/directory", s.handleAgentDirectory)
+	mux.HandleFunc("GET /api/v1/agents", s.handleListAgents)
+	mux.HandleFunc("POST /api/v1/agents", s.handleCreateAgent)
+	mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGetAgent)
+	mux.HandleFunc("PATCH /api/v1/agents/{id}", s.handleUpdateAgent)
+	mux.HandleFunc("POST /api/v1/agents/{id}/reset", s.handleResetAgentData)
+	mux.HandleFunc("DELETE /api/v1/agents/{id}", s.handleDeleteAgent)
+	mux.HandleFunc("GET /api/v1/agents/{id}/avatar", s.handleGetAvatar)
+	mux.HandleFunc("POST /api/v1/agents/{id}/avatar", s.handleUploadAvatar)
+	mux.HandleFunc("GET /api/v1/agents/{id}/messages", s.handleGetMessages)
+	mux.HandleFunc("POST /api/v1/agents/{id}/avatar/generated", s.handleUploadGeneratedAvatar)
+	mux.HandleFunc("POST /api/v1/agents/generate-persona", s.handleGeneratePersona)
+	mux.HandleFunc("POST /api/v1/agents/generate-name", s.handleGenerateName)
+	mux.HandleFunc("POST /api/v1/agents/generate-avatar", s.handleGenerateAvatar)
+	mux.HandleFunc("GET /api/v1/agents/preview-avatar", s.handlePreviewAvatar)
+	mux.HandleFunc("GET /api/v1/agents/{id}/credentials", s.handleListCredentials)
+	mux.HandleFunc("POST /api/v1/agents/{id}/credentials", s.handleAddCredential)
+	mux.HandleFunc("PATCH /api/v1/agents/{id}/credentials/{credId}", s.handleUpdateCredential)
+	mux.HandleFunc("DELETE /api/v1/agents/{id}/credentials/{credId}", s.handleDeleteCredential)
+	mux.HandleFunc("GET /api/v1/agents/{id}/credentials/{credId}/password", s.handleRevealCredentialPassword)
+	mux.HandleFunc("GET /api/v1/agents/{id}/credentials/{credId}/totp", s.handleGetTOTPCode)
+	mux.HandleFunc("POST /api/v1/agents/{id}/credentials/parse-qr", s.handleParseQR)
+	mux.HandleFunc("POST /api/v1/agents/{id}/credentials/parse-uri", s.handleParseOTPURI)
+	mux.HandleFunc("GET /api/v1/agents/{id}/ws", s.handleAgentWebSocket)
+
+	if s.groupdms != nil {
+		mux.HandleFunc("GET /api/v1/groupdms", s.handleListGroupDMs)
+		mux.HandleFunc("POST /api/v1/groupdms", s.handleCreateGroupDM)
+		mux.HandleFunc("GET /api/v1/groupdms/{id}", s.handleGetGroupDM)
+		mux.HandleFunc("DELETE /api/v1/groupdms/{id}", s.handleDeleteGroupDM)
+		mux.HandleFunc("GET /api/v1/groupdms/{id}/messages", s.handleGetGroupMessages)
+		mux.HandleFunc("POST /api/v1/groupdms/{id}/messages", s.handlePostGroupMessage)
+		mux.HandleFunc("GET /api/v1/agents/{id}/groups", s.handleListAgentGroups)
+	}
+}
+
+func (s *Server) registerStaticFiles(mux *http.ServeMux, staticFS fs.FS) {
+	fileServer := http.FileServer(http.FS(staticFS))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if path == "/" {
+			path = "index.html"
+		} else {
+			path = strings.TrimPrefix(path, "/")
+		}
+
+		if _, err := fs.Stat(staticFS, path); err == nil {
 			if strings.HasPrefix(r.URL.Path, "/assets/") {
-				http.NotFound(w, r)
-				return
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			} else {
+				w.Header().Set("Cache-Control", "no-cache")
 			}
-			w.Header().Set("Cache-Control", "no-cache")
-			r.URL.Path = "/"
 			fileServer.ServeHTTP(w, r)
-		})
-	}
-
-	s.httpSrv = &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1MB
-	}
-
-	return s
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/assets/") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-cache")
+		r.URL.Path = "/"
+		fileServer.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) Serve(ln net.Listener) error {
