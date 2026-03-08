@@ -1,10 +1,8 @@
 package agent
 
 import (
-	"bufio"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"time"
@@ -62,67 +60,13 @@ func appendGroupMessage(groupID string, msg *GroupMessage) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	path := filepath.Join(dir, messagesFile)
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	_, err = f.Write(data)
-	return err
+	return jsonlAppend(filepath.Join(dir, messagesFile), msg)
 }
 
 // loadGroupMessages reads messages from a group's JSONL transcript with pagination.
 func loadGroupMessages(groupID string, limit int, before string) ([]*GroupMessage, bool, error) {
 	path := filepath.Join(groupDir(groupID), messagesFile)
-	f, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, false, nil
-		}
-		return nil, false, err
-	}
-	defer f.Close()
-
-	var all []*GroupMessage
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		var msg GroupMessage
-		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
-			continue
-		}
-		all = append(all, &msg)
-	}
-	if err := scanner.Err(); err != nil {
-		return all, false, err
-	}
-
-	if before != "" {
-		idx := -1
-		for i, m := range all {
-			if m.ID == before {
-				idx = i
-				break
-			}
-		}
-		if idx >= 0 {
-			all = all[:idx]
-		}
-	}
-
-	hasMore := false
-	if limit > 0 && len(all) > limit {
-		hasMore = true
-		all = all[len(all)-limit:]
-	}
-	return all, hasMore, nil
+	return jsonlLoadPaginated(path, limit, before, func(m *GroupMessage) string { return m.ID })
 }
 
 func newGroupMessage(agentID, agentName, content string) *GroupMessage {
