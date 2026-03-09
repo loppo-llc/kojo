@@ -40,9 +40,9 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	// Prevent user's persona autoload hook from overriding the agent's persona.
 	disableGeminiPersonaHook(dir, b.logger)
 
-	// gemini -p triggers headless mode and appends to stdin content.
-	// Pass system prompt via stdin to avoid exposing it in process args (visible in ps).
-	// The user message goes in -p (short, safe to expose).
+	// gemini -p triggers headless mode. Yargs with nargs:1 correctly
+	// consumes the next arg as the value even if it starts with "-",
+	// so option injection is not an issue here (unlike Claude's commander.js).
 	args := []string{
 		"-p", userMessage,
 		"-o", "stream-json",

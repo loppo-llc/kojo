@@ -38,7 +38,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	}
 
 	args := []string{
-		"-p", userMessage,
+		"-p",
 		"--output-format", "stream-json",
 		"--verbose",
 		"--dangerously-skip-permissions",
@@ -75,6 +75,10 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION"}, agent.ID)
 	cmd.Dir = dir
+
+	// Pass user message via stdin to avoid option injection when the message
+	// starts with "-" (which would be misinterpreted as a CLI flag).
+	cmd.Stdin = strings.NewReader(userMessage)
 
 	// Capture stderr for error diagnostics (limit to 4KB to prevent memory issues)
 	var stderrBuf bytes.Buffer
