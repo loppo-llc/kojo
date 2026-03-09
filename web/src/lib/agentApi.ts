@@ -97,6 +97,7 @@ export interface ChatEvent {
   message?: AgentMessage;
   usage?: { inputTokens: number; outputTokens: number };
   errorMessage?: string;
+  startedAt?: string; // RFC3339 timestamp of when processing started
 }
 
 async function get<T>(path: string): Promise<T> {

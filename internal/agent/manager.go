@@ -11,6 +11,11 @@ import (
 	"time"
 )
 
+type busyEntry struct {
+	cancel    context.CancelFunc
+	startedAt time.Time
+}
+
 // Manager manages agent CRUD, chat orchestration, and lifecycle.
 type Manager struct {
 	mu       sync.Mutex
@@ -25,7 +30,7 @@ type Manager struct {
 	groupdms *GroupDMManager
 
 	// busy tracks which agents have an active chat.
-	busy   map[string]context.CancelFunc
+	busy   map[string]busyEntry
 	busyMu sync.Mutex
 
 	// resetting tracks agents currently being reset (blocks new chats).
@@ -55,7 +60,7 @@ func NewManager(logger *slog.Logger) *Manager {
 		store:     newStore(logger),
 		creds:     creds,
 		logger:    logger,
-		busy:       make(map[string]context.CancelFunc),
+		busy:       make(map[string]busyEntry),
 		resetting:  make(map[string]bool),
 		profileGen: make(map[string]bool),
 	}
@@ -453,8 +458,8 @@ func (m *Manager) ResetData(id string) error {
 		return fmt.Errorf("agent is busy, try again later")
 	}
 	m.resetting[id] = true
-	if cancel, busy := m.busy[id]; busy {
-		cancel()
+	if entry, busy := m.busy[id]; busy {
+		entry.cancel()
 	}
 	m.busyMu.Unlock()
 
@@ -549,8 +554,8 @@ func (m *Manager) Delete(id string) error {
 		return fmt.Errorf("agent is busy, try again later")
 	}
 	// Abort any running chat
-	if cancel, busy := m.busy[id]; busy {
-		cancel()
+	if entry, busy := m.busy[id]; busy {
+		entry.cancel()
 	}
 	m.busyMu.Unlock()
 
@@ -609,7 +614,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		return nil, fmt.Errorf("agent is busy")
 	}
 	chatCtx, cancel := context.WithCancel(ctx)
-	m.busy[agentID] = cancel
+	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now()}
 	m.busyMu.Unlock()
 
 	// Get the backend
@@ -718,8 +723,8 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 // Abort cancels any running chat for an agent.
 func (m *Manager) Abort(agentID string) {
 	m.busyMu.Lock()
-	if cancel, ok := m.busy[agentID]; ok {
-		cancel()
+	if entry, ok := m.busy[agentID]; ok {
+		entry.cancel()
 	}
 	m.busyMu.Unlock()
 }
@@ -748,6 +753,18 @@ func (m *Manager) IsBusy(agentID string) bool {
 	return ok
 }
 
+// BusySince returns the time when the agent started its current chat.
+// Returns zero time and false if the agent is not busy.
+func (m *Manager) BusySince(agentID string) (time.Time, bool) {
+	m.busyMu.Lock()
+	defer m.busyMu.Unlock()
+	entry, ok := m.busy[agentID]
+	if !ok {
+		return time.Time{}, false
+	}
+	return entry.startedAt, true
+}
+
 // Messages returns recent messages for an agent.
 func (m *Manager) Messages(agentID string, limit int) ([]*Message, error) {
 	return loadMessages(agentID, limit)
@@ -763,8 +780,8 @@ func (m *Manager) Shutdown() {
 	m.cron.Stop()
 
 	m.busyMu.Lock()
-	for _, cancel := range m.busy {
-		cancel()
+	for _, entry := range m.busy {
+		entry.cancel()
 	}
 	m.busyMu.Unlock()
 

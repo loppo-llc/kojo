@@ -1,4 +1,4 @@
-import { memo, useState, useCallback, useMemo, useEffect, useRef } from "react";
+import { memo, useState, useCallback, useMemo, useEffect } from "react";
 import type { AgentMessage } from "../../lib/agentApi";
 import { ToolUseCard } from "./ToolUseCard";
 import { AgentAvatar } from "./AgentAvatar";
@@ -410,6 +410,7 @@ interface StreamingMessageProps {
   agentId: string;
   status: string;
   avatarHash?: string;
+  startTime: number;
 }
 
 export function StreamingMessage({
@@ -420,8 +421,8 @@ export function StreamingMessage({
   agentId,
   status,
   avatarHash,
+  startTime,
 }: StreamingMessageProps) {
-  const startTimeRef = useRef(Date.now());
 
   let activeTool: string | null = null;
   for (let i = toolUses.length - 1; i >= 0; i--) {
@@ -440,7 +441,7 @@ export function StreamingMessage({
             <span className="w-1.5 h-1.5 bg-neutral-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
             <span className="w-1.5 h-1.5 bg-neutral-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
             <span className="w-1.5 h-1.5 bg-neutral-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
-            <ElapsedTimer startTime={startTimeRef.current} threshold={3} className="text-xs text-neutral-500 ml-2" />
+            <ElapsedTimer startTime={startTime} threshold={3} className="text-xs text-neutral-500 ml-2" />
           </div>
         )}
         {thinking && <ThinkingBlock text={thinking} streaming={!text} />}
@@ -460,7 +461,7 @@ export function StreamingMessage({
         {/* Status bar: elapsed time + active tool */}
         {(text || toolUses.length > 0) && (
           <div className="flex items-center gap-2 mt-1.5 text-[10px] text-neutral-500">
-            <ElapsedTimer startTime={startTimeRef.current} className="" />
+            <ElapsedTimer startTime={startTime} className="" />
             {activeTool && (
               <span className="flex items-center gap-1">
                 <span className="w-1 h-1 bg-blue-400 rounded-full animate-pulse" />

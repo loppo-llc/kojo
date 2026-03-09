@@ -46,11 +46,13 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 	// If the agent has a chat running in the background (e.g. user navigated
 	// away and came back), notify the client and monitor completion.
 	var bgDone <-chan agent.ChatEvent
-	if s.agents.IsBusy(agentID) {
-		_ = writeJSON(ctx, conn, map[string]string{
-			"type":   "status",
-			"status": "thinking",
-		})
+	if since, busy := s.agents.BusySince(agentID); busy {
+		statusMsg := map[string]any{
+			"type":      "status",
+			"status":    "thinking",
+			"startedAt": since.UTC().Format(time.RFC3339),
+		}
+		_ = writeJSON(ctx, conn, statusMsg)
 		ch := make(chan agent.ChatEvent, 1)
 		bgDone = ch
 		go func() {

@@ -18,6 +18,7 @@ export function AgentChat() {
   const [streamThinking, setStreamThinking] = useState("");
   const [streamTools, setStreamTools] = useState<Array<{ name: string; input: string; output: string | null }>>([]);
   const [streamStatus, setStreamStatus] = useState("");
+  const [streamStartTime, setStreamStartTime] = useState<number>(Date.now());
   const [hasMore, setHasMore] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -100,6 +101,7 @@ export function AgentChat() {
     setStreamThinking("");
     setStreamTools([]);
     setStreamStatus("");
+    setStreamStartTime(Date.now());
   }, []);
 
   const onEvent = useCallback(
@@ -109,6 +111,9 @@ export function AgentChat() {
           setStreamStatus(event.status ?? "");
           if (event.status === "thinking") {
             setStreaming(true);
+            if (event.startedAt) {
+              setStreamStartTime(new Date(event.startedAt).getTime());
+            }
           }
           break;
         case "text":
@@ -206,6 +211,7 @@ export function AgentChat() {
     setStreamThinking("");
     setStreamTools([]);
     setStreamStatus("thinking");
+    setStreamStartTime(Date.now());
     sendMessage(text);
 
     // Reset textarea height
@@ -305,6 +311,7 @@ export function AgentChat() {
             agentId={agent.id}
             status={streamStatus}
             avatarHash={agent.avatarHash}
+            startTime={streamStartTime}
           />
         )}
         <div ref={messagesEndRef} />
