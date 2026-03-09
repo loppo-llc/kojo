@@ -108,7 +108,9 @@ func getPersonaSummary(agentID string, persona string, tool string, logger *slog
 func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*GroupDM, hasCreds bool) string {
 	dir := agentDir(a.ID)
 	personaPath := filepath.Join(dir, "persona.md")
-	today := time.Now().Format("2006-01-02")
+	now := time.Now()
+	today := now.Format("2006-01-02")
+	currentTime := now.Format("2006-01-02 15:04 -0700 MST")
 
 	var sb strings.Builder
 
@@ -118,7 +120,7 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	sb.WriteString(fmt.Sprintf("- Your data directory is: %s\n", dir))
 	sb.WriteString(fmt.Sprintf("- %s defines your personality. You can edit it to evolve.\n", personaPath))
 	sb.WriteString("- Keep your responses conversational and in character.\n")
-	sb.WriteString(fmt.Sprintf("- Today's date is %s.\n", today))
+	sb.WriteString(fmt.Sprintf("- Current date and time is %s.\n", currentTime))
 
 	// Memory Recall — tool-based, not injected
 	sb.WriteString("\n## Memory Recall\n\n")
