@@ -7,8 +7,11 @@ import { MarkdownRenderer } from "./MarkdownRenderer";
 // File extensions that can be previewed
 const IMAGE_EXTS = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
 // Match absolute file paths (Unix or Windows-style) with media extensions
+// Unix: starts with /, Windows: starts with drive letter like C:\
+// Path segments: exclude only delimiters that indicate end-of-path (comma, semicolon, quotes, newline, slash).
+// This allows Unicode, spaces, parens, apostrophes, etc. in filenames.
 const MEDIA_PATH_RE =
-  /(?:(?:\/[\w.@~+-]+)+|[A-Z]:\\(?:[\w.@~+ -]+\\)*[\w.@~+ -]+)\.(png|jpe?g|gif|webp|svg|bmp|ico|avif|mp4|webm|mov|avi|mkv)\b/gi;
+  /(?:(?:\/[^,;:"<>\n/][^,;:"<>\n/]*)+|[A-Z]:\\(?:[^,;:"<>\n\\]+\\)*[^,;:"<>\n\\]+)\.(png|jpe?g|gif|webp|svg|bmp|ico|avif|mp4|webm|mov|avi|mkv)\b/gi;
 
 interface ChatMessageProps {
   message: AgentMessage;
@@ -241,7 +244,7 @@ function MessageContent({ content, isUser, timestamp }: { content: string; isUse
 }
 
 /** Text with clickable media file paths */
-function MediaTextContent({
+export function MediaTextContent({
   parts,
   onPreview,
 }: {
@@ -259,19 +262,19 @@ function MediaTextContent({
             onClick={() =>
               onPreview({ path: part.value, type: isImage ? "image" : "video" })
             }
-            className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 bg-neutral-700/50 hover:bg-neutral-600/50 rounded text-xs font-mono text-blue-300 hover:text-blue-200 transition-colors"
+            className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 bg-neutral-700/50 hover:bg-neutral-600/50 rounded text-xs font-mono text-blue-300 hover:text-blue-200 transition-colors max-w-full min-w-0"
             title={`Preview ${part.value}`}
           >
             {isImage ? (
-              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909M3.75 21h16.5A2.25 2.25 0 0022.5 18.75V5.25A2.25 2.25 0 0020.25 3H3.75A2.25 2.25 0 001.5 5.25v13.5A2.25 2.25 0 003.75 21z" />
               </svg>
             ) : (
-              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.348a1.125 1.125 0 010 1.971l-11.54 6.347a1.125 1.125 0 01-1.667-.985V5.653z" />
               </svg>
             )}
-            {part.value.split("/").pop()}
+            <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{part.value.split(/[/\\]/).pop()}</span>
           </button>
         );
       })}
@@ -280,7 +283,7 @@ function MediaTextContent({
 }
 
 /** Full-screen overlay for image/video preview */
-function MediaOverlay({
+export function MediaOverlay({
   path,
   type,
   onClose,
@@ -337,7 +340,7 @@ function MediaOverlay({
 }
 
 /** Split text into text parts and media file path parts */
-function splitMediaPaths(text: string): Array<{ type: "text" | "media"; value: string }> {
+export function splitMediaPaths(text: string): Array<{ type: "text" | "media"; value: string }> {
   const parts: Array<{ type: "text" | "media"; value: string }> = [];
   let lastIndex = 0;
 

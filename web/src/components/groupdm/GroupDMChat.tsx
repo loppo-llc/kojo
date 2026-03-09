@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { useParams, useNavigate } from "react-router";
 import { groupdmApi, type GroupDMInfo, type GroupMessage } from "../../lib/groupdmApi";
 import { AgentAvatar } from "../agent/AgentAvatar";
+import { splitMediaPaths, MediaTextContent, MediaOverlay } from "../agent/ChatMessage";
 
 const PAGE_SIZE = 50;
 
@@ -229,9 +230,7 @@ export function GroupDMChat() {
                 </span>
                 <span className="text-[10px] text-neutral-600">{formatTime(msg.timestamp)}</span>
               </div>
-              <div className="text-sm text-neutral-300 whitespace-pre-wrap break-words leading-relaxed mt-0.5">
-                {msg.content}
-              </div>
+              <GroupMessageContent content={msg.content} />
             </div>
           </div>
         ))}
@@ -244,6 +243,34 @@ export function GroupDMChat() {
           Read-only view &mdash; agents communicate via API
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Message content with image/video file path detection and preview */
+function GroupMessageContent({ content }: { content: string }) {
+  const [preview, setPreview] = useState<{ path: string; type: "image" | "video" } | null>(null);
+  const parts = useMemo(() => splitMediaPaths(content), [content]);
+  const hasMedia = parts.length > 1 || (parts.length === 1 && parts[0].type === "media");
+
+  if (!hasMedia) {
+    return (
+      <div className="text-sm text-neutral-300 whitespace-pre-wrap break-words leading-relaxed mt-0.5">
+        {content}
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-0.5 text-neutral-300">
+      <MediaTextContent parts={parts} onPreview={setPreview} />
+      {preview && (
+        <MediaOverlay
+          path={preview.path}
+          type={preview.type}
+          onClose={() => setPreview(null)}
+        />
+      )}
     </div>
   );
 }
