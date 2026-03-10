@@ -116,32 +116,11 @@ func (p *notifyPoller) RebuildSources(agentID string, configs []notifysource.Con
 	}
 
 	// Purge state for sources that are no longer active
-	prefix := agentID + ":"
 	activeKeys := make(map[string]bool)
 	for id := range agentSources {
-		activeKeys[prefix+id] = true
+		activeKeys[agentID+":"+id] = true
 	}
-	for k := range p.cursors {
-		if strings.HasPrefix(k, prefix) && !activeKeys[k] {
-			delete(p.cursors, k)
-		}
-	}
-	for k := range p.lastPoll {
-		if strings.HasPrefix(k, prefix) && !activeKeys[k] {
-			delete(p.lastPoll, k)
-		}
-	}
-	// Remove pending notifications for removed sources (match by sourceID)
-	filtered := p.pending[:0]
-	for _, pn := range p.pending {
-		if pn.agentID == agentID {
-			if _, ok := agentSources[pn.sourceID]; !ok {
-				continue // source was removed
-			}
-		}
-		filtered = append(filtered, pn)
-	}
-	p.pending = filtered
+	p.purgeKeysLocked(agentID, activeKeys)
 
 	if len(agentSources) > 0 {
 		p.sources[agentID] = agentSources
@@ -162,23 +141,32 @@ func (p *notifyPoller) RemoveAgent(agentID string) {
 // purgeAgentStateLocked removes all cursors, lastPoll, and pending for an agent.
 // Caller must hold p.mu.
 func (p *notifyPoller) purgeAgentStateLocked(agentID string) {
+	p.purgeKeysLocked(agentID, nil)
+}
+
+// purgeKeysLocked removes cursors/lastPoll/pending entries for agentID.
+// If keepKeys is non-nil, only entries NOT in keepKeys are removed.
+// If keepKeys is nil, all entries for the agent are removed.
+// Caller must hold p.mu.
+func (p *notifyPoller) purgeKeysLocked(agentID string, keepKeys map[string]bool) {
 	prefix := agentID + ":"
 	for k := range p.cursors {
-		if strings.HasPrefix(k, prefix) {
+		if strings.HasPrefix(k, prefix) && !keepKeys[k] {
 			delete(p.cursors, k)
 		}
 	}
 	for k := range p.lastPoll {
-		if strings.HasPrefix(k, prefix) {
+		if strings.HasPrefix(k, prefix) && !keepKeys[k] {
 			delete(p.lastPoll, k)
 		}
 	}
 
 	filtered := p.pending[:0]
 	for _, pn := range p.pending {
-		if pn.agentID != agentID {
-			filtered = append(filtered, pn)
+		if pn.agentID == agentID && !keepKeys[agentID+":"+pn.sourceID] {
+			continue
 		}
+		filtered = append(filtered, pn)
 	}
 	p.pending = filtered
 

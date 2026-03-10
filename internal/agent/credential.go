@@ -244,20 +244,17 @@ func (s *CredentialStore) ListCredentials(agentID string) ([]*Credential, error)
 // scanCredentialMasked scans a credential row without decrypting secrets.
 // Password and TOTPSecret are replaced with presence indicators.
 func scanCredentialMasked(sc scannable) (*Credential, error) {
-	var c Credential
-	var pwEnc, totpEnc string
-	err := sc.Scan(&c.ID, &c.Label, &c.Username, &pwEnc, &totpEnc,
-		&c.TOTPAlgorithm, &c.TOTPDigits, &c.TOTPPeriod, &c.CreatedAt, &c.UpdatedAt)
+	c, pwEnc, totpEnc, err := scanCredentialColumns(sc)
 	if err != nil {
 		return nil, err
 	}
 	if pwEnc != "" {
-		c.Password = "••••••••"
+		c.Password = maskedValue
 	}
 	if totpEnc != "" {
-		c.TOTPSecret = "••••••••"
+		c.TOTPSecret = maskedValue
 	}
-	return &c, nil
+	return c, nil
 }
 
 // AddCredential adds a new credential for an agent.
@@ -440,19 +437,25 @@ type scannable interface {
 	Scan(dest ...any) error
 }
 
-func (s *CredentialStore) scanCredential(sc scannable) (*Credential, error) {
-	return s.scanCredentialInner(sc)
-}
-
-func (s *CredentialStore) scanCredentialRow(row *sql.Row) (*Credential, error) {
-	return s.scanCredentialInner(row)
-}
-
-func (s *CredentialStore) scanCredentialInner(sc scannable) (*Credential, error) {
+// scanCredentialColumns scans the common credential columns from a row.
+// Returns the credential with raw encrypted values for password and TOTP secret.
+func scanCredentialColumns(sc scannable) (*Credential, string, string, error) {
 	var c Credential
 	var pwEnc, totpEnc string
 	err := sc.Scan(&c.ID, &c.Label, &c.Username, &pwEnc, &totpEnc,
 		&c.TOTPAlgorithm, &c.TOTPDigits, &c.TOTPPeriod, &c.CreatedAt, &c.UpdatedAt)
+	if err != nil {
+		return nil, "", "", err
+	}
+	return &c, pwEnc, totpEnc, nil
+}
+
+func (s *CredentialStore) scanCredentialRow(row *sql.Row) (*Credential, error) {
+	return s.scanAndDecrypt(row)
+}
+
+func (s *CredentialStore) scanAndDecrypt(sc scannable) (*Credential, error) {
+	c, pwEnc, totpEnc, err := scanCredentialColumns(sc)
 	if err != nil {
 		return nil, err
 	}
@@ -464,7 +467,7 @@ func (s *CredentialStore) scanCredentialInner(sc scannable) (*Credential, error)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt totp secret: %w", err)
 	}
-	return &c, nil
+	return c, nil
 }
 
 // migrateLegacy migrates credentials.json files from agent directories to the database.

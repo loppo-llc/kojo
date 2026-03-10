@@ -121,6 +121,44 @@ func (idx *MemoryIndex) Close() error {
 	return idx.db.Close()
 }
 
+// indexWriter wraps prepared FTS and chunk insert statements to eliminate
+// duplicated prepare/exec/close patterns across indexing methods.
+type indexWriter struct {
+	fts    *sql.Stmt
+	chunk  *sql.Stmt
+	idx    *MemoryIndex
+	logger *slog.Logger
+}
+
+func (idx *MemoryIndex) newIndexWriter() (*indexWriter, error) {
+	fts, err := idx.db.Prepare("INSERT INTO memory_fts(source, content, timestamp) VALUES(?, ?, ?)")
+	if err != nil {
+		return nil, err
+	}
+	chunk, err := idx.db.Prepare("INSERT INTO chunks(source, content, content_hash, timestamp, embedding) VALUES(?, ?, ?, ?, ?)")
+	if err != nil {
+		fts.Close()
+		return nil, err
+	}
+	return &indexWriter{fts: fts, chunk: chunk, idx: idx, logger: idx.logger}, nil
+}
+
+func (w *indexWriter) Close() {
+	w.fts.Close()
+	w.chunk.Close()
+}
+
+func (w *indexWriter) insert(source, content, timestamp string) {
+	if _, err := w.fts.Exec(source, content, timestamp); err != nil {
+		w.logger.Debug("failed to index FTS entry", "source", source, "err", err)
+	}
+	hash := contentHash(content)
+	cached := w.idx.getCachedEmbedding(hash)
+	if _, err := w.chunk.Exec(source, content, hash, timestamp, cached); err != nil {
+		w.logger.Debug("failed to index chunk", "source", source, "err", err)
+	}
+}
+
 // IndexMessages indexes messages from the JSONL transcript.
 func (idx *MemoryIndex) IndexMessages(agentID string) error {
 	idx.mu.Lock()
@@ -139,31 +177,17 @@ func (idx *MemoryIndex) IndexMessages(agentID string) error {
 		return err
 	}
 
-	ftsStmt, err := idx.db.Prepare("INSERT INTO memory_fts(source, content, timestamp) VALUES(?, ?, ?)")
+	w, err := idx.newIndexWriter()
 	if err != nil {
 		return err
 	}
-	defer ftsStmt.Close()
-
-	chunkStmt, err := idx.db.Prepare("INSERT INTO chunks(source, content, content_hash, timestamp, embedding) VALUES(?, ?, ?, ?, ?)")
-	if err != nil {
-		return err
-	}
-	defer chunkStmt.Close()
+	defer w.Close()
 
 	for _, msg := range msgs {
 		if msg.Content == "" {
 			continue
 		}
-		text := msg.Role + ": " + msg.Content
-		if _, err := ftsStmt.Exec("message", text, msg.Timestamp); err != nil {
-			idx.logger.Debug("failed to index message", "id", msg.ID, "err", err)
-		}
-		hash := contentHash(text)
-		cached := idx.getCachedEmbedding(hash)
-		if _, err := chunkStmt.Exec("message", text, hash, msg.Timestamp, cached); err != nil {
-			idx.logger.Debug("failed to index message chunk", "id", msg.ID, "err", err)
-		}
+		w.insert("message", msg.Role+": "+msg.Content, msg.Timestamp)
 	}
 
 	// Update message_count to stay in sync with incremental indexing
@@ -189,17 +213,11 @@ func (idx *MemoryIndex) IndexFiles(agentID string) error {
 		return err
 	}
 
-	ftsStmt, err := idx.db.Prepare("INSERT INTO memory_fts(source, content, timestamp) VALUES(?, ?, ?)")
+	w, err := idx.newIndexWriter()
 	if err != nil {
 		return err
 	}
-	defer ftsStmt.Close()
-
-	chunkStmt, err := idx.db.Prepare("INSERT INTO chunks(source, content, content_hash, timestamp, embedding) VALUES(?, ?, ?, ?, ?)")
-	if err != nil {
-		return err
-	}
-	defer chunkStmt.Close()
+	defer w.Close()
 
 	// Index MEMORY.md
 	memoryPath := filepath.Join(dir, "MEMORY.md")
@@ -210,14 +228,7 @@ func (idx *MemoryIndex) IndexFiles(agentID string) error {
 			if strings.TrimSpace(section) == "" {
 				continue
 			}
-			if _, err := ftsStmt.Exec("memory", section, now); err != nil {
-				idx.logger.Debug("failed to index memory section", "err", err)
-			}
-			hash := contentHash(section)
-			cached := idx.getCachedEmbedding(hash)
-			if _, err := chunkStmt.Exec("memory", section, hash, now, cached); err != nil {
-				idx.logger.Debug("failed to index memory chunk", "err", err)
-			}
+			w.insert("memory", section, now)
 		}
 	}
 
@@ -234,14 +245,7 @@ func (idx *MemoryIndex) IndexFiles(agentID string) error {
 				continue
 			}
 			date := strings.TrimSuffix(entry.Name(), ".md")
-			if _, err := ftsStmt.Exec("daily", string(data), date); err != nil {
-				idx.logger.Debug("failed to index daily note", "file", entry.Name(), "err", err)
-			}
-			hash := contentHash(string(data))
-			cached := idx.getCachedEmbedding(hash)
-			if _, err := chunkStmt.Exec("daily", string(data), hash, date, cached); err != nil {
-				idx.logger.Debug("failed to index daily chunk", "file", entry.Name(), "err", err)
-			}
+			w.insert("daily", string(data), date)
 		}
 	}
 
@@ -313,31 +317,17 @@ func (idx *MemoryIndex) IndexNewMessages(agentID string) {
 		return // no new messages
 	}
 
-	ftsStmt, err := idx.db.Prepare("INSERT INTO memory_fts(source, content, timestamp) VALUES(?, ?, ?)")
+	w, err := idx.newIndexWriter()
 	if err != nil {
 		return
 	}
-	defer ftsStmt.Close()
-
-	chunkStmt, err := idx.db.Prepare("INSERT INTO chunks(source, content, content_hash, timestamp, embedding) VALUES(?, ?, ?, ?, ?)")
-	if err != nil {
-		return
-	}
-	defer chunkStmt.Close()
+	defer w.Close()
 
 	for _, msg := range msgs[lastCount:] {
 		if msg.Content == "" {
 			continue
 		}
-		text := msg.Role + ": " + msg.Content
-		if _, err := ftsStmt.Exec("message", text, msg.Timestamp); err != nil {
-			idx.logger.Debug("failed to index new message", "err", err)
-		}
-		hash := contentHash(text)
-		cached := idx.getCachedEmbedding(hash)
-		if _, err := chunkStmt.Exec("message", text, hash, msg.Timestamp, cached); err != nil {
-			idx.logger.Debug("failed to index new message chunk", "err", err)
-		}
+		w.insert("message", msg.Role+": "+msg.Content, msg.Timestamp)
 	}
 
 	if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_count", fmt.Sprintf("%d", len(msgs))); err != nil {
