@@ -50,42 +50,91 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("agent websocket connected", "agent", agentID)
 
 	// If the agent has a chat running in the background (e.g. user navigated
-	// away and came back), notify the client and monitor completion.
-	var bgDone <-chan agent.ChatEvent
-	if since, busy := s.agents.BusySince(agentID); busy {
+	// away and came back), notify the client and resume streaming live events.
+	var bgEvents <-chan agent.ChatEvent
+	if since, events, busy := s.agents.BusyState(agentID); busy {
 		statusMsg := map[string]any{
 			"type":      "status",
 			"status":    "thinking",
 			"startedAt": since.UTC().Format(time.RFC3339),
 		}
 		_ = writeJSON(ctx, conn, statusMsg)
-		ch := make(chan agent.ChatEvent, 1)
-		bgDone = ch
-		go func() {
-			defer close(ch)
-			ticker := time.NewTicker(500 * time.Millisecond)
-			defer ticker.Stop()
+
+		if events != nil {
+			// Drain stale buffered events so the client only sees live
+			// updates from this point forward. If "done" is already in
+			// the buffer, deliver it immediately and skip live streaming.
+			sentTerminal := false
+		drained := false
+		drainLoop:
 			for {
 				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					if !s.agents.IsBusy(agentID) {
-						// Chat finished — send the latest assistant message
-						msgs, _ := s.agents.Messages(agentID, 1)
-						if len(msgs) > 0 && msgs[len(msgs)-1].Role == "assistant" {
-							ch <- agent.ChatEvent{
-								Type:    "done",
-								Message: msgs[len(msgs)-1],
-							}
-						} else {
-							ch <- agent.ChatEvent{Type: "done"}
-						}
-						return
+				case ev, ok := <-events:
+					if !ok {
+						// Channel closed — agent already finished.
+						drained = true
+						break drainLoop
 					}
+					if ev.Type == "done" || ev.Type == "error" {
+						_ = writeJSON(ctx, conn, ev)
+						sentTerminal = true
+						drained = true
+						break drainLoop
+					}
+					// Skip stale streaming events (text deltas, tool_use, etc.)
+				default:
+					// Buffer empty — remaining events are live.
+					break drainLoop
 				}
 			}
-		}()
+			if !drained {
+				bgEvents = events
+			} else if !sentTerminal {
+				// Channel closed without terminal event — load final message.
+				msgs, _ := s.agents.Messages(agentID, 1)
+				if len(msgs) > 0 && msgs[len(msgs)-1].Role == "assistant" {
+					_ = writeJSON(ctx, conn, agent.ChatEvent{
+						Type:    "done",
+						Message: msgs[len(msgs)-1],
+					})
+				} else {
+					_ = writeJSON(ctx, conn, agent.ChatEvent{Type: "done"})
+				}
+			}
+		} else {
+			// Fallback: no event channel available, poll for completion.
+			ch := make(chan agent.ChatEvent, 1)
+			bgEvents = ch
+			go func() {
+				defer close(ch)
+				ticker := time.NewTicker(500 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						if !s.agents.IsBusy(agentID) {
+							var ev agent.ChatEvent
+							msgs, _ := s.agents.Messages(agentID, 1)
+							if len(msgs) > 0 && msgs[len(msgs)-1].Role == "assistant" {
+								ev = agent.ChatEvent{
+									Type:    "done",
+									Message: msgs[len(msgs)-1],
+								}
+							} else {
+								ev = agent.ChatEvent{Type: "done"}
+							}
+							select {
+							case ch <- ev:
+							case <-ctx.Done():
+							}
+							return
+						}
+					}
+				}
+			}()
+		}
 	}
 
 	// Channel for client messages (read goroutine → main loop)
@@ -139,11 +188,26 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-ctx.Done():
 			return
-		case event, ok := <-bgDone:
-			if ok {
-				_ = writeJSON(ctx, conn, event)
+		case event, ok := <-bgEvents:
+			if !ok {
+				// Channel closed — agent finished before we could read "done".
+				// Load the latest assistant message as a fallback.
+				bgEvents = nil
+				msgs, _ := s.agents.Messages(agentID, 1)
+				if len(msgs) > 0 && msgs[len(msgs)-1].Role == "assistant" {
+					_ = writeJSON(ctx, conn, agent.ChatEvent{
+						Type:    "done",
+						Message: msgs[len(msgs)-1],
+					})
+				} else {
+					_ = writeJSON(ctx, conn, agent.ChatEvent{Type: "done"})
+				}
+				continue
 			}
-			bgDone = nil // stop selecting on this channel
+			_ = writeJSON(ctx, conn, event)
+			if event.Type == "done" || event.Type == "error" {
+				bgEvents = nil // terminal event, stop reading
+			}
 		case msg := <-clientMsgs:
 			switch msg.Type {
 			case "message":

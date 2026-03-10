@@ -17,6 +17,7 @@ import (
 type busyEntry struct {
 	cancel    context.CancelFunc
 	startedAt time.Time
+	events    <-chan ChatEvent // live stream for reconnecting clients
 }
 
 // Manager manages agent CRUD, chat orchestration, and lifecycle.
@@ -656,6 +657,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		return nil, fmt.Errorf("agent is busy")
 	}
 	chatCtx, cancel := context.WithCancel(ctx)
+	// Placeholder entry — events channel is set after backend.Chat succeeds.
 	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now()}
 	m.busyMu.Unlock()
 
@@ -707,6 +709,12 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 
 	// Wrap the backend channel to handle completion
 	outCh := make(chan ChatEvent, 64)
+
+	// Store the events channel so reconnecting WebSockets can subscribe.
+	m.busyMu.Lock()
+	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: m.busy[agentID].startedAt, events: outCh}
+	m.busyMu.Unlock()
+
 	go func() {
 		defer close(outCh)
 		defer m.clearBusy(agentID)
@@ -815,6 +823,22 @@ func (m *Manager) BusySince(agentID string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return entry.startedAt, true
+}
+
+// BusyState returns the start time and live event channel for an agent's
+// ongoing chat under a single lock, so callers see a consistent snapshot.
+// The event channel may be nil if the backend hasn't started yet.
+// Only one WebSocket should read from the channel at a time; this is
+// naturally guaranteed because the previous reader exits on disconnect
+// before the new WebSocket connects.
+func (m *Manager) BusyState(agentID string) (startedAt time.Time, events <-chan ChatEvent, busy bool) {
+	m.busyMu.Lock()
+	defer m.busyMu.Unlock()
+	entry, ok := m.busy[agentID]
+	if !ok {
+		return time.Time{}, nil, false
+	}
+	return entry.startedAt, entry.events, true
 }
 
 // Messages returns recent messages for an agent.

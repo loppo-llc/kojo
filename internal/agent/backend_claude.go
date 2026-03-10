@@ -124,11 +124,9 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 				continue
 			}
 
-			b.logger.Debug("claude stream raw", "len", len(line))
-
 			var event claudeStreamEvent
 			if err := json.Unmarshal([]byte(line), &event); err != nil {
-				b.logger.Debug("failed to parse claude stream event", "line", line, "err", err)
+				b.logger.Debug("failed to parse claude stream event", "err", err)
 				continue
 			}
 
