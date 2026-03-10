@@ -19,6 +19,7 @@ import (
 	"github.com/makiuchi-d/gozxing/qrcode"
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
+	"golang.org/x/image/draw"
 )
 
 // Maximum image dimensions to prevent decompression bombs.
@@ -129,19 +130,98 @@ func DecodeQRImage(r io.Reader) ([]*OTPEntry, error) {
 		return nil, fmt.Errorf("failed to decode image: %w", err)
 	}
 
-	bmp, err := gozxing.NewBinaryBitmapFromImage(img)
+	entries, err := tryDecodeQR(img)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create bitmap: %w", err)
+		// Retry with scaled images — when the QR code is small relative to the
+		// image (e.g. a mobile screenshot), the finder pattern scanner's skip
+		// step can miss the patterns entirely.
+		for _, size := range []int{600, 1200} {
+			scaled := scaleImage(img, size)
+			if scaled == nil {
+				continue
+			}
+			entries, err2 := tryDecodeQR(scaled)
+			if err2 == nil {
+				return entries, nil
+			}
+			// Prefer more informative errors from scaled attempts.
+			if _, ok := err.(gozxing.NotFoundException); ok {
+				err = err2
+			}
+		}
+		return nil, fmt.Errorf("failed to decode QR code: %w", err)
+	}
+	return entries, nil
+}
+
+// scaleImage scales img so the longer side equals targetSize.
+// Returns nil if the image is already close to the target or scaling would exceed limits.
+func scaleImage(img image.Image, targetSize int) image.Image {
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	longer := w
+	if h > longer {
+		longer = h
+	}
+	// Skip if already close to target (within 25%).
+	if longer >= targetSize*3/4 && longer <= targetSize*5/4 {
+		return nil
+	}
+	ratio := float64(targetSize) / float64(longer)
+	newW := int(float64(w) * ratio)
+	newH := int(float64(h) * ratio)
+	if newW < 1 || newH < 1 {
+		return nil
+	}
+	if int64(newW)*int64(newH) > maxImagePixels {
+		return nil
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
+	draw.NearestNeighbor.Scale(dst, dst.Bounds(), img, b, draw.Over, nil)
+	return dst
+}
+
+// tryDecodeQR attempts QR decoding with multiple binarizer/inversion strategies.
+func tryDecodeQR(img image.Image) ([]*OTPEntry, error) {
+	hints := map[gozxing.DecodeHintType]interface{}{
+		gozxing.DecodeHintType_TRY_HARDER: true,
 	}
 
 	reader := qrcode.NewQRCodeReader()
-	result, err := reader.Decode(bmp, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode QR code: %w", err)
+	src := gozxing.NewLuminanceSourceFromImage(img)
+
+	tryDecode := func(ls gozxing.LuminanceSource, newBinarizer func(gozxing.LuminanceSource) gozxing.Binarizer) (*gozxing.Result, error) {
+		bmp, e := gozxing.NewBinaryBitmap(newBinarizer(ls))
+		if e != nil {
+			return nil, e
+		}
+		return reader.Decode(bmp, hints)
 	}
 
-	uri := result.GetText()
-	return ParseOTPURI(uri)
+	strategies := []struct {
+		src       gozxing.LuminanceSource
+		binarizer func(gozxing.LuminanceSource) gozxing.Binarizer
+	}{
+		{src, gozxing.NewHybridBinarizer},
+		{src, gozxing.NewGlobalHistgramBinarizer},
+		{src.Invert(), gozxing.NewHybridBinarizer},
+		{src.Invert(), gozxing.NewGlobalHistgramBinarizer},
+	}
+
+	var lastErr error
+	for _, s := range strategies {
+		result, err := tryDecode(s.src, s.binarizer)
+		if err == nil {
+			uri := result.GetText()
+			return ParseOTPURI(uri)
+		}
+		if lastErr == nil {
+			lastErr = err
+		} else if _, ok := lastErr.(gozxing.NotFoundException); ok {
+			lastErr = err
+		}
+	}
+	return nil, lastErr
 }
 
 // ParseOTPURI parses an otpauth:// or otpauth-migration:// URI and returns OTP entries.
