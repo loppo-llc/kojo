@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -361,7 +362,7 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 	ns.inFlight = false
 
 	if err != nil {
-		if strings.Contains(err.Error(), "busy") {
+		if errors.Is(err, ErrAgentBusy) {
 			// Agent busy — re-defer for retry after cooldown
 			if !ns.hasPending {
 				ns.agentID = agentID

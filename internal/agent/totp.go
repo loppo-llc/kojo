@@ -41,15 +41,15 @@ type OTPEntry struct {
 func NormalizeTOTPSecret(secret string) (string, error) {
 	secret = strings.TrimRight(strings.ToUpper(strings.TrimSpace(secret)), "=")
 	if secret == "" {
-		return "", fmt.Errorf("TOTP secret is empty")
+		return "", fmt.Errorf("%w: secret is empty", ErrInvalidTOTP)
 	}
 	_, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(secret)
 	if err != nil {
-		return "", fmt.Errorf("invalid TOTP secret (not valid base32): %w", err)
+		return "", fmt.Errorf("%w: not valid base32: %v", ErrInvalidTOTP, err)
 	}
 	_, err = totp.GenerateCode(secret, time.Now())
 	if err != nil {
-		return "", fmt.Errorf("TOTP secret failed code generation test: %w", err)
+		return "", fmt.Errorf("%w: code generation test failed: %v", ErrInvalidTOTP, err)
 	}
 	return secret, nil
 }
@@ -65,13 +65,13 @@ func ValidateTOTPParams(secret, algorithm string, digits, period int) (string, e
 	case "", "SHA1", "SHA256", "SHA512":
 		// ok
 	default:
-		return "", fmt.Errorf("unsupported TOTP algorithm: %s (must be SHA1, SHA256, or SHA512)", algorithm)
+		return "", fmt.Errorf("%w: unsupported algorithm %s (must be SHA1, SHA256, or SHA512)", ErrInvalidTOTP, algorithm)
 	}
 	if digits != 0 && digits != 6 && digits != 8 {
-		return "", fmt.Errorf("unsupported TOTP digits: %d (must be 6 or 8)", digits)
+		return "", fmt.Errorf("%w: unsupported digits %d (must be 6 or 8)", ErrInvalidTOTP, digits)
 	}
 	if period < 0 {
-		return "", fmt.Errorf("invalid TOTP period: %d", period)
+		return "", fmt.Errorf("%w: invalid period %d", ErrInvalidTOTP, period)
 	}
 	return normalized, nil
 }

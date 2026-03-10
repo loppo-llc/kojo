@@ -14,6 +14,7 @@ var (
 
 	ErrCredentialNotFound = errors.New("credential not found")
 	ErrNoTOTPSecret       = errors.New("no TOTP secret configured")
+	ErrInvalidTOTP        = errors.New("invalid TOTP parameters")
 
 	ErrUnsupportedTool     = errors.New("unsupported tool")
 	ErrUnsupportedInterval = errors.New("unsupported interval")

@@ -360,6 +360,15 @@ func (m *Manager) regeneratePublicProfile(agentID, persona string) {
 func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	has, hash := avatarMeta(id)
 
+	// Check agent exists before any file I/O
+	m.mu.Lock()
+	a, ok := m.agents[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
+	}
+	m.mu.Unlock()
+
 	// Write persona.md outside lock — if it fails, no in-memory state is modified
 	if cfg.Persona != nil {
 		if err := writePersonaFile(id, *cfg.Persona); err != nil {
@@ -368,11 +377,6 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 
 	m.mu.Lock()
-	a, ok := m.agents[id]
-	if !ok {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
-	}
 
 	oldPersona := a.Persona
 	if cfg.Persona != nil {
@@ -609,8 +613,6 @@ func (m *Manager) Delete(id string) error {
 		entry.cancel()
 	}
 	m.busyMu.Unlock()
-
-	delete(m.agents, id)
 	m.mu.Unlock()
 
 	// Remove credentials and notify tokens outside lock (DB I/O)
@@ -634,6 +636,11 @@ func (m *Manager) Delete(id string) error {
 	// Remove agent data directory
 	dir := agentDir(id)
 	os.RemoveAll(dir)
+
+	// Remove from in-memory map after all cleanup succeeds
+	m.mu.Lock()
+	delete(m.agents, id)
+	m.mu.Unlock()
 
 	m.save()
 	m.logger.Info("agent deleted", "id", id)
@@ -679,12 +686,12 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	// Get the backend
 	backend, ok := m.backends[agentCopy.Tool]
 	if !ok {
-		errMsg := fmt.Sprintf("%v: %s", ErrUnsupportedTool, agentCopy.Tool)
-		outCh <- ChatEvent{Type: "error", ErrorMessage: errMsg}
+		err := fmt.Errorf("%w: %s", ErrUnsupportedTool, agentCopy.Tool)
+		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
 		m.clearBusy(agentID)
 		cancel()
-		return nil, fmt.Errorf("%s", errMsg)
+		return nil, err
 	}
 
 	atts := attachments

@@ -396,7 +396,11 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 	}
 	cred, err := s.agents.Credentials().AddCredential(id, req.Label, req.Username, req.Password, totp)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		if errors.Is(err, agent.ErrInvalidTOTP) {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		} else {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, cred)
@@ -451,6 +455,8 @@ func (s *Server) handleUpdateCredential(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		if errors.Is(err, agent.ErrCredentialNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		} else if errors.Is(err, agent.ErrInvalidTOTP) {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		}
