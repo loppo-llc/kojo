@@ -354,7 +354,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	a, ok := m.agents[id]
 	if !ok {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("agent not found: %s", id)
+		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 	}
 
 	// Write persona.md first — if it fails, no in-memory state is modified
@@ -384,7 +384,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	// Validate before mutating
 	if cfg.IntervalMinutes != nil && !ValidInterval(*cfg.IntervalMinutes) {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("unsupported interval: %d minutes", *cfg.IntervalMinutes)
+		return nil, fmt.Errorf("%w: %d minutes", ErrUnsupportedInterval, *cfg.IntervalMinutes)
 	}
 	{
 		s, e := a.ActiveStart, a.ActiveEnd
@@ -468,7 +468,7 @@ func (m *Manager) UpdateNotifySources(id string, sources []notifysource.Config) 
 	a, ok := m.agents[id]
 	if !ok {
 		m.mu.Unlock()
-		return fmt.Errorf("agent not found: %s", id)
+		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 	}
 	a.NotifySources = sources
 	a.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
@@ -485,7 +485,7 @@ func (m *Manager) ResetData(id string) error {
 	a, ok := m.agents[id]
 	if !ok {
 		m.mu.Unlock()
-		return fmt.Errorf("agent not found: %s", id)
+		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 	}
 	name := a.Name
 	m.mu.Unlock()
@@ -494,7 +494,7 @@ func (m *Manager) ResetData(id string) error {
 	m.busyMu.Lock()
 	if m.resetting[id] {
 		m.busyMu.Unlock()
-		return fmt.Errorf("agent is busy, try again later")
+		return fmt.Errorf("%w, try again later", ErrAgentBusy)
 	}
 	m.resetting[id] = true
 	if entry, busy := m.busy[id]; busy {
@@ -517,7 +517,7 @@ func (m *Manager) ResetData(id string) error {
 			break
 		}
 		if i == 49 {
-			return fmt.Errorf("agent is busy, try again later")
+			return fmt.Errorf("%w, try again later", ErrAgentBusy)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -582,7 +582,7 @@ func (m *Manager) Delete(id string) error {
 	_, ok := m.agents[id]
 	if !ok {
 		m.mu.Unlock()
-		return fmt.Errorf("agent not found: %s", id)
+		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 	}
 
 	// Block if agent is being reset
@@ -590,7 +590,7 @@ func (m *Manager) Delete(id string) error {
 	if m.resetting[id] {
 		m.busyMu.Unlock()
 		m.mu.Unlock()
-		return fmt.Errorf("agent is busy, try again later")
+		return fmt.Errorf("%w, try again later", ErrAgentBusy)
 	}
 	// Abort any running chat
 	if entry, busy := m.busy[id]; busy {
@@ -640,7 +640,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	a, ok := m.agents[agentID]
 	if !ok {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("agent not found: %s", agentID)
+		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
 	}
 	// Copy agent data under lock
 	agentCopy := *a
@@ -650,11 +650,11 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	m.busyMu.Lock()
 	if m.resetting[agentID] {
 		m.busyMu.Unlock()
-		return nil, fmt.Errorf("agent is being reset")
+		return nil, ErrAgentResetting
 	}
 	if _, busy := m.busy[agentID]; busy {
 		m.busyMu.Unlock()
-		return nil, fmt.Errorf("agent is busy")
+		return nil, ErrAgentBusy
 	}
 	chatCtx, cancel := context.WithCancel(ctx)
 	// Create outCh and broadcaster upfront so they're available from the
@@ -668,7 +668,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	// Get the backend
 	backend, ok := m.backends[agentCopy.Tool]
 	if !ok {
-		errMsg := fmt.Sprintf("unsupported tool: %s", agentCopy.Tool)
+		errMsg := fmt.Sprintf("%v: %s", ErrUnsupportedTool, agentCopy.Tool)
 		outCh <- ChatEvent{Type: "error", ErrorMessage: errMsg}
 		close(outCh)
 		m.clearBusy(agentID)

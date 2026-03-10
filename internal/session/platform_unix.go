@@ -52,7 +52,7 @@ func (m *Manager) platformStartInternalTool(id, tool, toolPath, workDir string, 
 		var err error
 		toolPath, err = exec.LookPath(tool)
 		if err != nil {
-			return nil, fmt.Errorf("tool not found: %s", tool)
+			return nil, fmt.Errorf("%w: %s", ErrToolNotFound, tool)
 		}
 	}
 	cmd := exec.Command(toolPath, args...)

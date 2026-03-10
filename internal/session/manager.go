@@ -92,7 +92,7 @@ func NewManager(logger *slog.Logger) *Manager {
 
 func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, parentID string) (*Session, error) {
 	if !isAllowedTool(tool) {
-		return nil, fmt.Errorf("unsupported tool: %s", tool)
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedTool, tool)
 	}
 
 	// Internal tools (tmux/shell) are resolved by platform functions, not LookPath
@@ -101,7 +101,7 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 	if userTools[tool] {
 		toolPath, err = exec.LookPath(tool)
 		if err != nil {
-			return nil, fmt.Errorf("tool not found: %s", tool)
+			return nil, fmt.Errorf("%w: %s", ErrToolNotFound, tool)
 		}
 	}
 
@@ -208,13 +208,13 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 func (m *Manager) Restart(id string) (*Session, error) {
 	s, ok := m.Get(id)
 	if !ok {
-		return nil, fmt.Errorf("session not found: %s", id)
+		return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, id)
 	}
 
 	s.mu.Lock()
 	if s.Status == StatusRunning || s.restarting {
 		s.mu.Unlock()
-		return nil, fmt.Errorf("session is still running: %s", id)
+		return nil, fmt.Errorf("%w: %s", ErrSessionRunning, id)
 	}
 	s.restarting = true
 	tool := s.Tool
@@ -235,7 +235,7 @@ func (m *Manager) Restart(id string) (*Session, error) {
 	m.mu.Unlock()
 	if !stillExists {
 		clearRestarting()
-		return nil, fmt.Errorf("session not found: %s", id)
+		return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, id)
 	}
 
 	if !isAllowedTool(tool) {
@@ -250,7 +250,7 @@ func (m *Manager) Restart(id string) (*Session, error) {
 		toolPath, err = exec.LookPath(tool)
 		if err != nil {
 			clearRestarting()
-			return nil, fmt.Errorf("tool not found: %s", tool)
+			return nil, fmt.Errorf("%w: %s", ErrToolNotFound, tool)
 		}
 	}
 
@@ -354,7 +354,7 @@ func (m *Manager) Remove(id string) error {
 	s, ok := m.sessions[id]
 	if !ok {
 		m.mu.Unlock()
-		return fmt.Errorf("session not found: %s", id)
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, id)
 	}
 	// Check for running children first to avoid orphans
 	for _, cs := range m.sessions {
@@ -364,7 +364,7 @@ func (m *Manager) Remove(id string) error {
 			cs.mu.Unlock()
 			if cStatus == StatusRunning {
 				m.mu.Unlock()
-				return fmt.Errorf("cannot remove session with running children: %s", id)
+				return fmt.Errorf("%w: %s", ErrHasRunningChildren, id)
 			}
 		}
 	}
@@ -372,7 +372,7 @@ func (m *Manager) Remove(id string) error {
 	if s.Status == StatusRunning || s.restarting {
 		s.mu.Unlock()
 		m.mu.Unlock()
-		return fmt.Errorf("cannot remove running session: %s", id)
+		return fmt.Errorf("%w: %s", ErrSessionRunning, id)
 	}
 	delete(m.sessions, id)
 	s.mu.Unlock()
@@ -389,13 +389,13 @@ func (m *Manager) Remove(id string) error {
 func (m *Manager) Stop(id string) error {
 	s, ok := m.Get(id)
 	if !ok {
-		return fmt.Errorf("session not found: %s", id)
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, id)
 	}
 
 	s.mu.Lock()
 	if s.Status != StatusRunning || s.restarting {
 		s.mu.Unlock()
-		return fmt.Errorf("session not running: %s", id)
+		return fmt.Errorf("%w: %s", ErrSessionNotRunning, id)
 	}
 	s.mu.Unlock()
 
@@ -406,7 +406,7 @@ func (m *Manager) Stop(id string) error {
 func (m *Manager) TmuxAction(id, action string) error {
 	s, ok := m.Get(id)
 	if !ok {
-		return fmt.Errorf("session not found: %s", id)
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, id)
 	}
 
 	s.mu.Lock()
@@ -416,13 +416,13 @@ func (m *Manager) TmuxAction(id, action string) error {
 	s.mu.Unlock()
 
 	if !internalTools[tool] {
-		return fmt.Errorf("not a terminal session: %s", id)
+		return fmt.Errorf("%w: %s", ErrNotTerminal, id)
 	}
 	if status != StatusRunning {
-		return fmt.Errorf("session not running: %s", id)
+		return fmt.Errorf("%w: %s", ErrSessionNotRunning, id)
 	}
 	if toolSessionID == "" {
-		return fmt.Errorf("session has no tmux ID: %s", id)
+		return fmt.Errorf("%w: %s", ErrNoTmuxID, id)
 	}
 
 	return tmuxRunAction(toolSessionID, action)

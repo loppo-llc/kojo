@@ -81,7 +81,7 @@ func (m *GroupDMManager) APIBase() string {
 // Create creates a new group DM with the given members.
 func (m *GroupDMManager) Create(name string, memberIDs []string) (*GroupDM, error) {
 	if len(memberIDs) < 2 {
-		return nil, fmt.Errorf("group requires at least 2 members")
+		return nil, ErrGroupTooFew
 	}
 
 	members, err := m.resolveMembers(memberIDs)
@@ -89,7 +89,7 @@ func (m *GroupDMManager) Create(name string, memberIDs []string) (*GroupDM, erro
 		return nil, err
 	}
 	if len(members) < 2 {
-		return nil, fmt.Errorf("group requires at least 2 unique members")
+		return nil, ErrGroupTooFew
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -147,7 +147,7 @@ func (m *GroupDMManager) Delete(id string) error {
 	_, ok := m.groups[id]
 	if !ok {
 		m.mu.Unlock()
-		return fmt.Errorf("group not found: %s", id)
+		return fmt.Errorf("%w: %s", ErrGroupNotFound, id)
 	}
 	delete(m.groups, id)
 	m.mu.Unlock()
@@ -169,7 +169,7 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 	g, ok := m.groups[groupID]
 	if !ok {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("group not found: %s", groupID)
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
 	}
 
 	// Verify sender is a member
@@ -184,7 +184,7 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 	}
 	if !isMember {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("agent %s is not a member of group %s", agentID, groupID)
+		return nil, fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, agentID, groupID)
 	}
 
 	// Collect other members for notification
@@ -228,7 +228,7 @@ func (m *GroupDMManager) Messages(groupID string, limit int, before string) ([]*
 	_, ok := m.groups[groupID]
 	m.mu.Unlock()
 	if !ok {
-		return nil, false, fmt.Errorf("group not found: %s", groupID)
+		return nil, false, fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
 	}
 	return loadGroupMessages(groupID, limit, before)
 }
@@ -416,7 +416,7 @@ func (m *GroupDMManager) resolveMembers(ids []string) ([]GroupMember, error) {
 		seen[id] = true
 		a, ok := m.agentMgr.Get(id)
 		if !ok {
-			return nil, fmt.Errorf("agent not found: %s", id)
+			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 		}
 		members = append(members, GroupMember{AgentID: a.ID, AgentName: a.Name})
 	}

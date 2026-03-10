@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -343,7 +344,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		err = s.sessions.Remove(id)
 	}
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, session.ErrSessionNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
 		} else {
 			writeError(w, http.StatusConflict, "conflict", err.Error())
@@ -390,7 +391,7 @@ func (s *Server) handleRestartSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	sess, err := s.sessions.Restart(id)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, session.ErrSessionNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
 		} else {
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
@@ -414,14 +415,13 @@ func (s *Server) handleTmuxAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.sessions.TmuxAction(id, req.Action); err != nil {
-		msg := err.Error()
 		switch {
-		case strings.Contains(msg, "not found"):
-			writeError(w, http.StatusNotFound, "not_found", msg)
-		case strings.Contains(msg, "not running"), strings.Contains(msg, "not a terminal"):
-			writeError(w, http.StatusConflict, "conflict", msg)
+		case errors.Is(err, session.ErrSessionNotFound):
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		case errors.Is(err, session.ErrSessionNotRunning), errors.Is(err, session.ErrNotTerminal):
+			writeError(w, http.StatusConflict, "conflict", err.Error())
 		default:
-			writeError(w, http.StatusBadRequest, "bad_request", msg)
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		}
 		return
 	}

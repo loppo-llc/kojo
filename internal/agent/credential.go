@@ -380,7 +380,7 @@ func (s *CredentialStore) DeleteCredential(agentID, credID string) error {
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("credential not found: %s", credID)
+		return fmt.Errorf("%w: %s", ErrCredentialNotFound, credID)
 	}
 	return nil
 }
@@ -416,7 +416,7 @@ func (s *CredentialStore) GetTOTPCode(agentID, credID string) (string, int64, er
 		return "", 0, err
 	}
 	if c.TOTPSecret == "" {
-		return "", 0, fmt.Errorf("no TOTP secret configured for credential: %s", credID)
+		return "", 0, fmt.Errorf("%w for credential: %s", ErrNoTOTPSecret, credID)
 	}
 	return GenerateTOTPCode(c.TOTPSecret, c.TOTPAlgorithm, c.TOTPDigits, c.TOTPPeriod)
 }
@@ -431,7 +431,7 @@ func (s *CredentialStore) getCredentialLocked(agentID, credID string) (*Credenti
 	)
 	c, err := s.scanCredentialRow(row)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("credential not found: %s", credID)
+		return nil, fmt.Errorf("%w: %s", ErrCredentialNotFound, credID)
 	}
 	return c, err
 }

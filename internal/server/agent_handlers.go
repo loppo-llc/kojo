@@ -76,7 +76,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	a, err := s.agents.Update(id, cfg)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, agent.ErrAgentNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
 		} else {
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
@@ -89,9 +89,9 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.agents.ResetData(id); err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, agent.ErrAgentNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
-		} else if strings.Contains(err.Error(), "busy") {
+		} else if errors.Is(err, agent.ErrAgentBusy) {
 			writeError(w, http.StatusConflict, "conflict", err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
@@ -104,9 +104,9 @@ func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.agents.Delete(id); err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, agent.ErrAgentNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
-		} else if strings.Contains(err.Error(), "busy") {
+		} else if errors.Is(err, agent.ErrAgentBusy) {
 			writeError(w, http.StatusConflict, "conflict", err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
@@ -396,11 +396,7 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 	}
 	cred, err := s.agents.Credentials().AddCredential(id, req.Label, req.Username, req.Password, totp)
 	if err != nil {
-		if strings.Contains(err.Error(), "TOTP") || strings.Contains(err.Error(), "base32") {
-			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		} else {
-			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
-		}
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, cred)
@@ -453,10 +449,8 @@ func (s *Server) handleUpdateCredential(w http.ResponseWriter, r *http.Request) 
 	}
 	cred, err := s.agents.Credentials().UpdateCredential(id, credID, req.Label, req.Username, req.Password, totp)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, agent.ErrCredentialNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
-		} else if strings.Contains(err.Error(), "TOTP") || strings.Contains(err.Error(), "base32") {
-			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		}
@@ -476,7 +470,7 @@ func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := s.agents.Credentials().DeleteCredential(id, credID); err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, agent.ErrCredentialNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
@@ -498,7 +492,7 @@ func (s *Server) handleRevealCredentialPassword(w http.ResponseWriter, r *http.R
 	}
 	password, err := s.agents.Credentials().RevealPassword(id, credID)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, agent.ErrCredentialNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
@@ -521,7 +515,7 @@ func (s *Server) handleGetTOTPCode(w http.ResponseWriter, r *http.Request) {
 	}
 	code, remaining, err := s.agents.Credentials().GetTOTPCode(id, credID)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "no TOTP") {
+		if errors.Is(err, agent.ErrCredentialNotFound) || errors.Is(err, agent.ErrNoTOTPSecret) {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
