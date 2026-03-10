@@ -565,13 +565,13 @@ func (m *Manager) ResetData(id string) error {
 	clearClaudeSession(id)
 	clearGeminiSession(id)
 
-	// Recreate empty memory directory and MEMORY.md
+	// Recreate empty memory directory and MEMORY.md (required for agent to function)
 	if err := os.MkdirAll(filepath.Join(dir, "memory"), 0o755); err != nil {
-		m.logger.Warn("reset: failed to recreate memory dir", "agent", id, "err", err)
+		return fmt.Errorf("recreate memory dir: %w", err)
 	}
 	initial := fmt.Sprintf("# %s's Memory\n\nThis file stores persistent memories. Update it as you learn new things.\n", name)
 	if err := os.WriteFile(filepath.Join(dir, "MEMORY.md"), []byte(initial), 0o644); err != nil {
-		m.logger.Warn("reset: failed to recreate MEMORY.md", "agent", id, "err", err)
+		return fmt.Errorf("recreate MEMORY.md: %w", err)
 	}
 
 	// Clear last message preview
@@ -638,11 +638,13 @@ func (m *Manager) Delete(id string) error {
 		m.groupdms.RemoveAgent(id)
 	}
 
-	// Remove agent data directory
+	// Remove agent data directory (best-effort: credentials/cron/notify already cleaned up)
 	dir := agentDir(id)
-	os.RemoveAll(dir)
+	if err := os.RemoveAll(dir); err != nil {
+		m.logger.Warn("failed to remove agent dir", "agent", id, "err", err)
+	}
 
-	// Remove from in-memory map after all cleanup succeeds
+	// Remove from in-memory map
 	m.mu.Lock()
 	delete(m.agents, id)
 	m.mu.Unlock()
