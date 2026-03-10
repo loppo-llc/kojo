@@ -550,9 +550,9 @@ func (s *Server) handleViewFile(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	result, err := s.files.View(path)
 	if err != nil {
-		if strings.Contains(err.Error(), "unsupported") {
+		if errors.Is(err, filebrowser.ErrUnsupportedFile) {
 			writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", err.Error())
-		} else if strings.Contains(err.Error(), "too large") {
+		} else if errors.Is(err, filebrowser.ErrFileTooLarge) {
 			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", err.Error())
 		} else {
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())

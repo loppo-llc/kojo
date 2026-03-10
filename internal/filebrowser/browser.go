@@ -1,6 +1,7 @@
 package filebrowser
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -10,6 +11,12 @@ import (
 	"runtime"
 	"strings"
 	"time"
+)
+
+// Sentinel errors for file browser operations.
+var (
+	ErrUnsupportedFile = errors.New("unsupported file type")
+	ErrFileTooLarge    = errors.New("file too large")
 )
 
 const maxFileSize = 1024 * 1024 // 1MB
@@ -164,7 +171,7 @@ func (b *Browser) View(path string) (*FileView, error) {
 
 	// text
 	if info.Size() > maxFileSize {
-		return nil, fmt.Errorf("file too large: %d bytes (max %d)", info.Size(), maxFileSize)
+		return nil, fmt.Errorf("%w: %d bytes (max %d)", ErrFileTooLarge, info.Size(), maxFileSize)
 	}
 
 	content, err := os.ReadFile(path)
@@ -174,7 +181,7 @@ func (b *Browser) View(path string) (*FileView, error) {
 
 	// check if binary
 	if isBinary(content) {
-		return nil, fmt.Errorf("unsupported file type: binary")
+		return nil, fmt.Errorf("%w: binary", ErrUnsupportedFile)
 	}
 
 	lang := langExts[ext]

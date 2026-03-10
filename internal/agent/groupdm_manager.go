@@ -362,7 +362,7 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 	ns.inFlight = false
 
 	if err != nil {
-		if errors.Is(err, ErrAgentBusy) {
+		if errors.Is(err, ErrAgentBusy) || errors.Is(err, ErrAgentResetting) {
 			// Agent busy — re-defer for retry after cooldown
 			if !ns.hasPending {
 				ns.agentID = agentID

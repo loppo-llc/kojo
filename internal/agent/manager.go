@@ -377,6 +377,12 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 
 	m.mu.Lock()
+	// Re-check: agent may have been deleted concurrently
+	a, ok = m.agents[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
+	}
 
 	oldPersona := a.Persona
 	if cfg.Persona != nil {
