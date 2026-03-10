@@ -1,5 +1,5 @@
 import { memo, useState, useCallback, useMemo, useEffect } from "react";
-import type { AgentMessage } from "../../lib/agentApi";
+import type { AgentMessage, AgentMessageAttachment } from "../../lib/agentApi";
 import { ToolUseCard } from "./ToolUseCard";
 import { AgentAvatar } from "./AgentAvatar";
 import { MarkdownRenderer } from "./MarkdownRenderer";
@@ -49,6 +49,10 @@ export const ChatMessage = memo(function ChatMessage({
         } px-3.5 py-2.5`}
       >
         {!isUser && message.thinking && <ThinkingBlock text={message.thinking} />}
+        {/* Attachments */}
+        {message.attachments && message.attachments.length > 0 && (
+          <AttachmentList attachments={message.attachments} isUser={isUser} />
+        )}
         <MessageContent content={message.content} isUser={isUser} timestamp={message.timestamp} />
 
         {/* Tool uses */}
@@ -71,6 +75,59 @@ export const ChatMessage = memo(function ChatMessage({
     </div>
   );
 });
+
+/** Display file attachments on a message */
+function AttachmentList({ attachments, isUser }: { attachments: AgentMessageAttachment[]; isUser: boolean }) {
+  const [preview, setPreview] = useState<{ path: string; type: "image" | "video" } | null>(null);
+
+  return (
+    <>
+      <div className="flex flex-wrap gap-1.5 mb-2">
+        {attachments.map((att) => {
+          const isImage = att.mime.startsWith("image/");
+          if (isImage) {
+            return (
+              <button
+                key={att.path}
+                onClick={() => setPreview({ path: att.path, type: "image" })}
+                className="block rounded-lg overflow-hidden hover:opacity-80 transition-opacity"
+              >
+                <img
+                  src={`/api/v1/files/raw?path=${encodeURIComponent(att.path)}`}
+                  alt={att.name}
+                  className="max-w-[200px] max-h-[150px] object-cover rounded-lg"
+                />
+              </button>
+            );
+          }
+          return (
+            <div
+              key={att.path}
+              className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs ${
+                isUser ? "bg-blue-500/30" : "bg-neutral-700/50"
+              }`}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 opacity-60">
+                <path d="M3 3.5A1.5 1.5 0 014.5 2h6.879a1.5 1.5 0 011.06.44l4.122 4.12A1.5 1.5 0 0117 7.622V16.5a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 013 16.5v-13z" />
+              </svg>
+              <span className="max-w-[150px] truncate">{att.name}</span>
+              <span className="opacity-50">{formatFileSize(att.size)}</span>
+            </div>
+          );
+        })}
+      </div>
+      {preview && (
+        <MediaOverlay path={preview.path} type={preview.type} onClose={() => setPreview(null)} />
+      )}
+    </>
+  );
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
 
 /** System / error messages -- centered, distinct styling */
 function SystemMessage({ message }: { message: AgentMessage }) {

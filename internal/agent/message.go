@@ -4,15 +4,24 @@ import (
 	"time"
 )
 
+// MessageAttachment represents a file attached to a chat message.
+type MessageAttachment struct {
+	Path string `json:"path"`
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+	Mime string `json:"mime"`
+}
+
 // Message represents a single chat message in the transcript.
 type Message struct {
-	ID        string     `json:"id"`
-	Role      string     `json:"role"` // "user", "assistant", "system"
-	Content   string     `json:"content"`
-	Thinking  string     `json:"thinking,omitempty"` // intermediate reasoning (shown collapsed in UI)
-	ToolUses  []ToolUse  `json:"toolUses,omitempty"`
-	Timestamp string     `json:"timestamp"` // RFC3339
-	Usage     *Usage     `json:"usage,omitempty"`
+	ID          string              `json:"id"`
+	Role        string              `json:"role"` // "user", "assistant", "system"
+	Content     string              `json:"content"`
+	Thinking    string              `json:"thinking,omitempty"` // intermediate reasoning (shown collapsed in UI)
+	ToolUses    []ToolUse           `json:"toolUses,omitempty"`
+	Attachments []MessageAttachment `json:"attachments,omitempty"`
+	Timestamp   string              `json:"timestamp"` // RFC3339
+	Usage       *Usage              `json:"usage,omitempty"`
 }
 
 // ToolUse represents a single tool invocation within a message.
@@ -46,12 +55,13 @@ func generateMessageID() string {
 	return generatePrefixedID("m_")
 }
 
-func newUserMessage(content string) *Message {
+func newUserMessage(content string, attachments []MessageAttachment) *Message {
 	return &Message{
-		ID:        generateMessageID(),
-		Role:      "user",
-		Content:   content,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		ID:          generateMessageID(),
+		Role:        "user",
+		Content:     content,
+		Attachments: attachments,
+		Timestamp:   time.Now().UTC().Format(time.RFC3339),
 	}
 }
 

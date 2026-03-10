@@ -353,7 +353,7 @@ func (p *notifyPoller) sendSystemMessage(agentID, sourceID, message string, retr
 	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
 	defer cancel()
 
-	events, err := p.mgr.Chat(ctx, agentID, message, "system")
+	events, err := p.mgr.Chat(ctx, agentID, message, "system", nil)
 	if err != nil {
 		retries++
 		if retries >= notifyMaxRetries {

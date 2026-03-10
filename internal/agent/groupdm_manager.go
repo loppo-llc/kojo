@@ -265,7 +265,7 @@ func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName, senderName str
 	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
 	defer cancel()
 
-	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system")
+	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system", nil)
 	if err != nil {
 		// Agent might be busy — that's expected, not an error worth warning about
 		if !strings.Contains(err.Error(), "busy") {

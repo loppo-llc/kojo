@@ -41,6 +41,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		"-p",
 		"--output-format", "stream-json",
 		"--verbose",
+		"--include-partial-messages",
 		"--dangerously-skip-permissions",
 	}
 
@@ -123,10 +124,27 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 				continue
 			}
 
+			b.logger.Debug("claude stream raw", "len", len(line))
+
 			var event claudeStreamEvent
 			if err := json.Unmarshal([]byte(line), &event); err != nil {
 				b.logger.Debug("failed to parse claude stream event", "line", line, "err", err)
 				continue
+			}
+
+			// Unwrap stream_event wrapper emitted by --include-partial-messages.
+			// The inner "event" field contains the actual streaming event
+			// (content_block_start, content_block_delta, etc.).
+			if event.Type == "stream_event" && len(event.Event) > 0 {
+				var inner claudeStreamEvent
+				if err := json.Unmarshal(event.Event, &inner); err != nil {
+					b.logger.Debug("failed to parse inner stream event", "err", err)
+					continue
+				}
+				if inner.Type == "" {
+					continue
+				}
+				event = inner
 			}
 
 			switch event.Type {
@@ -270,6 +288,9 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 // Claude stream-json event types
 type claudeStreamEvent struct {
 	Type string `json:"type"`
+
+	// "stream_event" wrapper (--include-partial-messages)
+	Event json.RawMessage `json:"event,omitempty"`
 
 	// "system" event
 	Subtype string `json:"subtype,omitempty"`

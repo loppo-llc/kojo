@@ -3,8 +3,13 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/coder/websocket"
 	"github.com/loppo-llc/kojo/internal/agent"
@@ -12,8 +17,9 @@ import (
 
 // Agent WebSocket message types
 type agentWSClientMsg struct {
-	Type    string `json:"type"`    // "message", "abort"
-	Content string `json:"content"` // for "message" type
+	Type        string                  `json:"type"`                  // "message", "abort"
+	Content     string                  `json:"content"`               // for "message" type
+	Attachments []agent.MessageAttachment `json:"attachments,omitempty"` // file attachments
 }
 
 func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -141,7 +147,15 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 		case msg := <-clientMsgs:
 			switch msg.Type {
 			case "message":
-				if msg.Content == "" {
+				if msg.Content == "" && len(msg.Attachments) == 0 {
+					continue
+				}
+
+				// Validate attachments: paths must be inside uploadDir and exist on disk.
+				validatedAtts := validateAttachments(msg.Attachments)
+
+				// Reject empty messages after validation
+				if msg.Content == "" && len(validatedAtts) == 0 {
 					continue
 				}
 
@@ -162,7 +176,7 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 
 				// Use background context for chat so it survives WebSocket disconnects.
 				// The response is saved to transcript even if the client navigates away.
-				events, err := s.agents.Chat(context.Background(), agentID, msg.Content, "user")
+				events, err := s.agents.Chat(context.Background(), agentID, msg.Content, "user", validatedAtts)
 				if err != nil {
 					_ = writeJSON(ctx, conn, map[string]string{
 						"type":         "error",
@@ -226,4 +240,69 @@ func (s *Server) streamAgentEvents(
 			// Ignore other messages while streaming
 		}
 	}
+}
+
+// validateAttachments checks that each attachment path is inside the upload
+// directory and exists on disk, then rebuilds metadata from the file system.
+// Any attachment that fails validation is silently dropped.
+func validateAttachments(atts []agent.MessageAttachment) []agent.MessageAttachment {
+	if len(atts) == 0 {
+		return nil
+	}
+
+	// Resolve uploadDir once (handles /tmp → /private/tmp on macOS)
+	canonicalUploadDir, err := filepath.EvalSymlinks(uploadDir)
+	if err != nil {
+		canonicalUploadDir = uploadDir
+	}
+
+	result := make([]agent.MessageAttachment, 0, len(atts))
+	for _, a := range atts {
+		// Resolve to absolute, canonical path
+		resolved, err := filepath.Abs(a.Path)
+		if err != nil {
+			continue
+		}
+		resolved, err = filepath.EvalSymlinks(resolved)
+		if err != nil {
+			continue
+		}
+
+		// Must be inside the upload directory
+		if !strings.HasPrefix(resolved, canonicalUploadDir+string(filepath.Separator)) && resolved != canonicalUploadDir {
+			continue
+		}
+
+		// Must exist
+		info, err := os.Stat(resolved)
+		if err != nil || info.IsDir() {
+			continue
+		}
+
+		// Derive metadata from disk, not client. Strip control characters
+		// from filenames to prevent prompt injection via crafted names.
+		name := sanitizeFilename(filepath.Base(resolved))
+		mimeType := mime.TypeByExtension(filepath.Ext(name))
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+
+		result = append(result, agent.MessageAttachment{
+			Path: resolved,
+			Name: name,
+			Size: info.Size(),
+			Mime: mimeType,
+		})
+	}
+	return result
+}
+
+// sanitizeFilename removes control characters and newlines from a filename.
+func sanitizeFilename(name string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, name)
 }

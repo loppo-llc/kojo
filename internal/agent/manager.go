@@ -631,7 +631,7 @@ func (m *Manager) Delete(id string) error {
 // Chat sends a message to an agent and returns a channel of streaming events.
 // The role parameter controls how the input message is stored in the transcript
 // ("user" for interactive chat, "system" for cron-triggered messages).
-func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, role string) (<-chan ChatEvent, error) {
+func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, role string, attachments []MessageAttachment) (<-chan ChatEvent, error) {
 	// Sync persona.md → Agent.Persona before chat
 	m.syncPersona(agentID)
 
@@ -667,15 +667,25 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		return nil, fmt.Errorf("unsupported tool: %s", agentCopy.Tool)
 	}
 
+	atts := attachments
+
 	// Save input message to transcript
 	var inputMsg *Message
 	if role == "system" {
 		inputMsg = newSystemMessage(userMessage)
 	} else {
-		inputMsg = newUserMessage(userMessage)
+		inputMsg = newUserMessage(userMessage, atts)
 	}
 	if err := appendMessage(agentID, inputMsg); err != nil {
 		m.logger.Warn("failed to save input message", "err", err)
+	}
+
+	// Build the effective message for the backend.
+	// When attachments are present, prepend file references so the CLI
+	// can access them (e.g. via Read tool for images/text).
+	effectiveMessage := userMessage
+	if len(atts) > 0 {
+		effectiveMessage = formatMessageWithAttachments(userMessage, atts)
 	}
 
 	// Build system prompt with group DM context
@@ -688,7 +698,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	systemPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
 
 	// Start chat
-	backendCh, err := backend.Chat(chatCtx, &agentCopy, userMessage, systemPrompt)
+	backendCh, err := backend.Chat(chatCtx, &agentCopy, effectiveMessage, systemPrompt)
 	if err != nil {
 		m.clearBusy(agentID)
 		cancel()
@@ -896,6 +906,25 @@ func isRateLimitMessage(msg *Message) bool {
 		}
 	}
 	return false
+}
+
+// formatMessageWithAttachments prepends attachment references to the user
+// message so the CLI backend can access the files via its Read tool.
+func formatMessageWithAttachments(message string, atts []MessageAttachment) string {
+	var b strings.Builder
+	b.WriteString("[Attached files — use your Read tool to view these files]\n")
+	for _, a := range atts {
+		b.WriteString("- ")
+		b.WriteString(a.Path)
+		b.WriteString(" (")
+		b.WriteString(a.Name)
+		b.WriteString(", ")
+		b.WriteString(a.Mime)
+		b.WriteString(")\n")
+	}
+	b.WriteString("\n")
+	b.WriteString(message)
+	return b.String()
 }
 
 func truncatePreview(s string, maxLen int) string {

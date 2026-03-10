@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { useParams, useNavigate } from "react-router";
-import { agentApi, type AgentInfo, type AgentMessage, type ChatEvent } from "../../lib/agentApi";
+import { agentApi, type AgentInfo, type AgentMessage, type AgentMessageAttachment, type ChatEvent } from "../../lib/agentApi";
+import { api } from "../../lib/api";
 import { useAgentWebSocket } from "../../hooks/useAgentWebSocket";
 import { ChatMessage, StreamingMessage } from "./ChatMessage";
 import { AgentAvatar } from "./AgentAvatar";
@@ -20,6 +21,10 @@ export function AgentChat() {
   const [streamStatus, setStreamStatus] = useState("");
   const [streamStartTime, setStreamStartTime] = useState<number>(Date.now());
   const [hasMore, setHasMore] = useState(false);
+  const [pendingFiles, setPendingFiles] = useState<AgentMessageAttachment[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -192,15 +197,52 @@ export function AgentChat() {
     onDisconnect,
   });
 
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    setUploading(true);
+    setUploadError(null);
+    try {
+      const results = await Promise.allSettled(
+        Array.from(files).map((file) => api.upload(file)),
+      );
+      const uploaded: AgentMessageAttachment[] = [];
+      const failed: string[] = [];
+      for (let i = 0; i < results.length; i++) {
+        const r = results[i];
+        if (r.status === "fulfilled") {
+          uploaded.push({ path: r.value.path, name: r.value.name, size: r.value.size, mime: r.value.mime });
+        } else {
+          failed.push(Array.from(files)[i].name);
+        }
+      }
+      if (uploaded.length > 0) {
+        setPendingFiles((prev) => [...prev, ...uploaded]);
+      }
+      if (failed.length > 0) {
+        setUploadError(`Upload failed: ${failed.join(", ")}`);
+      }
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const removePendingFile = (index: number) => {
+    setPendingFiles((prev) => prev.filter((_, i) => i !== index));
+  };
+
   const handleSend = () => {
     const text = input.trim();
-    if (!text || streaming || !connected) return;
+    if ((!text && pendingFiles.length === 0) || streaming || !connected) return;
 
     // Add user message immediately
     const userMsg: AgentMessage = {
       id: "pending_" + Date.now(),
       role: "user",
       content: text,
+      attachments: pendingFiles.length > 0 ? pendingFiles : undefined,
       timestamp: new Date().toISOString(),
     };
     setMessages((prev) => [...prev, userMsg]);
@@ -212,7 +254,9 @@ export function AgentChat() {
     setStreamTools([]);
     setStreamStatus("thinking");
     setStreamStartTime(Date.now());
-    sendMessage(text);
+    sendMessage(text, pendingFiles.length > 0 ? pendingFiles : undefined);
+    setPendingFiles([]);
+    setUploadError(null);
 
     // Reset textarea height
     if (textareaRef.current) {
@@ -319,7 +363,74 @@ export function AgentChat() {
 
       {/* Input */}
       <div className="border-t border-neutral-800 px-4 py-3 shrink-0">
+        {/* Upload error */}
+        {uploadError && (
+          <div className="flex items-center gap-2 mb-2 px-3 py-1.5 bg-red-950/50 border border-red-900/50 rounded-lg text-xs text-red-300">
+            <span className="flex-1">{uploadError}</span>
+            <button onClick={() => setUploadError(null)} className="text-red-400 hover:text-red-200">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3">
+                <path d="M5.28 4.22a.75.75 0 00-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 101.06 1.06L8 9.06l2.72 2.72a.75.75 0 101.06-1.06L9.06 8l2.72-2.72a.75.75 0 00-1.06-1.06L8 6.94 5.28 4.22z" />
+              </svg>
+            </button>
+          </div>
+        )}
+        {/* Pending file attachments */}
+        {pendingFiles.length > 0 && (
+          <div className="flex flex-wrap gap-2 mb-2">
+            {pendingFiles.map((file, i) => (
+              <div
+                key={file.path}
+                className="flex items-center gap-1.5 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded-lg text-xs text-neutral-300"
+              >
+                {file.mime.startsWith("image/") ? (
+                  <img
+                    src={`/api/v1/files/raw?path=${encodeURIComponent(file.path)}`}
+                    alt={file.name}
+                    className="w-6 h-6 rounded object-cover"
+                  />
+                ) : (
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-neutral-500">
+                    <path d="M3 3.5A1.5 1.5 0 014.5 2h6.879a1.5 1.5 0 011.06.44l4.122 4.12A1.5 1.5 0 0117 7.622V16.5a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 013 16.5v-13z" />
+                  </svg>
+                )}
+                <span className="max-w-[120px] truncate">{file.name}</span>
+                <button
+                  onClick={() => removePendingFile(i)}
+                  className="text-neutral-500 hover:text-neutral-300 ml-0.5"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3">
+                    <path d="M5.28 4.22a.75.75 0 00-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 101.06 1.06L8 9.06l2.72 2.72a.75.75 0 101.06-1.06L9.06 8l2.72-2.72a.75.75 0 00-1.06-1.06L8 6.94 5.28 4.22z" />
+                  </svg>
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
         <div className="flex items-end gap-2">
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            onChange={handleFileSelect}
+            className="hidden"
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploading || streaming}
+            className="p-2 text-neutral-500 hover:text-neutral-300 disabled:opacity-40 shrink-0"
+            title="Attach files"
+          >
+            {uploading ? (
+              <svg className="w-5 h-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
+            ) : (
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
+                <path fillRule="evenodd" d="M15.621 4.379a3 3 0 00-4.242 0l-7 7a3 3 0 004.241 4.243h.001l.497-.5a.75.75 0 011.064 1.057l-.498.501-.002.002a4.5 4.5 0 01-6.364-6.364l7-7a4.5 4.5 0 016.368 6.36l-3.455 3.553A2.625 2.625 0 119.52 9.52l3.45-3.451a.75.75 0 111.061 1.06l-3.45 3.451a1.125 1.125 0 001.587 1.595l3.454-3.553a3 3 0 000-4.242z" clipRule="evenodd" />
+              </svg>
+            )}
+          </button>
           <textarea
             ref={textareaRef}
             value={input}
@@ -343,7 +454,7 @@ export function AgentChat() {
           ) : (
             <button
               onClick={handleSend}
-              disabled={!input.trim() || !connected}
+              disabled={(!input.trim() && pendingFiles.length === 0) || !connected}
               className="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-xl text-sm font-medium disabled:opacity-40 shrink-0"
             >
               Send

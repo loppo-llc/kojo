@@ -49,12 +49,20 @@ export interface AgentUpdateParams extends Partial<AgentConfig> {
   publicProfileOverride?: boolean;
 }
 
+export interface AgentMessageAttachment {
+  path: string;
+  name: string;
+  size: number;
+  mime: string;
+}
+
 export interface AgentMessage {
   id: string;
   role: "user" | "assistant" | "system";
   content: string;
   thinking?: string;
   toolUses?: ToolUse[];
+  attachments?: AgentMessageAttachment[];
   timestamp: string;
   usage?: { inputTokens: number; outputTokens: number };
 }

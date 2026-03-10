@@ -591,7 +591,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	safeName := filepath.Base(header.Filename)
+	safeName := sanitizeFilename(filepath.Base(header.Filename))
 	filename := fmt.Sprintf("%d_%s", time.Now().UnixNano(), safeName)
 	destPath := filepath.Join(uploadDir, filename)
 

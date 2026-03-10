@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from "react";
-import type { ChatEvent } from "../lib/agentApi";
+import type { AgentMessageAttachment, ChatEvent } from "../lib/agentApi";
 
 interface UseAgentWebSocketOptions {
   agentId: string;
@@ -77,9 +77,13 @@ export function useAgentWebSocket({
     };
   }, [connect]);
 
-  const sendMessage = useCallback((content: string) => {
+  const sendMessage = useCallback((content: string, attachments?: AgentMessageAttachment[]) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: "message", content }));
+      const msg: Record<string, unknown> = { type: "message", content };
+      if (attachments && attachments.length > 0) {
+        msg.attachments = attachments;
+      }
+      wsRef.current.send(JSON.stringify(msg));
     }
   }, []);
 
