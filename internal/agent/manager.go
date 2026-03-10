@@ -547,33 +547,53 @@ func (m *Manager) ResetData(id string) error {
 	dir := agentDir(id)
 
 	// Remove conversation log
-	os.Remove(filepath.Join(dir, messagesFile))
+	if err := os.Remove(filepath.Join(dir, messagesFile)); err != nil && !os.IsNotExist(err) {
+		m.logger.Warn("reset: failed to remove messages", "agent", id, "err", err)
+	}
 
 	// Remove memory files
-	os.RemoveAll(filepath.Join(dir, "memory"))
-	os.Remove(filepath.Join(dir, "MEMORY.md"))
+	if err := os.RemoveAll(filepath.Join(dir, "memory")); err != nil {
+		m.logger.Warn("reset: failed to remove memory dir", "agent", id, "err", err)
+	}
+	if err := os.Remove(filepath.Join(dir, "MEMORY.md")); err != nil && !os.IsNotExist(err) {
+		m.logger.Warn("reset: failed to remove MEMORY.md", "agent", id, "err", err)
+	}
 
 	// Remove FTS index
-	os.RemoveAll(filepath.Join(dir, indexDir))
+	if err := os.RemoveAll(filepath.Join(dir, indexDir)); err != nil {
+		m.logger.Warn("reset: failed to remove index dir", "agent", id, "err", err)
+	}
 
 	// Remove persona summary cache (will be regenerated)
-	os.Remove(filepath.Join(dir, "persona_summary.md"))
+	if err := os.Remove(filepath.Join(dir, "persona_summary.md")); err != nil && !os.IsNotExist(err) {
+		m.logger.Warn("reset: failed to remove persona summary", "agent", id, "err", err)
+	}
 
 	// Remove cron lock file
-	os.Remove(filepath.Join(dir, cronLockFile))
+	if err := os.Remove(filepath.Join(dir, cronLockFile)); err != nil && !os.IsNotExist(err) {
+		m.logger.Warn("reset: failed to remove cron lock", "agent", id, "err", err)
+	}
 
 	// Remove CLI local state so next chat starts fresh
-	os.RemoveAll(filepath.Join(dir, ".claude"))
-	os.RemoveAll(filepath.Join(dir, ".gemini"))
+	if err := os.RemoveAll(filepath.Join(dir, ".claude")); err != nil {
+		m.logger.Warn("reset: failed to remove .claude dir", "agent", id, "err", err)
+	}
+	if err := os.RemoveAll(filepath.Join(dir, ".gemini")); err != nil {
+		m.logger.Warn("reset: failed to remove .gemini dir", "agent", id, "err", err)
+	}
 
 	// Clear global CLI session stores
 	clearClaudeSession(id)
 	clearGeminiSession(id)
 
 	// Recreate empty memory directory and MEMORY.md
-	os.MkdirAll(filepath.Join(dir, "memory"), 0o755)
+	if err := os.MkdirAll(filepath.Join(dir, "memory"), 0o755); err != nil {
+		m.logger.Warn("reset: failed to recreate memory dir", "agent", id, "err", err)
+	}
 	initial := fmt.Sprintf("# %s's Memory\n\nThis file stores persistent memories. Update it as you learn new things.\n", name)
-	os.WriteFile(filepath.Join(dir, "MEMORY.md"), []byte(initial), 0o644)
+	if err := os.WriteFile(filepath.Join(dir, "MEMORY.md"), []byte(initial), 0o644); err != nil {
+		m.logger.Warn("reset: failed to recreate MEMORY.md", "agent", id, "err", err)
+	}
 
 	// Clear last message preview
 	m.mu.Lock()

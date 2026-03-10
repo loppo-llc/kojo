@@ -390,17 +390,25 @@ func (p *notifyPoller) loadCursors() {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	json.Unmarshal(data, &p.cursors)
+	if err := json.Unmarshal(data, &p.cursors); err != nil {
+		p.logger.Warn("failed to parse notify cursors", "path", path, "err", err)
+	}
 }
 
 func (p *notifyPoller) saveCursorsLocked() {
 	path := filepath.Join(configDir(), notifyCursorFile)
 	data, err := json.Marshal(p.cursors)
 	if err != nil {
+		p.logger.Warn("failed to marshal notify cursors", "err", err)
 		return
 	}
-	os.MkdirAll(filepath.Dir(path), 0o755)
-	os.WriteFile(path, data, 0o644)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		p.logger.Warn("failed to create cursor dir", "err", err)
+		return
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		p.logger.Warn("failed to write notify cursors", "path", path, "err", err)
+	}
 }
 
 func configDir() string {

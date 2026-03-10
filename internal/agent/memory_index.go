@@ -90,8 +90,14 @@ func OpenMemoryIndex(agentID string, logger *slog.Logger) (*MemoryIndex, error) 
 		db.Close()
 		return nil, fmt.Errorf("create chunks table: %w", err)
 	}
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(content_hash)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source)`)
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(content_hash)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create chunks hash index: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create chunks source index: %w", err)
+	}
 
 	// Embedding cache persists across re-indexes
 	if _, err := db.Exec(`
@@ -129,7 +135,9 @@ func (idx *MemoryIndex) IndexMessages(agentID string) error {
 	if _, err := idx.db.Exec("DELETE FROM memory_fts WHERE source = 'message'"); err != nil {
 		return err
 	}
-	idx.db.Exec("DELETE FROM chunks WHERE source = 'message'")
+	if _, err := idx.db.Exec("DELETE FROM chunks WHERE source = 'message'"); err != nil {
+		return err
+	}
 
 	ftsStmt, err := idx.db.Prepare("INSERT INTO memory_fts(source, content, timestamp) VALUES(?, ?, ?)")
 	if err != nil {
@@ -153,11 +161,15 @@ func (idx *MemoryIndex) IndexMessages(agentID string) error {
 		}
 		hash := contentHash(text)
 		cached := idx.getCachedEmbedding(hash)
-		chunkStmt.Exec("message", text, hash, msg.Timestamp, cached)
+		if _, err := chunkStmt.Exec("message", text, hash, msg.Timestamp, cached); err != nil {
+			idx.logger.Debug("failed to index message chunk", "id", msg.ID, "err", err)
+		}
 	}
 
 	// Update message_count to stay in sync with incremental indexing
-	idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_count", fmt.Sprintf("%d", len(msgs)))
+	if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_count", fmt.Sprintf("%d", len(msgs))); err != nil {
+		idx.logger.Debug("failed to update message_count meta", "err", err)
+	}
 	idx.updateMeta("message")
 	return nil
 }
@@ -173,7 +185,9 @@ func (idx *MemoryIndex) IndexFiles(agentID string) error {
 	if _, err := idx.db.Exec("DELETE FROM memory_fts WHERE source IN ('memory', 'daily')"); err != nil {
 		return err
 	}
-	idx.db.Exec("DELETE FROM chunks WHERE source IN ('memory', 'daily')")
+	if _, err := idx.db.Exec("DELETE FROM chunks WHERE source IN ('memory', 'daily')"); err != nil {
+		return err
+	}
 
 	ftsStmt, err := idx.db.Prepare("INSERT INTO memory_fts(source, content, timestamp) VALUES(?, ?, ?)")
 	if err != nil {
@@ -196,10 +210,14 @@ func (idx *MemoryIndex) IndexFiles(agentID string) error {
 			if strings.TrimSpace(section) == "" {
 				continue
 			}
-			ftsStmt.Exec("memory", section, now)
+			if _, err := ftsStmt.Exec("memory", section, now); err != nil {
+				idx.logger.Debug("failed to index memory section", "err", err)
+			}
 			hash := contentHash(section)
 			cached := idx.getCachedEmbedding(hash)
-			chunkStmt.Exec("memory", section, hash, now, cached)
+			if _, err := chunkStmt.Exec("memory", section, hash, now, cached); err != nil {
+				idx.logger.Debug("failed to index memory chunk", "err", err)
+			}
 		}
 	}
 
@@ -216,10 +234,14 @@ func (idx *MemoryIndex) IndexFiles(agentID string) error {
 				continue
 			}
 			date := strings.TrimSuffix(entry.Name(), ".md")
-			ftsStmt.Exec("daily", string(data), date)
+			if _, err := ftsStmt.Exec("daily", string(data), date); err != nil {
+				idx.logger.Debug("failed to index daily note", "file", entry.Name(), "err", err)
+			}
 			hash := contentHash(string(data))
 			cached := idx.getCachedEmbedding(hash)
-			chunkStmt.Exec("daily", string(data), hash, date, cached)
+			if _, err := chunkStmt.Exec("daily", string(data), hash, date, cached); err != nil {
+				idx.logger.Debug("failed to index daily chunk", "file", entry.Name(), "err", err)
+			}
 		}
 	}
 
@@ -263,18 +285,26 @@ func (idx *MemoryIndex) IndexNewMessages(agentID string) {
 		var ftsCount int
 		if err := idx.db.QueryRow("SELECT COUNT(*) FROM memory_fts WHERE source = 'message'").Scan(&ftsCount); err == nil && ftsCount > 0 {
 			// Existing DB without message_count tracking. Save current total and skip.
-			idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_count", fmt.Sprintf("%d", len(msgs)))
+			if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_count", fmt.Sprintf("%d", len(msgs))); err != nil {
+				idx.logger.Debug("failed to save message_count baseline", "err", err)
+			}
 			return
 		}
 	}
 
 	// If messages were truncated/rebuilt (count shrank), do a full reindex
 	if len(msgs) < lastCount {
-		idx.db.Exec("DELETE FROM memory_fts WHERE source = 'message'")
-		idx.db.Exec("DELETE FROM chunks WHERE source = 'message'")
+		if _, err := idx.db.Exec("DELETE FROM memory_fts WHERE source = 'message'"); err != nil {
+			idx.logger.Debug("failed to clear FTS messages for reindex", "err", err)
+		}
+		if _, err := idx.db.Exec("DELETE FROM chunks WHERE source = 'message'"); err != nil {
+			idx.logger.Debug("failed to clear chunks for reindex", "err", err)
+		}
 		lastCount = 0
 		if len(msgs) == 0 {
-			idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_count", "0")
+			if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_count", "0"); err != nil {
+				idx.logger.Debug("failed to reset message_count", "err", err)
+			}
 			return
 		}
 	}
@@ -300,13 +330,19 @@ func (idx *MemoryIndex) IndexNewMessages(agentID string) {
 			continue
 		}
 		text := msg.Role + ": " + msg.Content
-		ftsStmt.Exec("message", text, msg.Timestamp)
+		if _, err := ftsStmt.Exec("message", text, msg.Timestamp); err != nil {
+			idx.logger.Debug("failed to index new message", "err", err)
+		}
 		hash := contentHash(text)
 		cached := idx.getCachedEmbedding(hash)
-		chunkStmt.Exec("message", text, hash, msg.Timestamp, cached)
+		if _, err := chunkStmt.Exec("message", text, hash, msg.Timestamp, cached); err != nil {
+			idx.logger.Debug("failed to index new message chunk", "err", err)
+		}
 	}
 
-	idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_count", fmt.Sprintf("%d", len(msgs)))
+	if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_count", fmt.Sprintf("%d", len(msgs))); err != nil {
+		idx.logger.Debug("failed to update message_count", "err", err)
+	}
 	idx.updateMeta("message")
 }
 
@@ -615,13 +651,18 @@ func (idx *MemoryIndex) embedPendingChunks(apiKey string) {
 
 	// Mark selected rows as in-progress (empty blob) to prevent duplicate
 	// API calls from concurrent goroutines picking up the same rows.
-	markStmt, _ := idx.db.Prepare("UPDATE chunks SET embedding = X'' WHERE id = ?")
-	if markStmt != nil {
-		for _, p := range items {
-			markStmt.Exec(p.id)
-		}
-		markStmt.Close()
+	markStmt, err := idx.db.Prepare("UPDATE chunks SET embedding = X'' WHERE id = ?")
+	if err != nil {
+		idx.logger.Debug("failed to prepare mark statement", "err", err)
+		idx.mu.Unlock()
+		return
 	}
+	for _, p := range items {
+		if _, err := markStmt.Exec(p.id); err != nil {
+			idx.logger.Debug("failed to mark chunk as in-progress", "id", p.id, "err", err)
+		}
+	}
+	markStmt.Close()
 	idx.mu.Unlock()
 
 	texts := make([]string, len(items))
@@ -635,10 +676,14 @@ func (idx *MemoryIndex) embedPendingChunks(apiKey string) {
 		idx.logger.Debug("batch embedding failed", "err", err)
 		// Revert marks so they can be retried
 		idx.mu.Lock()
-		revert, _ := idx.db.Prepare("UPDATE chunks SET embedding = NULL WHERE id = ? AND LENGTH(embedding) = 0")
-		if revert != nil {
+		revert, err := idx.db.Prepare("UPDATE chunks SET embedding = NULL WHERE id = ? AND LENGTH(embedding) = 0")
+		if err != nil {
+			idx.logger.Debug("failed to prepare revert statement", "err", err)
+		} else {
 			for _, p := range items {
-				revert.Exec(p.id)
+				if _, err := revert.Exec(p.id); err != nil {
+					idx.logger.Debug("failed to revert chunk mark", "id", p.id, "err", err)
+				}
 			}
 			revert.Close()
 		}
@@ -654,7 +699,9 @@ func (idx *MemoryIndex) embedPendingChunks(apiKey string) {
 	if err != nil {
 		// Can't write — revert all markers
 		for _, p := range items {
-			idx.db.Exec("UPDATE chunks SET embedding = NULL WHERE id = ? AND LENGTH(embedding) = 0", p.id)
+			if _, err := idx.db.Exec("UPDATE chunks SET embedding = NULL WHERE id = ? AND LENGTH(embedding) = 0", p.id); err != nil {
+				idx.logger.Debug("failed to revert chunk mark on write failure", "id", p.id, "err", err)
+			}
 		}
 		return
 	}
@@ -675,7 +722,9 @@ func (idx *MemoryIndex) embedPendingChunks(apiKey string) {
 			continue
 		}
 		if cacheStmt != nil {
-			cacheStmt.Exec(items[i].hash, blob)
+			if _, err := cacheStmt.Exec(items[i].hash, blob); err != nil {
+				idx.logger.Debug("failed to cache embedding", "hash", items[i].hash, "err", err)
+			}
 		}
 		written[items[i].id] = true
 	}
@@ -683,7 +732,9 @@ func (idx *MemoryIndex) embedPendingChunks(apiKey string) {
 	// Revert any in-progress markers that weren't written (partial response or write failure)
 	for _, p := range items {
 		if !written[p.id] {
-			idx.db.Exec("UPDATE chunks SET embedding = NULL WHERE id = ? AND LENGTH(embedding) = 0", p.id)
+			if _, err := idx.db.Exec("UPDATE chunks SET embedding = NULL WHERE id = ? AND LENGTH(embedding) = 0", p.id); err != nil {
+				idx.logger.Debug("failed to revert unwritten chunk mark", "id", p.id, "err", err)
+			}
 		}
 	}
 }
@@ -697,7 +748,9 @@ func (idx *MemoryIndex) getCachedEmbedding(hash string) []byte {
 
 func (idx *MemoryIndex) updateMeta(source string) {
 	now := time.Now().UTC().Format(time.RFC3339)
-	idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, source, now)
+	if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, source, now); err != nil {
+		idx.logger.Debug("failed to update index meta", "source", source, "err", err)
+	}
 }
 
 // splitSections splits markdown text by ## headings for granular indexing.
