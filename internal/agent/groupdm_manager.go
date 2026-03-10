@@ -23,6 +23,22 @@ const notifyTimeout = 10 * time.Minute
 // for the same group. This prevents sequential ping-pong loops.
 const notifyCooldown = 50 * time.Second
 
+// notifyState tracks cooldown and deferred notification state per (groupID, agentID).
+type notifyState struct {
+	lastSent time.Time   // when the last notification was successfully sent
+	timer    *time.Timer // pending delivery timer (nil if none)
+	gen      uint64      // generation counter; incremented on cancel to invalidate stale timers
+	inFlight bool        // true while a delivery is in progress (prevents concurrent sends)
+
+	// deferred notification payload
+	agentID    string
+	groupID    string
+	groupName  string
+	sender     string
+	msgTime    string // original message timestamp (RFC3339)
+	hasPending bool
+}
+
 // GroupDMManager manages group DM CRUD, message posting, and notifications.
 type GroupDMManager struct {
 	mu       sync.Mutex
@@ -31,19 +47,18 @@ type GroupDMManager struct {
 	logger   *slog.Logger
 	apiBase  string // base URL for agent-facing API (e.g. "http://127.0.0.1:8080")
 
-	// lastNotify tracks the last notification time per (groupID, agentID)
-	// to enforce cooldown and prevent ping-pong loops.
-	lastNotify   map[string]time.Time
-	lastNotifyMu sync.Mutex
+	// notify tracks cooldown + deferred notification state per (groupID:agentID).
+	notify   map[string]*notifyState
+	notifyMu sync.Mutex
 }
 
 // NewGroupDMManager creates a new GroupDMManager.
 func NewGroupDMManager(agentMgr *Manager, logger *slog.Logger) *GroupDMManager {
 	m := &GroupDMManager{
-		groups:     make(map[string]*GroupDM),
-		agentMgr:   agentMgr,
-		logger:     logger,
-		lastNotify: make(map[string]time.Time),
+		groups:   make(map[string]*GroupDM),
+		agentMgr: agentMgr,
+		logger:   logger,
+		notify:   make(map[string]*notifyState),
 	}
 	m.load()
 	return m
@@ -198,8 +213,9 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 
 	// Notify other members asynchronously (unless suppressed to prevent loops)
 	if notify {
+		msgTime := msg.Timestamp
 		for _, r := range recipients {
-			go m.notifyAgent(r.AgentID, groupID, groupName, senderName)
+			go m.notifyAgent(r.AgentID, groupID, groupName, senderName, msgTime)
 		}
 	}
 
@@ -237,27 +253,91 @@ func (m *GroupDMManager) GroupsForAgent(agentID string) []*GroupDM {
 // The notification only says there's a new message — no untrusted content is injected.
 // The agent reads the actual messages via the API.
 // Enforces a per-(group, agent) cooldown to prevent ping-pong loops.
-func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName, senderName string) {
-	// Cooldown check
+func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName, senderName, msgTime string) {
 	key := groupID + ":" + agentID
-	m.lastNotifyMu.Lock()
-	if last, ok := m.lastNotify[key]; ok && time.Since(last) < notifyCooldown {
-		m.lastNotifyMu.Unlock()
-		m.logger.Debug("notification skipped (cooldown)", "agent", agentID, "group", groupID)
+
+	m.notifyMu.Lock()
+	ns := m.notify[key]
+	if ns == nil {
+		ns = &notifyState{}
+		m.notify[key] = ns
+	}
+
+	// Defer if: cooldown active, delivery in progress, or a pending timer exists
+	elapsed := time.Since(ns.lastSent)
+	if elapsed < notifyCooldown || ns.inFlight || ns.timer != nil {
+		ns.agentID = agentID
+		ns.groupID = groupID
+		ns.groupName = groupName
+		ns.sender = senderName
+		ns.msgTime = msgTime
+		ns.hasPending = true
+
+		if ns.timer == nil && !ns.inFlight {
+			delay := notifyCooldown - elapsed
+			if delay < 0 {
+				delay = 0
+			}
+			gen := ns.gen
+			ns.timer = time.AfterFunc(delay, func() {
+				m.firePending(key, gen)
+			})
+			m.logger.Debug("notification deferred", "agent", agentID, "group", groupID, "delay", delay)
+		} else {
+			m.logger.Debug("notification updated (pending)", "agent", agentID, "group", groupID)
+		}
+		m.notifyMu.Unlock()
 		return
 	}
-	m.lastNotifyMu.Unlock()
 
+	// Reserve delivery slot
+	gen := ns.gen
+	ns.inFlight = true
+	m.notifyMu.Unlock()
+
+	m.deliverNotification(key, gen, agentID, groupID, groupName, senderName, msgTime)
+}
+
+// firePending delivers the most recent deferred notification for the key.
+// The generation check ensures stale timers (from cancelled/cleaned keys) are no-ops.
+func (m *GroupDMManager) firePending(key string, gen uint64) {
+	m.notifyMu.Lock()
+	ns := m.notify[key]
+	if ns == nil || ns.gen != gen || !ns.hasPending {
+		if ns != nil {
+			ns.timer = nil
+		}
+		m.notifyMu.Unlock()
+		return
+	}
+
+	agentID := ns.agentID
+	groupID := ns.groupID
+	groupName := ns.groupName
+	sender := ns.sender
+	msgTime := ns.msgTime
+	ns.hasPending = false
+	ns.timer = nil
+	ns.inFlight = true
+	m.notifyMu.Unlock()
+
+	m.deliverNotification(key, gen, agentID, groupID, groupName, sender, msgTime)
+}
+
+// deliverNotification sends a notification to the agent immediately.
+// On transient failure (agent busy), it re-defers for retry after cooldown.
+// The gen parameter prevents operating on state that was cleaned up.
+func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, groupID, groupName, senderName, msgTime string) {
 	apiBase := m.APIBase()
 	curlFlags := "-s"
 	if strings.HasPrefix(apiBase, "https://") {
 		curlFlags = "-sk"
 	}
 	notification := fmt.Sprintf(
-		"[Group DM: %s] New message from %s.\n"+
+		"[Group DM: %s] New message from %s at %s.\n"+
 			"Read: curl %s '%s/api/v1/groupdms/%s/messages?limit=20'\n"+
 			"Reply: curl %s -X POST '%s/api/v1/groupdms/%s/messages' -H 'Content-Type: application/json' -d '{\"agentId\":\"%s\",\"content\":\"your reply\"}'",
-		groupName, senderName,
+		groupName, senderName, msgTime,
 		curlFlags, apiBase, groupID,
 		curlFlags, apiBase, groupID, agentID,
 	)
@@ -266,18 +346,59 @@ func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName, senderName str
 	defer cancel()
 
 	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system", nil)
+
+	m.notifyMu.Lock()
+	ns := m.notify[key]
+	if ns == nil || ns.gen != gen {
+		// Key was cleaned up while we were delivering — drop silently
+		m.notifyMu.Unlock()
+		if err == nil {
+			for range events {
+			}
+		}
+		return
+	}
+	ns.inFlight = false
+
 	if err != nil {
-		// Agent might be busy — that's expected, not an error worth warning about
-		if !strings.Contains(err.Error(), "busy") {
+		if strings.Contains(err.Error(), "busy") {
+			// Agent busy — re-defer for retry after cooldown
+			if !ns.hasPending {
+				ns.agentID = agentID
+				ns.groupID = groupID
+				ns.groupName = groupName
+				ns.sender = senderName
+				ns.msgTime = msgTime
+				ns.hasPending = true
+			}
+			if ns.timer == nil {
+				ns.timer = time.AfterFunc(notifyCooldown, func() {
+					m.firePending(key, gen)
+				})
+			}
+			m.notifyMu.Unlock()
+			m.logger.Debug("agent busy, notification re-deferred", "agent", agentID, "group", groupID)
+		} else {
+			// Non-transient error — release inFlight, fire pending if any arrived during delivery
+			if ns.hasPending && ns.timer == nil {
+				ns.timer = time.AfterFunc(0, func() {
+					m.firePending(key, gen)
+				})
+			}
+			m.notifyMu.Unlock()
 			m.logger.Warn("failed to notify agent", "agent", agentID, "group", groupID, "err", err)
 		}
 		return
 	}
 
-	// Record cooldown only after successful chat initiation
-	m.lastNotifyMu.Lock()
-	m.lastNotify[key] = time.Now()
-	m.lastNotifyMu.Unlock()
+	// Success — record cooldown and fire any pending notification that arrived during delivery
+	ns.lastSent = time.Now()
+	if ns.hasPending && ns.timer == nil {
+		ns.timer = time.AfterFunc(notifyCooldown, func() {
+			m.firePending(key, gen)
+		})
+	}
+	m.notifyMu.Unlock()
 
 	// Drain events
 	for range events {
@@ -359,13 +480,18 @@ func (m *GroupDMManager) RemoveAgent(agentID string) {
 
 // cleanNotifyKeys removes cooldown entries matching a group or agent prefix.
 func (m *GroupDMManager) cleanNotifyKeys(prefix string) {
-	m.lastNotifyMu.Lock()
-	for key := range m.lastNotify {
+	m.notifyMu.Lock()
+	for key, ns := range m.notify {
 		if strings.HasPrefix(key, prefix+":") || strings.HasSuffix(key, ":"+prefix) {
-			delete(m.lastNotify, key)
+			// Bump generation to invalidate any in-flight timer callback
+			ns.gen++
+			if ns.timer != nil {
+				ns.timer.Stop()
+			}
+			delete(m.notify, key)
 		}
 	}
-	m.lastNotifyMu.Unlock()
+	m.notifyMu.Unlock()
 }
 
 // --- Persistence ---
