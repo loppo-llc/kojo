@@ -440,28 +440,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		a.AvatarHash = a.UpdatedAt
 	}
 
-	// Handle public profile auto-generation logic (before copy for correct response)
-	personaChanged := cfg.Persona != nil && *cfg.Persona != oldPersona
-	needsRegen := false
-	if !a.PublicProfileOverride {
-		if personaChanged && *cfg.Persona == "" {
-			// Persona emptied → clear profile
-			a.PublicProfile = ""
-		} else if personaChanged && *cfg.Persona != "" {
-			// Persona actually changed → will regenerate
-			a.PublicProfile = ""
-			needsRegen = true
-		}
-		if cfg.PublicProfileOverride != nil && !*cfg.PublicProfileOverride && a.Persona != "" {
-			// Override turned OFF → will regenerate
-			a.PublicProfile = ""
-			needsRegen = true
-		}
-	}
-	// Override OFF + empty persona → clear any leftover manual profile
-	if !a.PublicProfileOverride && a.Persona == "" {
-		a.PublicProfile = ""
-	}
+	needsRegen := resolvePublicProfile(a, cfg, oldPersona)
 
 	// Take a copy for return and post-lock operations
 	cp := copyAgent(a)
@@ -768,66 +747,76 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		defer close(outCh)
 		defer m.clearBusy(agentID)
 		defer cancel()
-
-		for {
-			select {
-			case event, ok := <-backendCh:
-				if !ok {
-					return
-				}
-				// Convert rate-limit notices to system messages before
-				// sending, so both UI and transcript see the same role.
-				if event.Type == "done" && event.Message != nil && isRateLimitMessage(event.Message) {
-					event.Message.Role = "system"
-				}
-
-				// Save assistant message to transcript BEFORE publishing
-				// the terminal event, so synthesizeTerminal can find it.
-				if event.Type == "done" && event.Message != nil {
-					if err := appendMessage(agentID, event.Message); err != nil {
-						m.logger.Warn("failed to save assistant message", "err", err)
-					}
-
-					// Sync persona.md → Agent.Persona (agent may have edited it)
-					m.syncPersona(agentID)
-
-					// Update last message preview
-					m.mu.Lock()
-					if ag, ok := m.agents[agentID]; ok {
-						ag.LastMessage = &MessagePreview{
-							Content:   truncatePreview(event.Message.Content, 100),
-							Role:      event.Message.Role,
-							Timestamp: event.Message.Timestamp,
-						}
-						ag.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-					}
-					m.mu.Unlock()
-					m.save()
-				}
-
-				// Terminal events (done/error) use blocking send so the
-				// client always receives them. Streaming events use
-				// non-blocking send — if no reader (WS disconnected),
-				// they are dropped but processing continues.
-				if event.Type == "done" || event.Type == "error" {
-					select {
-					case outCh <- event:
-					case <-chatCtx.Done():
-						return
-					}
-				} else {
-					select {
-					case outCh <- event:
-					default:
-					}
-				}
-			case <-chatCtx.Done():
-				return
-			}
-		}
+		m.processChatEvents(chatCtx, agentID, backendCh, outCh)
 	}()
 
 	return callerCh, nil
+}
+
+// processChatEvents reads events from the backend channel, persists messages,
+// and forwards events to outCh for the broadcaster.
+func (m *Manager) processChatEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent) {
+	for {
+		select {
+		case event, ok := <-backendCh:
+			if !ok {
+				return
+			}
+			// Convert rate-limit notices to system messages before
+			// sending, so both UI and transcript see the same role.
+			if event.Type == "done" && event.Message != nil && isRateLimitMessage(event.Message) {
+				event.Message.Role = "system"
+			}
+
+			// Save assistant message to transcript BEFORE publishing
+			// the terminal event, so synthesizeTerminal can find it.
+			if event.Type == "done" && event.Message != nil {
+				m.persistDoneEvent(agentID, event.Message)
+			}
+
+			// Terminal events (done/error) use blocking send so the
+			// client always receives them. Streaming events use
+			// non-blocking send — if no reader (WS disconnected),
+			// they are dropped but processing continues.
+			if event.Type == "done" || event.Type == "error" {
+				select {
+				case outCh <- event:
+				case <-ctx.Done():
+					return
+				}
+			} else {
+				select {
+				case outCh <- event:
+				default:
+				}
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// persistDoneEvent saves the assistant message and updates agent state.
+func (m *Manager) persistDoneEvent(agentID string, msg *Message) {
+	if err := appendMessage(agentID, msg); err != nil {
+		m.logger.Warn("failed to save assistant message", "err", err)
+	}
+
+	// Sync persona.md → Agent.Persona (agent may have edited it)
+	m.syncPersona(agentID)
+
+	// Update last message preview
+	m.mu.Lock()
+	if ag, ok := m.agents[agentID]; ok {
+		ag.LastMessage = &MessagePreview{
+			Content:   truncatePreview(msg.Content, 100),
+			Role:      msg.Role,
+			Timestamp: msg.Timestamp,
+		}
+		ag.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	m.mu.Unlock()
+	m.save()
 }
 
 // Abort cancels any running chat for an agent.
@@ -952,6 +941,34 @@ func copyAgent(a *Agent) *Agent {
 		}
 	}
 	return &cp
+}
+
+// resolvePublicProfile determines whether the agent's public profile needs
+// regeneration based on persona/override changes, clearing the profile as needed.
+// Returns true if background regeneration should be triggered.
+func resolvePublicProfile(a *Agent, cfg AgentUpdateConfig, oldPersona string) bool {
+	personaChanged := cfg.Persona != nil && *cfg.Persona != oldPersona
+	needsRegen := false
+	if !a.PublicProfileOverride {
+		if personaChanged && *cfg.Persona == "" {
+			// Persona emptied → clear profile
+			a.PublicProfile = ""
+		} else if personaChanged && *cfg.Persona != "" {
+			// Persona actually changed → will regenerate
+			a.PublicProfile = ""
+			needsRegen = true
+		}
+		if cfg.PublicProfileOverride != nil && !*cfg.PublicProfileOverride && a.Persona != "" {
+			// Override turned OFF → will regenerate
+			a.PublicProfile = ""
+			needsRegen = true
+		}
+	}
+	// Override OFF + empty persona → clear any leftover manual profile
+	if !a.PublicProfileOverride && a.Persona == "" {
+		a.PublicProfile = ""
+	}
+	return needsRegen
 }
 
 // isRateLimitMessage detects CLI rate-limit notices that should be shown

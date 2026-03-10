@@ -500,7 +500,12 @@ func (idx *MemoryIndex) hybridSearch(query string, limit int) []SearchResult {
 		return nil
 	}
 
-	// Normalize and merge
+	return mergeSearchResults(vecResults, ftsResults, limit)
+}
+
+// mergeSearchResults combines vector and FTS5 results using weighted scoring,
+// deduplicates by content hash, and returns the top results.
+func mergeSearchResults(vecResults, ftsResults []SearchResult, limit int) []SearchResult {
 	type scored struct {
 		result SearchResult
 		vec    float64
