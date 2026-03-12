@@ -175,12 +175,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 				}
 
 			case "content_block_start":
-				if event.ContentBlock.Type == "tool_use" {
-					if !send(ChatEvent{Type: "tool_use", ToolName: event.ContentBlock.Name}) {
-						cmd.Wait()
-						return
-					}
-				}
+				// tool_use is sent later when the full input is available (see "tool_use" case).
 
 			case "content_block_delta":
 				if event.Delta.Type == "text_delta" && event.Delta.Text != "" {
