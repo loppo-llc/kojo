@@ -250,19 +250,32 @@ func (s *Server) streamAgentEvents(
 		case msg := <-clientMsgs:
 			if msg.Type == "abort" {
 				s.agents.Abort(agentID)
-				// Drain remaining events with timeout
+				// Drain remaining events, forwarding any real terminal event.
+				var terminal *agent.ChatEvent
 				drainTimer := time.NewTimer(10 * time.Second)
 				defer drainTimer.Stop()
 			drainLoop:
 				for {
 					select {
-					case _, ok := <-events:
+					case ev, ok := <-events:
 						if !ok {
+							break drainLoop
+						}
+						if ev.Type == "done" || ev.Type == "error" {
+							terminal = &ev
 							break drainLoop
 						}
 					case <-drainTimer.C:
 						break drainLoop
 					}
+				}
+				// Send the real terminal if the backend delivered one,
+				// otherwise send an empty done so the client can commit
+				// partial streaming content.
+				if terminal != nil {
+					_ = writeJSON(ctx, conn, *terminal)
+				} else {
+					_ = writeJSON(ctx, conn, agent.ChatEvent{Type: "done"})
 				}
 				return
 			}

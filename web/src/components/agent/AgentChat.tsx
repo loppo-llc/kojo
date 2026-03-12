@@ -32,6 +32,12 @@ export function AgentChat() {
   const loadingMoreRef = useRef(false);
   const suppressAutoScrollRef = useRef(false);
   const scrollRestoreRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
+  const abortedContentRef = useRef<{ text: string; thinking: string; tools: Array<{ name: string; input: string; output: string | null }> } | null>(null);
+  // Live refs for streaming content — updated synchronously in onEvent
+  // so handleAbort always snapshots the latest data (React state lags).
+  const liveStreamTextRef = useRef("");
+  const liveStreamThinkingRef = useRef("");
+  const liveStreamToolsRef = useRef<Array<{ name: string; input: string; output: string | null }>>([]);
 
   // Restore draft and textarea height on mount / id change
   useEffect(() => {
@@ -49,6 +55,7 @@ export function AgentChat() {
   // Load agent and initial messages
   useEffect(() => {
     if (!id) return;
+    abortedContentRef.current = null; // Clear stale abort snapshot on agent change
     agentApi.get(id).then(setAgent).catch(() => navigate("/agents"));
     agentApi.messages(id, PAGE_SIZE).then((r) => {
       setMessages(r.messages);
@@ -108,6 +115,9 @@ export function AgentChat() {
     setStreamTools([]);
     setStreamStatus("");
     setStreamStartTime(Date.now());
+    liveStreamTextRef.current = "";
+    liveStreamThinkingRef.current = "";
+    liveStreamToolsRef.current = [];
   }, []);
 
   const onEvent = useCallback(
@@ -123,20 +133,29 @@ export function AgentChat() {
           }
           break;
         case "text":
+          liveStreamTextRef.current += event.delta ?? "";
           setStreamText((prev) => prev + (event.delta ?? ""));
           break;
         case "thinking":
+          liveStreamThinkingRef.current += event.delta ?? "";
           setStreamThinking((prev) => prev + (event.delta ?? ""));
           break;
         case "tool_use":
           if (event.toolName) {
-            setStreamTools((prev) => [
-              ...prev,
-              { name: event.toolName!, input: event.toolInput ?? "", output: null },
-            ]);
+            const tool = { name: event.toolName!, input: event.toolInput ?? "", output: null };
+            liveStreamToolsRef.current = [...liveStreamToolsRef.current, tool];
+            setStreamTools((prev) => [...prev, tool]);
           }
           break;
-        case "tool_result":
+        case "tool_result": {
+          const liveTools = [...liveStreamToolsRef.current];
+          for (let i = liveTools.length - 1; i >= 0; i--) {
+            if (liveTools[i].name === event.toolName && liveTools[i].output === null) {
+              liveTools[i] = { ...liveTools[i], output: event.toolOutput ?? "" };
+              break;
+            }
+          }
+          liveStreamToolsRef.current = liveTools;
           setStreamTools((prev) => {
             const copy = [...prev];
             for (let i = copy.length - 1; i >= 0; i--) {
@@ -148,7 +167,12 @@ export function AgentChat() {
             return copy;
           });
           break;
-        case "done":
+        }
+        case "done": {
+          // Capture and clear abort snapshot before any branching
+          const abortSnapshot = abortedContentRef.current;
+          abortedContentRef.current = null;
+
           if (event.message) {
             // Deduplicate by message ID (bgDone may overlap with initial load)
             setMessages((prev) =>
@@ -182,7 +206,24 @@ export function AgentChat() {
               ];
             });
           }
-          if (!event.message && id) {
+          if (!event.message && abortSnapshot) {
+            // Aborted: commit partial streaming content as a local message
+            if (abortSnapshot.text || abortSnapshot.thinking || abortSnapshot.tools.length > 0) {
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: "aborted_" + Date.now(),
+                  role: "assistant" as const,
+                  content: abortSnapshot.text,
+                  thinking: abortSnapshot.thinking || undefined,
+                  toolUses: abortSnapshot.tools.length > 0
+                    ? abortSnapshot.tools.map((t: { name: string; input: string; output: string | null }) => ({ name: t.name, input: t.input, output: t.output ?? "" }))
+                    : undefined,
+                  timestamp: localRFC3339(),
+                },
+              ]);
+            }
+          } else if (!event.message && id) {
             // Background chat finished — reload recent and merge with older loaded messages
             agentApi.messages(id, PAGE_SIZE).then((r) => {
               setMessages((prev) => {
@@ -195,7 +236,9 @@ export function AgentChat() {
           }
           resetStream();
           break;
+        }
         case "error": {
+          abortedContentRef.current = null; // Clear on every terminal path
           const errorContent = `⚠️ Error: ${event.errorMessage || "An error occurred"}`;
           setMessages((prev) => {
             // Skip if already shown (e.g. loaded from transcript on reconnect)
@@ -222,6 +265,9 @@ export function AgentChat() {
   );
 
   const onDisconnect = useCallback(() => {
+    // Don't clear abortedContentRef here — if the socket drops after
+    // handleAbort() but before the terminal "done" arrives, the snapshot
+    // must survive the reconnect cycle.
     resetStream();
   }, [resetStream]);
 
@@ -230,6 +276,16 @@ export function AgentChat() {
     onEvent,
     onDisconnect,
   });
+
+  const handleAbort = useCallback(() => {
+    // Snapshot live refs (sync with onEvent, not async React state)
+    abortedContentRef.current = {
+      text: liveStreamTextRef.current,
+      thinking: liveStreamThinkingRef.current,
+      tools: liveStreamToolsRef.current,
+    };
+    abort();
+  }, [abort]);
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -270,6 +326,7 @@ export function AgentChat() {
   const handleSend = () => {
     const text = input.trim();
     if ((!text && pendingFiles.length === 0) || streaming || !connected) return;
+    abortedContentRef.current = null; // Clear any stale abort snapshot
 
     // Add user message immediately
     const userMsg: AgentMessage = {
@@ -480,7 +537,7 @@ export function AgentChat() {
           />
           {streaming ? (
             <button
-              onClick={abort}
+              onClick={handleAbort}
               className="px-4 py-2 bg-red-600 hover:bg-red-500 rounded-xl text-sm font-medium shrink-0"
             >
               Stop
