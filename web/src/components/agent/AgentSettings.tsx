@@ -4,6 +4,7 @@ import { agentApi, type AgentInfo } from "../../lib/agentApi";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
 import { NotifySourcesEditor } from "./NotifySourcesEditor";
+import { defaultModelForTool, modelsForTool } from "../../lib/toolModels";
 
 export function AgentSettings() {
   const { id } = useParams<{ id: string }>();
@@ -275,12 +276,20 @@ export function AgentSettings() {
         {/* Model */}
         <div>
           <label className="block text-sm text-neutral-400 mb-2">Model</label>
-          <input
-            type="text"
+          <select
             value={model}
             onChange={(e) => setModel(e.target.value)}
             className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-          />
+          >
+            {model && !modelsForTool(tool).includes(model) && (
+              <option value={model}>{model}</option>
+            )}
+            {modelsForTool(tool).map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
         </div>
 
         {/* Tool */}
@@ -290,7 +299,12 @@ export function AgentSettings() {
             {["claude", "codex", "gemini"].map((t) => (
               <button
                 key={t}
-                onClick={() => setTool(t)}
+                onClick={() => {
+                  if (t !== tool) {
+                    setTool(t);
+                    setModel(defaultModelForTool(t));
+                  }
+                }}
                 className={`flex-1 px-3 py-2 rounded text-sm font-mono ${
                   tool === t
                     ? "bg-neutral-700 border border-neutral-500"
