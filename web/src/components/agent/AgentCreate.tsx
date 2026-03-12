@@ -3,7 +3,7 @@ import { useNavigate } from "react-router";
 import { agentApi } from "../../lib/agentApi";
 import { ScheduleEditor } from "./ScheduleEditor";
 import { api, type ServerInfo } from "../../lib/api";
-import { defaultModelForTool, modelsForTool } from "../../lib/toolModels";
+import { defaultModelForTool, modelsForTool, effortLevels, supportsEffort } from "../../lib/toolModels";
 
 type GenPhase = "idle" | "persona" | "name" | "avatar" | "all-name" | "all-avatar";
 
@@ -13,6 +13,7 @@ export function AgentCreate() {
   const [name, setName] = useState("");
   const [persona, setPersona] = useState("");
   const [model, setModel] = useState("sonnet");
+  const [effort, setEffort] = useState("");
   const [tool, setTool] = useState("claude");
   const [intervalMinutes, setIntervalMinutes] = useState(30);
   const [activeStart, setActiveStart] = useState("");
@@ -207,6 +208,7 @@ export function AgentCreate() {
         name: name.trim(),
         persona: persona.trim(),
         model,
+        effort: supportsEffort(tool) && effort ? effort : undefined,
         tool,
         intervalMinutes,
         activeStart: activeStart || undefined,
@@ -441,6 +443,25 @@ export function AgentCreate() {
             ))}
           </select>
         </div>
+
+        {/* Effort (claude only) */}
+        {supportsEffort(tool) && (
+          <div>
+            <label className="block text-sm text-neutral-400 mb-2">Effort</label>
+            <select
+              value={effort}
+              onChange={(e) => setEffort(e.target.value)}
+              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+            >
+              <option value="">default (high)</option>
+              {effortLevels.map((e) => (
+                <option key={e} value={e}>
+                  {e}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
 
         {/* Schedule */}
         <ScheduleEditor

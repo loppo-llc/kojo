@@ -53,6 +53,10 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		args = append(args, "--model", agent.Model)
 	}
 
+	if agent.Effort != "" {
+		args = append(args, "--effort", agent.Effort)
+	}
+
 	// Use --continue for conversation continuity when a session already exists
 	// in the agent's working directory. Otherwise use --session-id to create
 	// a new session with a deterministic UUID derived from the agent ID.

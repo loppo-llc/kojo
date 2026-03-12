@@ -16,6 +16,7 @@ export interface AgentInfo {
   name: string;
   persona: string;
   model: string;
+  effort: string;
   tool: string;
   intervalMinutes: number;
   activeStart?: string;
@@ -38,6 +39,7 @@ export interface AgentConfig {
   name: string;
   persona: string;
   model?: string;
+  effort?: string;
   tool?: string;
   intervalMinutes?: number;
   activeStart?: string;

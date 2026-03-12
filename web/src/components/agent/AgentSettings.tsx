@@ -4,7 +4,7 @@ import { agentApi, type AgentInfo } from "../../lib/agentApi";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
 import { NotifySourcesEditor } from "./NotifySourcesEditor";
-import { defaultModelForTool, modelsForTool } from "../../lib/toolModels";
+import { defaultModelForTool, modelsForTool, effortLevels, supportsEffort } from "../../lib/toolModels";
 
 export function AgentSettings() {
   const { id } = useParams<{ id: string }>();
@@ -15,6 +15,7 @@ export function AgentSettings() {
   const [publicProfile, setPublicProfile] = useState("");
   const [publicProfileOverride, setPublicProfileOverride] = useState(false);
   const [model, setModel] = useState("");
+  const [effort, setEffort] = useState("");
   const [tool, setTool] = useState("");
   const [intervalMinutes, setIntervalMinutes] = useState(30);
   const [activeStart, setActiveStart] = useState("");
@@ -39,6 +40,7 @@ export function AgentSettings() {
       setPublicProfile(a.publicProfile ?? "");
       setPublicProfileOverride(a.publicProfileOverride ?? false);
       setModel(a.model);
+      setEffort(a.effort || "");
       setTool(a.tool);
       setIntervalMinutes(a.intervalMinutes);
       setActiveStart(a.activeStart ?? "");
@@ -57,6 +59,7 @@ export function AgentSettings() {
         ...(publicProfileOverride ? { publicProfile: publicProfile.trim() } : {}),
         publicProfileOverride,
         model: model.trim(),
+        effort: supportsEffort(tool) ? effort : undefined,
         tool: tool.trim(),
         intervalMinutes,
         activeStart,
@@ -291,6 +294,25 @@ export function AgentSettings() {
             ))}
           </select>
         </div>
+
+        {/* Effort (claude only) */}
+        {supportsEffort(tool) && (
+          <div>
+            <label className="block text-sm text-neutral-400 mb-2">Effort</label>
+            <select
+              value={effort}
+              onChange={(e) => setEffort(e.target.value)}
+              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+            >
+              <option value="">default (high)</option>
+              {effortLevels.map((e) => (
+                <option key={e} value={e}>
+                  {e}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
 
         {/* Tool */}
         <div>

@@ -65,12 +65,23 @@ func ValidInterval(minutes int) bool {
 	return allowedIntervals[minutes]
 }
 
+// allowedEfforts defines valid effort levels (claude only). Empty string is allowed (= default).
+var allowedEfforts = map[string]bool{
+	"": true, "low": true, "medium": true, "high": true, "max": true,
+}
+
+// ValidEffort returns true if the given effort level is valid.
+func ValidEffort(effort string) bool {
+	return allowedEfforts[effort]
+}
+
 // Agent represents a persistent AI persona (friend).
 type Agent struct {
 	ID              string `json:"id"`
 	Name            string `json:"name"`
 	Persona         string `json:"persona"`         // persona description (markdown)
 	Model           string `json:"model"`           // e.g. "sonnet", "opus"
+	Effort          string `json:"effort,omitempty"` // claude only: "low", "medium", "high", "max"
 	Tool            string `json:"tool"`            // CLI tool: "claude", "codex", "gemini"
 	IntervalMinutes int    `json:"intervalMinutes"` // periodic execution interval in minutes (0 = disabled)
 	ActiveStart     string `json:"activeStart,omitempty"` // HH:MM — start of active window (empty = no restriction)
@@ -118,6 +129,7 @@ type AgentConfig struct {
 	Name            string  `json:"name"`
 	Persona         string  `json:"persona"`
 	Model           string  `json:"model"`
+	Effort          string  `json:"effort"`
 	Tool            string  `json:"tool"`
 	IntervalMinutes *int    `json:"intervalMinutes"` // nil = use default (30)
 	ActiveStart     *string `json:"activeStart"`     // HH:MM or empty
@@ -132,6 +144,7 @@ type AgentUpdateConfig struct {
 	PublicProfile         *string `json:"publicProfile"`
 	PublicProfileOverride *bool   `json:"publicProfileOverride"`
 	Model                 *string `json:"model"`
+	Effort                *string `json:"effort"`
 	Tool                  *string `json:"tool"`
 	IntervalMinutes       *int    `json:"intervalMinutes"`
 	ActiveStart           *string `json:"activeStart"`
@@ -161,11 +174,15 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	if err := ValidActiveHours(activeStart, activeEnd); err != nil {
 		return nil, err
 	}
+	if !ValidEffort(cfg.Effort) {
+		return nil, fmt.Errorf("unsupported effort level: %q", cfg.Effort)
+	}
 	a := &Agent{
 		ID:              generateID(),
 		Name:            cfg.Name,
 		Persona:         cfg.Persona,
 		Model:           cfg.Model,
+		Effort:          cfg.Effort,
 		Tool:            cfg.Tool,
 		IntervalMinutes: interval,
 		ActiveStart:     activeStart,

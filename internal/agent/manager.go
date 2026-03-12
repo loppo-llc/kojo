@@ -400,6 +400,13 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.Model != nil {
 		a.Model = *cfg.Model
 	}
+	if cfg.Effort != nil {
+		if !ValidEffort(*cfg.Effort) {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("unsupported effort level: %q", *cfg.Effort)
+		}
+		a.Effort = *cfg.Effort
+	}
 	if cfg.Tool != nil {
 		a.Tool = *cfg.Tool
 	}
