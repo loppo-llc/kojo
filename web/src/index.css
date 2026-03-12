@@ -50,9 +50,20 @@ html, body, #root {
 .md-content h2 { font-size: 1.1em; }
 .md-content h3 { font-size: 1em; }
 
-.md-content ul, .md-content ol {
+.md-content ul:not(.contains-task-list) {
   margin: 0.3em 0;
   padding-left: 1.4em;
+  list-style-type: disc;
+}
+.md-content ol:not(.contains-task-list) {
+  margin: 0.3em 0;
+  padding-left: 1.4em;
+  list-style-type: decimal;
+}
+.md-content .contains-task-list {
+  margin: 0.3em 0;
+  padding-left: 1.4em;
+  list-style: none;
 }
 .md-content li { margin: 0.15em 0; }
 .md-content li::marker { color: #737373; }
