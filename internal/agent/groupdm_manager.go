@@ -573,6 +573,151 @@ func (m *GroupDMManager) copyGroup(g *GroupDM) *GroupDM {
 	return &cp
 }
 
+// AddMember adds an agent to an existing group DM. callerAgentID must be a current member.
+// Notifies existing members about the new addition.
+func (m *GroupDMManager) AddMember(id, newAgentID, callerAgentID string) (*GroupDM, error) {
+	// Resolve the new member first (outside lock)
+	a, ok := m.agentMgr.Get(newAgentID)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, newAgentID)
+	}
+	newMember := GroupMember{AgentID: a.ID, AgentName: a.Name}
+
+	m.mu.Lock()
+	g, ok := m.groups[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+	}
+
+	// Verify caller is a member
+	var callerName string
+	callerOK := false
+	for _, mem := range g.Members {
+		if mem.AgentID == callerAgentID {
+			callerOK = true
+			callerName = mem.AgentName
+		}
+		if mem.AgentID == newAgentID {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: %s in group %s", ErrGroupAlreadyMember, newAgentID, id)
+		}
+	}
+	if callerAgentID == "" || !callerOK {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, callerAgentID, id)
+	}
+
+	g.Members = append(g.Members, newMember)
+	g.UpdatedAt = time.Now().Format(time.RFC3339)
+
+	// Collect recipients (all members except the new one)
+	var recipients []GroupMember
+	for _, mem := range g.Members {
+		if mem.AgentID != newAgentID {
+			recipients = append(recipients, mem)
+		}
+	}
+	groupName := g.Name
+	cp := m.copyGroup(g)
+	m.mu.Unlock()
+
+	m.save()
+	m.logger.Info("member added to group DM", "group", id, "agent", newAgentID)
+
+	// Notify existing members about the addition
+	for _, r := range recipients {
+		go m.notifyMemberChange(r.AgentID, id, groupName, callerName, newMember.AgentName, "added")
+	}
+	// Notify the new member that they were added
+	go m.notifyMemberChange(newAgentID, id, groupName, callerName, newMember.AgentName, "added_you")
+
+	return cp, nil
+}
+
+// LeaveGroup removes an agent from a group DM voluntarily.
+// The group is deleted if fewer than 2 members remain.
+func (m *GroupDMManager) LeaveGroup(id, agentID string) error {
+	m.mu.Lock()
+	g, ok := m.groups[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+	}
+
+	// Find and remove the member
+	var leaverName string
+	var filtered []GroupMember
+	for _, mem := range g.Members {
+		if mem.AgentID == agentID {
+			leaverName = mem.AgentName
+		} else {
+			filtered = append(filtered, mem)
+		}
+	}
+	if leaverName == "" {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, agentID, id)
+	}
+
+	deleteGroup := len(filtered) < 2
+	// Always collect remaining members for notification (even on group deletion)
+	remaining := make([]GroupMember, len(filtered))
+	copy(remaining, filtered)
+	groupName := g.Name
+
+	if deleteGroup {
+		delete(m.groups, id)
+	} else {
+		g.Members = filtered
+		g.UpdatedAt = time.Now().Format(time.RFC3339)
+	}
+	m.mu.Unlock()
+
+	if deleteGroup {
+		os.RemoveAll(groupDir(id))
+		m.cleanNotifyKeys(id)
+	} else {
+		m.cleanNotifyKeys(id + ":" + agentID)
+	}
+
+	m.save()
+	m.logger.Info("agent left group DM", "group", id, "agent", agentID, "deleted", deleteGroup)
+
+	// Notify remaining members (including the last one when group is dissolved)
+	for _, r := range remaining {
+		go m.notifyMemberChange(r.AgentID, id, groupName, leaverName, leaverName, "left")
+	}
+
+	return nil
+}
+
+// notifyMemberChange sends a notification about member addition or departure.
+func (m *GroupDMManager) notifyMemberChange(agentID, groupID, groupName, actorName, targetName, action string) {
+	var notification string
+	switch action {
+	case "added":
+		notification = fmt.Sprintf("[Group DM: %s] %s added %s to the group.", groupName, actorName, targetName)
+	case "added_you":
+		notification = fmt.Sprintf("[Group DM: %s] %s added you to the group.", groupName, actorName)
+	case "left":
+		notification = fmt.Sprintf("[Group DM: %s] %s left the group.", groupName, targetName)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+	defer cancel()
+
+	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system", nil)
+	if err != nil {
+		if !errors.Is(err, ErrAgentBusy) && !errors.Is(err, ErrAgentResetting) {
+			m.logger.Warn("failed to notify member change", "agent", agentID, "group", groupID, "action", action, "err", err)
+		}
+		return
+	}
+	for range events {
+	}
+}
+
 // RemoveAgent removes an agent from all groups. Groups with fewer than 2 members are deleted.
 func (m *GroupDMManager) RemoveAgent(agentID string) {
 	m.mu.Lock()
@@ -613,11 +758,12 @@ func (m *GroupDMManager) RemoveAgent(agentID string) {
 	}
 }
 
-// cleanNotifyKeys removes cooldown entries matching a group or agent prefix.
+// cleanNotifyKeys removes cooldown entries matching a group or agent prefix,
+// or an exact key match (e.g. "groupID:agentID").
 func (m *GroupDMManager) cleanNotifyKeys(prefix string) {
 	m.notifyMu.Lock()
 	for key, ns := range m.notify {
-		if strings.HasPrefix(key, prefix+":") || strings.HasSuffix(key, ":"+prefix) {
+		if key == prefix || strings.HasPrefix(key, prefix+":") || strings.HasSuffix(key, ":"+prefix) {
 			// Bump generation to invalidate any in-flight timer callback
 			ns.gen++
 			if ns.timer != nil {

@@ -69,6 +69,12 @@ export const groupdmApi = {
   setCooldown: (id: string, cooldown: number) =>
     patch<GroupDMInfo>(`/api/v1/groupdms/${id}`, { cooldown }),
 
+  addMember: (id: string, agentId: string, callerAgentId: string) =>
+    post<GroupDMInfo>(`/api/v1/groupdms/${id}/members`, { agentId, callerAgentId }),
+
+  leave: (id: string, agentId: string) =>
+    del<{ ok: boolean }>(`/api/v1/groupdms/${id}/members/${agentId}`),
+
   delete: (id: string) => del<{ ok: boolean }>(`/api/v1/groupdms/${id}`),
 
   messages: (id: string, limit = 50, before?: string) => {

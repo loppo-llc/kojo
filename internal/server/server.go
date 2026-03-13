@@ -72,16 +72,18 @@ func New(cfg Config) *Server {
 		version:  cfg.Version,
 	}
 
-	// send push notification when a session exits
-	if s.notify != nil {
-		s.sessions.OnSessionExit = func(sess *session.Session) {
-			info := sess.Info()
+	// send push notification when an agent finishes its response
+	if s.notify != nil && s.agents != nil {
+		s.agents.OnChatDone = func(ag *agent.Agent, msg *agent.Message) {
+			preview := msg.Content
+			if len(preview) > 200 {
+				preview = preview[:200] + "..."
+			}
 			payload, _ := json.Marshal(map[string]any{
-				"type":      "session_exit",
-				"tool":      info.Tool,
-				"workDir":   info.WorkDir,
-				"exitCode":  info.ExitCode,
-				"sessionId": info.ID,
+				"type":    "agent_chat_done",
+				"agentId": ag.ID,
+				"name":    ag.Name,
+				"preview": preview,
 			})
 			s.notify.Send(payload)
 		}
@@ -203,6 +205,8 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("GET /api/v1/groupdms/{id}", s.handleGetGroupDM)
 		mux.HandleFunc("PATCH /api/v1/groupdms/{id}", s.handleRenameGroupDM)
 		mux.HandleFunc("DELETE /api/v1/groupdms/{id}", s.handleDeleteGroupDM)
+		mux.HandleFunc("POST /api/v1/groupdms/{id}/members", s.handleAddGroupMember)
+		mux.HandleFunc("DELETE /api/v1/groupdms/{id}/members/{agentId}", s.handleLeaveGroup)
 		mux.HandleFunc("GET /api/v1/groupdms/{id}/messages", s.handleGetGroupMessages)
 		mux.HandleFunc("POST /api/v1/groupdms/{id}/messages", s.handlePostGroupMessage)
 		mux.HandleFunc("GET /api/v1/agents/{id}/groups", s.handleListAgentGroups)

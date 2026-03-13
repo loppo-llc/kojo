@@ -154,6 +154,42 @@ func (s *Server) handlePostGroupMessage(w http.ResponseWriter, r *http.Request) 
 	writeJSONResponse(w, http.StatusOK, msg)
 }
 
+func (s *Server) handleAddGroupMember(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		AgentID       string `json:"agentId"`
+		CallerAgentID string `json:"callerAgentId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	if req.AgentID == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "agentId is required")
+		return
+	}
+	if req.CallerAgentID == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "callerAgentId is required")
+		return
+	}
+	g, err := s.groupdms.AddMember(id, req.AgentID, req.CallerAgentID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, g)
+}
+
+func (s *Server) handleLeaveGroup(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	agentID := r.PathValue("agentId")
+	if err := s.groupdms.LeaveGroup(id, agentID); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (s *Server) handleListAgentGroups(w http.ResponseWriter, r *http.Request) {
 	agentID := r.PathValue("id")
 	groups := s.groupdms.GroupsForAgent(agentID)
