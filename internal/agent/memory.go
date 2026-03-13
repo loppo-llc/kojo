@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -53,7 +54,7 @@ func truncatePersona(persona string) string {
 
 // getPersonaSummary returns a concise summary of the persona for system prompt injection.
 // It caches the summary in persona_summary.md and regenerates when persona.md is newer.
-// Fallback chain: Gemini API → agent's CLI tool → truncation.
+// Fallback chain: agent's own CLI tool → other available CLI tools → truncation.
 func getPersonaSummary(agentID string, persona string, tool string, logger *slog.Logger) string {
 	dir := agentDir(agentID)
 	personaPath := filepath.Join(dir, "persona.md")
@@ -68,20 +69,29 @@ func getPersonaSummary(agentID string, persona string, tool string, logger *slog
 		}
 	}
 
-	// 1. Try Gemini API (fast, works for all agents)
+	// 1. Try agent's own CLI tool (claude / codex / gemini)
 	var summary string
-	if result, err := SummarizePersona(persona); err != nil {
-		logger.Warn("Gemini persona summary failed", "agent", agentID, "err", err)
+	if result, err := SummarizeWithCLI(tool, persona); err != nil {
+		logger.Warn("CLI persona summary failed", "agent", agentID, "tool", tool, "err", err)
 	} else {
 		summary = result
 	}
 
-	// 2. Fallback: agent's own CLI tool (claude -p / codex exec)
-	if summary == "" && (tool == "claude" || tool == "codex") {
-		if result, err := SummarizeWithCLI(tool, persona); err != nil {
-			logger.Warn("CLI persona summary failed", "agent", agentID, "tool", tool, "err", err)
-		} else {
-			summary = result
+	// 2. Fallback: try other available CLI tools
+	if summary == "" {
+		for _, fallback := range []string{"claude", "codex", "gemini"} {
+			if fallback == tool {
+				continue
+			}
+			if _, err := exec.LookPath(fallback); err != nil {
+				continue
+			}
+			if result, err := SummarizeWithCLI(fallback, persona); err != nil {
+				logger.Warn("CLI persona summary fallback failed", "agent", agentID, "tool", fallback, "err", err)
+			} else {
+				summary = result
+				break
+			}
 		}
 	}
 

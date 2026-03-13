@@ -1,18 +1,14 @@
 package agent
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 )
-
-const compactionTimeout = 120 * time.Second
 
 const (
 	// compactionThreshold is the minimum MEMORY.md size (bytes) to trigger compaction.
@@ -26,10 +22,11 @@ const (
 )
 
 // maybeCompact checks whether an agent's MEMORY.md needs compaction and, if so,
-// consolidates it with old diary files. Tries Codex first, falls back to Gemini.
+// consolidates it with old diary files via CLI backends.
+// Prefers the agent's own tool, then falls back to other available CLIs.
 // Runs synchronously — caller is responsible for lifecycle management.
 // Never mutates files on failure; uses mtime checks to avoid clobbering concurrent edits.
-func maybeCompact(agentID string, logger *slog.Logger) {
+func maybeCompact(agentID string, tool string, logger *slog.Logger) {
 	dir := agentDir(agentID)
 	memPath := filepath.Join(dir, "MEMORY.md")
 
@@ -58,15 +55,11 @@ func maybeCompact(agentID string, logger *slog.Logger) {
 		return
 	}
 
-	// Try Codex first, fall back to Gemini
-	compacted, err := compactWithCodex(prompt)
+	// Try agent's own CLI tool first, then fall back to others
+	compacted, err := generateWithPreferred(tool, prompt)
 	if err != nil {
-		logger.Debug("compaction: Codex failed, trying Gemini", "agent", agentID, "err", err)
-		compacted, err = compactWithGemini(prompt)
-		if err != nil {
-			logger.Warn("compaction: all backends failed", "agent", agentID, "err", err)
-			return
-		}
+		logger.Warn("compaction: all backends failed", "agent", agentID, "err", err)
+		return
 	}
 
 	compacted = strings.TrimSpace(compacted)
@@ -136,58 +129,6 @@ func maybeCompact(agentID string, logger *slog.Logger) {
 	)
 }
 
-// compactWithCodex uses the Codex CLI for compaction. Writes the prompt to a
-// temp file to avoid ARG_MAX issues with large memory contents.
-func compactWithCodex(prompt string) (string, error) {
-	if _, err := exec.LookPath("codex"); err != nil {
-		return "", fmt.Errorf("codex not found in PATH")
-	}
-
-	// Write prompt to temp file (codex has no stdin mode)
-	promptFile, err := os.CreateTemp("", "kojo-compact-prompt-*.md")
-	if err != nil {
-		return "", err
-	}
-	promptPath := promptFile.Name()
-	defer os.Remove(promptPath)
-	if _, err := promptFile.WriteString(prompt); err != nil {
-		promptFile.Close()
-		return "", err
-	}
-	promptFile.Close()
-
-	outFile, err := os.CreateTemp("", "kojo-compact-out-*.md")
-	if err != nil {
-		return "", err
-	}
-	outPath := outFile.Name()
-	outFile.Close()
-	defer os.Remove(outPath)
-
-	ctx, cancel := context.WithTimeout(context.Background(), compactionTimeout)
-	defer cancel()
-
-	shortPrompt := fmt.Sprintf("Read the file at %s and follow its instructions. Output only the result.", promptPath)
-	cmd := exec.CommandContext(ctx, "codex", "exec", "--ephemeral", "--skip-git-repo-check", "-o", outPath, shortPrompt)
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("codex exec: %w", err)
-	}
-
-	data, err := os.ReadFile(outPath)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}
-
-// compactWithGemini uses the Gemini API for compaction (fallback).
-func compactWithGemini(prompt string) (string, error) {
-	apiKey, err := loadGeminiAPIKey()
-	if err != nil {
-		return "", err
-	}
-	return callGemini(apiKey, prompt)
-}
 
 // diaryEntry holds a diary file's content and metadata for safe compaction.
 type diaryEntry struct {
