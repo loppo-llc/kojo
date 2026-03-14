@@ -58,6 +58,18 @@ export function Dashboard() {
   const [groupDMs, setGroupDMs] = useState<GroupDMInfo[]>([]);
   const [cronPaused, setCronPaused] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [collapsedAgents, setCollapsedAgents] = useState<Set<string>>(() => {
+    try {
+      const saved = localStorage.getItem("kojo:collapsed-agents");
+      return saved ? new Set(JSON.parse(saved)) : new Set();
+    } catch { return new Set(); }
+  });
+  const [collapsedGroupDMs, setCollapsedGroupDMs] = useState<Set<string>>(() => {
+    try {
+      const saved = localStorage.getItem("kojo:collapsed-groupdms");
+      return saved ? new Set(JSON.parse(saved)) : new Set();
+    } catch { return new Set(); }
+  });
   const navigate = useNavigate();
   const { state: pushState, loading: pushLoading, subscribe: pushSubscribe } = usePushNotifications();
 
@@ -100,6 +112,34 @@ export function Dashboard() {
       const next = new Set(prev);
       if (next.has(key)) next.delete(key);
       else next.add(key);
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    try { localStorage.setItem("kojo:collapsed-agents", JSON.stringify([...collapsedAgents])); } catch { /* quota / private mode */ }
+  }, [collapsedAgents]);
+
+  useEffect(() => {
+    try { localStorage.setItem("kojo:collapsed-groupdms", JSON.stringify([...collapsedGroupDMs])); } catch { /* quota / private mode */ }
+  }, [collapsedGroupDMs]);
+
+  const toggleCollapseAgent = (agentId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setCollapsedAgents((prev) => {
+      const next = new Set(prev);
+      if (next.has(agentId)) next.delete(agentId);
+      else next.add(agentId);
+      return next;
+    });
+  };
+
+  const toggleCollapseGroupDM = (groupId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setCollapsedGroupDMs((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
       return next;
     });
   };
@@ -190,38 +230,74 @@ export function Dashboard() {
               <p className="text-neutral-500 text-center py-8 text-sm">No agents yet</p>
             )}
             <div className="space-y-2">
-              {sortedAgents.map((agent) => (
-                <button
-                  key={agent.id}
-                  onClick={() => navigate(`/agents/${agent.id}`)}
-                  className="w-full flex items-center gap-3 p-3 bg-neutral-900 hover:bg-neutral-800 rounded-lg border border-neutral-800 text-left transition-colors"
-                >
-                  <AgentAvatar agentId={agent.id} name={agent.name} size="lg" cacheBust={agent.avatarHash} />
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center justify-between">
-                      <span className="font-medium text-sm truncate">{agent.name}</span>
-                      <span className="text-[10px] text-neutral-600 shrink-0 ml-2">
-                        {agent.lastMessage
-                          ? timeAgo(agent.lastMessage.timestamp)
-                          : timeAgo(agent.createdAt)}
-                      </span>
-                    </div>
-                    <div className="text-xs text-neutral-500 truncate mt-0.5">
-                      {agent.lastMessage
-                        ? `${agent.lastMessage.role === "user" ? "You: " : ""}${agent.lastMessage.content}`
-                        : agent.persona
-                          ? agent.persona.slice(0, 60) + (agent.persona.length > 60 ? "..." : "")
-                          : "No messages yet"}
-                    </div>
-                    <div className="flex items-center gap-2 mt-1">
-                      <span className="text-[10px] text-neutral-600 font-mono">{agent.tool}</span>
-                      {agent.model && (
-                        <span className="text-[10px] text-neutral-600 font-mono">{agent.model}</span>
+              {sortedAgents.map((agent) => {
+                const isCollapsed = collapsedAgents.has(agent.id);
+                return (
+                  <div
+                    key={agent.id}
+                    className="flex items-center bg-neutral-900 hover:bg-neutral-800 rounded-lg border border-neutral-800 transition-colors"
+                  >
+                    <button
+                      onClick={(e) => toggleCollapseAgent(agent.id, e)}
+                      className="p-2 pl-3 text-neutral-600 hover:text-neutral-400 shrink-0 self-stretch flex items-center"
+                      title={isCollapsed ? "Expand" : "Collapse"}
+                    >
+                      <svg
+                        className={`w-3 h-3 transition-transform ${isCollapsed ? "" : "rotate-90"}`}
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                        strokeWidth={2}
+                      >
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                      </svg>
+                    </button>
+                    <button
+                      onClick={() => navigate(`/agents/${agent.id}`)}
+                      className={`flex-1 flex items-center gap-3 text-left min-w-0 ${isCollapsed ? "py-1.5 pr-3 pl-1" : "p-3 pl-1"}`}
+                    >
+                      {!isCollapsed && (
+                        <AgentAvatar agentId={agent.id} name={agent.name} size="lg" cacheBust={agent.avatarHash} />
                       )}
-                    </div>
+                      {isCollapsed ? (
+                        <div className="flex items-center gap-2 flex-1 min-w-0">
+                          <span className="font-medium text-sm truncate">{agent.name}</span>
+                          <span className="text-[10px] text-neutral-600 font-mono">{agent.tool}</span>
+                          <span className="text-[10px] text-neutral-600 shrink-0 ml-auto">
+                            {agent.lastMessage
+                              ? timeAgo(agent.lastMessage.timestamp)
+                              : timeAgo(agent.createdAt)}
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between">
+                            <span className="font-medium text-sm truncate">{agent.name}</span>
+                            <span className="text-[10px] text-neutral-600 shrink-0 ml-2">
+                              {agent.lastMessage
+                                ? timeAgo(agent.lastMessage.timestamp)
+                                : timeAgo(agent.createdAt)}
+                            </span>
+                          </div>
+                          <div className="text-xs text-neutral-500 truncate mt-0.5">
+                            {agent.lastMessage
+                              ? `${agent.lastMessage.role === "user" ? "You: " : ""}${agent.lastMessage.content}`
+                              : agent.persona
+                                ? agent.persona.slice(0, 60) + (agent.persona.length > 60 ? "..." : "")
+                                : "No messages yet"}
+                          </div>
+                          <div className="flex items-center gap-2 mt-1">
+                            <span className="text-[10px] text-neutral-600 font-mono">{agent.tool}</span>
+                            {agent.model && (
+                              <span className="text-[10px] text-neutral-600 font-mono">{agent.model}</span>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </button>
                   </div>
-                </button>
-              ))}
+                );
+              })}
             </div>
           </section>
 
@@ -236,30 +312,63 @@ export function Dashboard() {
           <div className="space-y-2">
             {[...groupDMs]
               .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
-              .map((g) => (
-                <button
-                  key={g.id}
-                  onClick={() => navigate(`/groupdms/${g.id}`)}
-                  className="w-full flex items-center gap-3 p-3 bg-neutral-900 hover:bg-neutral-800 rounded-lg border border-neutral-800 text-left transition-colors"
-                >
-                  <div className="flex -space-x-1.5 shrink-0">
-                    {g.members.slice(0, 3).map((m) => (
-                      <AgentAvatar key={m.agentId} agentId={m.agentId} name={m.agentName} size="sm" />
-                    ))}
+              .map((g) => {
+                const isCollapsed = collapsedGroupDMs.has(g.id);
+                return (
+                  <div
+                    key={g.id}
+                    className="flex items-center bg-neutral-900 hover:bg-neutral-800 rounded-lg border border-neutral-800 transition-colors"
+                  >
+                    <button
+                      onClick={(e) => toggleCollapseGroupDM(g.id, e)}
+                      className="p-2 pl-3 text-neutral-600 hover:text-neutral-400 shrink-0 self-stretch flex items-center"
+                      title={isCollapsed ? "Expand" : "Collapse"}
+                    >
+                      <svg
+                        className={`w-3 h-3 transition-transform ${isCollapsed ? "" : "rotate-90"}`}
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                        strokeWidth={2}
+                      >
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                      </svg>
+                    </button>
+                    <button
+                      onClick={() => navigate(`/groupdms/${g.id}`)}
+                      className={`flex-1 flex items-center gap-3 text-left min-w-0 ${isCollapsed ? "py-1.5 pr-3 pl-1" : "p-3 pl-1"}`}
+                    >
+                      {!isCollapsed && (
+                        <div className="flex -space-x-1.5 shrink-0">
+                          {g.members.slice(0, 3).map((m) => (
+                            <AgentAvatar key={m.agentId} agentId={m.agentId} name={m.agentName} size="sm" />
+                          ))}
+                        </div>
+                      )}
+                      {isCollapsed ? (
+                        <div className="flex items-center gap-2 flex-1 min-w-0">
+                          <span className="font-medium text-sm truncate">{g.name}</span>
+                          <span className="text-[10px] text-neutral-600 shrink-0 ml-auto">
+                            {timeAgo(g.updatedAt)}
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between">
+                            <span className="font-medium text-sm truncate">{g.name}</span>
+                            <span className="text-[10px] text-neutral-600 shrink-0 ml-2">
+                              {timeAgo(g.updatedAt)}
+                            </span>
+                          </div>
+                          <div className="text-xs text-neutral-500 truncate mt-0.5">
+                            {g.members.map((m) => m.agentName).join(", ")}
+                          </div>
+                        </div>
+                      )}
+                    </button>
                   </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center justify-between">
-                      <span className="font-medium text-sm truncate">{g.name}</span>
-                      <span className="text-[10px] text-neutral-600 shrink-0 ml-2">
-                        {timeAgo(g.updatedAt)}
-                      </span>
-                    </div>
-                    <div className="text-xs text-neutral-500 truncate mt-0.5">
-                      {g.members.map((m) => m.agentName).join(", ")}
-                    </div>
-                  </div>
-                </button>
-              ))}
+                );
+              })}
           </div>
         </section>
 

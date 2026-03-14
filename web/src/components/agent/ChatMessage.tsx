@@ -55,13 +55,9 @@ export const ChatMessage = memo(function ChatMessage({
         )}
         <MessageContent content={message.content} isUser={isUser} timestamp={message.timestamp} />
 
-        {/* Tool uses */}
+        {/* Tool uses — collapsed by default for completed messages */}
         {message.toolUses && message.toolUses.length > 0 && (
-          <div className="mt-2">
-            {message.toolUses.map((tu, i) => (
-              <ToolUseCard key={i} toolUse={tu} />
-            ))}
-          </div>
+          <CollapsedToolUses toolUses={message.toolUses} />
         )}
 
         {/* Usage */}
@@ -439,6 +435,51 @@ export function splitMediaPaths(text: string): Array<{ type: "text" | "media"; v
   }
 
   return parts.length > 0 ? parts : [{ type: "text", value: text }];
+}
+
+/** Collapsed tool uses summary for completed messages */
+function CollapsedToolUses({ toolUses }: { toolUses: import("../../lib/agentApi").ToolUse[] }) {
+  const [expanded, setExpanded] = useState(false);
+
+  // Deduplicate tool names for summary
+  const toolCounts = new Map<string, number>();
+  for (const tu of toolUses) {
+    toolCounts.set(tu.name, (toolCounts.get(tu.name) ?? 0) + 1);
+  }
+  const summary = [...toolCounts.entries()]
+    .map(([name, count]) => count > 1 ? `${name} x${count}` : name)
+    .join(", ");
+
+  return (
+    <div className="mt-2">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex items-center gap-1.5 text-[11px] text-neutral-500 hover:text-neutral-400 transition-colors"
+      >
+        <svg
+          className={`w-3 h-3 transition-transform ${expanded ? "rotate-90" : ""}`}
+          fill="none"
+          viewBox="0 0 24 24"
+          stroke="currentColor"
+          strokeWidth={2}
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
+        </svg>
+        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M11.42 15.17L17.25 21A2.652 2.652 0 0021 17.25l-5.877-5.877M11.42 15.17l2.496-3.03c.317-.384.74-.626 1.208-.766M11.42 15.17l-4.655 5.653a2.548 2.548 0 11-3.586-3.586l6.837-5.63m5.108-.233c.55-.164 1.163-.188 1.743-.14a4.5 4.5 0 004.486-6.336l-3.276 3.277a3.004 3.004 0 01-2.25-2.25l3.276-3.276a4.5 4.5 0 00-6.336 4.486c.091 1.076-.071 2.264-.904 2.95l-.102.085m-1.745 1.437L5.909 7.5H4.5L2.25 3.75l1.5-1.5L7.5 4.5v1.409l4.26 4.26m-1.745 1.437l1.745-1.437m6.615 8.206L15.75 15.75M4.867 19.125h.008v.008h-.008v-.008z" />
+        </svg>
+        <span className="font-mono">{toolUses.length} tool{toolUses.length > 1 ? "s" : ""}</span>
+        {!expanded && <span className="text-neutral-600 truncate max-w-[200px]">{summary}</span>}
+      </button>
+      {expanded && (
+        <div className="mt-1">
+          {toolUses.map((tu, i) => (
+            <ToolUseCard key={i} toolUse={tu} defaultExpanded />
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 /** Collapsible thinking/reasoning block */

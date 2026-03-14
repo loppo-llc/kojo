@@ -3,6 +3,7 @@ import type { ToolUse } from "../../lib/agentApi";
 
 interface ToolUseCardProps {
   toolUse: ToolUse;
+  defaultExpanded?: boolean;
 }
 
 function extractDescription(input: string): string | undefined {
@@ -18,8 +19,8 @@ function extractDescription(input: string): string | undefined {
   return undefined;
 }
 
-export function ToolUseCard({ toolUse }: ToolUseCardProps) {
-  const [expanded, setExpanded] = useState(false);
+export function ToolUseCard({ toolUse, defaultExpanded = false }: ToolUseCardProps) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
   const description = extractDescription(toolUse.input);
 
   return (
