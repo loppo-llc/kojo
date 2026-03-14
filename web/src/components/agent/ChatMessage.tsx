@@ -1,17 +1,25 @@
-import { memo, useState, useCallback, useMemo, useEffect } from "react";
+import { memo, useState, useCallback, useMemo, useEffect, useRef } from "react";
 import type { AgentMessage, AgentMessageAttachment } from "../../lib/agentApi";
 import { ToolUseCard } from "./ToolUseCard";
 import { AgentAvatar } from "./AgentAvatar";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 
-// File extensions that can be previewed
+// File extension categories
 const IMAGE_EXTS = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
-// Match absolute file paths (Unix or Windows-style) with media extensions
+const VIDEO_EXTS = /\.(mp4|webm|mov|avi|mkv)$/i;
+
+// Match absolute file paths (Unix or Windows-style) with any file extension (1-10 chars).
 // Unix: starts with /, Windows: starts with drive letter like C:\
 // Path segments: exclude only delimiters that indicate end-of-path (comma, semicolon, quotes, newline, slash).
 // This allows Unicode, spaces, parens, apostrophes, etc. in filenames.
-const MEDIA_PATH_RE =
-  /(?:(?:\/[^,;:"<>\n/][^,;:"<>\n/]*)+|[A-Z]:\\(?:[^,;:"<>\n\\]+\\)*[^,;:"<>\n\\]+)\.(png|jpe?g|gif|webp|svg|bmp|ico|avif|mp4|webm|mov|avi|mkv)\b/gi;
+const FILE_PATH_RE =
+  /(?:(?:\/[^,;:"<>\n/][^,;:"<>\n/]*)+|[A-Z]:\\(?:[^,;:"<>\n\\]+\\)*[^,;:"<>\n\\]+)\.[a-zA-Z0-9]{1,10}\b/gi;
+
+function getFileType(path: string): "image" | "video" | "other" {
+  if (IMAGE_EXTS.test(path)) return "image";
+  if (VIDEO_EXTS.test(path)) return "video";
+  return "other";
+}
 
 interface ChatMessageProps {
   message: AgentMessage;
@@ -125,6 +133,91 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
+/** Clickable file path chip with hover tooltip */
+function FilePathChip({
+  path,
+  onPreview,
+}: {
+  path: string;
+  onPreview: (p: { path: string; type: "image" | "video" }) => void;
+}) {
+  const fileType = getFileType(path);
+  const [hover, setHover] = useState(false);
+  const [fileSize, setFileSize] = useState<string | null>(null);
+  const fetchedRef = useRef(false);
+  const rawUrl = `/api/v1/files/raw?path=${encodeURIComponent(path)}`;
+  const fileName = path.split(/[/\\]/).pop() || path;
+
+  // Fetch file size on first hover (for non-image files)
+  useEffect(() => {
+    if (!hover || fileType === "image" || fetchedRef.current) return;
+    fetchedRef.current = true;
+    fetch(rawUrl, { method: "HEAD" })
+      .then((res) => {
+        const len = res.headers.get("content-length");
+        setFileSize(len ? formatFileSize(Number(len)) : "—");
+      })
+      .catch(() => setFileSize("—"));
+  }, [hover, fileType, rawUrl]);
+
+  const handleClick = () => {
+    if (fileType === "other") {
+      const a = document.createElement("a");
+      a.href = `${rawUrl}&download=1`;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } else {
+      onPreview({ path, type: fileType });
+    }
+  };
+
+  return (
+    <span
+      className="relative inline-flex"
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+    >
+      <button
+        onClick={handleClick}
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 bg-neutral-700/50 hover:bg-neutral-600/50 rounded text-xs font-mono text-blue-300 hover:text-blue-200 transition-colors max-w-full min-w-0"
+        title={fileType === "other" ? `Download ${fileName}` : `Preview ${fileName}`}
+      >
+        {fileType === "image" ? (
+          <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909M3.75 21h16.5A2.25 2.25 0 0022.5 18.75V5.25A2.25 2.25 0 0020.25 3H3.75A2.25 2.25 0 001.5 5.25v13.5A2.25 2.25 0 003.75 21z" />
+          </svg>
+        ) : fileType === "video" ? (
+          <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.348a1.125 1.125 0 010 1.971l-11.54 6.347a1.125 1.125 0 01-1.667-.985V5.653z" />
+          </svg>
+        ) : (
+          <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+          </svg>
+        )}
+        <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{fileName}</span>
+      </button>
+      {hover && (
+        <div className="absolute bottom-full left-0 mb-1.5 z-40 pointer-events-none">
+          {fileType === "image" ? (
+            <img
+              src={rawUrl}
+              alt={fileName}
+              className="max-w-[200px] max-h-[150px] object-contain rounded-lg shadow-lg border border-neutral-700 bg-neutral-900"
+            />
+          ) : (
+            <div className="px-2 py-1 bg-neutral-800 rounded text-xs text-neutral-300 shadow-lg border border-neutral-700 whitespace-nowrap">
+              {fileSize || "…"}
+            </div>
+          )}
+        </div>
+      )}
+    </span>
+  );
+}
+
 // Match "[Group DM: <name>] New message from <sender> at <timestamp>."
 // Uses greedy match up to "] New message from" to handle "]" in group names.
 const GROUP_DM_RE = /^\[Group DM: (.+)\] New message from (.+?)(?:\s+at\s+\S+)?\.?\n/;
@@ -217,8 +310,8 @@ function MessageContent({ content, isUser, timestamp }: { content: string; isUse
   const [viewMode, setViewMode] = useState<"markdown" | "plain">("markdown");
   const [copied, setCopied] = useState(false);
 
-  const parts = useMemo(() => splitMediaPaths(content), [content]);
-  const hasMedia = parts.length > 1 || (parts.length === 1 && parts[0].type === "media");
+  const parts = useMemo(() => splitFilePaths(content), [content]);
+  const hasFiles = parts.length > 1 || (parts.length === 1 && parts[0].type === "file");
 
   const handleCopy = useCallback(() => {
     navigator.clipboard.writeText(content).then(
@@ -259,8 +352,8 @@ function MessageContent({ content, isUser, timestamp }: { content: string; isUse
         {copied ? "Copied" : "Copy"}
       </button>
 
-      {/* Plain/Markdown toggle */}
-      <button
+      {/* Plain/Markdown toggle — hidden when file paths force plain mode */}
+      {!hasFiles && <button
         onClick={() => setViewMode(viewMode === "markdown" ? "plain" : "markdown")}
         className={btnCls}
         title={viewMode === "markdown" ? "Show plain text" : "Show rendered"}
@@ -280,16 +373,16 @@ function MessageContent({ content, isUser, timestamp }: { content: string; isUse
             Render
           </>
         )}
-      </button>
+      </button>}
     </div>
   );
 
-  // Plain text mode or media-containing messages
-  if (viewMode === "plain" || hasMedia) {
+  // Plain text mode or file-path-containing messages
+  if (viewMode === "plain" || hasFiles) {
     return (
       <>
-        {hasMedia ? (
-          <MediaTextContent parts={parts} onPreview={setPreview} />
+        {hasFiles ? (
+          <FileTextContent parts={parts} onPreview={setPreview} />
         ) : (
           <div className="text-sm whitespace-pre-wrap break-words leading-relaxed">
             {content}
@@ -318,40 +411,19 @@ function MessageContent({ content, isUser, timestamp }: { content: string; isUse
   );
 }
 
-/** Text with clickable media file paths */
-export function MediaTextContent({
+/** Text with clickable file paths (image/video/other) */
+export function FileTextContent({
   parts,
   onPreview,
 }: {
-  parts: Array<{ type: "text" | "media"; value: string }>;
+  parts: Array<{ type: "text" | "file"; value: string }>;
   onPreview: (p: { path: string; type: "image" | "video" }) => void;
 }) {
   return (
     <div className="text-sm whitespace-pre-wrap break-words leading-relaxed">
       {parts.map((part, i) => {
         if (part.type === "text") return <span key={i}>{part.value}</span>;
-        const isImage = IMAGE_EXTS.test(part.value);
-        return (
-          <button
-            key={i}
-            onClick={() =>
-              onPreview({ path: part.value, type: isImage ? "image" : "video" })
-            }
-            className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 bg-neutral-700/50 hover:bg-neutral-600/50 rounded text-xs font-mono text-blue-300 hover:text-blue-200 transition-colors max-w-full min-w-0"
-            title={`Preview ${part.value}`}
-          >
-            {isImage ? (
-              <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909M3.75 21h16.5A2.25 2.25 0 0022.5 18.75V5.25A2.25 2.25 0 0020.25 3H3.75A2.25 2.25 0 001.5 5.25v13.5A2.25 2.25 0 003.75 21z" />
-              </svg>
-            ) : (
-              <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.348a1.125 1.125 0 010 1.971l-11.54 6.347a1.125 1.125 0 01-1.667-.985V5.653z" />
-              </svg>
-            )}
-            <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{part.value.split(/[/\\]/).pop()}</span>
-          </button>
-        );
+        return <FilePathChip key={i} path={part.value} onPreview={onPreview} />;
       })}
     </div>
   );
@@ -414,19 +486,24 @@ export function MediaOverlay({
   );
 }
 
-/** Split text into text parts and media file path parts */
-export function splitMediaPaths(text: string): Array<{ type: "text" | "media"; value: string }> {
-  const parts: Array<{ type: "text" | "media"; value: string }> = [];
+/** Split text into text parts and file path parts */
+export function splitFilePaths(text: string): Array<{ type: "text" | "file"; value: string }> {
+  const parts: Array<{ type: "text" | "file"; value: string }> = [];
   let lastIndex = 0;
 
   // Reset regex state
-  MEDIA_PATH_RE.lastIndex = 0;
+  FILE_PATH_RE.lastIndex = 0;
   let match;
-  while ((match = MEDIA_PATH_RE.exec(text)) !== null) {
+  while ((match = FILE_PATH_RE.exec(text)) !== null) {
+    // Only match paths preceded by whitespace, start of text, or safe delimiters
+    if (match.index > 0) {
+      const prev = text[match.index - 1];
+      if (" \t\n\r`\"'".indexOf(prev) === -1) continue;
+    }
     if (match.index > lastIndex) {
       parts.push({ type: "text", value: text.slice(lastIndex, match.index) });
     }
-    parts.push({ type: "media", value: match[0] });
+    parts.push({ type: "file", value: match[0] });
     lastIndex = match.index + match[0].length;
   }
 

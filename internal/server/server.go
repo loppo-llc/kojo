@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"mime"
 	"log/slog"
 	"net"
 	"net/http"
@@ -574,6 +575,9 @@ func (s *Server) handleViewFile(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRawFile(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
+	if r.URL.Query().Get("download") == "1" {
+		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(path)}))
+	}
 	s.files.ServeRaw(w, r, path)
 }
 

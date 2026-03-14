@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { useParams, useNavigate } from "react-router";
 import { groupdmApi, type GroupDMInfo, type GroupMessage } from "../../lib/groupdmApi";
 import { AgentAvatar } from "../agent/AgentAvatar";
-import { splitMediaPaths, MediaTextContent, MediaOverlay } from "../agent/ChatMessage";
+import { splitFilePaths, FileTextContent, MediaOverlay } from "../agent/ChatMessage";
 
 const PAGE_SIZE = 50;
 
@@ -291,13 +291,13 @@ export function GroupDMChat() {
   );
 }
 
-/** Message content with image/video file path detection and preview */
+/** Message content with file path detection, hover preview, and download */
 function GroupMessageContent({ content }: { content: string }) {
   const [preview, setPreview] = useState<{ path: string; type: "image" | "video" } | null>(null);
-  const parts = useMemo(() => splitMediaPaths(content), [content]);
-  const hasMedia = parts.length > 1 || (parts.length === 1 && parts[0].type === "media");
+  const parts = useMemo(() => splitFilePaths(content), [content]);
+  const hasFiles = parts.length > 1 || (parts.length === 1 && parts[0].type === "file");
 
-  if (!hasMedia) {
+  if (!hasFiles) {
     return (
       <div className="text-sm text-neutral-300 whitespace-pre-wrap break-words leading-relaxed mt-0.5">
         {content}
@@ -307,7 +307,7 @@ function GroupMessageContent({ content }: { content: string }) {
 
   return (
     <div className="mt-0.5 text-neutral-300">
-      <MediaTextContent parts={parts} onPreview={setPreview} />
+      <FileTextContent parts={parts} onPreview={setPreview} />
       {preview && (
         <MediaOverlay
           path={preview.path}
