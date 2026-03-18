@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type SessionInfo } from "../lib/api";
-import { toBase64, restoreScrollback } from "../lib/utils";
+import { toBase64, base64ToBytes, restoreScrollback } from "../lib/utils";
 import { createOutputBuffer, type OutputBuffer } from "../lib/outputBuffer";
 import { useTerminal } from "../hooks/useTerminal";
 import { useSpecialKeys } from "../hooks/useSpecialKeys";
@@ -93,13 +93,13 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
       switch (msg.type) {
         case "output":
           if (msg.data) {
-            const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
+            const bytes = base64ToBytes(msg.data);
             outputBufRef.current!.push(bytes);
           }
           break;
         case "scrollback":
           if (msg.data) {
-            const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
+            const bytes = base64ToBytes(msg.data);
             restoreScrollback(term, bytes, autoScrollRef);
           }
           break;

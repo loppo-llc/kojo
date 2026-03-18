@@ -3,7 +3,7 @@ import { useParams, useNavigate, useLocation } from "react-router";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { useTerminal } from "../hooks/useTerminal";
 import { api, type SessionInfo, type Attachment } from "../lib/api";
-import { restoreScrollback } from "../lib/utils";
+import { restoreScrollback, base64ToBytes } from "../lib/utils";
 import { useSpecialKeys } from "../hooks/useSpecialKeys";
 import { FileBrowser } from "./FileBrowser";
 import { GitPanel } from "./GitPanel";
@@ -151,7 +151,7 @@ export function SessionPage() {
     if (gotScrollbackRef.current) return;
     const term = xtermRef.current;
     if (!term) return;
-    const bytes = Uint8Array.from(atob(session.lastOutput), (c) => c.charCodeAt(0));
+    const bytes = base64ToBytes(session.lastOutput);
     term.write(bytes, () => {
       term.scrollToBottom();
     });

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from "react";
-import { toBase64 } from "../lib/utils";
+import { toBase64, base64ToBytes } from "../lib/utils";
 import { createOutputBuffer, type OutputBuffer } from "../lib/outputBuffer";
 import type { Attachment } from "../lib/api";
 
@@ -63,13 +63,13 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
       switch (msg.type) {
         case "output":
           if (msg.data) {
-            const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
+            const bytes = base64ToBytes(msg.data);
             bufRef.current!.push(bytes);
           }
           break;
         case "scrollback":
           if (msg.data) {
-            const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
+            const bytes = base64ToBytes(msg.data);
             onScrollback(bytes);
           }
           break;

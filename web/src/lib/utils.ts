@@ -25,6 +25,11 @@ export function restoreScrollback(
   term.write(data, restore);
 }
 
+/** Decode a standard base64 string to Uint8Array. */
+export function base64ToBytes(b64: string): Uint8Array {
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+
 export function toBase64(str: string): string {
   return btoa(
     Array.from(new TextEncoder().encode(str), (b) => String.fromCharCode(b)).join(""),
