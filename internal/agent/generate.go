@@ -289,22 +289,12 @@ func SummarizeWithCLI(tool string, persona string) (string, error) {
 	}
 }
 
-// globalCreds holds a reference to the credential store for API key lookups.
-// Set by SetGlobalCredentialStore during manager initialization.
-var globalCreds *CredentialStore
-
-// SetGlobalCredentialStore sets the package-level credential store reference.
-// Called once during Manager initialization.
-func SetGlobalCredentialStore(cs *CredentialStore) {
-	globalCreds = cs
-}
-
 // loadGeminiAPIKey loads the Gemini API key.
 // Priority: 1) encrypted credential store, 2) nanobanana credentials file (fallback).
-func loadGeminiAPIKey() (string, error) {
+func loadGeminiAPIKey(creds *CredentialStore) (string, error) {
 	// 1. Try credential store (encrypted, set via Settings UI)
-	if globalCreds != nil {
-		if key, err := globalCreds.GetToken("gemini", "", "", "api_key"); err == nil && key != "" {
+	if creds != nil {
+		if key, err := creds.GetToken("gemini", "", "", "api_key"); err == nil && key != "" {
 			return key, nil
 		}
 	}

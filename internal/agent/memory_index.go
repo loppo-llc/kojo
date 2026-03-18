@@ -31,10 +31,11 @@ type MemoryIndex struct {
 	mu     sync.Mutex
 	db     *sql.DB
 	logger *slog.Logger
+	creds  *CredentialStore
 }
 
 // OpenMemoryIndex opens or creates the FTS5 index for an agent.
-func OpenMemoryIndex(agentID string, logger *slog.Logger) (*MemoryIndex, error) {
+func OpenMemoryIndex(agentID string, logger *slog.Logger, creds *CredentialStore) (*MemoryIndex, error) {
 	dir := filepath.Join(agentDir(agentID), indexDir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create index dir: %w", err)
@@ -110,7 +111,7 @@ func OpenMemoryIndex(agentID string, logger *slog.Logger) (*MemoryIndex, error) 
 		return nil, fmt.Errorf("create embedding_cache table: %w", err)
 	}
 
-	return &MemoryIndex{db: db, logger: logger}, nil
+	return &MemoryIndex{db: db, logger: logger, creds: creds}, nil
 }
 
 // Close closes the database.
@@ -501,7 +502,7 @@ func (idx *MemoryIndex) BuildContextFromQuery(query string) string {
 // hybridSearch combines FTS5 BM25 results with vector cosine similarity.
 // Returns nil if vector search is unavailable (no API key or no embeddings).
 func (idx *MemoryIndex) hybridSearch(query string, limit int) []SearchResult {
-	apiKey, err := loadGeminiAPIKey()
+	apiKey, err := loadGeminiAPIKey(idx.creds)
 	if err != nil {
 		return nil // no API key, skip vector search
 	}

@@ -63,7 +63,6 @@ func NewManager(logger *slog.Logger) *Manager {
 	if err != nil {
 		logger.Warn("failed to open credential store", "err", err)
 	}
-	SetGlobalCredentialStore(creds)
 
 	m := &Manager{
 		agents: make(map[string]*Agent),
@@ -150,7 +149,7 @@ func (m *Manager) getOrOpenIndex(agentID string) *MemoryIndex {
 	m.memIndexesMu.Unlock()
 
 	// Open outside lock
-	idx, err := OpenMemoryIndex(agentID, m.logger)
+	idx, err := OpenMemoryIndex(agentID, m.logger, m.creds)
 	if err != nil {
 		m.logger.Warn("failed to open memory index", "agent", agentID, "err", err)
 		return nil
