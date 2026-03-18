@@ -1,4 +1,4 @@
-const BASE = "";
+import { get, post, del, patch, put, upload } from "./httpClient";
 
 export const INTERVAL_PRESETS = [
   { label: "Off", value: 0 },
@@ -134,48 +134,6 @@ export interface ChatEvent {
   startedAt?: string; // RFC3339 timestamp of when processing started
 }
 
-async function get<T>(path: string): Promise<T> {
-  const res = await fetch(BASE + path);
-  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
-async function post<T>(path: string, body?: unknown): Promise<T> {
-  const res = await fetch(BASE + path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
-async function del<T>(path: string): Promise<T> {
-  const res = await fetch(BASE + path, { method: "DELETE" });
-  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
-async function patch<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(BASE + path, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
-async function put<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(BASE + path, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
 export const agentApi = {
   list: () =>
     get<{ agents: AgentInfo[] }>("/api/v1/agents").then((r) => r.agents ?? []),
@@ -199,15 +157,10 @@ export const agentApi = {
 
   avatarUrl: (id: string) => `/api/v1/agents/${id}/avatar`,
 
-  uploadAvatar: async (id: string, file: File) => {
+  uploadAvatar: (id: string, file: File) => {
     const form = new FormData();
     form.append("avatar", file);
-    const res = await fetch(`${BASE}/api/v1/agents/${id}/avatar`, {
-      method: "POST",
-      body: form,
-    });
-    if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-    return res.json() as Promise<{ ok: boolean }>;
+    return upload<{ ok: boolean }>(`/api/v1/agents/${id}/avatar`, form);
   },
 
   uploadGeneratedAvatar: (id: string, avatarPath: string) =>
@@ -236,7 +189,7 @@ export const agentApi = {
     }),
 
   previewAvatarUrl: (path: string) =>
-    `${BASE}/api/v1/agents/preview-avatar?path=${encodeURIComponent(path)}`,
+    `/api/v1/agents/preview-avatar?path=${encodeURIComponent(path)}`,
 
   credentials: {
     list: (agentId: string) =>
@@ -292,15 +245,13 @@ export const agentApi = {
         `/api/v1/agents/${agentId}/credentials/${credId}/totp`,
       ),
 
-    parseQR: async (agentId: string, file: File) => {
+    parseQR: (agentId: string, file: File) => {
       const form = new FormData();
       form.append("qr", file);
-      const res = await fetch(`${BASE}/api/v1/agents/${agentId}/credentials/parse-qr`, {
-        method: "POST",
-        body: form,
-      });
-      if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-      return (res.json() as Promise<{ entries: OTPEntry[] }>).then((r) => r.entries ?? []);
+      return upload<{ entries: OTPEntry[] }>(
+        `/api/v1/agents/${agentId}/credentials/parse-qr`,
+        form,
+      ).then((r) => r.entries ?? []);
     },
 
     parseOTPURI: (agentId: string, uri: string) =>
@@ -327,12 +278,8 @@ export const agentApi = {
         data,
       ).then((r) => r.source),
 
-    delete: async (agentId: string, sourceId: string) => {
-      const res = await fetch(`${BASE}/api/v1/agents/${agentId}/notify-sources/${sourceId}`, {
-        method: "DELETE",
-      });
-      if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-    },
+    delete: (agentId: string, sourceId: string) =>
+      del<unknown>(`/api/v1/agents/${agentId}/notify-sources/${sourceId}`),
 
     startAuth: (agentId: string, sourceId: string) =>
       get<{ authUrl: string }>(
@@ -352,12 +299,8 @@ export const agentApi = {
         clientSecret,
       }),
 
-    delete: async (provider: string) => {
-      const res = await fetch(`${BASE}/api/v1/oauth-clients/${provider}`, {
-        method: "DELETE",
-      });
-      if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-    },
+    delete: (provider: string) =>
+      del<unknown>(`/api/v1/oauth-clients/${provider}`),
   },
 
   apiKeys: {
@@ -367,12 +310,8 @@ export const agentApi = {
     set: (provider: string, apiKey: string) =>
       put<{ ok: boolean }>(`/api/v1/api-keys/${provider}`, { apiKey }),
 
-    delete: async (provider: string) => {
-      const res = await fetch(`${BASE}/api/v1/api-keys/${provider}`, {
-        method: "DELETE",
-      });
-      if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-    },
+    delete: (provider: string) =>
+      del<unknown>(`/api/v1/api-keys/${provider}`),
   },
 
   notifySourceTypes: () =>

@@ -1,4 +1,4 @@
-const BASE = "";
+import { get, post, del, patch, upload } from "./httpClient";
 
 export interface SessionInfo {
   id: string;
@@ -64,38 +64,6 @@ export interface GitLogEntry {
   date: string;
 }
 
-async function get<T>(path: string): Promise<T> {
-  const res = await fetch(BASE + path);
-  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
-async function post<T>(path: string, body?: unknown): Promise<T> {
-  const res = await fetch(BASE + path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
-async function del<T>(path: string): Promise<T> {
-  const res = await fetch(BASE + path, { method: "DELETE" });
-  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
-async function patch<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(BASE + path, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
 export const api = {
   info: () => get<ServerInfo>("/api/v1/info"),
   dirSuggest: (prefix: string) =>
@@ -156,11 +124,9 @@ export const api = {
       post<{ ok: boolean }>("/api/v1/push/unsubscribe", { endpoint }),
   },
 
-  upload: async (file: File) => {
+  upload: (file: File) => {
     const form = new FormData();
     form.append("file", file);
-    const res = await fetch(BASE + "/api/v1/upload", { method: "POST", body: form });
-    if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-    return res.json() as Promise<{ path: string; name: string; size: number; mime: string }>;
+    return upload<{ path: string; name: string; size: number; mime: string }>("/api/v1/upload", form);
   },
 };
