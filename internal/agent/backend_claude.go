@@ -70,7 +70,14 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	disablePersonaHook(dir, b.logger)
 
 	if hasExistingSession(dir) {
-		args = append(args, "--continue")
+		if memoryModifiedSinceSession(dir) {
+			b.logger.Info("memory modified since last session, resetting Claude session", "agent", agent.ID)
+			clearClaudeSession(agent.ID)
+			sessionID := agentIDToUUID(agent.ID)
+			args = append(args, "--session-id", sessionID)
+		} else {
+			args = append(args, "--continue")
+		}
 	} else {
 		sessionID := agentIDToUUID(agent.ID)
 		args = append(args, "--session-id", sessionID)
@@ -608,6 +615,56 @@ func findSessionFile(projectDir string, sessionID string) string {
 		}
 	}
 	return best
+}
+
+// memoryModifiedSinceSession returns true if MEMORY.md or any file in memory/
+// has been modified after the most recent Claude session JSONL file.
+func memoryModifiedSinceSession(agentDir string) bool {
+	absDir, err := filepath.Abs(agentDir)
+	if err != nil {
+		return false
+	}
+
+	// Find the newest session JSONL mtime
+	projectDir := claudeProjectDir(absDir)
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		return false
+	}
+	var sessionMtime time.Time
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
+			if info, err := e.Info(); err == nil && info.ModTime().After(sessionMtime) {
+				sessionMtime = info.ModTime()
+			}
+		}
+	}
+	if sessionMtime.IsZero() {
+		return false
+	}
+
+	// Add 1-second tolerance to absorb filesystem timestamp resolution limits.
+	// Memory must be strictly newer than session + skew to trigger a reset.
+	cutoff := sessionMtime.Add(time.Second)
+
+	// Check MEMORY.md
+	if info, err := os.Stat(filepath.Join(agentDir, "MEMORY.md")); err == nil && info.ModTime().After(cutoff) {
+		return true
+	}
+
+	// Check memory/ directory entries
+	memDir := filepath.Join(agentDir, "memory")
+	memEntries, err := os.ReadDir(memDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range memEntries {
+		if info, err := e.Info(); err == nil && info.ModTime().After(cutoff) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // clearClaudeSession removes Claude session JSONL files from the global

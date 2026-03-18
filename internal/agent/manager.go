@@ -46,6 +46,10 @@ type Manager struct {
 	// cronPaused globally pauses all cron jobs when true.
 	cronPaused bool
 
+	// memIndexes caches open MemoryIndex instances per agent.
+	memIndexes   map[string]*MemoryIndex
+	memIndexesMu sync.Mutex
+
 	// notifyPoller polls external notification sources.
 	notifyPoller *notifyPoller
 
@@ -74,6 +78,7 @@ func NewManager(logger *slog.Logger) *Manager {
 		busy:       make(map[string]busyEntry),
 		resetting:  make(map[string]bool),
 		profileGen: make(map[string]bool),
+		memIndexes: make(map[string]*MemoryIndex),
 	}
 
 	m.cron = newCronScheduler(m, logger)
@@ -132,6 +137,60 @@ func NewManager(logger *slog.Logger) *Manager {
 // Called after both managers are created to avoid circular dependency.
 func (m *Manager) SetGroupDMManager(gdm *GroupDMManager) {
 	m.groupdms = gdm
+}
+
+// getOrOpenIndex returns a cached MemoryIndex for the agent, opening one if needed.
+// Uses double-checked locking to avoid holding the mutex during I/O.
+func (m *Manager) getOrOpenIndex(agentID string) *MemoryIndex {
+	m.memIndexesMu.Lock()
+	if idx, ok := m.memIndexes[agentID]; ok {
+		m.memIndexesMu.Unlock()
+		return idx
+	}
+	m.memIndexesMu.Unlock()
+
+	// Open outside lock
+	idx, err := OpenMemoryIndex(agentID, m.logger)
+	if err != nil {
+		m.logger.Warn("failed to open memory index", "agent", agentID, "err", err)
+		return nil
+	}
+
+	// Re-check and store
+	m.memIndexesMu.Lock()
+	if existing, ok := m.memIndexes[agentID]; ok {
+		m.memIndexesMu.Unlock()
+		idx.Close() // another goroutine opened it first
+		return existing
+	}
+	m.memIndexes[agentID] = idx
+	m.memIndexesMu.Unlock()
+	return idx
+}
+
+// closeIndex closes and removes the cached MemoryIndex for an agent.
+func (m *Manager) closeIndex(agentID string) {
+	m.memIndexesMu.Lock()
+	idx, ok := m.memIndexes[agentID]
+	if ok {
+		delete(m.memIndexes, agentID)
+	}
+	m.memIndexesMu.Unlock()
+
+	if ok {
+		idx.Close()
+	}
+}
+
+// CloseAllIndexes closes all cached MemoryIndex instances.
+func (m *Manager) CloseAllIndexes() {
+	m.memIndexesMu.Lock()
+	defer m.memIndexesMu.Unlock()
+
+	for id, idx := range m.memIndexes {
+		idx.Close()
+		delete(m.memIndexes, id)
+	}
 }
 
 // Create creates a new agent.
@@ -549,7 +608,8 @@ func (m *Manager) ResetData(id string) error {
 		m.logger.Warn("reset: failed to remove MEMORY.md", "agent", id, "err", err)
 	}
 
-	// Remove FTS index
+	// Close and remove FTS index
+	m.closeIndex(id)
 	if err := os.RemoveAll(filepath.Join(dir, indexDir)); err != nil {
 		m.logger.Warn("reset: failed to remove index dir", "agent", id, "err", err)
 	}
@@ -624,12 +684,34 @@ func (m *Manager) Delete(id string) error {
 		m.mu.Unlock()
 		return fmt.Errorf("%w, try again later", ErrAgentBusy)
 	}
-	// Abort any running chat
+	// Abort any running chat and wait for it to finish
 	if entry, busy := m.busy[id]; busy {
 		entry.cancel()
 	}
+	// Mark as resetting to block post-chat re-indexing
+	m.resetting[id] = true
 	m.busyMu.Unlock()
 	m.mu.Unlock()
+
+	defer func() {
+		m.busyMu.Lock()
+		delete(m.resetting, id)
+		m.busyMu.Unlock()
+	}()
+
+	// Wait for active chat to finish (up to 5 seconds)
+	for i := 0; i < 50; i++ {
+		m.busyMu.Lock()
+		_, stillBusy := m.busy[id]
+		m.busyMu.Unlock()
+		if !stillBusy {
+			break
+		}
+		if i == 49 {
+			return fmt.Errorf("%w, try again later", ErrAgentBusy)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	// Remove credentials and notify tokens outside lock (DB I/O)
 	if m.creds != nil {
@@ -648,6 +730,9 @@ func (m *Manager) Delete(id string) error {
 	if m.groupdms != nil {
 		m.groupdms.RemoveAgent(id)
 	}
+
+	// Close cached memory index before removing directory
+	m.closeIndex(id)
 
 	// Remove agent data directory (best-effort: credentials/cron/notify already cleaned up)
 	dir := agentDir(id)
@@ -714,7 +799,26 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 
 	atts := attachments
 
-	// Save input message to transcript
+	// Build system prompt with group DM context
+	var apiBase string
+	var groups []*GroupDM
+	if m.groupdms != nil {
+		apiBase = m.groupdms.APIBase()
+		groups = m.groupdms.GroupsForAgent(agentID)
+	}
+	systemPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
+
+	// Update memory index and inject relevant context BEFORE saving input
+	// to avoid the current message appearing in search results (prompt injection).
+	if idx := m.getOrOpenIndex(agentID); idx != nil {
+		idx.IndexFilesIfStale(agentID)
+		idx.IndexNewMessages(agentID)
+		if memCtx := idx.BuildContextFromQuery(userMessage); memCtx != "" {
+			systemPrompt += "\n\n" + memCtx
+		}
+	}
+
+	// Save input message to transcript (after memory search to avoid self-injection)
 	var inputMsg *Message
 	if role == "system" {
 		inputMsg = newSystemMessage(userMessage)
@@ -732,15 +836,6 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	if len(atts) > 0 {
 		effectiveMessage = formatMessageWithAttachments(userMessage, atts)
 	}
-
-	// Build system prompt with group DM context
-	var apiBase string
-	var groups []*GroupDM
-	if m.groupdms != nil {
-		apiBase = m.groupdms.APIBase()
-		groups = m.groupdms.GroupsForAgent(agentID)
-	}
-	systemPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
 
 	// Start chat
 	backendCh, err := backend.Chat(chatCtx, &agentCopy, effectiveMessage, systemPrompt)
@@ -761,6 +856,21 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		defer m.clearBusy(agentID)
 		defer cancel()
 		m.processChatEvents(chatCtx, agentID, backendCh, outCh)
+
+		// Update memory index after chat completes.
+		// Skip if agent was deleted/reset during chat to avoid reopening a closed index.
+		m.busyMu.Lock()
+		isResetting := m.resetting[agentID]
+		m.busyMu.Unlock()
+		m.mu.Lock()
+		_, agentExists := m.agents[agentID]
+		m.mu.Unlock()
+		if agentExists && !isResetting {
+			if idx := m.getOrOpenIndex(agentID); idx != nil {
+				idx.IndexNewMessages(agentID)
+				idx.IndexFilesIfStale(agentID)
+			}
+		}
 	}()
 
 	return callerCh, nil
