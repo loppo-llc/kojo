@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"errors"
 	"testing"
 )
 
@@ -55,11 +56,11 @@ func newTestManager(t *testing.T) *Manager {
 
 	logger := testLogger()
 	m := &Manager{
-		agents:   make(map[string]*Agent),
-		backends: make(map[string]ChatBackend),
-		store:    &store{dir: tmp + "/agents", logger: logger},
-		logger:   logger,
-		busy:     make(map[string]busyEntry),
+		agents:     make(map[string]*Agent),
+		backends:   make(map[string]ChatBackend),
+		store:      &store{dir: tmp + "/agents", logger: logger},
+		logger:     logger,
+		busy:       make(map[string]busyEntry),
 		resetting:  make(map[string]bool),
 		profileGen: make(map[string]bool),
 		memIndexes: make(map[string]*MemoryIndex),
@@ -92,9 +93,9 @@ func TestGroupDMManager_CreateDefaultName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Default name is "Alice, Bob" (order may vary based on input)
-	if g.Name == "" {
-		t.Error("expected non-empty default name")
+	// defaultGroupName joins member names in input order
+	if g.Name != "Alice, Bob" {
+		t.Errorf("default name = %q, want %q", g.Name, "Alice, Bob")
 	}
 }
 
@@ -102,8 +103,8 @@ func TestGroupDMManager_CreateTooFewMembers(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
 	_, err := gdm.Create("Solo", []string{"ag_alice"}, 0)
-	if err == nil {
-		t.Error("expected error for single member")
+	if !errors.Is(err, ErrGroupTooFew) {
+		t.Errorf("expected ErrGroupTooFew, got %v", err)
 	}
 }
 
@@ -111,8 +112,8 @@ func TestGroupDMManager_CreateNonexistentAgent(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
 	_, err := gdm.Create("Bad", []string{"ag_alice", "ag_nonexistent"}, 0)
-	if err == nil {
-		t.Error("expected error for nonexistent agent")
+	if !errors.Is(err, ErrAgentNotFound) {
+		t.Errorf("expected ErrAgentNotFound, got %v", err)
 	}
 }
 
@@ -120,8 +121,8 @@ func TestGroupDMManager_CreateDeduplicatesMembers(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
 	_, err := gdm.Create("Dup", []string{"ag_alice", "ag_alice"}, 0)
-	if err == nil {
-		t.Error("expected error when deduplicated members < 2")
+	if !errors.Is(err, ErrGroupTooFew) {
+		t.Errorf("expected ErrGroupTooFew after dedup, got %v", err)
 	}
 }
 
@@ -172,8 +173,8 @@ func TestGroupDMManager_DeleteNotFound(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
 	err := gdm.Delete("gd_nonexistent", false)
-	if err == nil {
-		t.Error("expected error for nonexistent group")
+	if !errors.Is(err, ErrGroupNotFound) {
+		t.Errorf("expected ErrGroupNotFound, got %v", err)
 	}
 }
 
@@ -225,8 +226,17 @@ func TestGroupDMManager_RenameNotMember(t *testing.T) {
 	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0)
 
 	_, err := gdm.Rename(g.ID, "New", "ag_charlie")
-	if err == nil {
-		t.Error("expected error for non-member rename")
+	if !errors.Is(err, ErrGroupNotMember) {
+		t.Errorf("expected ErrGroupNotMember, got %v", err)
+	}
+}
+
+func TestGroupDMManager_RenameNotFound(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+
+	_, err := gdm.Rename("gd_nonexistent", "New", "ag_alice")
+	if !errors.Is(err, ErrGroupNotFound) {
+		t.Errorf("expected ErrGroupNotFound, got %v", err)
 	}
 }
 
@@ -250,8 +260,19 @@ func TestGroupDMManager_AddMemberDuplicate(t *testing.T) {
 	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0)
 
 	_, err := gdm.AddMember(g.ID, "ag_alice", "ag_bob")
-	if err == nil {
-		t.Error("expected error for duplicate member")
+	if !errors.Is(err, ErrGroupAlreadyMember) {
+		t.Errorf("expected ErrGroupAlreadyMember, got %v", err)
+	}
+}
+
+func TestGroupDMManager_AddMemberNotMember(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+
+	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0)
+
+	_, err := gdm.AddMember(g.ID, "ag_charlie", "ag_charlie")
+	if !errors.Is(err, ErrGroupNotMember) {
+		t.Errorf("expected ErrGroupNotMember, got %v", err)
 	}
 }
 
@@ -270,6 +291,17 @@ func TestGroupDMManager_LeaveGroup(t *testing.T) {
 	}
 	if len(got.Members) != 2 {
 		t.Errorf("expected 2 members after leave, got %d", len(got.Members))
+	}
+}
+
+func TestGroupDMManager_LeaveGroupNotMember(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+
+	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0)
+
+	err := gdm.LeaveGroup(g.ID, "ag_charlie")
+	if !errors.Is(err, ErrGroupNotMember) {
+		t.Errorf("expected ErrGroupNotMember, got %v", err)
 	}
 }
 
