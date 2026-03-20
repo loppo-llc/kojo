@@ -18,6 +18,7 @@ export interface AgentInfo {
   model: string;
   effort: string;
   tool: string;
+  workDir: string;
   intervalMinutes: number;
   activeStart?: string;
   activeEnd?: string;
@@ -41,6 +42,7 @@ export interface AgentConfig {
   model?: string;
   effort?: string;
   tool?: string;
+  workDir?: string;
   intervalMinutes?: number;
   activeStart?: string;
   activeEnd?: string;

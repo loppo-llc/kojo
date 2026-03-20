@@ -15,6 +15,7 @@ export function AgentCreate() {
   const [model, setModel] = useState("sonnet");
   const [effort, setEffort] = useState("");
   const [tool, setTool] = useState("claude");
+  const [workDir, setWorkDir] = useState("");
   const [intervalMinutes, setIntervalMinutes] = useState(30);
   const [activeStart, setActiveStart] = useState("");
   const [activeEnd, setActiveEnd] = useState("");
@@ -210,6 +211,7 @@ export function AgentCreate() {
         model,
         effort: supportsEffort(tool) && effort ? effort : undefined,
         tool,
+        workDir: workDir.trim() || undefined,
         intervalMinutes,
         activeStart: activeStart || undefined,
         activeEnd: activeEnd || undefined,
@@ -462,6 +464,19 @@ export function AgentCreate() {
             </select>
           </div>
         )}
+
+        {/* File Storage */}
+        <div>
+          <label className="block text-sm text-neutral-400 mb-2">File Storage</label>
+          <input
+            type="text"
+            value={workDir}
+            onChange={(e) => setWorkDir(e.target.value)}
+            placeholder="(default: agent data dir)"
+            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm font-mono focus:outline-none focus:border-neutral-500"
+          />
+          <p className="text-xs text-neutral-600 mt-1">Generated files are saved here.</p>
+        </div>
 
         {/* Schedule */}
         <ScheduleEditor

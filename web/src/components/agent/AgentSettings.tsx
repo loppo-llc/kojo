@@ -17,6 +17,7 @@ export function AgentSettings() {
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState("");
   const [tool, setTool] = useState("");
+  const [workDir, setWorkDir] = useState("");
   const [intervalMinutes, setIntervalMinutes] = useState(30);
   const [activeStart, setActiveStart] = useState("");
   const [activeEnd, setActiveEnd] = useState("");
@@ -42,6 +43,7 @@ export function AgentSettings() {
       setModel(a.model);
       setEffort(a.effort || "");
       setTool(a.tool);
+      setWorkDir(a.workDir ?? "");
       setIntervalMinutes(a.intervalMinutes);
       setActiveStart(a.activeStart ?? "");
       setActiveEnd(a.activeEnd ?? "");
@@ -61,6 +63,7 @@ export function AgentSettings() {
         model: model.trim(),
         effort: supportsEffort(tool) ? effort : undefined,
         tool: tool.trim(),
+        workDir: workDir.trim(),
         intervalMinutes,
         activeStart,
         activeEnd,
@@ -337,6 +340,19 @@ export function AgentSettings() {
               </button>
             ))}
           </div>
+        </div>
+
+        {/* File Storage */}
+        <div>
+          <label className="block text-sm text-neutral-400 mb-2">File Storage</label>
+          <input
+            type="text"
+            value={workDir}
+            onChange={(e) => setWorkDir(e.target.value)}
+            placeholder="(default: agent data dir)"
+            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm font-mono focus:outline-none focus:border-neutral-500"
+          />
+          <p className="text-xs text-neutral-600 mt-1">Generated files are saved here.</p>
         </div>
 
         {/* Schedule */}

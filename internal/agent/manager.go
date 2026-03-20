@@ -472,6 +472,19 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.Tool != nil {
 		a.Tool = *cfg.Tool
 	}
+	if cfg.WorkDir != nil {
+		if *cfg.WorkDir != "" {
+			if !filepath.IsAbs(*cfg.WorkDir) {
+				m.mu.Unlock()
+				return nil, fmt.Errorf("workDir must be an absolute path: %s", *cfg.WorkDir)
+			}
+			if info, err := os.Stat(*cfg.WorkDir); err != nil || !info.IsDir() {
+				m.mu.Unlock()
+				return nil, fmt.Errorf("workDir does not exist or is not a directory: %s", *cfg.WorkDir)
+			}
+		}
+		a.WorkDir = *cfg.WorkDir
+	}
 	// Validate before mutating
 	if cfg.IntervalMinutes != nil && !ValidInterval(*cfg.IntervalMinutes) {
 		m.mu.Unlock()

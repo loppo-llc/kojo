@@ -94,6 +94,18 @@ func (st *store) Load() ([]*Agent, error) {
 			a.ActiveEnd = ""
 			needsSave = true
 		}
+		// Validate loaded workDir — clear invalid values (not absolute or not a directory)
+		if a.WorkDir != "" {
+			if !filepath.IsAbs(a.WorkDir) {
+				st.logger.Warn("invalid workDir in stored data (not absolute), clearing", "agent", a.ID, "workDir", a.WorkDir)
+				a.WorkDir = ""
+				needsSave = true
+			} else if info, err := os.Stat(a.WorkDir); err != nil || !info.IsDir() {
+				st.logger.Warn("workDir does not exist or is not a directory, clearing", "agent", a.ID, "workDir", a.WorkDir)
+				a.WorkDir = ""
+				needsSave = true
+			}
+		}
 	}
 	if needsSave {
 		st.Save(agents)

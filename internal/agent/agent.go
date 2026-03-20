@@ -3,6 +3,8 @@ package agent
 import (
 	"fmt"
 	"hash/fnv"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -83,6 +85,7 @@ type Agent struct {
 	Model           string `json:"model"`           // e.g. "sonnet", "opus"
 	Effort          string `json:"effort,omitempty"` // claude only: "low", "medium", "high", "max"
 	Tool            string `json:"tool"`            // CLI tool: "claude", "codex", "gemini"
+	WorkDir         string `json:"workDir,omitempty"` // file storage directory (empty = agentDir)
 	IntervalMinutes int    `json:"intervalMinutes"` // periodic execution interval in minutes (0 = disabled)
 	ActiveStart     string `json:"activeStart,omitempty"` // HH:MM — start of active window (empty = no restriction)
 	ActiveEnd       string `json:"activeEnd,omitempty"`   // HH:MM — end of active window (empty = no restriction)
@@ -131,6 +134,7 @@ type AgentConfig struct {
 	Model           string  `json:"model"`
 	Effort          string  `json:"effort"`
 	Tool            string  `json:"tool"`
+	WorkDir         string  `json:"workDir"`
 	IntervalMinutes *int    `json:"intervalMinutes"` // nil = use default (30)
 	ActiveStart     *string `json:"activeStart"`     // HH:MM or empty
 	ActiveEnd       *string `json:"activeEnd"`       // HH:MM or empty
@@ -146,6 +150,7 @@ type AgentUpdateConfig struct {
 	Model                 *string `json:"model"`
 	Effort                *string `json:"effort"`
 	Tool                  *string `json:"tool"`
+	WorkDir               *string `json:"workDir"`
 	IntervalMinutes       *int    `json:"intervalMinutes"`
 	ActiveStart           *string `json:"activeStart"`
 	ActiveEnd             *string `json:"activeEnd"`
@@ -177,6 +182,14 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	if !ValidEffort(cfg.Effort) {
 		return nil, fmt.Errorf("unsupported effort level: %q", cfg.Effort)
 	}
+	if cfg.WorkDir != "" {
+		if !filepath.IsAbs(cfg.WorkDir) {
+			return nil, fmt.Errorf("workDir must be an absolute path: %s", cfg.WorkDir)
+		}
+		if info, err := os.Stat(cfg.WorkDir); err != nil || !info.IsDir() {
+			return nil, fmt.Errorf("workDir does not exist or is not a directory: %s", cfg.WorkDir)
+		}
+	}
 	a := &Agent{
 		ID:              generateID(),
 		Name:            cfg.Name,
@@ -184,6 +197,7 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		Model:           cfg.Model,
 		Effort:          cfg.Effort,
 		Tool:            cfg.Tool,
+		WorkDir:         cfg.WorkDir,
 		IntervalMinutes: interval,
 		ActiveStart:     activeStart,
 		ActiveEnd:       activeEnd,

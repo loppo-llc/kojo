@@ -128,6 +128,14 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	sb.WriteString("# Instructions\n\n")
 	sb.WriteString("- Stay in character at all times.\n")
 	sb.WriteString(fmt.Sprintf("- Your data directory is: %s\n", dir))
+	sb.WriteString(fmt.Sprintf("  - This is also your current working directory (cwd). Relative paths resolve here.\n"))
+	fileDir := dir
+	if a.WorkDir != "" {
+		fileDir = a.WorkDir
+	}
+	sb.WriteString(fmt.Sprintf("- Your file storage directory is: %s\n", fileDir))
+	sb.WriteString("  - IMPORTANT: When saving generated files (images, documents, downloads, etc.), always use absolute paths under this directory.\n")
+	sb.WriteString("  - NEVER save files to /tmp or other temporary directories — they will be lost.\n")
 	sb.WriteString(fmt.Sprintf("- %s defines your personality. You can edit it to evolve.\n", personaPath))
 	sb.WriteString("- Keep your responses conversational and in character.\n")
 	sb.WriteString(fmt.Sprintf("- Current date and time is %s.\n", currentTime))

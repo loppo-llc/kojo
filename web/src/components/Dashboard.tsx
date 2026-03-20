@@ -291,6 +291,9 @@ export function Dashboard() {
                             {agent.model && (
                               <span className="text-[10px] text-neutral-600 font-mono">{agent.model}</span>
                             )}
+                            {agent.workDir && (
+                              <span className="text-[10px] text-neutral-600 font-mono truncate">{agent.workDir}</span>
+                            )}
                           </div>
                         </div>
                       )}
