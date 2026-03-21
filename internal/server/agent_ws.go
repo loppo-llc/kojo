@@ -49,62 +49,7 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.Info("agent websocket connected", "agent", agentID)
 
-	// If the agent has a chat running in the background (e.g. user navigated
-	// away and came back), notify the client and resume streaming live events.
-	var bgEvents <-chan agent.ChatEvent
-	var bgUnsub func()
-	if since, past, live, unsub, busy := s.agents.Subscribe(agentID); busy {
-		bgUnsub = unsub
-		_ = writeJSON(ctx, conn, map[string]any{
-			"type":      "status",
-			"status":    "thinking",
-			"startedAt": since.Format(time.RFC3339),
-		})
-
-		// Replay past events so the client catches up.
-		sentTerminal := false
-		for _, ev := range past {
-			_ = writeJSON(ctx, conn, ev)
-			if ev.Type == "done" || ev.Type == "error" {
-				sentTerminal = true
-				break
-			}
-		}
-
-		if sentTerminal {
-			// Already finished — nothing more to stream.
-			unsub()
-			bgUnsub = nil
-		} else if live != nil {
-			bgEvents = live
-		} else {
-			// Fallback: no broadcaster available, poll for completion.
-			unsub()
-			bgUnsub = nil
-			ch := make(chan agent.ChatEvent, 1)
-			bgEvents = ch
-			go func() {
-				defer close(ch)
-				ticker := time.NewTicker(500 * time.Millisecond)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-ticker.C:
-						if !s.agents.IsBusy(agentID) {
-							ev := s.synthesizeTerminal(agentID)
-							select {
-							case ch <- ev:
-							case <-ctx.Done():
-							}
-							return
-						}
-					}
-				}
-			}()
-		}
-	}
+	bgEvents, bgUnsub := s.resumeBackgroundChat(ctx, conn, agentID)
 	defer func() {
 		if bgUnsub != nil {
 			bgUnsub()
@@ -219,29 +164,7 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 			case "abort":
 				s.agents.Abort(agentID)
 				if bgEvents != nil {
-					// Drain bgEvents so the client gets a proper terminal
-					// event (or an empty done for the abort snapshot path)
-					// instead of a stale synthesizeTerminal message.
-					var terminal *agent.ChatEvent
-					drainTimer := time.NewTimer(10 * time.Second)
-				bgDrainLoop:
-					for {
-						select {
-						case ev, ok := <-bgEvents:
-							if !ok {
-								break bgDrainLoop
-							}
-							if ev.Type == "done" || ev.Type == "error" {
-								terminal = &ev
-								break bgDrainLoop
-							}
-						case <-drainTimer.C:
-							break bgDrainLoop
-						case <-ctx.Done():
-							break bgDrainLoop
-						}
-					}
-					drainTimer.Stop()
+					terminal := drainAfterAbort(ctx, bgEvents)
 					bgEvents = nil
 					if bgUnsub != nil {
 						bgUnsub()
@@ -288,28 +211,7 @@ func (s *Server) streamAgentEvents(
 		case msg := <-clientMsgs:
 			if msg.Type == "abort" {
 				s.agents.Abort(agentID)
-				// Drain remaining events, forwarding any real terminal event.
-				var terminal *agent.ChatEvent
-				drainTimer := time.NewTimer(10 * time.Second)
-				defer drainTimer.Stop()
-			drainLoop:
-				for {
-					select {
-					case ev, ok := <-events:
-						if !ok {
-							break drainLoop
-						}
-						if ev.Type == "done" || ev.Type == "error" {
-							terminal = &ev
-							break drainLoop
-						}
-					case <-drainTimer.C:
-						break drainLoop
-					}
-				}
-				// Send the real terminal if the backend delivered one,
-				// otherwise send an empty done so the client can commit
-				// partial streaming content.
+				terminal := drainAfterAbort(ctx, events)
 				if terminal != nil {
 					_ = writeJSON(ctx, conn, *terminal)
 				} else {
@@ -397,6 +299,90 @@ func validateAttachments(atts []agent.MessageAttachment) []agent.MessageAttachme
 		})
 	}
 	return result
+}
+
+// resumeBackgroundChat checks for an active chat and sets up live event
+// streaming if one is running. Returns the event channel and unsubscribe func.
+func (s *Server) resumeBackgroundChat(
+	ctx context.Context,
+	conn *websocket.Conn,
+	agentID string,
+) (<-chan agent.ChatEvent, func()) {
+	since, past, live, unsub, busy := s.agents.Subscribe(agentID)
+	if !busy {
+		return nil, nil
+	}
+
+	_ = writeJSON(ctx, conn, map[string]any{
+		"type":      "status",
+		"status":    "thinking",
+		"startedAt": since.Format(time.RFC3339),
+	})
+
+	// Replay past events so the client catches up.
+	sentTerminal := false
+	for _, ev := range past {
+		_ = writeJSON(ctx, conn, ev)
+		if ev.Type == "done" || ev.Type == "error" {
+			sentTerminal = true
+			break
+		}
+	}
+
+	if sentTerminal {
+		unsub()
+		return nil, nil
+	}
+	if live != nil {
+		return live, unsub
+	}
+
+	// Fallback: no broadcaster available, poll for completion.
+	unsub()
+	ch := make(chan agent.ChatEvent, 1)
+	go func() {
+		defer close(ch)
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !s.agents.IsBusy(agentID) {
+					ev := s.synthesizeTerminal(agentID)
+					select {
+					case ch <- ev:
+					case <-ctx.Done():
+					}
+					return
+				}
+			}
+		}
+	}()
+	return ch, nil
+}
+
+// drainAfterAbort reads from an event channel after abort, waiting up to 10s
+// for a terminal event. Returns the terminal event if one was received.
+func drainAfterAbort(ctx context.Context, events <-chan agent.ChatEvent) *agent.ChatEvent {
+	drainTimer := time.NewTimer(10 * time.Second)
+	defer drainTimer.Stop()
+	for {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				return nil
+			}
+			if ev.Type == "done" || ev.Type == "error" {
+				return &ev
+			}
+		case <-drainTimer.C:
+			return nil
+		case <-ctx.Done():
+			return nil
+		}
+	}
 }
 
 // sanitizeFilename removes control characters and newlines from a filename.
