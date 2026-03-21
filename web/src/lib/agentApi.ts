@@ -136,6 +136,14 @@ export interface ChatEvent {
   startedAt?: string; // RFC3339 timestamp of when processing started
 }
 
+export interface AgentTask {
+  id: string;
+  title: string;
+  status: "open" | "done";
+  createdAt: string;
+  updatedAt: string;
+}
+
 export const agentApi = {
   list: () =>
     get<{ agents: AgentInfo[] }>("/api/v1/agents").then((r) => r.agents ?? []),
@@ -156,6 +164,21 @@ export const agentApi = {
   delete: (id: string) => del<{ ok: boolean }>(`/api/v1/agents/${id}`),
 
   resetData: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/reset`),
+
+  resetSession: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/reset-session`),
+
+  tasks: {
+    list: (agentId: string) =>
+      get<{ tasks: AgentTask[] }>(`/api/v1/agents/${agentId}/tasks`).then(
+        (r) => r.tasks ?? [],
+      ),
+    create: (agentId: string, title: string) =>
+      post<AgentTask>(`/api/v1/agents/${agentId}/tasks`, { title }),
+    update: (agentId: string, taskId: string, data: { title?: string; status?: string }) =>
+      patch<AgentTask>(`/api/v1/agents/${agentId}/tasks/${taskId}`, data),
+    delete: (agentId: string, taskId: string) =>
+      del<{ ok: boolean }>(`/api/v1/agents/${agentId}/tasks/${taskId}`),
+  },
 
   avatarUrl: (id: string) => `/api/v1/agents/${id}/avatar`,
 

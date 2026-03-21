@@ -639,3 +639,114 @@ func (s *Server) handleUploadGeneratedAvatar(w http.ResponseWriter, r *http.Requ
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// --- Task Handlers ---
+
+func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	tasks, err := agent.ListTasks(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"tasks": tasks})
+}
+
+func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	var params agent.TaskCreateParams
+	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	task, err := agent.CreateTask(id, params)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, task)
+}
+
+func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	taskID := r.PathValue("taskId")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	var params agent.TaskUpdateParams
+	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	task, err := agent.UpdateTask(id, taskID, params)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		} else {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		}
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, task)
+}
+
+func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	taskID := r.PathValue("taskId")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	if err := agent.DeleteTask(id, taskID); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		} else {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// --- Pre-Compact Handler ---
+
+func (s *Server) handlePreCompact(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	a, ok := s.agents.Get(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	// Run synchronously — the PreCompact hook blocks until this returns
+	if err := agent.PreCompactSummarize(id, a.Tool, s.logger); err != nil {
+		s.logger.Warn("pre-compact summarize failed", "agent", id, "err", err)
+		// Return 200 anyway — don't block compaction on summary failure
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// --- Session Reset Handler ---
+
+func (s *Server) handleResetSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.agents.ResetSession(id); err != nil {
+		if errors.Is(err, agent.ErrAgentNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		} else if errors.Is(err, agent.ErrAgentBusy) {
+			writeError(w, http.StatusConflict, "conflict", err.Error())
+		} else {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+

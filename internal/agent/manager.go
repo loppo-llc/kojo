@@ -631,6 +631,17 @@ func (m *Manager) ResetData(id string) error {
 		m.logger.Warn("reset: failed to remove persona summary", "agent", id, "err", err)
 	}
 
+	// Remove tasks (acquire lock to avoid racing with concurrent task API calls)
+	mu := agentTaskLock(id)
+	mu.Lock()
+	DeleteTasksFile(id)
+	mu.Unlock()
+
+	// Remove auto-summary marker
+	if err := os.Remove(filepath.Join(dir, autoSummaryMarkerFile)); err != nil && !os.IsNotExist(err) {
+		m.logger.Warn("reset: failed to remove autosummary marker", "agent", id, "err", err)
+	}
+
 	// Remove cron lock file
 	if err := os.Remove(filepath.Join(dir, cronLockFile)); err != nil && !os.IsNotExist(err) {
 		m.logger.Warn("reset: failed to remove cron lock", "agent", id, "err", err)
@@ -818,6 +829,11 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		apiBase = m.groupdms.APIBase()
 		groups = m.groupdms.GroupsForAgent(agentID)
 	}
+	// Prepare Claude settings (persona override + PreCompact hook) before backend starts
+	if agentCopy.Tool == "claude" {
+		PrepareClaudeSettings(agentID, apiBase, m.logger)
+	}
+
 	systemPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
 
 	// Update memory index and inject relevant context BEFORE saving input
@@ -882,6 +898,8 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 				idx.IndexNewMessages(agentID)
 				idx.IndexFilesIfStale(agentID)
 			}
+			// Memory compaction summaries are handled by PreCompact hook
+			// (see injectPreCompactHook), not by post-chat polling.
 		}
 	}()
 
@@ -972,6 +990,50 @@ func (m *Manager) persistDoneEvent(agentID string, msg *Message) {
 	}
 	m.mu.Unlock()
 	m.save()
+}
+
+// ResetSession clears the CLI session (e.g. Claude JSONL) for an agent
+// without deleting conversation history or memory. The next chat will start
+// a fresh CLI session with the full system prompt re-injected.
+func (m *Manager) ResetSession(agentID string) error {
+	m.mu.Lock()
+	a, ok := m.agents[agentID]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
+	}
+	tool := a.Tool
+	m.mu.Unlock()
+
+	// Block new chats during session reset (same pattern as ResetData)
+	m.busyMu.Lock()
+	if _, busy := m.busy[agentID]; busy {
+		m.busyMu.Unlock()
+		return ErrAgentBusy
+	}
+	if m.resetting[agentID] {
+		m.busyMu.Unlock()
+		return fmt.Errorf("%w, try again later", ErrAgentBusy)
+	}
+	m.resetting[agentID] = true
+	m.busyMu.Unlock()
+
+	defer func() {
+		m.busyMu.Lock()
+		delete(m.resetting, agentID)
+		m.busyMu.Unlock()
+	}()
+
+	switch tool {
+	case "claude":
+		clearClaudeSession(agentID)
+	case "gemini":
+		clearGeminiSession(agentID)
+	}
+	// Codex uses ephemeral sessions — no persistent state to clear
+
+	m.logger.Info("CLI session reset", "agent", agentID, "tool", tool)
+	return nil
 }
 
 // Abort cancels any running chat for an agent.

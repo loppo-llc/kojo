@@ -64,11 +64,13 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	dir := agentDir(agent.ID)
 	os.MkdirAll(dir, 0o755)
 
-	// Prevent user's persona autoload hook from overriding the agent's persona.
-	// The SessionStart hook writes to CLAUDE.local.md in the working directory,
-	// which overrides --system-prompt. Remove it and create .claude/settings.local.json
-	// so the hook sees a local persona override and skips writing.
-	disablePersonaHook(dir, b.logger)
+	// Remove CLAUDE.local.md to prevent persona autoload hook from
+	// overriding --system-prompt. The .claude/settings.local.json
+	// (including persona override + PreCompact hook) is written by
+	// Manager.Chat via PrepareClaudeSettings before this method runs.
+	if err := os.Remove(filepath.Join(dir, "CLAUDE.local.md")); err != nil && !os.IsNotExist(err) {
+		b.logger.Warn("failed to remove CLAUDE.local.md from agent dir", "dir", dir, "err", err)
+	}
 
 	if hasExistingSession(dir) {
 		if memoryModifiedSinceSession(dir) {
@@ -237,7 +239,11 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 
 		switch event.Type {
 		case "system":
-			if !send(ChatEvent{Type: "status", Status: "thinking"}) {
+			status := "thinking"
+			if event.Subtype == "compact_boundary" {
+				status = "compacting"
+			}
+			if !send(ChatEvent{Type: "status", Status: status}) {
 				res.cancelled = true
 				return res
 			}
@@ -709,22 +715,50 @@ func clearClaudeSession(agentID string) {
 	}
 }
 
-// disablePersonaHook removes any CLAUDE.local.md written by the user's
-// persona autoload hook and writes .claude/settings.local.json with a
-// dummy persona name so the hook won't recreate the file on session start.
-func disablePersonaHook(dir string, logger *slog.Logger) {
-	if err := os.Remove(filepath.Join(dir, "CLAUDE.local.md")); err != nil && !os.IsNotExist(err) {
-		logger.Warn("failed to remove CLAUDE.local.md from agent dir", "dir", dir, "err", err)
-	}
-
+// PrepareClaudeSettings writes .claude/settings.local.json with persona
+// override and (when apiBase is available) a PreCompact hook that calls
+// kojo's API to save a conversation summary before Claude compacts context.
+// Called from Manager.Chat before backend.Chat to ensure settings are in
+// place before the Claude process reads them.
+func PrepareClaudeSettings(agentID, apiBase string, logger *slog.Logger) {
+	dir := agentDir(agentID)
 	claudeDir := filepath.Join(dir, ".claude")
 	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
-		logger.Warn("failed to create .claude dir in agent dir", "dir", dir, "err", err)
+		logger.Warn("failed to create .claude dir", "agent", agentID, "err", err)
 		return
 	}
+
+	var settings string
+	if apiBase == "" {
+		// No API base — just disable persona hook
+		settings = "{\"persona\":\"agent-managed\"}\n"
+	} else {
+		curlFlags := "-s"
+		if strings.HasPrefix(apiBase, "https://") {
+			curlFlags = "-sk"
+		}
+		settings = fmt.Sprintf(`{
+  "persona": "agent-managed",
+  "hooks": {
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl %s -X POST '%s/api/v1/agents/%s/pre-compact' -H 'Content-Type: application/json' -d '{}' --max-time 120"
+          }
+        ]
+      }
+    ]
+  }
+}
+`, curlFlags, apiBase, agentID)
+	}
+
 	settingsPath := filepath.Join(claudeDir, "settings.local.json")
-	if err := os.WriteFile(settingsPath, []byte("{\"persona\":\"agent-managed\"}\n"), 0o644); err != nil {
-		logger.Warn("failed to write .claude/settings.local.json", "dir", dir, "err", err)
+	if err := os.WriteFile(settingsPath, []byte(settings), 0o644); err != nil {
+		logger.Warn("failed to write claude settings", "agent", agentID, "err", err)
 	}
 }
 

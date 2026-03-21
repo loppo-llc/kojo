@@ -24,6 +24,7 @@ export function AgentSettings() {
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const [resettingSession, setResettingSession] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState(false);
   const [avatarToken, setAvatarToken] = useState(() => Date.now());
@@ -77,6 +78,21 @@ export function AgentSettings() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleResetSession = async () => {
+    if (!confirm("Reset CLI session? Conversation history and memory are kept, but the AI will start a fresh context window.")) return;
+    setResettingSession(true);
+    setError("");
+    try {
+      await agentApi.resetSession(id!);
+      setSuccess(true);
+      setTimeout(() => setSuccess(false), 2000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setResettingSession(false);
     }
   };
 
@@ -394,6 +410,19 @@ export function AgentSettings() {
           >
             Credentials
           </button>
+        </div>
+
+        <div className="border-t border-neutral-800 pt-5">
+          <button
+            onClick={handleResetSession}
+            disabled={resettingSession}
+            className="w-full py-3 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded-lg text-sm font-medium disabled:opacity-40"
+          >
+            {resettingSession ? "Resetting..." : "Reset CLI Session"}
+          </button>
+          <p className="text-xs text-neutral-600 mt-1">
+            Force a fresh context window. History and memory are kept, but the AI re-reads everything from scratch.
+          </p>
         </div>
 
         <div className="border-t border-neutral-800 pt-5 space-y-3">

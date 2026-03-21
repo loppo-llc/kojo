@@ -238,6 +238,37 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 		sb.WriteString("You can create new group conversations with other agents when collaboration would be useful.\n\n")
 	}
 
+	// Active Tasks (persisted, compaction-safe)
+	if taskSummary := ActiveTasksSummary(a.ID); taskSummary != "" {
+		sb.WriteString("\n")
+		sb.WriteString(taskSummary)
+		sb.WriteString("\n")
+	}
+
+	// Today's diary notes (auto-generated summaries)
+	if diarySummary := RecentDiarySummary(a.ID); diarySummary != "" {
+		sb.WriteString("\n")
+		sb.WriteString(diarySummary)
+		sb.WriteString("\n")
+	}
+
+	// Task API
+	if apiBase != "" {
+		curlFlags := "-s"
+		if strings.HasPrefix(apiBase, "https://") {
+			curlFlags = "-sk"
+		}
+		sb.WriteString("\n## Task Management API\n\n")
+		sb.WriteString("Use these endpoints to track tasks that must survive across conversation sessions.\n")
+		sb.WriteString("Tasks are persisted server-side and re-injected into every system prompt — they are immune to context compaction.\n\n")
+		sb.WriteString(fmt.Sprintf("List tasks: `curl %s '%s/api/v1/agents/%s/tasks'`\n", curlFlags, apiBase, a.ID))
+		sb.WriteString(fmt.Sprintf("Create task: `curl %s -X POST '%s/api/v1/agents/%s/tasks' -H 'Content-Type: application/json' -d '{\"title\":\"...\"}'`\n", curlFlags, apiBase, a.ID))
+		sb.WriteString(fmt.Sprintf("Complete task: `curl %s -X PATCH '%s/api/v1/agents/%s/tasks/TASK_ID' -H 'Content-Type: application/json' -d '{\"status\":\"done\"}'`\n", curlFlags, apiBase, a.ID))
+		sb.WriteString(fmt.Sprintf("Delete task: `curl %s -X DELETE '%s/api/v1/agents/%s/tasks/TASK_ID'`\n", curlFlags, apiBase, a.ID))
+		sb.WriteString("\nWhen starting a multi-step task, create a task so you won't forget it even if context is compressed.\n")
+		sb.WriteString("Mark tasks as done when completed. Delete tasks that are no longer relevant.\n")
+	}
+
 	// Persona
 	if a.Persona != "" {
 		runes := []rune(a.Persona)
