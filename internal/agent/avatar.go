@@ -45,6 +45,17 @@ func avatarMeta(agentID string) (exists bool, hash string) {
 	return true, fmt.Sprintf("%x", fi.ModTime().UnixNano())
 }
 
+// applyAvatarMeta sets HasAvatar and AvatarHash on the agent.
+// Falls back to UpdatedAt as hash when no avatar exists.
+func applyAvatarMeta(a *Agent) {
+	has, hash := avatarMeta(a.ID)
+	a.HasAvatar = has
+	a.AvatarHash = hash
+	if !has {
+		a.AvatarHash = a.UpdatedAt
+	}
+}
+
 // avatarFilePath returns the path to the agent's avatar file, or "".
 func avatarFilePath(agentID string) string {
 	dir := agentDir(agentID)
