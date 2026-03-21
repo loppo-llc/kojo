@@ -573,36 +573,14 @@ func (m *Manager) ResetData(id string) error {
 	name := a.Name
 	m.mu.Unlock()
 
-	// Mark agent as resetting to block new chats/deletes/concurrent resets
-	m.busyMu.Lock()
-	if m.resetting[id] {
-		m.busyMu.Unlock()
-		return fmt.Errorf("%w, try again later", ErrAgentBusy)
+	cleanup, err := m.acquireResetGuard(id)
+	if err != nil {
+		return err
 	}
-	m.resetting[id] = true
-	if entry, busy := m.busy[id]; busy {
-		entry.cancel()
-	}
-	m.busyMu.Unlock()
+	defer cleanup()
 
-	defer func() {
-		m.busyMu.Lock()
-		delete(m.resetting, id)
-		m.busyMu.Unlock()
-	}()
-
-	// Wait for the chat goroutine to finish (max 5s)
-	for i := 0; i < 50; i++ {
-		m.busyMu.Lock()
-		_, busy := m.busy[id]
-		m.busyMu.Unlock()
-		if !busy {
-			break
-		}
-		if i == 49 {
-			return fmt.Errorf("%w, try again later", ErrAgentBusy)
-		}
-		time.Sleep(100 * time.Millisecond)
+	if err := m.waitBusyClear(id); err != nil {
+		return err
 	}
 
 	dir := agentDir(id)
@@ -695,45 +673,19 @@ func (m *Manager) HasCredentials() bool {
 func (m *Manager) Delete(id string) error {
 	m.mu.Lock()
 	_, ok := m.agents[id]
+	m.mu.Unlock()
 	if !ok {
-		m.mu.Unlock()
 		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 	}
 
-	// Block if agent is being reset
-	m.busyMu.Lock()
-	if m.resetting[id] {
-		m.busyMu.Unlock()
-		m.mu.Unlock()
-		return fmt.Errorf("%w, try again later", ErrAgentBusy)
+	cleanup, err := m.acquireResetGuard(id)
+	if err != nil {
+		return err
 	}
-	// Abort any running chat and wait for it to finish
-	if entry, busy := m.busy[id]; busy {
-		entry.cancel()
-	}
-	// Mark as resetting to block post-chat re-indexing
-	m.resetting[id] = true
-	m.busyMu.Unlock()
-	m.mu.Unlock()
+	defer cleanup()
 
-	defer func() {
-		m.busyMu.Lock()
-		delete(m.resetting, id)
-		m.busyMu.Unlock()
-	}()
-
-	// Wait for active chat to finish (up to 5 seconds)
-	for i := 0; i < 50; i++ {
-		m.busyMu.Lock()
-		_, stillBusy := m.busy[id]
-		m.busyMu.Unlock()
-		if !stillBusy {
-			break
-		}
-		if i == 49 {
-			return fmt.Errorf("%w, try again later", ErrAgentBusy)
-		}
-		time.Sleep(100 * time.Millisecond)
+	if err := m.waitBusyClear(id); err != nil {
+		return err
 	}
 
 	// Remove credentials and notify tokens outside lock (DB I/O)
@@ -1005,7 +957,7 @@ func (m *Manager) ResetSession(agentID string) error {
 	tool := a.Tool
 	m.mu.Unlock()
 
-	// Block new chats during session reset (same pattern as ResetData)
+	// Block if agent is busy or being reset
 	m.busyMu.Lock()
 	if _, busy := m.busy[agentID]; busy {
 		m.busyMu.Unlock()
@@ -1126,6 +1078,47 @@ func (m *Manager) clearBusy(agentID string) {
 	m.busyMu.Lock()
 	delete(m.busy, agentID)
 	m.busyMu.Unlock()
+}
+
+// waitBusyClear waits up to 5 seconds for the agent's busy entry to be removed.
+// Returns ErrAgentBusy if the agent is still busy after the timeout.
+func (m *Manager) waitBusyClear(agentID string) error {
+	for i := 0; i < 50; i++ {
+		m.busyMu.Lock()
+		_, busy := m.busy[agentID]
+		m.busyMu.Unlock()
+		if !busy {
+			return nil
+		}
+		if i == 49 {
+			return fmt.Errorf("%w, try again later", ErrAgentBusy)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return nil
+}
+
+// acquireResetGuard marks the agent as resetting, cancels any active chat,
+// and returns a cleanup function that removes the resetting flag.
+// Returns ErrAgentBusy if the agent is already being reset.
+func (m *Manager) acquireResetGuard(agentID string) (func(), error) {
+	m.busyMu.Lock()
+	if m.resetting[agentID] {
+		m.busyMu.Unlock()
+		return nil, fmt.Errorf("%w, try again later", ErrAgentBusy)
+	}
+	m.resetting[agentID] = true
+	if entry, busy := m.busy[agentID]; busy {
+		entry.cancel()
+	}
+	m.busyMu.Unlock()
+
+	cleanup := func() {
+		m.busyMu.Lock()
+		delete(m.resetting, agentID)
+		m.busyMu.Unlock()
+	}
+	return cleanup, nil
 }
 
 func (m *Manager) save() {
