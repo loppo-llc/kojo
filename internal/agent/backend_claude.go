@@ -62,7 +62,9 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	// in the agent's working directory. Otherwise use --session-id to create
 	// a new session with a deterministic UUID derived from the agent ID.
 	dir := agentDir(agent.ID)
-	os.MkdirAll(dir, 0o755)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("create agent dir: %w", err)
+	}
 
 	// Remove CLAUDE.local.md to prevent persona autoload hook from
 	// overriding --system-prompt. The .claude/settings.local.json
