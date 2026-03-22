@@ -29,6 +29,25 @@ import (
 	"github.com/loppo-llc/kojo/internal/session"
 )
 
+func init() {
+	// Register video MIME types as fallback for systems where the OS MIME
+	// database is missing or incomplete (e.g. minimal Linux containers).
+	// mime.AddExtensionType is a no-op if the type is already registered.
+	for ext, ct := range map[string]string{
+		".mp4":  "video/mp4",
+		".webm": "video/webm",
+		".mov":  "video/quicktime",
+		".avi":  "video/x-msvideo",
+		".mkv":  "video/x-matroska",
+		".ogv":  "video/ogg",
+		".flv":  "video/x-flv",
+		".wmv":  "video/x-ms-wmv",
+		".m4v":  "video/x-m4v",
+	} {
+		mime.AddExtensionType(ext, ct)
+	}
+}
+
 // wsOriginPatterns lists allowed WebSocket origins for both session and agent endpoints.
 var wsOriginPatterns = []string{"100.*.*.*", "*.ts.net", "localhost:*", "127.0.0.1:*"}
 

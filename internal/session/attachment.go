@@ -41,6 +41,7 @@ var mediaExts = map[string]string{
 	".flv":  "video/x-flv",
 	".wmv":  "video/x-ms-wmv",
 	".m4v":  "video/x-m4v",
+	".ogv":  "video/ogg",
 }
 
 const attachTailSize = 8192

@@ -7,7 +7,7 @@ import { formatSize } from "../../lib/utils";
 
 // File extension categories
 const IMAGE_EXTS = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
-const VIDEO_EXTS = /\.(mp4|webm|mov|avi|mkv)$/i;
+const VIDEO_EXTS = /\.(mp4|webm|mov|avi|mkv|ogv|m4v|flv|wmv)$/i;
 
 // Match absolute file paths (Unix or Windows-style) with any file extension (1-10 chars).
 // Unix: starts with /, Windows: starts with drive letter like C:\
@@ -89,7 +89,9 @@ function AttachmentList({ attachments, isUser }: { attachments: AgentMessageAtta
     <>
       <div className="flex flex-wrap gap-1.5 mb-2">
         {attachments.map((att) => {
-          const isImage = att.mime.startsWith("image/");
+          const extType = getFileType(att.name || att.path);
+          const isImage = att.mime.startsWith("image/") || extType === "image";
+          const isVideo = !isImage && (att.mime.startsWith("video/") || extType === "video");
           if (isImage) {
             return (
               <button
@@ -102,6 +104,23 @@ function AttachmentList({ attachments, isUser }: { attachments: AgentMessageAtta
                   alt={att.name}
                   className="max-w-[200px] max-h-[150px] object-cover rounded-lg"
                 />
+              </button>
+            );
+          }
+          if (isVideo) {
+            return (
+              <button
+                key={att.path}
+                onClick={() => setPreview({ path: att.path, type: "video" })}
+                className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs hover:opacity-80 transition-opacity ${
+                  isUser ? "bg-blue-500/30" : "bg-neutral-700/50"
+                }`}
+              >
+                <svg className="w-4 h-4 opacity-60" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.348a1.125 1.125 0 010 1.971l-11.54 6.347a1.125 1.125 0 01-1.667-.985V5.653z" />
+                </svg>
+                <span className="max-w-[150px] truncate">{att.name}</span>
+                <span className="opacity-50">{formatSize(att.size)}</span>
               </button>
             );
           }
@@ -436,6 +455,8 @@ export function MediaOverlay({
   onClose: () => void;
 }) {
   const rawUrl = `/api/v1/files/raw?path=${encodeURIComponent(path)}`;
+  const [videoError, setVideoError] = useState(false);
+  const fileName = path.split(/[/\\]/).pop() || path;
 
   const handleBackdrop = useCallback(
     (e: React.MouseEvent) => {
@@ -465,11 +486,28 @@ export function MediaOverlay({
             alt={path}
             className="max-w-[90vw] max-h-[85vh] object-contain rounded-lg shadow-2xl"
           />
+        ) : videoError ? (
+          <div className="flex flex-col items-center gap-3 p-8 bg-neutral-900 rounded-lg shadow-2xl">
+            <svg className="w-12 h-12 text-neutral-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+            </svg>
+            <p className="text-sm text-neutral-400">This video format cannot be played in the browser.</p>
+            <a
+              href={`${rawUrl}&download=1`}
+              download={fileName}
+              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition-colors"
+              onClick={(e) => e.stopPropagation()}
+            >
+              Download
+            </a>
+          </div>
         ) : (
           <video
             src={rawUrl}
             controls
             autoPlay
+            playsInline
+            onError={() => setVideoError(true)}
             className="max-w-[90vw] max-h-[85vh] rounded-lg shadow-2xl"
           />
         )}
