@@ -1,6 +1,9 @@
-import { Children, isValidElement, cloneElement, useMemo } from "react";
+import { Children, isValidElement, cloneElement, createContext, useContext, useMemo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+
+const InsideLinkCtx = createContext(false);
+const InsidePreCtx = createContext(false);
 
 interface MarkdownRendererProps {
   content: string;
@@ -58,23 +61,27 @@ export function MarkdownRenderer({ content, processText }: MarkdownRendererProps
             lang = cls.replace("language-", "");
           }
           return (
-            <div className="md-code-wrap">
-              {lang && <div className="md-code-lang">{lang}</div>}
-              <pre {...props}>{children}</pre>
-            </div>
+            <InsidePreCtx.Provider value={true}>
+              <div className="md-code-wrap">
+                {lang && <div className="md-code-lang">{lang}</div>}
+                <pre {...props}>{children}</pre>
+              </div>
+            </InsidePreCtx.Provider>
           );
         },
         a({ children, href, ...props }: React.ComponentProps<"a">) {
           return (
-            <a
-              href={href}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="md-link"
-              {...props}
-            >
-              {children}
-            </a>
+            <InsideLinkCtx.Provider value={true}>
+              <a
+                href={href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="md-link"
+                {...props}
+              >
+                {children}
+              </a>
+            </InsideLinkCtx.Provider>
           );
         },
         ...(processText && {
@@ -89,6 +96,22 @@ export function MarkdownRenderer({ content, processText }: MarkdownRendererProps
           h5: withText("h5"),
           h6: withText("h6"),
           blockquote: withText("blockquote"),
+          code({ children, node: _node, className, ...props }: any) {
+            const insideLink = useContext(InsideLinkCtx);
+            const insidePre = useContext(InsidePreCtx);
+            // Only process inline code (skip code blocks and code inside links).
+            // Replace only when the entire content is a single file path.
+            const text = typeof children === "string" ? children
+              : Array.isArray(children) && children.length === 1 && typeof children[0] === "string" ? children[0]
+              : null;
+            if (!insidePre && !insideLink && text) {
+              const result = processText(text);
+              if (Array.isArray(result) && result.length === 1 && typeof result[0] !== "string") {
+                return <>{result}</>;
+              }
+            }
+            return <code className={className} {...props}>{children}</code>;
+          },
         }),
       };
     },
