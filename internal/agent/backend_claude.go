@@ -167,16 +167,16 @@ func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir s
 		b.logger.Warn("failed to remove CLAUDE.local.md from agent dir", "dir", dir, "err", err)
 	}
 
-	if hasExistingSession(dir) {
-		if memoryModifiedSinceSession(dir) {
-			b.logger.Info("memory modified since last session, resetting Claude session", "agent", agent.ID)
-			clearClaudeSession(agent.ID)
-			args = append(args, "--session-id", agentIDToUUID(agent.ID))
-		} else {
-			args = append(args, "--continue")
-		}
+	// Use --resume to append to the same persistent session, or --session-id
+	// to create the first one. --continue creates a new session file each
+	// time, causing cron check-ins and user messages to branch into parallel
+	// sessions — then the next --continue picks whichever branch was most
+	// recent, losing the other's context.
+	sessionID := agentIDToUUID(agent.ID)
+	if sessionFileUsable(dir, sessionID) {
+		args = append(args, "--resume", sessionID)
 	} else {
-		args = append(args, "--session-id", agentIDToUUID(agent.ID))
+		args = append(args, "--session-id", sessionID)
 	}
 
 	return args
@@ -499,11 +499,21 @@ func claudeConfigDir() string {
 // hasExistingSession checks whether a Claude session JSONL file already exists
 // for the given agent working directory by looking at Claude's project data.
 func hasExistingSession(agentDir string) bool {
+	return hasSessionFile(agentDir, "")
+}
+
+// hasSessionFile checks whether a specific session JSONL file exists.
+// If sessionID is empty, it returns true if any session file exists.
+func hasSessionFile(agentDir string, sessionID string) bool {
 	absDir, err := filepath.Abs(agentDir)
 	if err != nil {
 		return false
 	}
 	projectDir := claudeProjectDir(absDir)
+	if sessionID != "" {
+		_, err := os.Stat(filepath.Join(projectDir, sessionID+".jsonl"))
+		return err == nil
+	}
 	entries, err := os.ReadDir(projectDir)
 	if err != nil {
 		return false
@@ -514,6 +524,26 @@ func hasExistingSession(agentDir string) bool {
 		}
 	}
 	return false
+}
+
+// sessionFileUsable checks whether the deterministic session file exists and
+// is minimally valid (non-empty). If the file is corrupt or empty, it is
+// removed so that the caller can create a fresh session with --session-id.
+func sessionFileUsable(agentDir string, sessionID string) bool {
+	absDir, err := filepath.Abs(agentDir)
+	if err != nil {
+		return false
+	}
+	path := filepath.Join(claudeProjectDir(absDir), sessionID+".jsonl")
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	if info.Size() == 0 {
+		os.Remove(path)
+		return false
+	}
+	return true
 }
 
 // agentIDToUUID converts an agent ID (e.g. "ag_8cf247118ad856e8") to a
@@ -610,18 +640,18 @@ func recoverFromSession(agentID string, sessionID string, logger *slog.Logger) s
 }
 
 // findSessionFile locates the Claude session JSONL in projectDir.
-// When sessionID is provided, it looks for "<sessionID>.jsonl" first.
-// Falls back to the most recently modified .jsonl file.
+// When sessionID is provided, it looks for "<sessionID>.jsonl" only.
+// When sessionID is empty, falls back to the most recently modified .jsonl file.
 func findSessionFile(projectDir string, sessionID string) string {
-	// Try exact match first.
 	if sessionID != "" {
 		path := filepath.Join(projectDir, sessionID+".jsonl")
 		if _, err := os.Stat(path); err == nil {
 			return path
 		}
+		return ""
 	}
 
-	// Fallback: newest .jsonl by modification time.
+	// Fallback for callers that don't have a session ID (e.g. loadSessionMessages).
 	entries, err := os.ReadDir(projectDir)
 	if err != nil {
 		return ""
@@ -644,55 +674,6 @@ func findSessionFile(projectDir string, sessionID string) string {
 	return best
 }
 
-// memoryModifiedSinceSession returns true if MEMORY.md or any file in memory/
-// has been modified after the most recent Claude session JSONL file.
-func memoryModifiedSinceSession(agentDir string) bool {
-	absDir, err := filepath.Abs(agentDir)
-	if err != nil {
-		return false
-	}
-
-	// Find the newest session JSONL mtime
-	projectDir := claudeProjectDir(absDir)
-	entries, err := os.ReadDir(projectDir)
-	if err != nil {
-		return false
-	}
-	var sessionMtime time.Time
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
-			if info, err := e.Info(); err == nil && info.ModTime().After(sessionMtime) {
-				sessionMtime = info.ModTime()
-			}
-		}
-	}
-	if sessionMtime.IsZero() {
-		return false
-	}
-
-	// Add 1-second tolerance to absorb filesystem timestamp resolution limits.
-	// Memory must be strictly newer than session + skew to trigger a reset.
-	cutoff := sessionMtime.Add(time.Second)
-
-	// Check MEMORY.md
-	if info, err := os.Stat(filepath.Join(agentDir, "MEMORY.md")); err == nil && info.ModTime().After(cutoff) {
-		return true
-	}
-
-	// Check memory/ directory entries
-	memDir := filepath.Join(agentDir, "memory")
-	memEntries, err := os.ReadDir(memDir)
-	if err != nil {
-		return false
-	}
-	for _, e := range memEntries {
-		if info, err := e.Info(); err == nil && info.ModTime().After(cutoff) {
-			return true
-		}
-	}
-
-	return false
-}
 
 // clearClaudeSession removes Claude session JSONL files from the global
 // config store for the given agent, forcing the next chat to start fresh.

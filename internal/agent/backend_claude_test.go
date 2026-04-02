@@ -356,18 +356,23 @@ func TestFindSessionFile(t *testing.T) {
 		}
 	})
 
-	t.Run("falls back to newest when sessionID not found", func(t *testing.T) {
+	t.Run("returns empty when sessionID not found", func(t *testing.T) {
 		dir := t.TempDir()
-		old := filepath.Join(dir, "old.jsonl")
-		os.WriteFile(old, []byte("{}"), 0o644)
-
-		// Touch newer file
-		newer := filepath.Join(dir, "newer.jsonl")
-		os.WriteFile(newer, []byte("{}"), 0o644)
+		os.WriteFile(filepath.Join(dir, "old.jsonl"), []byte("{}"), 0o644)
+		os.WriteFile(filepath.Join(dir, "newer.jsonl"), []byte("{}"), 0o644)
 
 		got := findSessionFile(dir, "nonexistent")
-		// Should pick the newest file (both are created near-simultaneously,
-		// but newer was written last)
+		if got != "" {
+			t.Errorf("expected empty for nonexistent sessionID, got %q", got)
+		}
+	})
+
+	t.Run("falls back to newest when sessionID empty", func(t *testing.T) {
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, "old.jsonl"), []byte("{}"), 0o644)
+		os.WriteFile(filepath.Join(dir, "newer.jsonl"), []byte("{}"), 0o644)
+
+		got := findSessionFile(dir, "")
 		if got == "" {
 			t.Error("expected a file, got empty")
 		}
