@@ -9,7 +9,11 @@ import (
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/notifysource"
+	"github.com/loppo-llc/kojo/internal/slackbot"
 )
+
+// SlackBotConfig is an alias for slackbot.Config used in Agent JSON serialization.
+type SlackBotConfig = slackbot.Config
 
 // ValidActiveHours validates the active hours range.
 // Both must be empty (no restriction) or both must be valid HH:MM format.
@@ -113,6 +117,9 @@ type Agent struct {
 
 	// NotifySources holds notification source configurations for this agent.
 	NotifySources []notifysource.Config `json:"notifySources,omitempty"`
+
+	// SlackBot holds the Slack Socket Mode bot configuration for this agent.
+	SlackBot *SlackBotConfig `json:"slackBot,omitempty"`
 
 	// LastMessage is a preview of the most recent message (for list display).
 	LastMessage *MessagePreview `json:"lastMessage,omitempty"`

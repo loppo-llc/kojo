@@ -5,6 +5,7 @@ import { api } from "../../lib/api";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
 import { NotifySourcesEditor } from "./NotifySourcesEditor";
+import { SlackBotSettings } from "./SlackBotSettings";
 import { defaultModelForTool, modelsForTool, effortLevels, supportsEffort } from "../../lib/toolModels";
 
 export function AgentSettings() {
@@ -466,6 +467,9 @@ export function AgentSettings() {
 
         {/* Notifications */}
         <NotifySourcesEditor agentId={id!} />
+
+        {/* Slack Bot */}
+        <SlackBotSettings agentId={id!} />
 
         <div className="border-t border-neutral-800 pt-5">
           <button

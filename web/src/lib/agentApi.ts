@@ -146,6 +146,21 @@ export interface AgentTask {
   updatedAt: string;
 }
 
+export interface SlackBotStatus {
+  enabled: boolean;
+  threadReplies: boolean;
+  hasAppToken: boolean;
+  hasBotToken: boolean;
+  connected: boolean;
+}
+
+export interface SlackBotSetRequest {
+  enabled: boolean;
+  appToken?: string;
+  botToken?: string;
+  threadReplies?: boolean;
+}
+
 export const agentApi = {
   list: () =>
     get<{ agents: AgentInfo[] }>("/api/v1/agents").then((r) => r.agents ?? []),
@@ -345,4 +360,20 @@ export const agentApi = {
     get<{ types: NotifySourceType[] }>("/api/v1/notify-source-types").then(
       (r) => r.types ?? [],
     ),
+
+  slackBot: {
+    get: (agentId: string) =>
+      get<SlackBotStatus>(`/api/v1/agents/${agentId}/slackbot`),
+
+    set: (agentId: string, cfg: SlackBotSetRequest) =>
+      put<{ ok: boolean }>(`/api/v1/agents/${agentId}/slackbot`, cfg),
+
+    delete: (agentId: string) =>
+      del<{ ok: boolean }>(`/api/v1/agents/${agentId}/slackbot`),
+
+    test: (agentId: string) =>
+      post<{ ok: boolean; team: string; botUser: string }>(
+        `/api/v1/agents/${agentId}/slackbot/test`,
+      ),
+  },
 };

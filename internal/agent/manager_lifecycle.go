@@ -136,6 +136,9 @@ func (m *Manager) Delete(id string) error {
 
 	m.cron.Remove(id)
 	m.notifyPoller.RemoveAgent(id)
+	if m.slackHub != nil {
+		m.slackHub.StopBot(id)
+	}
 
 	// Remove agent from group DMs
 	if m.groupdms != nil {

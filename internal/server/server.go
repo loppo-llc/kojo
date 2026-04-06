@@ -225,6 +225,12 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	// Session reset (CLI session only, keeps conversation history)
 	mux.HandleFunc("POST /api/v1/agents/{id}/reset-session", s.handleResetSession)
 
+	// Slack bot
+	mux.HandleFunc("GET /api/v1/agents/{id}/slackbot", s.handleGetSlackBot)
+	mux.HandleFunc("PUT /api/v1/agents/{id}/slackbot", s.handleSetSlackBot)
+	mux.HandleFunc("DELETE /api/v1/agents/{id}/slackbot", s.handleDeleteSlackBot)
+	mux.HandleFunc("POST /api/v1/agents/{id}/slackbot/test", s.handleTestSlackBot)
+
 	// Notify sources
 	mux.HandleFunc("GET /api/v1/agents/{id}/notify-sources", s.handleListNotifySources)
 	mux.HandleFunc("POST /api/v1/agents/{id}/notify-sources", s.handleCreateNotifySource)
