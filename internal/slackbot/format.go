@@ -1,6 +1,7 @@
 package slackbot
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -14,13 +15,22 @@ var (
 	reLinkBare     = regexp.MustCompile(`<(https?://[^>]+)>`)
 
 	// Slack user/channel mentions: <@U12345> or <#C12345|channel-name>
-	reUserMention   = regexp.MustCompile(`<@([A-Z0-9]+)>`)
+	reUserMention    = regexp.MustCompile(`<@([A-Z0-9]+)>`)
 	reChannelMention = regexp.MustCompile(`<#[A-Z0-9]+\|([^>]+)>`)
 
 	// Markdown bold **text** → Slack bold *text*
 	reMdBold = regexp.MustCompile(`\*\*(.+?)\*\*`)
 	// Markdown strikethrough ~~text~~ → Slack ~text~
 	reMdStrike = regexp.MustCompile(`~~(.+?)~~`)
+	// Markdown link [text](url) → Slack <url|text>
+	reMdLink = regexp.MustCompile(`\[([^\]]+)\]\((https?://[^)]+)\)`)
+	// Markdown heading: lines starting with # (1-6 levels)
+	reMdHeading = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`)
+
+	// Code blocks (fenced with ```)
+	reCodeBlock = regexp.MustCompile("(?s)```[^\n]*\n(.*?)```")
+	// Inline code
+	reInlineCode = regexp.MustCompile("`[^`]+`")
 )
 
 // SlackToPlain converts Slack mrkdwn to plain text suitable for the agent.
@@ -32,26 +42,60 @@ func SlackToPlain(text string) string {
 	text = reLinkBare.ReplaceAllString(text, "$1")
 	// Replace channel mentions: <#C123|general> → #general
 	text = reChannelMention.ReplaceAllString(text, "#$1")
-	// User mentions are kept as-is for now (resolved by caller if needed)
+	// Simplify user mentions: <@U12345> → @U12345
+	text = reUserMention.ReplaceAllString(text, "@$1")
 	return text
 }
 
-// StripBotMention removes the bot's own @mention from the beginning of a message.
+// StripBotMention removes all @bot mentions from the message text.
 func StripBotMention(text, botUserID string) string {
 	mention := "<@" + botUserID + ">"
-	text = strings.TrimPrefix(text, mention)
-	text = strings.TrimLeft(text, " ")
+	text = strings.ReplaceAll(text, mention, "")
+	text = strings.TrimSpace(text)
 	return text
 }
 
 // PlainToSlack converts standard Markdown from agent output to Slack mrkdwn.
+// It preserves code blocks and inline code from being transformed.
 func PlainToSlack(text string) string {
+	// Extract code blocks and inline code, replace with placeholders
+	type placeholder struct {
+		key     string
+		content string
+	}
+	var placeholders []placeholder
+	idx := 0
+
+	// Replace fenced code blocks first
+	text = reCodeBlock.ReplaceAllStringFunc(text, func(match string) string {
+		key := fmt.Sprintf("\x00CODEBLOCK%d\x00", idx)
+		placeholders = append(placeholders, placeholder{key, match})
+		idx++
+		return key
+	})
+
+	// Replace inline code
+	text = reInlineCode.ReplaceAllStringFunc(text, func(match string) string {
+		key := fmt.Sprintf("\x00INLINECODE%d\x00", idx)
+		placeholders = append(placeholders, placeholder{key, match})
+		idx++
+		return key
+	})
+
 	// Convert **bold** to *bold*
 	text = reMdBold.ReplaceAllString(text, "*$1*")
 	// Convert ~~strike~~ to ~strike~
 	text = reMdStrike.ReplaceAllString(text, "~$1~")
-	// Code blocks and inline code use the same syntax — no conversion needed.
-	// Italic (_text_) is the same — no conversion needed.
+	// Convert [text](url) to <url|text>
+	text = reMdLink.ReplaceAllString(text, "<$2|$1>")
+	// Convert headings to bold text
+	text = reMdHeading.ReplaceAllString(text, "*$1*")
+
+	// Restore code blocks and inline code
+	for _, p := range placeholders {
+		text = strings.Replace(text, p.key, p.content, 1)
+	}
+
 	return text
 }
 

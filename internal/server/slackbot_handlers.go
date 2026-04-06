@@ -87,8 +87,18 @@ func (s *Server) handleSetSlackBot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.AppToken != "" && req.BotToken != "" {
-		if err := slackbot.StoreTokens(creds, agentID, req.AppToken, req.BotToken); err != nil {
+	if req.AppToken != "" || req.BotToken != "" {
+		// Load existing tokens so we can do partial updates
+		existingApp, existingBot, _ := slackbot.LoadTokens(creds, agentID)
+		appToken := req.AppToken
+		if appToken == "" {
+			appToken = existingApp
+		}
+		botToken := req.BotToken
+		if botToken == "" {
+			botToken = existingBot
+		}
+		if err := slackbot.StoreTokens(creds, agentID, appToken, botToken); err != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 			return
 		}

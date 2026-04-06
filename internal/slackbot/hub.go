@@ -48,15 +48,29 @@ func (h *Hub) StartBot(agentID string, cfg Config) {
 		return
 	}
 
+	// Remove existing bot from map, then stop it outside the lock.
+	// Re-check under lock before inserting the new bot.
 	h.mu.Lock()
-	// Stop existing bot if any
-	if old, ok := h.bots[agentID]; ok {
-		h.mu.Unlock()
+	old, hadOld := h.bots[agentID]
+	if hadOld {
+		delete(h.bots, agentID)
+	}
+	h.mu.Unlock()
+
+	if hadOld {
 		old.Stop()
-		h.mu.Lock()
 	}
 
 	bot := NewBot(agentID, cfg, appToken, botToken, h.mgr, h.logger)
+
+	h.mu.Lock()
+	// If another goroutine raced and already registered a bot, stop it first.
+	if racing, ok := h.bots[agentID]; ok {
+		delete(h.bots, agentID)
+		h.mu.Unlock()
+		racing.Stop()
+		h.mu.Lock()
+	}
 	h.bots[agentID] = bot
 	h.mu.Unlock()
 

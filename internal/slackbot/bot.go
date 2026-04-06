@@ -2,6 +2,7 @@ package slackbot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -45,6 +46,10 @@ type Bot struct {
 	// pending tracks messages received while agent is busy
 	pendingMu sync.Mutex
 	pending   []pendingMsg
+
+	// userCache caches Slack user ID → display name
+	userCacheMu sync.RWMutex
+	userCache   map[string]string
 }
 
 type pendingMsg struct {
@@ -58,8 +63,11 @@ type pendingMsg struct {
 
 const (
 	maxPendingRetries = 3
+	maxPendingQueue   = 20
 	pendingRetryDelay = 5 * time.Second
 	slackMaxMsgLen    = 3000
+	maxRateLimitRetry = 3
+	userCacheTTL      = 10 * time.Minute
 )
 
 // NewBot creates a new Bot instance. Call Run() to start it.
@@ -68,13 +76,14 @@ func NewBot(agentID string, cfg Config, appToken, botToken string, mgr ChatManag
 	sm := socketmode.New(api, socketmode.OptionLog(slog.NewLogLogger(logger.Handler(), slog.LevelWarn)))
 
 	return &Bot{
-		agentID: agentID,
-		config:  cfg,
-		api:     api,
-		sm:      sm,
-		mgr:     mgr,
-		logger:  logger.With("component", "slackbot", "agent", agentID),
-		done:    make(chan struct{}),
+		agentID:   agentID,
+		config:    cfg,
+		api:       api,
+		sm:        sm,
+		mgr:       mgr,
+		logger:    logger.With("component", "slackbot", "agent", agentID),
+		done:      make(chan struct{}),
+		userCache: make(map[string]string),
 	}
 }
 
@@ -205,8 +214,11 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 	// Convert Slack formatting to plain text
 	text = SlackToPlain(text)
 
+	// Resolve user display name
+	displayName := b.resolveUserName(userID)
+
 	// Build message with Slack context
-	formattedMsg := fmt.Sprintf("[Slack @%s] %s", userID, text)
+	formattedMsg := fmt.Sprintf("[Slack @%s] %s", displayName, text)
 
 	// Determine reply thread: use existing thread or start new one
 	replyTS := threadTS
@@ -215,12 +227,19 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 	}
 
 	if b.mgr.IsBusy(b.agentID) {
+		// Check queue limit
+		b.pendingMu.Lock()
+		if len(b.pending) >= maxPendingQueue {
+			b.pendingMu.Unlock()
+			b.logger.Warn("slack pending queue full, dropping message", "user", userID)
+			b.postMessage(ctx, channel, replyTS, "Sorry, too many messages are queued. Please try again later.")
+			return
+		}
 		// Add hourglass reaction and queue
 		_ = b.api.AddReactionContext(ctx, "hourglass_flowing_sand", slack.ItemRef{
 			Channel:   channel,
 			Timestamp: messageTS,
 		})
-		b.pendingMu.Lock()
 		b.pending = append(b.pending, pendingMsg{
 			channel:   channel,
 			threadTS:  replyTS,
@@ -240,24 +259,27 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, mes
 	events, err := b.mgr.ChatForSlack(ctx, b.agentID, message, "user")
 	if err != nil {
 		b.logger.Warn("failed to start agent chat from slack", "err", err)
-		b.postMessage(ctx, channel, threadTS, fmt.Sprintf("Error: %s", err.Error()))
+		b.postMessage(ctx, channel, threadTS, "Sorry, I couldn't process your message right now. Please try again later.")
 		return
 	}
 
 	// Accumulate response
 	var response strings.Builder
+	hasError := false
 	for evt := range events {
 		switch evt.Type {
 		case "text":
 			response.WriteString(evt.Delta)
 		case "error":
-			if evt.ErrorMessage != "" {
-				response.WriteString("\n[Error: " + evt.ErrorMessage + "]")
-			}
+			hasError = true
+			b.logger.Warn("agent returned error during slack chat", "err", evt.ErrorMessage)
 		}
 	}
 
 	if response.Len() == 0 {
+		if hasError {
+			b.postMessage(ctx, channel, threadTS, "Sorry, something went wrong while processing your request.")
+		}
 		return
 	}
 
@@ -287,10 +309,30 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) {
 	if threadTS != "" {
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
-	_, _, err := b.api.PostMessageContext(ctx, channel, opts...)
-	if err != nil {
+
+	for attempt := range maxRateLimitRetry {
+		_, _, err := b.api.PostMessageContext(ctx, channel, opts...)
+		if err == nil {
+			return
+		}
+		var rlErr *slack.RateLimitedError
+		if errors.As(err, &rlErr) {
+			wait := rlErr.RetryAfter
+			if wait <= 0 {
+				wait = time.Duration(attempt+1) * time.Second
+			}
+			b.logger.Debug("slack rate limited, waiting", "retryAfter", wait)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(wait):
+				continue
+			}
+		}
 		b.logger.Warn("failed to post slack message", "channel", channel, "err", err)
+		return
 	}
+	b.logger.Warn("failed to post slack message after rate limit retries", "channel", channel)
 }
 
 func (b *Bot) processPending(ctx context.Context) {
@@ -309,14 +351,68 @@ func (b *Bot) processPending(ctx context.Context) {
 		if msg.retries >= maxPendingRetries {
 			b.logger.Warn("slack pending message dropped after max retries", "user", msg.userID)
 			b.postMessage(ctx, msg.channel, msg.threadTS, "Sorry, I'm currently busy. Please try again later.")
+			// Remove hourglass reaction
+			_ = b.api.RemoveReactionContext(ctx, "hourglass_flowing_sand", slack.ItemRef{
+				Channel:   msg.channel,
+				Timestamp: msg.messageTS,
+			})
+			// Continue processing remaining pending messages
+			b.processPending(ctx)
 			return
 		}
-		// Re-queue
+		// Re-queue and schedule a retry
 		b.pendingMu.Lock()
-		b.pending = append(b.pending, msg)
+		b.pending = append([]pendingMsg{msg}, b.pending...)
 		b.pendingMu.Unlock()
+
+		go func() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(pendingRetryDelay):
+				b.processPending(ctx)
+			}
+		}()
 		return
 	}
 
 	b.sendToAgent(ctx, msg.channel, msg.threadTS, msg.messageTS, msg.text)
+}
+
+// resolveUserName resolves a Slack user ID to a display name, with caching.
+func (b *Bot) resolveUserName(userID string) string {
+	b.userCacheMu.RLock()
+	if name, ok := b.userCache[userID]; ok {
+		b.userCacheMu.RUnlock()
+		return name
+	}
+	b.userCacheMu.RUnlock()
+
+	user, err := b.api.GetUserInfo(userID)
+	if err != nil {
+		b.logger.Debug("failed to resolve slack user", "userID", userID, "err", err)
+		return userID // fallback to raw ID
+	}
+
+	name := user.Profile.DisplayName
+	if name == "" {
+		name = user.RealName
+	}
+	if name == "" {
+		name = user.Name
+	}
+
+	b.userCacheMu.Lock()
+	b.userCache[userID] = name
+	b.userCacheMu.Unlock()
+
+	// Expire cache entry after TTL
+	go func() {
+		time.Sleep(userCacheTTL)
+		b.userCacheMu.Lock()
+		delete(b.userCache, userID)
+		b.userCacheMu.Unlock()
+	}()
+
+	return name
 }
