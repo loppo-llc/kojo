@@ -149,6 +149,9 @@ export interface AgentTask {
 export interface SlackBotStatus {
   enabled: boolean;
   threadReplies: boolean;
+  respondDM: boolean;
+  respondMention: boolean;
+  respondThread: boolean;
   hasAppToken: boolean;
   hasBotToken: boolean;
   connected: boolean;
@@ -159,6 +162,9 @@ export interface SlackBotSetRequest {
   appToken?: string;
   botToken?: string;
   threadReplies?: boolean;
+  respondDM?: boolean;
+  respondMention?: boolean;
+  respondThread?: boolean;
 }
 
 export const agentApi = {

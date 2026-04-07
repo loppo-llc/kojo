@@ -163,7 +163,7 @@ func NewManager(logger *slog.Logger) *Manager {
 	}
 
 	// Initialize Slack bot hub
-	m.slackHub = slackbot.NewHub(&slackChatAdapter{m: m}, creds, logger)
+	m.slackHub = slackbot.NewHub(&slackChatAdapter{m: m}, creds, func(id string) string { return agentDir(id) }, logger)
 	for _, a := range m.agents {
 		if a.SlackBot != nil && a.SlackBot.Enabled {
 			m.slackHub.StartBot(a.ID, *a.SlackBot)
@@ -668,7 +668,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	}
 
 	// Start chat
-	backendCh, err := backend.Chat(chatCtx, &agentCopy, effectiveMessage, systemPrompt)
+	backendCh, err := backend.Chat(chatCtx, &agentCopy, effectiveMessage, systemPrompt, ChatOptions{})
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
@@ -691,6 +691,125 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	}()
 
 	return callerCh, nil
+}
+
+// ChatOneShot runs a one-shot chat that does not save to transcript
+// (messages.jsonl) and does not resume the CLI session. Used for external
+// platform conversations (Slack, Discord) that carry their own context.
+// Memory (MEMORY.md, diary) access is still available via system prompt.
+func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string) (<-chan ChatEvent, error) {
+	m.syncPersona(agentID)
+
+	m.mu.Lock()
+	a, ok := m.agents[agentID]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
+	}
+	agentCopy := *a
+	m.mu.Unlock()
+
+	m.busyMu.Lock()
+	if m.resetting[agentID] {
+		m.busyMu.Unlock()
+		return nil, ErrAgentResetting
+	}
+	if _, busy := m.busy[agentID]; busy {
+		m.busyMu.Unlock()
+		return nil, ErrAgentBusy
+	}
+	chatCtx, cancel := context.WithCancel(ctx)
+	outCh := make(chan ChatEvent, 64)
+	bc := newChatBroadcaster(outCh)
+	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc}
+	m.busyMu.Unlock()
+
+	backend, ok := m.backends[agentCopy.Tool]
+	if !ok {
+		err := fmt.Errorf("%w: %s", ErrUnsupportedTool, agentCopy.Tool)
+		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
+		close(outCh)
+		m.clearBusy(agentID)
+		cancel()
+		return nil, err
+	}
+
+	// Build system prompt (same as Chat — includes memory, credentials, etc.)
+	var apiBase string
+	var groups []*GroupDM
+	if m.groupdms != nil {
+		apiBase = m.groupdms.APIBase()
+		groups = m.groupdms.GroupsForAgent(agentID)
+	}
+	if agentCopy.Tool == "claude" {
+		PrepareClaudeSettings(agentID, apiBase, m.logger)
+	}
+
+	systemPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
+
+	// Memory context injection (read-only query, no indexing of this message)
+	if idx := m.getOrOpenIndex(agentID); idx != nil {
+		idx.IndexFilesIfStale(agentID)
+		if memCtx := idx.BuildContextFromQuery(userMessage); memCtx != "" {
+			systemPrompt += "\n\n" + memCtx
+		}
+	}
+
+	// NOTE: No appendMessage — one-shot chats are not saved to transcript.
+
+	backendCh, err := backend.Chat(chatCtx, &agentCopy, userMessage, systemPrompt, ChatOptions{OneShot: true})
+	if err != nil {
+		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
+		close(outCh)
+		m.clearBusy(agentID)
+		cancel()
+		return nil, err
+	}
+
+	_, callerCh, _ := bc.Subscribe()
+
+	go func() {
+		defer close(outCh)
+		defer m.clearBusy(agentID)
+		defer cancel()
+		m.processOneShotEvents(chatCtx, agentID, backendCh, outCh)
+	}()
+
+	return callerCh, nil
+}
+
+// processOneShotEvents is like processChatEvents but does not persist
+// messages to the transcript. It still forwards events to outCh.
+func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent) {
+	for {
+		select {
+		case event, ok := <-backendCh:
+			if !ok {
+				return
+			}
+			// Terminal events use blocking send; streaming events are non-blocking.
+			if event.Type == "done" || event.Type == "error" {
+				// Sync persona in case agent edited it during this chat
+				if event.Type == "done" {
+					m.syncPersona(agentID)
+				}
+				select {
+				case outCh <- event:
+				case <-ctx.Done():
+					return
+				}
+			} else {
+				select {
+				case outCh <- event:
+				default:
+				}
+			}
+		case <-ctx.Done():
+			for range backendCh {
+			}
+			return
+		}
+	}
 }
 
 // processChatEvents reads events from the backend channel, persists messages,
@@ -948,6 +1067,25 @@ func (a *slackChatAdapter) ChatForSlack(ctx context.Context, agentID, message, r
 		return nil, err
 	}
 	// Convert agent.ChatEvent channel to slackbot.ChatEvent channel
+	out := make(chan slackbot.ChatEvent, 64)
+	go func() {
+		defer close(out)
+		for evt := range agentCh {
+			out <- slackbot.ChatEvent{
+				Type:         evt.Type,
+				Delta:        evt.Delta,
+				ErrorMessage: evt.ErrorMessage,
+			}
+		}
+	}()
+	return out, nil
+}
+
+func (a *slackChatAdapter) ChatForSlackOneShot(ctx context.Context, agentID, message, role string) (<-chan slackbot.ChatEvent, error) {
+	agentCh, err := a.m.ChatOneShot(ctx, agentID, message)
+	if err != nil {
+		return nil, err
+	}
 	out := make(chan slackbot.ChatEvent, 64)
 	go func() {
 		defer close(out)

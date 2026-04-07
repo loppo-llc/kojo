@@ -6,11 +6,19 @@ import (
 	"strings"
 )
 
+// ChatOptions holds optional parameters for a chat invocation.
+type ChatOptions struct {
+	// OneShot skips session resumption, running a fresh ephemeral session.
+	// Used for Slack and other external platform conversations that have
+	// their own conversation context.
+	OneShot bool
+}
+
 // ChatBackend abstracts a CLI tool for agent chat.
 type ChatBackend interface {
 	// Chat sends a message and returns a channel of streaming events.
 	// The channel is closed when the response is complete.
-	Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string) (<-chan ChatEvent, error)
+	Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error)
 
 	// Name returns the tool identifier (e.g. "claude", "codex", "gemini").
 	Name() string

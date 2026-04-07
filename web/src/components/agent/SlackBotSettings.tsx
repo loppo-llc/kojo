@@ -7,6 +7,9 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
   const [appToken, setAppToken] = useState("");
   const [botToken, setBotToken] = useState("");
   const [threadReplies, setThreadReplies] = useState(true);
+  const [respondDM, setRespondDM] = useState(true);
+  const [respondMention, setRespondMention] = useState(true);
+  const [respondThread, setRespondThread] = useState(true);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [error, setError] = useState("");
@@ -17,6 +20,9 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
       setStatus(s);
       setEnabled(s.enabled);
       setThreadReplies(s.threadReplies);
+      setRespondDM(s.respondDM);
+      setRespondMention(s.respondMention);
+      setRespondThread(s.respondThread);
     }).catch(() => {});
   }, [agentId]);
 
@@ -29,6 +35,9 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
         ...(appToken ? { appToken } : {}),
         ...(botToken ? { botToken } : {}),
         threadReplies,
+        respondDM,
+        respondMention,
+        respondThread,
       });
       setAppToken("");
       setBotToken("");
@@ -140,6 +149,40 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
           />
           <span className="text-xs text-neutral-400">Always reply in thread</span>
         </label>
+
+        {/* Reaction patterns */}
+        <div>
+          <div className="text-xs text-neutral-500 mb-2">Respond to:</div>
+          <div className="space-y-1.5 ml-1">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={respondDM}
+                onChange={(e) => setRespondDM(e.target.checked)}
+                className="rounded border-neutral-600"
+              />
+              <span className="text-xs text-neutral-400">Direct messages</span>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={respondMention}
+                onChange={(e) => setRespondMention(e.target.checked)}
+                className="rounded border-neutral-600"
+              />
+              <span className="text-xs text-neutral-400">@mentions in channels</span>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={respondThread}
+                onChange={(e) => setRespondThread(e.target.checked)}
+                className="rounded border-neutral-600"
+              />
+              <span className="text-xs text-neutral-400">Thread follow-ups (auto-reply without mention)</span>
+            </label>
+          </div>
+        </div>
 
         {error && (
           <div className="p-2 bg-red-950 border border-red-800 rounded text-xs text-red-300">

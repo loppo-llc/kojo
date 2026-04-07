@@ -32,7 +32,7 @@ func (b *CodexBackend) Available() bool {
 	return err == nil
 }
 
-func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string) (<-chan ChatEvent, error) {
+func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error) {
 	codexPath, err := exec.LookPath("codex")
 	if err != nil {
 		return nil, fmt.Errorf("codex not found in PATH")

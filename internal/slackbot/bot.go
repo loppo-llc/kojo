@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/chathistory"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
@@ -27,18 +28,20 @@ type ChatEvent struct {
 // ChatManager is the interface the bot uses to interact with agents.
 type ChatManager interface {
 	ChatForSlack(ctx context.Context, agentID, message, role string) (<-chan ChatEvent, error)
+	ChatForSlackOneShot(ctx context.Context, agentID, message, role string) (<-chan ChatEvent, error)
 	IsBusy(agentID string) bool
 }
 
 // Bot manages a single Slack Socket Mode connection for one agent.
 type Bot struct {
-	agentID   string
-	config    Config
-	api       *slack.Client
-	sm        *socketmode.Client
-	mgr       ChatManager
-	logger    *slog.Logger
-	botUserID string
+	agentID      string
+	agentDataDir string // agent data directory for history file storage
+	config       Config
+	api          *slack.Client
+	sm           *socketmode.Client
+	mgr          ChatManager
+	logger       *slog.Logger
+	botUserID    string
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -71,19 +74,21 @@ const (
 )
 
 // NewBot creates a new Bot instance. Call Run() to start it.
-func NewBot(agentID string, cfg Config, appToken, botToken string, mgr ChatManager, logger *slog.Logger) *Bot {
+// agentDataDir is the agent's data directory used for storing conversation history files.
+func NewBot(agentID string, agentDataDir string, cfg Config, appToken, botToken string, mgr ChatManager, logger *slog.Logger) *Bot {
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
 	sm := socketmode.New(api, socketmode.OptionLog(slog.NewLogLogger(logger.Handler(), slog.LevelWarn)))
 
 	return &Bot{
-		agentID:   agentID,
-		config:    cfg,
-		api:       api,
-		sm:        sm,
-		mgr:       mgr,
-		logger:    logger.With("component", "slackbot", "agent", agentID),
-		done:      make(chan struct{}),
-		userCache: make(map[string]string),
+		agentID:      agentID,
+		agentDataDir: agentDataDir,
+		config:       cfg,
+		api:          api,
+		sm:           sm,
+		mgr:          mgr,
+		logger:       logger.With("component", "slackbot", "agent", agentID),
+		done:         make(chan struct{}),
+		userCache:    make(map[string]string),
 	}
 }
 
@@ -185,18 +190,65 @@ func (b *Bot) handleCallbackEvent(ctx context.Context, inner slackevents.EventsA
 }
 
 func (b *Bot) handleMessageEvent(ctx context.Context, ev *slackevents.MessageEvent) {
-	// Only handle direct messages (im)
-	if ev.ChannelType != "im" {
-		return
-	}
 	// Ignore bot's own messages and message edits/deletes
 	if ev.User == b.botUserID || ev.User == "" || ev.SubType != "" {
 		return
 	}
-	b.processIncoming(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.Text, ev.User)
+
+	// Direct messages
+	if ev.ChannelType == "im" {
+		if !b.config.ReactDM() {
+			return
+		}
+		b.processIncoming(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.Text, ev.User)
+		return
+	}
+
+	// Channel thread replies: respond without mention if this is a thread
+	// we've previously participated in (history exists), the last message
+	// in history was from us, and the new message doesn't mention someone else.
+	if b.config.ReactThread() && ev.ThreadTimeStamp != "" && b.shouldAutoReply(ev.Channel, ev.ThreadTimeStamp, ev.Text) {
+		b.processIncoming(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.Text, ev.User)
+	}
+}
+
+// shouldAutoReply checks whether the bot should respond to a thread message
+// without being explicitly mentioned. Returns true when:
+//  1. The thread has existing conversation history (bot was mentioned before)
+//  2. The last message in that history was from the bot (direct follow-up)
+//  3. The message does not mention another user (not directed at someone else)
+func (b *Bot) shouldAutoReply(channelID, threadTS, rawText string) bool {
+	if b.agentDataDir == "" {
+		return false
+	}
+
+	// 1. Check history exists for this thread
+	path := chathistory.HistoryFilePath(b.agentDataDir, "slack", channelID, threadTS)
+	if !chathistory.HasHistory(path) {
+		return false
+	}
+
+	// 2. Last message in history must be from the bot
+	last := chathistory.LastMessage(path)
+	if last == nil || !last.IsBot || last.UserID != b.botUserID {
+		return false
+	}
+
+	// 3. Message must not mention another user (bot's own mention is OK)
+	mentions := reUserMention.FindAllStringSubmatch(rawText, -1)
+	for _, m := range mentions {
+		if len(m) > 1 && m[1] != b.botUserID {
+			return false // mentions someone other than the bot
+		}
+	}
+
+	return true
 }
 
 func (b *Bot) handleAppMentionEvent(ctx context.Context, ev *slackevents.AppMentionEvent) {
+	if !b.config.ReactMention() {
+		return
+	}
 	// Ignore our own messages
 	if ev.User == b.botUserID || ev.User == "" {
 		return
@@ -217,8 +269,22 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 	// Resolve user display name
 	displayName := b.resolveUserName(userID)
 
-	// Build message with Slack context
-	formattedMsg := fmt.Sprintf("[Slack @%s] %s", displayName, text)
+	// Fetch conversation history from Slack for context injection
+	var history []chathistory.HistoryMessage
+	if threadTS != "" {
+		history = FetchThreadHistory(ctx, b.api, b.agentDataDir, channel, threadTS, b.resolveUserName, b.logger)
+	} else {
+		history = FetchChannelHistory(ctx, b.api, b.agentDataDir, channel, channelHistoryLimit, b.resolveUserName, b.logger)
+	}
+
+	// Build enriched message with conversation history
+	var sb strings.Builder
+	if len(history) > 0 {
+		sb.WriteString(chathistory.FormatForInjection(history, b.botUserID, chathistory.DefaultMaxMessages, chathistory.DefaultMaxChars))
+		sb.WriteString("\n---\n\n")
+	}
+	sb.WriteString(fmt.Sprintf("[Slack @%s] %s", displayName, text))
+	formattedMsg := sb.String()
 
 	// Determine reply thread: use existing thread or start new one
 	replyTS := threadTS
@@ -256,7 +322,7 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 }
 
 func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, message string) {
-	events, err := b.mgr.ChatForSlack(ctx, b.agentID, message, "user")
+	events, err := b.mgr.ChatForSlackOneShot(ctx, b.agentID, message, "user")
 	if err != nil {
 		b.logger.Warn("failed to start agent chat from slack", "err", err)
 		b.postMessage(ctx, channel, threadTS, "Sorry, I couldn't process your message right now. Please try again later.")
@@ -288,6 +354,26 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, mes
 	chunks := SplitMessage(text, slackMaxMsgLen)
 	for _, chunk := range chunks {
 		b.postMessage(ctx, channel, threadTS, chunk)
+	}
+
+	// Save bot response to thread history so shouldAutoReply can detect
+	// that the last message was from the bot on subsequent thread messages.
+	if threadTS != "" && b.agentDataDir != "" {
+		botMsg := chathistory.HistoryMessage{
+			Platform:  "slack",
+			ChannelID: channel,
+			ThreadID:  threadTS,
+			MessageID: fmt.Sprintf("%d.bot", time.Now().Unix()),
+			UserID:    b.botUserID,
+			UserName:  "assistant",
+			Text:      response.String(),
+			Timestamp: time.Now().Format(time.RFC3339),
+			IsBot:     true,
+		}
+		path := chathistory.HistoryFilePath(b.agentDataDir, "slack", channel, threadTS)
+		if err := chathistory.AppendMessages(path, []chathistory.HistoryMessage{botMsg}); err != nil {
+			b.logger.Warn("failed to save bot response to thread history", "err", err)
+		}
 	}
 
 	// Remove hourglass if this was from a pending message

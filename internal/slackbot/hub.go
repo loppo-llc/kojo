@@ -6,27 +6,33 @@ import (
 	"sync"
 )
 
+// AgentDataDirFunc resolves an agent ID to its data directory path.
+type AgentDataDirFunc func(agentID string) string
+
 // Hub manages all SlackBot instances across agents.
 type Hub struct {
-	mu     sync.Mutex
-	bots   map[string]*Bot // agentID → bot
-	mgr    ChatManager
-	tokens TokenProvider
-	logger *slog.Logger
-	ctx    context.Context
-	cancel context.CancelFunc
+	mu           sync.Mutex
+	bots         map[string]*Bot // agentID → bot
+	mgr          ChatManager
+	tokens       TokenProvider
+	agentDataDir AgentDataDirFunc
+	logger       *slog.Logger
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 // NewHub creates a new Hub. Call Stop() on shutdown.
-func NewHub(mgr ChatManager, tokens TokenProvider, logger *slog.Logger) *Hub {
+// agentDataDir resolves an agent ID to its data directory path for history file storage.
+func NewHub(mgr ChatManager, tokens TokenProvider, agentDataDir AgentDataDirFunc, logger *slog.Logger) *Hub {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Hub{
-		bots:   make(map[string]*Bot),
-		mgr:    mgr,
-		tokens: tokens,
-		logger: logger.With("component", "slackbot-hub"),
-		ctx:    ctx,
-		cancel: cancel,
+		bots:         make(map[string]*Bot),
+		mgr:          mgr,
+		tokens:       tokens,
+		agentDataDir: agentDataDir,
+		logger:       logger.With("component", "slackbot-hub"),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 }
 
@@ -61,7 +67,11 @@ func (h *Hub) StartBot(agentID string, cfg Config) {
 		old.Stop()
 	}
 
-	bot := NewBot(agentID, cfg, appToken, botToken, h.mgr, h.logger)
+	dataDir := ""
+	if h.agentDataDir != nil {
+		dataDir = h.agentDataDir(agentID)
+	}
+	bot := NewBot(agentID, dataDir, cfg, appToken, botToken, h.mgr, h.logger)
 
 	h.mu.Lock()
 	// If another goroutine raced and already registered a bot, stop it first.

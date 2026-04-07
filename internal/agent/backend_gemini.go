@@ -29,7 +29,7 @@ func (b *GeminiBackend) Available() bool {
 	return err == nil
 }
 
-func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string) (<-chan ChatEvent, error) {
+func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error) {
 	geminiPath, err := exec.LookPath("gemini")
 	if err != nil {
 		return nil, fmt.Errorf("gemini not found in PATH")
@@ -52,8 +52,9 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		"-y", // auto-approve all tool calls
 	}
 
-	// Resume previous session for conversation continuity and faster startup
-	if hasGeminiSession(dir) {
+	// Resume previous session for conversation continuity and faster startup.
+	// OneShot mode (e.g. Slack) skips session resumption.
+	if !opts.OneShot && hasGeminiSession(dir) {
 		args = append(args, "--resume", "latest")
 	}
 

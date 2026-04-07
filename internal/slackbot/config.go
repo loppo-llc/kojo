@@ -10,7 +10,22 @@ import (
 type Config struct {
 	Enabled       bool `json:"enabled"`
 	ThreadReplies bool `json:"threadReplies"` // always reply in-thread (default true)
+
+	// Reaction patterns — which message types the bot responds to.
+	// All default to true for backwards compatibility.
+	RespondDM      *bool `json:"respondDM,omitempty"`      // respond to direct messages
+	RespondMention *bool `json:"respondMention,omitempty"`  // respond to @mentions in channels
+	RespondThread  *bool `json:"respondThread,omitempty"`   // auto-reply in threads with history
 }
+
+// ReactDM returns whether the bot should respond to direct messages.
+func (c *Config) ReactDM() bool { return c.RespondDM == nil || *c.RespondDM }
+
+// ReactMention returns whether the bot should respond to @mentions.
+func (c *Config) ReactMention() bool { return c.RespondMention == nil || *c.RespondMention }
+
+// ReactThread returns whether the bot should auto-reply in threads with history.
+func (c *Config) ReactThread() bool { return c.RespondThread == nil || *c.RespondThread }
 
 // Validate checks that the configuration is minimally valid.
 func (c *Config) Validate() error {

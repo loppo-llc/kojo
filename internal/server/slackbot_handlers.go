@@ -11,18 +11,24 @@ import (
 // --- Slack Bot Configuration ---
 
 type slackBotRequest struct {
-	Enabled       bool   `json:"enabled"`
-	AppToken      string `json:"appToken"`
-	BotToken      string `json:"botToken"`
-	ThreadReplies *bool  `json:"threadReplies"`
+	Enabled        bool   `json:"enabled"`
+	AppToken       string `json:"appToken"`
+	BotToken       string `json:"botToken"`
+	ThreadReplies  *bool  `json:"threadReplies"`
+	RespondDM      *bool  `json:"respondDM"`
+	RespondMention *bool  `json:"respondMention"`
+	RespondThread  *bool  `json:"respondThread"`
 }
 
 type slackBotResponse struct {
-	Enabled       bool   `json:"enabled"`
-	ThreadReplies bool   `json:"threadReplies"`
-	HasAppToken   bool   `json:"hasAppToken"`
-	HasBotToken   bool   `json:"hasBotToken"`
-	Connected     bool   `json:"connected"`
+	Enabled        bool `json:"enabled"`
+	ThreadReplies  bool `json:"threadReplies"`
+	RespondDM      bool `json:"respondDM"`
+	RespondMention bool `json:"respondMention"`
+	RespondThread  bool `json:"respondThread"`
+	HasAppToken    bool `json:"hasAppToken"`
+	HasBotToken    bool `json:"hasBotToken"`
+	Connected      bool `json:"connected"`
 }
 
 func (s *Server) handleGetSlackBot(w http.ResponseWriter, r *http.Request) {
@@ -33,10 +39,18 @@ func (s *Server) handleGetSlackBot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := slackBotResponse{}
+	resp := slackBotResponse{
+		// Defaults for when SlackBot is nil
+		RespondDM:      true,
+		RespondMention: true,
+		RespondThread:  true,
+	}
 	if a.SlackBot != nil {
 		resp.Enabled = a.SlackBot.Enabled
 		resp.ThreadReplies = a.SlackBot.ThreadReplies
+		resp.RespondDM = a.SlackBot.ReactDM()
+		resp.RespondMention = a.SlackBot.ReactMention()
+		resp.RespondThread = a.SlackBot.ReactThread()
 	}
 
 	// Check if tokens exist
@@ -110,8 +124,11 @@ func (s *Server) handleSetSlackBot(w http.ResponseWriter, r *http.Request) {
 		threadReplies = *req.ThreadReplies
 	}
 	cfg := slackbot.Config{
-		Enabled:       req.Enabled,
-		ThreadReplies: threadReplies,
+		Enabled:        req.Enabled,
+		ThreadReplies:  threadReplies,
+		RespondDM:      req.RespondDM,
+		RespondMention: req.RespondMention,
+		RespondThread:  req.RespondThread,
 	}
 
 	// Update agent
