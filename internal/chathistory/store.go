@@ -81,26 +81,39 @@ func AppendMessages(path string, msgs []HistoryMessage) error {
 	return nil
 }
 
-// WriteMessages overwrites a history file with the given messages.
+// WriteMessages atomically overwrites a history file with the given messages.
 // Used for channel-level sliding window history.
+// Writes to a temporary file first and renames it into place so that a crash
+// mid-write never corrupts the existing file.
 func WriteMessages(path string, msgs []HistoryMessage) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create history dir: %w", err)
 	}
-	f, err := os.Create(path)
+
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
 	if err != nil {
-		return fmt.Errorf("create history file: %w", err)
+		return fmt.Errorf("create temp history file: %w", err)
 	}
-	defer f.Close()
 
 	enc := json.NewEncoder(f)
 	enc.SetEscapeHTML(false)
 	for i := range msgs {
 		if err := enc.Encode(&msgs[i]); err != nil {
+			f.Close()
+			os.Remove(tmp)
 			return fmt.Errorf("encode message: %w", err)
 		}
 	}
-	return nil
+
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("sync history file: %w", err)
+	}
+	f.Close()
+
+	return os.Rename(tmp, path)
 }
 
 // LastMessage returns the last entry in a JSONL file.

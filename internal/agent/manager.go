@@ -72,6 +72,15 @@ type Manager struct {
 	// chatWatchers tracks per-agent channels notified when a new chat starts.
 	chatWatchers   map[string]map[*chatWatcher]struct{}
 	chatWatchersMu sync.Mutex
+
+	// oneShotCancels tracks cancel functions for in-flight one-shot chats
+	// (e.g. Slack) so they can be cleaned up on Shutdown or agent Delete.
+	// Unlike busy (which allows only one chat per agent), multiple one-shot
+	// chats may run concurrently for the same agent.
+	// Keyed by a unique int64 ID since context.CancelFunc is not comparable.
+	oneShotSeq       int64
+	oneShotCancels   map[string]map[int64]context.CancelFunc // agentID → id → cancel
+	oneShotCancelsMu sync.Mutex
 }
 
 // NewManager creates a new agent manager.
@@ -96,7 +105,8 @@ func NewManager(logger *slog.Logger) *Manager {
 		resetting:    make(map[string]bool),
 		profileGen:   make(map[string]bool),
 		memIndexes:   make(map[string]*MemoryIndex),
-		chatWatchers: make(map[string]map[*chatWatcher]struct{}),
+		chatWatchers:   make(map[string]map[*chatWatcher]struct{}),
+		oneShotCancels: make(map[string]map[int64]context.CancelFunc),
 	}
 
 	// Expose LM Studio backend for model listing
@@ -570,6 +580,15 @@ func (m *Manager) UpdateSlackBot(id string, cfg *SlackBotConfig) error {
 	m.mu.Unlock()
 
 	m.save()
+
+	// Reconcile running bot with new config (mirrors UpdateNotifySources pattern).
+	if m.slackHub != nil {
+		if cfg != nil && cfg.Enabled {
+			m.slackHub.Reconfigure(id, *cfg)
+		} else {
+			m.slackHub.StopBot(id)
+		}
+	}
 	return nil
 }
 
@@ -738,6 +757,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	m.busyMu.Unlock()
 
 	chatCtx, cancel := context.WithCancel(ctx)
+	osID := m.trackOneShot(agentID, cancel)
 	outCh := make(chan ChatEvent, 64)
 
 	backend, ok := m.backends[agentCopy.Tool]
@@ -746,6 +766,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
 		cancel()
+		m.untrackOneShot(agentID, osID)
 		return nil, err
 	}
 
@@ -777,12 +798,14 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
 		cancel()
+		m.untrackOneShot(agentID, osID)
 		return nil, err
 	}
 
 	go func() {
 		defer close(outCh)
 		defer cancel()
+		defer m.untrackOneShot(agentID, osID)
 		m.processOneShotEvents(chatCtx, agentID, backendCh, outCh)
 	}()
 
@@ -1025,6 +1048,56 @@ func (m *Manager) SetCronPaused(paused bool) {
 	m.logger.Info("cron pause toggled", "paused", paused)
 }
 
+// trackOneShot registers a one-shot chat's cancel func so it can be
+// cleaned up on Shutdown or agent Delete. Returns an ID for untracking.
+func (m *Manager) trackOneShot(agentID string, cancel context.CancelFunc) int64 {
+	m.oneShotCancelsMu.Lock()
+	defer m.oneShotCancelsMu.Unlock()
+	m.oneShotSeq++
+	id := m.oneShotSeq
+	if m.oneShotCancels[agentID] == nil {
+		m.oneShotCancels[agentID] = make(map[int64]context.CancelFunc)
+	}
+	m.oneShotCancels[agentID][id] = cancel
+	return id
+}
+
+// untrackOneShot removes a one-shot chat's cancel func after it completes.
+func (m *Manager) untrackOneShot(agentID string, id int64) {
+	m.oneShotCancelsMu.Lock()
+	defer m.oneShotCancelsMu.Unlock()
+	if set, ok := m.oneShotCancels[agentID]; ok {
+		delete(set, id)
+		if len(set) == 0 {
+			delete(m.oneShotCancels, agentID)
+		}
+	}
+}
+
+// cancelOneShots cancels all in-flight one-shot chats for an agent.
+func (m *Manager) cancelOneShots(agentID string) {
+	m.oneShotCancelsMu.Lock()
+	cancels := m.oneShotCancels[agentID]
+	delete(m.oneShotCancels, agentID)
+	m.oneShotCancelsMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+// cancelAllOneShots cancels all in-flight one-shot chats across all agents.
+func (m *Manager) cancelAllOneShots() {
+	m.oneShotCancelsMu.Lock()
+	all := m.oneShotCancels
+	m.oneShotCancels = make(map[string]map[int64]context.CancelFunc)
+	m.oneShotCancelsMu.Unlock()
+	for _, cancels := range all {
+		for _, cancel := range cancels {
+			cancel()
+		}
+	}
+}
+
 // chatWatcher is a handle for a chat-start notification subscription.
 type chatWatcher struct {
 	ch chan struct{}
@@ -1107,6 +1180,8 @@ func (m *Manager) Shutdown() {
 		entry.cancel()
 	}
 	m.busyMu.Unlock()
+
+	m.cancelAllOneShots()
 
 	m.save()
 }

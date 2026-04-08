@@ -139,6 +139,7 @@ func (m *Manager) Delete(id string) error {
 
 	m.cron.Remove(id)
 	m.notifyPoller.RemoveAgent(id)
+	m.cancelOneShots(id)
 	if m.slackHub != nil {
 		m.slackHub.StopBot(id)
 	}
