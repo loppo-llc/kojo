@@ -40,7 +40,7 @@ type Usage struct {
 
 // ChatEvent is streamed from backend to WebSocket during a chat.
 type ChatEvent struct {
-	Type         string   `json:"type"` // "status", "text", "thinking", "tool_use", "tool_result", "done", "error"
+	Type         string   `json:"type"` // "status", "text", "thinking", "tool_use", "tool_result", "done", "error", "message"
 	Status       string   `json:"status,omitempty"`
 	Delta        string   `json:"delta,omitempty"`
 	ToolUseID    string   `json:"toolUseId,omitempty"`

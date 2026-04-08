@@ -673,6 +673,12 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	if err := appendMessage(agentID, inputMsg); err != nil {
 		m.logger.Warn("failed to save input message", "err", err)
 	}
+	// Stream the system message to WebSocket clients so it appears before
+	// the assistant response. User messages are added optimistically by the
+	// frontend, so only system messages need injection here.
+	if role == "system" {
+		outCh <- ChatEvent{Type: "message", Message: inputMsg}
+	}
 
 	// Build the effective message for the backend.
 	// When attachments are present, prepend file references so the CLI

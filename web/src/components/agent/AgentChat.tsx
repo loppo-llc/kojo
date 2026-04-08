@@ -173,6 +173,16 @@ export function AgentChat() {
           });
           break;
         }
+        case "message": {
+          if (event.message) {
+            setMessages((prev) =>
+              prev.some((m) => m.id === event.message!.id)
+                ? prev
+                : [...prev, event.message!],
+            );
+          }
+          break;
+        }
         case "done": {
           const abortedId = abortedIdRef.current;
           abortedIdRef.current = null;

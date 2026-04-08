@@ -137,7 +137,7 @@ export interface OTPEntry {
 }
 
 export interface ChatEvent {
-  type: "status" | "text" | "thinking" | "tool_use" | "tool_result" | "done" | "error";
+  type: "status" | "text" | "thinking" | "tool_use" | "tool_result" | "done" | "error" | "message";
   status?: string;
   delta?: string;
   toolUseId?: string;
