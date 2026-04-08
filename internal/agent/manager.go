@@ -68,6 +68,10 @@ type Manager struct {
 
 	// OnChatDone is called when an agent finishes its response.
 	OnChatDone func(agent *Agent, message *Message)
+
+	// chatWatchers tracks per-agent channels notified when a new chat starts.
+	chatWatchers   map[string]map[*chatWatcher]struct{}
+	chatWatchersMu sync.Mutex
 }
 
 // NewManager creates a new agent manager.
@@ -85,13 +89,14 @@ func NewManager(logger *slog.Logger) *Manager {
 			"gemini":    NewGeminiBackend(logger),
 			"lm-studio": NewLMStudioBackend(logger),
 		},
-		store:     newStore(logger),
-		creds:     creds,
-		logger:    logger,
-		busy:       make(map[string]busyEntry),
-		resetting:  make(map[string]bool),
-		profileGen: make(map[string]bool),
-		memIndexes: make(map[string]*MemoryIndex),
+		store:        newStore(logger),
+		creds:        creds,
+		logger:       logger,
+		busy:         make(map[string]busyEntry),
+		resetting:    make(map[string]bool),
+		profileGen:   make(map[string]bool),
+		memIndexes:   make(map[string]*MemoryIndex),
+		chatWatchers: make(map[string]map[*chatWatcher]struct{}),
 	}
 
 	// Expose LM Studio backend for model listing
@@ -619,6 +624,9 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc}
 	m.busyMu.Unlock()
 
+	// Notify any WebSocket clients watching this agent.
+	m.notifyChatStart(agentID)
+
 	// Resolve backend (may configure LMS proxy and clear agentCopy.Model)
 	backend, useLMSProxy, err := m.resolveBackend(agentID, &agentCopy)
 	if err != nil {
@@ -1019,6 +1027,44 @@ func (m *Manager) SetCronPaused(paused bool) {
 	m.mu.Unlock()
 	m.store.SaveCronPaused(paused)
 	m.logger.Info("cron pause toggled", "paused", paused)
+}
+
+// chatWatcher is a handle for a chat-start notification subscription.
+type chatWatcher struct {
+	ch chan struct{}
+}
+
+// WatchChatStart returns a channel that receives a signal whenever a new chat
+// starts for the given agent. Call the returned function to unsubscribe.
+func (m *Manager) WatchChatStart(agentID string) (<-chan struct{}, func()) {
+	w := &chatWatcher{ch: make(chan struct{}, 1)}
+	m.chatWatchersMu.Lock()
+	if m.chatWatchers[agentID] == nil {
+		m.chatWatchers[agentID] = make(map[*chatWatcher]struct{})
+	}
+	m.chatWatchers[agentID][w] = struct{}{}
+	m.chatWatchersMu.Unlock()
+	return w.ch, func() {
+		m.chatWatchersMu.Lock()
+		delete(m.chatWatchers[agentID], w)
+		if len(m.chatWatchers[agentID]) == 0 {
+			delete(m.chatWatchers, agentID)
+		}
+		m.chatWatchersMu.Unlock()
+	}
+}
+
+// notifyChatStart signals all watchers that a new chat has started for agentID.
+func (m *Manager) notifyChatStart(agentID string) {
+	m.chatWatchersMu.Lock()
+	watchers := m.chatWatchers[agentID]
+	for w := range watchers {
+		select {
+		case w.ch <- struct{}{}:
+		default:
+		}
+	}
+	m.chatWatchersMu.Unlock()
 }
 
 // Messages returns recent messages for an agent.

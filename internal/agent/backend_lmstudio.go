@@ -81,7 +81,7 @@ type lmsChatEndResult struct {
 	} `json:"result"`
 }
 
-func (b *LMStudioBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string) (<-chan ChatEvent, error) {
+func (b *LMStudioBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error) {
 	baseURL := lmsBaseURL()
 
 	// Build request
