@@ -116,7 +116,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 				Type:         "done",
 				Message:      msg,
 				Usage:        result.usage,
-				ErrorMessage: "timeout: process was terminated",
+				ErrorMessage: ErrMsgTimeout,
 			}
 			return
 		}

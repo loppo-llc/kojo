@@ -61,6 +61,12 @@ const (
 	slackMaxMsgLen    = 3000
 	maxRateLimitRetry = 3
 	userCacheTTL      = 10 * time.Minute
+
+	// platformSlack is the platform identifier used in chat history entries.
+	platformSlack = "slack"
+
+	// typingStatus is the assistant status text shown while processing a message.
+	typingStatus = "考え中…"
 )
 
 // NewBot creates a new Bot instance. Call Run() to start it.
@@ -133,9 +139,10 @@ func (b *Bot) Done() <-chan struct{} {
 }
 
 // TestConnection performs auth.test to validate the tokens.
-func TestConnection(appToken, botToken string) (team, botUser string, err error) {
+// The provided context controls the request timeout.
+func TestConnection(ctx context.Context, appToken, botToken string) (team, botUser string, err error) {
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
-	resp, err := api.AuthTest()
+	resp, err := api.AuthTestContext(ctx)
 	if err != nil {
 		return "", "", fmt.Errorf("auth.test failed: %w", err)
 	}
@@ -216,7 +223,7 @@ func (b *Bot) shouldAutoReply(channelID, threadTS, rawText string) bool {
 	}
 
 	// 1. Check history exists for this thread
-	path := chathistory.HistoryFilePath(b.agentDataDir, "slack", channelID, threadTS)
+	path := chathistory.HistoryFilePath(b.agentDataDir, platformSlack, channelID, threadTS)
 	if !chathistory.HasHistory(path) {
 		return false
 	}
@@ -289,7 +296,7 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 	// to the thread history file so it appears as the first entry.
 	if threadTS == "" && replyTS != "" && b.agentDataDir != "" {
 		userMsg := chathistory.HistoryMessage{
-			Platform:  "slack",
+			Platform:  platformSlack,
 			ChannelID: channel,
 			ThreadID:  replyTS,
 			MessageID: messageTS,
@@ -299,7 +306,7 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 			Timestamp: time.Now().Format(time.RFC3339),
 			IsBot:     false,
 		}
-		path := chathistory.HistoryFilePath(b.agentDataDir, "slack", channel, replyTS)
+		path := chathistory.HistoryFilePath(b.agentDataDir, platformSlack, channel, replyTS)
 		if err := chathistory.WriteMessages(path, []chathistory.HistoryMessage{userMsg}); err != nil {
 			b.logger.Warn("failed to save initial user message to thread history", "err", err)
 		}
@@ -324,7 +331,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, mes
 	_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
 		ChannelID: channel,
 		ThreadTS:  threadTS,
-		Status:    "考え中…",
+		Status:    typingStatus,
 	})
 
 	events, err := b.mgr.ChatForSlackOneShot(ctx, b.agentID, message, "user")
@@ -426,7 +433,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, mes
 	// that the last message was from the bot on subsequent thread messages.
 	if response.Len() > 0 && threadTS != "" && b.agentDataDir != "" {
 		botMsg := chathistory.HistoryMessage{
-			Platform:  "slack",
+			Platform:  platformSlack,
 			ChannelID: channel,
 			ThreadID:  threadTS,
 			MessageID: fmt.Sprintf("%d.bot", time.Now().Unix()),
@@ -436,7 +443,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, mes
 			Timestamp: time.Now().Format(time.RFC3339),
 			IsBot:     true,
 		}
-		path := chathistory.HistoryFilePath(b.agentDataDir, "slack", channel, threadTS)
+		path := chathistory.HistoryFilePath(b.agentDataDir, platformSlack, channel, threadTS)
 		if err := chathistory.AppendMessages(path, []chathistory.HistoryMessage{botMsg}); err != nil {
 			b.logger.Warn("failed to save bot response to thread history", "err", err)
 		}

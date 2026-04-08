@@ -592,11 +592,6 @@ func (m *Manager) UpdateSlackBot(id string, cfg *SlackBotConfig) error {
 	return nil
 }
 
-// Creds returns the credential store (may be nil).
-func (m *Manager) Creds() *CredentialStore {
-	return m.creds
-}
-
 // Credentials returns the credential store. Returns nil if the store failed to initialize.
 func (m *Manager) Credentials() *CredentialStore {
 	return m.creds

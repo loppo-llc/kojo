@@ -187,7 +187,7 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 				Type:         "done",
 				Message:      msg,
 				Usage:        usage,
-				ErrorMessage: "timeout: process was terminated",
+				ErrorMessage: ErrMsgTimeout,
 			}
 			return
 		}

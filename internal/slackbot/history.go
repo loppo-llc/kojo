@@ -34,7 +34,7 @@ const (
 // (with IDs like "1234567890.bot") used by shouldAutoReply. These are
 // ignored when determining the delta cursor.
 func FetchThreadHistory(ctx context.Context, api *slack.Client, agentDataDir, channelID, threadTS string, resolve UserResolver, logger *slog.Logger) []chathistory.HistoryMessage {
-	path := chathistory.HistoryFilePath(agentDataDir, "slack", channelID, threadTS)
+	path := chathistory.HistoryFilePath(agentDataDir, platformSlack, channelID, threadTS)
 
 	// If the previous fetch was incomplete, ignore the cursor and re-fetch
 	// the entire thread to recover missing messages.
@@ -95,7 +95,7 @@ func FetchThreadHistory(ctx context.Context, api *slack.Client, agentDataDir, ch
 
 	// Prepend incomplete marker if the fetch was partial
 	if !fetchComplete {
-		newMsgs = append([]chathistory.HistoryMessage{incompleteMarker("slack", channelID, threadTS)}, newMsgs...)
+		newMsgs = append([]chathistory.HistoryMessage{incompleteMarker(platformSlack, channelID, threadTS)}, newMsgs...)
 	}
 
 	if len(newMsgs) > 0 {
@@ -137,7 +137,7 @@ func FetchChannelHistory(ctx context.Context, api *slack.Client, agentDataDir, c
 	if err != nil {
 		logger.Warn("failed to fetch channel history", "channel", channelID, "err", err)
 		// Fall back to existing file (may contain incomplete marker from prior failure)
-		history, _ := chathistory.LoadHistory(chathistory.HistoryFilePath(agentDataDir, "slack", channelID, ""))
+		history, _ := chathistory.LoadHistory(chathistory.HistoryFilePath(agentDataDir, platformSlack, channelID, ""))
 		return history
 	}
 
@@ -153,7 +153,7 @@ func FetchChannelHistory(ctx context.Context, api *slack.Client, agentDataDir, c
 
 	// Overwrite channel history file (sliding window).
 	// A successful fetch replaces any previous incomplete data.
-	path := chathistory.HistoryFilePath(agentDataDir, "slack", channelID, "")
+	path := chathistory.HistoryFilePath(agentDataDir, platformSlack, channelID, "")
 	if err := chathistory.WriteMessages(path, msgs); err != nil {
 		logger.Warn("failed to save channel history", "path", path, "err", err)
 	}
@@ -206,7 +206,7 @@ func slackMsgToHistory(sm slack.Message, channelID, threadID string, resolve Use
 	text := SlackToPlain(sm.Text, resolve)
 
 	return chathistory.HistoryMessage{
-		Platform:  "slack",
+		Platform:  platformSlack,
 		ChannelID: channelID,
 		ThreadID:  threadID,
 		MessageID: sm.Timestamp,

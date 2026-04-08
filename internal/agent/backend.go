@@ -6,6 +6,10 @@ import (
 	"strings"
 )
 
+// ErrMsgTimeout is the error message attached to a "done" event when
+// the backend process is terminated due to a context timeout.
+const ErrMsgTimeout = "timeout: process was terminated"
+
 // ChatOptions holds optional parameters for a chat invocation.
 type ChatOptions struct {
 	// OneShot skips session resumption, running a fresh ephemeral session.

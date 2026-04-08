@@ -54,7 +54,7 @@ func (s *Server) handleGetSlackBot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if tokens exist
-	creds := s.agents.Creds()
+	creds := s.agents.Credentials()
 	if creds != nil {
 		appToken, _ := creds.GetToken("slack", agentID, "", "app_token")
 		botToken, _ := creds.GetToken("slack", agentID, "", "bot_token")
@@ -95,7 +95,7 @@ func (s *Server) handleSetSlackBot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Store tokens if provided
-	creds := s.agents.Creds()
+	creds := s.agents.Credentials()
 	if creds == nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "credential store not available")
 		return
@@ -167,7 +167,7 @@ func (s *Server) handleDeleteSlackBot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Delete tokens
-	creds := s.agents.Creds()
+	creds := s.agents.Credentials()
 	if creds != nil {
 		_ = slackbot.DeleteTokens(creds, agentID)
 	}
@@ -195,7 +195,7 @@ func (s *Server) handleTestSlackBot(w http.ResponseWriter, r *http.Request) {
 
 	// Fall back to stored tokens for any that weren't provided.
 	if appToken == "" || botToken == "" {
-		creds := s.agents.Creds()
+		creds := s.agents.Credentials()
 		if creds != nil {
 			storedApp, storedBot, _ := slackbot.LoadTokens(creds, agentID)
 			if appToken == "" {
@@ -212,7 +212,7 @@ func (s *Server) handleTestSlackBot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	team, botUser, err := slackbot.TestConnection(appToken, botToken)
+	team, botUser, err := slackbot.TestConnection(r.Context(), appToken, botToken)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "connection_failed", err.Error())
 		return
