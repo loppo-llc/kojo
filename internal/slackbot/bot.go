@@ -409,15 +409,29 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, mes
 
 	// Finalize
 	if streamTS != "" {
-		// Stop stream → message becomes permanent, typing indicator disappears.
-		// Send final full text with StopStream for reliability (in case some
-		// AppendStream calls were lost due to rate limiting or transient errors).
-		stopOpts := []slack.MsgOption{}
-		if response.Len() > 0 {
-			stopOpts = append(stopOpts, slack.MsgOptionMarkdownText(PlainToSlack(response.String())))
-		}
-		if _, _, err := b.api.StopStreamContext(ctx, channel, streamTS, stopOpts...); err != nil {
+		// Stop stream (no text — just finalize the typing indicator)
+		if _, _, err := b.api.StopStreamContext(ctx, channel, streamTS); err != nil {
 			b.logger.Warn("failed to stop slack stream", "err", err)
+		}
+
+		// Replace stream content with the full response via chat.update.
+		// This ensures complete text even if AppendStream calls were lost
+		// due to rate limiting, stream timeout, or transient errors.
+		if response.Len() > 0 {
+			text := PlainToSlack(response.String())
+			chunks := SplitMessage(text, slackMaxMsgLen)
+			// First chunk: update the streaming message in-place
+			updateOpts := []slack.MsgOption{slack.MsgOptionText(chunks[0], false)}
+			if threadTS != "" {
+				updateOpts = append(updateOpts, slack.MsgOptionTS(threadTS))
+			}
+			if _, _, _, err := b.api.UpdateMessageContext(ctx, channel, streamTS, updateOpts...); err != nil {
+				b.logger.Warn("failed to update stream message with final text", "err", err)
+			}
+			// Remaining chunks: post as follow-up messages
+			for _, chunk := range chunks[1:] {
+				b.postMessage(ctx, channel, threadTS, chunk)
+			}
 		}
 	} else if response.Len() > 0 {
 		// Fallback: traditional batch post (StartStream failed or no streaming support)
