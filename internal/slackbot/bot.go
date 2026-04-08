@@ -345,8 +345,16 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 const streamAppendInterval = 1 * time.Second
 
 func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, message string) {
+	// Show typing indicator (best-effort; requires Agents & Assistants + assistant:write scope)
+	_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
+		ChannelID: channel,
+		ThreadTS:  threadTS,
+		Status:    "考え中…",
+	})
+
 	events, err := b.mgr.ChatForSlackOneShot(ctx, b.agentID, message, "user")
 	if err != nil {
+		b.clearAssistantStatus(ctx, channel, threadTS)
 		b.logger.Warn("failed to start agent chat from slack", "err", err)
 		b.postMessage(ctx, channel, threadTS, "Sorry, I couldn't process your message right now. Please try again later.")
 		return
@@ -422,6 +430,9 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, mes
 		b.postMessage(ctx, channel, threadTS, "Sorry, something went wrong while processing your request.")
 	}
 
+	// Clear typing indicator (auto-clears on message post, but explicit clear as safety net)
+	b.clearAssistantStatus(ctx, channel, threadTS)
+
 	// Save bot response to thread history so shouldAutoReply can detect
 	// that the last message was from the bot on subsequent thread messages.
 	if response.Len() > 0 && threadTS != "" && b.agentDataDir != "" {
@@ -477,6 +488,15 @@ func (b *Bot) appendStream(ctx context.Context, channel, streamTS, text string) 
 		b.logger.Debug("append stream failed", "err", err)
 		return
 	}
+}
+
+// clearAssistantStatus clears the assistant typing indicator (best-effort).
+func (b *Bot) clearAssistantStatus(ctx context.Context, channel, threadTS string) {
+	_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
+		ChannelID: channel,
+		ThreadTS:  threadTS,
+		Status:    "", // empty = clear
+	})
 }
 
 func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) {
