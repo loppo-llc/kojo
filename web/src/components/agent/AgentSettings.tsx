@@ -21,6 +21,7 @@ export function AgentSettings() {
   const [tool, setTool] = useState("");
   const [workDir, setWorkDir] = useState("");
   const [intervalMinutes, setIntervalMinutes] = useState(30);
+  const [timeoutMinutes, setTimeoutMinutes] = useState(10);
   const [activeStart, setActiveStart] = useState("");
   const [activeEnd, setActiveEnd] = useState("");
   const [saving, setSaving] = useState(false);
@@ -56,6 +57,7 @@ export function AgentSettings() {
       setTool(a.tool);
       setWorkDir(a.workDir ?? "");
       setIntervalMinutes(a.intervalMinutes);
+      setTimeoutMinutes(a.timeoutMinutes || 10);
       setActiveStart(a.activeStart ?? "");
       setActiveEnd(a.activeEnd ?? "");
       setAllowedTools(a.allowedTools ?? []);
@@ -77,6 +79,7 @@ export function AgentSettings() {
         tool: tool.trim(),
         workDir: workDir.trim(),
         intervalMinutes,
+        timeoutMinutes,
         activeStart,
         activeEnd,
         allowedTools: tool === "lm-studio" ? allowedTools : undefined,
@@ -440,6 +443,8 @@ export function AgentSettings() {
         <ScheduleEditor
           intervalMinutes={intervalMinutes}
           onIntervalChange={setIntervalMinutes}
+          timeoutMinutes={timeoutMinutes}
+          onTimeoutChange={setTimeoutMinutes}
           activeStart={activeStart}
           activeEnd={activeEnd}
           onActiveStartChange={setActiveStart}

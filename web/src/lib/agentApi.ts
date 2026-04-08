@@ -11,6 +11,16 @@ export const INTERVAL_PRESETS = [
   { label: "24h", value: 1440 },
 ] as const;
 
+export const TIMEOUT_PRESETS = [
+  { label: "5m", value: 5 },
+  { label: "10m", value: 10 },
+  { label: "15m", value: 15 },
+  { label: "20m", value: 20 },
+  { label: "30m", value: 30 },
+  { label: "45m", value: 45 },
+  { label: "1h", value: 60 },
+] as const;
+
 export interface AgentInfo {
   id: string;
   name: string;
@@ -20,6 +30,7 @@ export interface AgentInfo {
   tool: string;
   workDir: string;
   intervalMinutes: number;
+  timeoutMinutes: number;
   activeStart?: string;
   activeEnd?: string;
   createdAt: string;
@@ -45,6 +56,7 @@ export interface AgentConfig {
   tool?: string;
   workDir?: string;
   intervalMinutes?: number;
+  timeoutMinutes?: number;
   activeStart?: string;
   activeEnd?: string;
 }

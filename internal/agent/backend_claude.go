@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -57,6 +58,11 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		cmd.Env = append(cmd.Env, "ANTHROPIC_BASE_URL="+b.proxyURL)
 	}
 	cmd.Dir = dir
+	// Send SIGTERM on context cancellation, then SIGKILL after 10s grace period.
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
+	cmd.WaitDelay = 10 * time.Second
 
 	// Pass user message via stdin to avoid option injection when the message
 	// starts with "-" (which would be misinterpreted as a CLI flag).
@@ -92,9 +98,26 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 		result := parseClaudeStream(stdout, b.logger, send)
 
-		// If stream was cancelled (send returned false), clean up process.
+		// If stream was cancelled (send returned false), clean up process
+		// and emit a partial done event so the transcript is persisted.
 		if result.cancelled {
 			cmd.Wait()
+			msg := newAssistantMessage()
+			msg.Content = result.fullText
+			if msg.Content == "" {
+				msg.Content = result.lastAssistantText
+			}
+			msg.Thinking = result.thinking
+			msg.ToolUses = result.toolUses
+			msg.Usage = result.usage
+			// Direct channel write (not send helper) since ctx is already cancelled.
+			// Channel buffer (64) guarantees this won't block.
+			ch <- ChatEvent{
+				Type:         "done",
+				Message:      msg,
+				Usage:        result.usage,
+				ErrorMessage: "timeout: process was terminated",
+			}
 			return
 		}
 

@@ -19,4 +19,5 @@ var (
 
 	ErrUnsupportedTool     = errors.New("unsupported tool")
 	ErrUnsupportedInterval = errors.New("unsupported interval")
+	ErrUnsupportedTimeout  = errors.New("unsupported timeout")
 )

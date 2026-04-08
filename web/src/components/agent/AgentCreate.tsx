@@ -17,6 +17,7 @@ export function AgentCreate() {
   const [tool, setTool] = useState("claude");
   const [workDir, setWorkDir] = useState("");
   const [intervalMinutes, setIntervalMinutes] = useState(30);
+  const [timeoutMinutes, setTimeoutMinutes] = useState(10);
   const [activeStart, setActiveStart] = useState("");
   const [activeEnd, setActiveEnd] = useState("");
   const [genPrompt, setGenPrompt] = useState("");
@@ -213,6 +214,7 @@ export function AgentCreate() {
         tool,
         workDir: workDir.trim() || undefined,
         intervalMinutes,
+        timeoutMinutes,
         activeStart: activeStart || undefined,
         activeEnd: activeEnd || undefined,
       });
@@ -502,6 +504,8 @@ export function AgentCreate() {
         <ScheduleEditor
           intervalMinutes={intervalMinutes}
           onIntervalChange={setIntervalMinutes}
+          timeoutMinutes={timeoutMinutes}
+          onTimeoutChange={setTimeoutMinutes}
           activeStart={activeStart}
           activeEnd={activeEnd}
           onActiveStartChange={setActiveStart}

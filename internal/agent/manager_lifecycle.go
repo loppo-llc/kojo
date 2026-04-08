@@ -65,9 +65,12 @@ func (m *Manager) ResetData(id string) error {
 		m.logger.Warn("reset: failed to remove autosummary marker", "agent", id, "err", err)
 	}
 
-	// Remove cron lock file
+	// Remove cron lock file and timeout marker
 	if err := os.Remove(filepath.Join(dir, cronLockFile)); err != nil && !os.IsNotExist(err) {
 		m.logger.Warn("reset: failed to remove cron lock", "agent", id, "err", err)
+	}
+	if err := os.Remove(filepath.Join(dir, cronTimeoutMarker)); err != nil && !os.IsNotExist(err) {
+		m.logger.Warn("reset: failed to remove cron timeout marker", "agent", id, "err", err)
 	}
 
 	// Remove CLI local state so next chat starts fresh

@@ -11,6 +11,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 )
 
 // GeminiBackend implements ChatBackend for the Gemini CLI.
@@ -64,6 +66,10 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 	cmd := exec.CommandContext(ctx, geminiPath, args...)
 	cmd.Dir = dir
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
+	cmd.WaitDelay = 10 * time.Second
 	// Pass system prompt via stdin to avoid Gemini CLI's @import parsing
 	// that would occur if embedded in GEMINI.md.
 	if systemPrompt != "" {
@@ -90,11 +96,14 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	go func() {
 		defer close(ch)
 
+		cancelled := false
+
 		send := func(e ChatEvent) bool {
 			select {
 			case ch <- e:
 				return true
 			case <-ctx.Done():
+				cancelled = true
 				return false
 			}
 		}
@@ -121,16 +130,14 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 			switch event.Type {
 			case "init":
 				if !send(ChatEvent{Type: "status", Status: "thinking"}) {
-					cmd.Wait()
-					return
+					break
 				}
 
 			case "message":
 				if event.Role == "assistant" && event.Content != "" {
 					fullText.WriteString(event.Content)
 					if !send(ChatEvent{Type: "text", Delta: event.Content}) {
-						cmd.Wait()
-						return
+						break
 					}
 				}
 
@@ -143,8 +150,7 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 				}
 				toolUses = append(toolUses, tu)
 				if !send(ChatEvent{Type: "tool_use", ToolUseID: event.ToolID, ToolName: event.ToolName, ToolInput: string(paramsJSON)}) {
-					cmd.Wait()
-					return
+					break
 				}
 
 			case "tool_result":
@@ -153,8 +159,7 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 					output = "Error: " + event.Error.Message
 				}
 				if !send(ChatEvent{Type: "tool_result", ToolUseID: event.ToolID, ToolName: event.ToolName, ToolOutput: output}) {
-					cmd.Wait()
-					return
+					break
 				}
 				matchToolOutput(toolUses, event.ToolID, "", output)
 
@@ -166,6 +171,25 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 					}
 				}
 			}
+
+			if cancelled {
+				break
+			}
+		}
+
+		if cancelled {
+			cmd.Wait()
+			msg := newAssistantMessage()
+			msg.Content = fullText.String()
+			msg.ToolUses = toolUses
+			msg.Usage = usage
+			ch <- ChatEvent{
+				Type:         "done",
+				Message:      msg,
+				Usage:        usage,
+				ErrorMessage: "timeout: process was terminated",
+			}
+			return
 		}
 
 		if err := scanner.Err(); err != nil {

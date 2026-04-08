@@ -292,6 +292,26 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 		replyTS = messageTS // reply in a thread starting from this message
 	}
 
+	// When creating a new thread (threadTS was empty), save the user's message
+	// to the thread history file so it appears as the first entry.
+	if threadTS == "" && replyTS != "" && b.agentDataDir != "" {
+		userMsg := chathistory.HistoryMessage{
+			Platform:  "slack",
+			ChannelID: channel,
+			ThreadID:  replyTS,
+			MessageID: messageTS,
+			UserID:    userID,
+			UserName:  displayName,
+			Text:      text,
+			Timestamp: time.Now().Format(time.RFC3339),
+			IsBot:     false,
+		}
+		path := chathistory.HistoryFilePath(b.agentDataDir, "slack", channel, replyTS)
+		if err := chathistory.WriteMessages(path, []chathistory.HistoryMessage{userMsg}); err != nil {
+			b.logger.Warn("failed to save initial user message to thread history", "err", err)
+		}
+	}
+
 	if b.mgr.IsBusy(b.agentID) {
 		// Check queue limit
 		b.pendingMu.Lock()
@@ -321,6 +341,9 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 	go b.sendToAgent(ctx, channel, replyTS, messageTS, formattedMsg)
 }
 
+// streamAppendInterval is the minimum interval between AppendStream calls.
+const streamAppendInterval = 1 * time.Second
+
 func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, message string) {
 	events, err := b.mgr.ChatForSlackOneShot(ctx, b.agentID, message, "user")
 	if err != nil {
@@ -329,36 +352,79 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, mes
 		return
 	}
 
-	// Accumulate response
-	var response strings.Builder
+	var response strings.Builder    // full response text
+	var pendingDelta strings.Builder // text not yet sent via AppendStream
+	var streamTS string              // ts of the streaming message (empty = not started or fallback)
+	var lastAppend time.Time
 	hasError := false
+	streamFailed := false // true if StartStream failed, use fallback
+
 	for evt := range events {
 		switch evt.Type {
 		case "text":
 			response.WriteString(evt.Delta)
+			pendingDelta.WriteString(evt.Delta)
+
+			// Start stream on first text event
+			if streamTS == "" && !streamFailed {
+				opts := []slack.MsgOption{}
+				if threadTS != "" {
+					opts = append(opts, slack.MsgOptionTS(threadTS))
+				}
+				_, ts, err := b.api.StartStreamContext(ctx, channel, opts...)
+				if err != nil {
+					b.logger.Warn("failed to start slack stream, falling back to batch post", "err", err)
+					streamFailed = true
+					continue
+				}
+				streamTS = ts
+				lastAppend = time.Now()
+			}
+
+			// Throttled append
+			if streamTS != "" && pendingDelta.Len() > 0 && time.Since(lastAppend) >= streamAppendInterval {
+				b.appendStream(ctx, channel, streamTS, pendingDelta.String())
+				pendingDelta.Reset()
+				lastAppend = time.Now()
+			}
+
 		case "error":
 			hasError = true
 			b.logger.Warn("agent returned error during slack chat", "err", evt.ErrorMessage)
 		}
 	}
 
-	if response.Len() == 0 {
-		if hasError {
-			b.postMessage(ctx, channel, threadTS, "Sorry, something went wrong while processing your request.")
-		}
-		return
+	// Flush remaining delta
+	if streamTS != "" && pendingDelta.Len() > 0 {
+		b.appendStream(ctx, channel, streamTS, pendingDelta.String())
 	}
 
-	// Convert markdown to Slack mrkdwn and post
-	text := PlainToSlack(response.String())
-	chunks := SplitMessage(text, slackMaxMsgLen)
-	for _, chunk := range chunks {
-		b.postMessage(ctx, channel, threadTS, chunk)
+	// Finalize
+	if streamTS != "" {
+		// Stop stream → message becomes permanent, typing indicator disappears.
+		// Send final full text with StopStream for reliability (in case some
+		// AppendStream calls were lost due to rate limiting or transient errors).
+		stopOpts := []slack.MsgOption{}
+		if response.Len() > 0 {
+			stopOpts = append(stopOpts, slack.MsgOptionMarkdownText(PlainToSlack(response.String())))
+		}
+		if _, _, err := b.api.StopStreamContext(ctx, channel, streamTS, stopOpts...); err != nil {
+			b.logger.Warn("failed to stop slack stream", "err", err)
+		}
+	} else if response.Len() > 0 {
+		// Fallback: traditional batch post (StartStream failed or no streaming support)
+		text := PlainToSlack(response.String())
+		chunks := SplitMessage(text, slackMaxMsgLen)
+		for _, chunk := range chunks {
+			b.postMessage(ctx, channel, threadTS, chunk)
+		}
+	} else if hasError {
+		b.postMessage(ctx, channel, threadTS, "Sorry, something went wrong while processing your request.")
 	}
 
 	// Save bot response to thread history so shouldAutoReply can detect
 	// that the last message was from the bot on subsequent thread messages.
-	if threadTS != "" && b.agentDataDir != "" {
+	if response.Len() > 0 && threadTS != "" && b.agentDataDir != "" {
 		botMsg := chathistory.HistoryMessage{
 			Platform:  "slack",
 			ChannelID: channel,
@@ -386,6 +452,31 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, mes
 
 	// Process any pending messages
 	b.processPending(ctx)
+}
+
+// appendStream appends text to a streaming Slack message with rate limit retry.
+func (b *Bot) appendStream(ctx context.Context, channel, streamTS, text string) {
+	for attempt := 0; attempt <= maxRateLimitRetry; attempt++ {
+		_, _, err := b.api.AppendStreamContext(ctx, channel, streamTS, slack.MsgOptionMarkdownText(text))
+		if err == nil {
+			return
+		}
+		var rlErr *slack.RateLimitedError
+		if errors.As(err, &rlErr) {
+			delay := rlErr.RetryAfter
+			if delay == 0 {
+				delay = time.Duration(attempt+1) * time.Second
+			}
+			select {
+			case <-time.After(delay):
+				continue
+			case <-ctx.Done():
+				return
+			}
+		}
+		b.logger.Debug("append stream failed", "err", err)
+		return
+	}
 }
 
 func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) {

@@ -473,6 +473,10 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %d minutes", ErrUnsupportedInterval, *cfg.IntervalMinutes)
 	}
+	if cfg.TimeoutMinutes != nil && !ValidTimeout(*cfg.TimeoutMinutes) {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %d minutes", ErrUnsupportedTimeout, *cfg.TimeoutMinutes)
+	}
 	{
 		s, e := a.ActiveStart, a.ActiveEnd
 		if cfg.ActiveStart != nil {
@@ -490,6 +494,9 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	oldInterval := a.IntervalMinutes
 	if cfg.IntervalMinutes != nil {
 		a.IntervalMinutes = *cfg.IntervalMinutes
+	}
+	if cfg.TimeoutMinutes != nil {
+		a.TimeoutMinutes = *cfg.TimeoutMinutes
 	}
 	if cfg.ActiveStart != nil {
 		a.ActiveStart = *cfg.ActiveStart
@@ -824,16 +831,27 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 
 	defer func() {
 		if receivedDone {
+			if ctx.Err() == context.DeadlineExceeded {
+				errMsg := newSystemMessage("⚠️ この定期チェックインは制限時間超過により中断されました。")
+				if err := appendMessage(agentID, errMsg); err != nil {
+					m.logger.Warn("failed to save timeout message", "err", err)
+				}
+			}
 			return
 		}
-		if accText.Len() == 0 && accThinking.Len() == 0 && len(accToolUses) == 0 {
-			return
+		if accText.Len() > 0 || accThinking.Len() > 0 || len(accToolUses) > 0 {
+			msg := newAssistantMessage()
+			msg.Content = accText.String()
+			msg.Thinking = accThinking.String()
+			msg.ToolUses = accToolUses
+			m.persistDoneEvent(agentID, msg)
 		}
-		msg := newAssistantMessage()
-		msg.Content = accText.String()
-		msg.Thinking = accThinking.String()
-		msg.ToolUses = accToolUses
-		m.persistDoneEvent(agentID, msg)
+		if ctx.Err() == context.DeadlineExceeded {
+			errMsg := newSystemMessage("⚠️ この定期チェックインは制限時間超過により中断されました。")
+			if err := appendMessage(agentID, errMsg); err != nil {
+				m.logger.Warn("failed to save timeout message", "err", err)
+			}
+		}
 	}()
 
 	// accumulate records streaming data for abort recovery.

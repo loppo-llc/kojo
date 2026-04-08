@@ -81,6 +81,17 @@ func ValidEffort(effort string) bool {
 	return allowedEfforts[effort]
 }
 
+// allowedTimeouts defines the valid timeoutMinutes values.
+// 0 means "use default" (10 minutes at runtime) for backward compatibility.
+var allowedTimeouts = map[int]bool{
+	0: true, 5: true, 10: true, 15: true, 20: true, 30: true, 45: true, 60: true,
+}
+
+// ValidTimeout returns true if the given timeout is in the allowed set.
+func ValidTimeout(minutes int) bool {
+	return allowedTimeouts[minutes]
+}
+
 // Agent represents a persistent AI persona (friend).
 type Agent struct {
 	ID              string `json:"id"`
@@ -91,6 +102,7 @@ type Agent struct {
 	Tool            string `json:"tool"`            // CLI tool: "claude", "codex", "gemini"
 	WorkDir         string `json:"workDir,omitempty"` // file storage directory (empty = agentDir)
 	IntervalMinutes int    `json:"intervalMinutes"` // periodic execution interval in minutes (0 = disabled)
+	TimeoutMinutes  int    `json:"timeoutMinutes"`  // max duration per cron run in minutes (0 = default 10)
 	ActiveStart     string `json:"activeStart,omitempty"` // HH:MM — start of active window (empty = no restriction)
 	ActiveEnd       string `json:"activeEnd,omitempty"`   // HH:MM — end of active window (empty = no restriction)
 	CreatedAt       string `json:"createdAt"`       // RFC3339
@@ -148,6 +160,7 @@ type AgentConfig struct {
 	Tool            string  `json:"tool"`
 	WorkDir         string  `json:"workDir"`
 	IntervalMinutes *int    `json:"intervalMinutes"` // nil = use default (30)
+	TimeoutMinutes  *int    `json:"timeoutMinutes"`  // nil = use default (0 = 10 min)
 	ActiveStart     *string `json:"activeStart"`     // HH:MM or empty
 	ActiveEnd       *string `json:"activeEnd"`       // HH:MM or empty
 }
@@ -164,6 +177,7 @@ type AgentUpdateConfig struct {
 	Tool                  *string `json:"tool"`
 	WorkDir               *string `json:"workDir"`
 	IntervalMinutes       *int    `json:"intervalMinutes"`
+	TimeoutMinutes        *int      `json:"timeoutMinutes"`
 	ActiveStart           *string   `json:"activeStart"`
 	ActiveEnd             *string   `json:"activeEnd"`
 	AllowedTools          []string  `json:"allowedTools"`
@@ -181,6 +195,13 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	}
 	if !ValidInterval(interval) {
 		return nil, fmt.Errorf("unsupported interval: %d minutes", interval)
+	}
+	timeoutMin := 0 // default (= 10 min at runtime)
+	if cfg.TimeoutMinutes != nil {
+		timeoutMin = *cfg.TimeoutMinutes
+	}
+	if !ValidTimeout(timeoutMin) {
+		return nil, fmt.Errorf("unsupported timeout: %d minutes", timeoutMin)
 	}
 	var activeStart, activeEnd string
 	if cfg.ActiveStart != nil {
@@ -212,6 +233,7 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		Tool:            cfg.Tool,
 		WorkDir:         cfg.WorkDir,
 		IntervalMinutes: interval,
+		TimeoutMinutes:  timeoutMin,
 		ActiveStart:     activeStart,
 		ActiveEnd:       activeEnd,
 		CreatedAt:       now,

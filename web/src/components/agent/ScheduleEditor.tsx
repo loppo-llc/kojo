@@ -1,9 +1,11 @@
 import { useState, useEffect } from "react";
-import { INTERVAL_PRESETS } from "../../lib/agentApi";
+import { INTERVAL_PRESETS, TIMEOUT_PRESETS } from "../../lib/agentApi";
 
 interface Props {
   intervalMinutes: number;
   onIntervalChange: (v: number) => void;
+  timeoutMinutes: number;
+  onTimeoutChange: (v: number) => void;
   activeStart: string;
   activeEnd: string;
   onActiveStartChange: (v: string) => void;
@@ -41,6 +43,8 @@ const HOUR_MARKS = [0, 3, 6, 9, 12, 15, 18, 21];
 export function ScheduleEditor({
   intervalMinutes,
   onIntervalChange,
+  timeoutMinutes,
+  onTimeoutChange,
   activeStart,
   activeEnd,
   onActiveStartChange,
@@ -94,6 +98,32 @@ export function ScheduleEditor({
           Timing is automatically staggered per agent.
         </p>
       </div>
+
+      {/* Timeout */}
+      {intervalMinutes > 0 && (
+        <div>
+          <label className="block text-sm text-neutral-400 mb-2">Timeout</label>
+          <div className="flex gap-1.5 flex-wrap">
+            {TIMEOUT_PRESETS.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => onTimeoutChange(opt.value)}
+                className={`px-3 py-1.5 rounded text-sm transition-colors ${
+                  timeoutMinutes === opt.value
+                    ? "bg-amber-900/60 border border-amber-700/80 text-amber-200"
+                    : "bg-neutral-900 border border-neutral-800 text-neutral-400 hover:border-neutral-600"
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-1.5 text-[11px] text-neutral-600">
+            Max duration for each scheduled run.
+          </p>
+        </div>
+      )}
 
       {/* Active Hours */}
       {intervalMinutes > 0 && (
