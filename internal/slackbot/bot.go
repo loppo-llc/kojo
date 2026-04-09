@@ -74,7 +74,7 @@ const (
 	platformSlack = "slack"
 
 	// typingStatus is the assistant status text shown while processing a message.
-	typingStatus = "考え中…"
+	typingStatus = "Thinking…"
 )
 
 // NewBot creates a new Bot instance. Call Run() to start it.
