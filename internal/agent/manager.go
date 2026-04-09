@@ -740,6 +740,16 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	osID := m.trackOneShot(agentID, cancel)
 	outCh := make(chan ChatEvent, 64)
 
+	// Slack messages: instruct the agent to separate thinking from reply.
+	if strings.Contains(userMessage, "[Slack @") {
+		prep.sysPrompt += "\n\n## Slack Response Format\n\n" +
+			"This message is from Slack. Your text output will be posted to Slack.\n" +
+			"Wrap ONLY your final reply in <reply>...</reply> tags.\n" +
+			"Text outside these tags is your internal workspace — use it freely to think, reason, plan, and execute tools.\n" +
+			"Only the content inside <reply> will be shown to the Slack user.\n" +
+			"Always include exactly one <reply> block at the end of your response.\n"
+	}
+
 	// NOTE: No appendMessage — one-shot chats are not saved to transcript.
 
 	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, userMessage, prep.sysPrompt, ChatOptions{OneShot: true})
