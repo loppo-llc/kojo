@@ -88,6 +88,12 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+
+	// Stop Slack bot before resetting to avoid stale file references.
+	if s.slackHub != nil {
+		s.slackHub.StopBot(id)
+	}
+
 	if err := s.agents.ResetData(id); err != nil {
 		if errors.Is(err, agent.ErrAgentNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
@@ -98,6 +104,14 @@ func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+
+	// Restart Slack bot if it was enabled.
+	if s.slackHub != nil {
+		if a, ok := s.agents.Get(id); ok && a.SlackBot != nil && a.SlackBot.Enabled {
+			s.slackHub.StartBot(id, *a.SlackBot)
+		}
+	}
+
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

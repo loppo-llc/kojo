@@ -70,6 +70,11 @@ func (m *Manager) ResetData(id string) error {
 		m.logger.Warn("reset: failed to remove cron lock", "agent", id, "err", err)
 	}
 
+	// Remove external platform chat history (Slack, etc.)
+	if err := os.RemoveAll(filepath.Join(dir, "chat_history")); err != nil {
+		m.logger.Warn("reset: failed to remove chat_history dir", "agent", id, "err", err)
+	}
+
 	// Remove CLI local state so next chat starts fresh
 	if err := os.RemoveAll(filepath.Join(dir, ".claude")); err != nil {
 		m.logger.Warn("reset: failed to remove .claude dir", "agent", id, "err", err)

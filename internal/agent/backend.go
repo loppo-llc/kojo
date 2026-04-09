@@ -57,6 +57,23 @@ func filterEnv(removePrefixes []string, agentID, dataDir string) []string {
 	return filtered
 }
 
+// emitTimeoutDone sends a partial "done" event with ErrMsgTimeout when the
+// backend process is terminated due to context cancellation. Used by all
+// backends to avoid duplicating the same timeout-done construction logic.
+func emitTimeoutDone(ch chan<- ChatEvent, content, thinking string, toolUses []ToolUse, usage *Usage) {
+	msg := newAssistantMessage()
+	msg.Content = content
+	msg.Thinking = thinking
+	msg.ToolUses = toolUses
+	msg.Usage = usage
+	ch <- ChatEvent{
+		Type:         "done",
+		Message:      msg,
+		Usage:        usage,
+		ErrorMessage: ErrMsgTimeout,
+	}
+}
+
 // matchToolOutput pairs a tool result with the most recent matching ToolUse
 // that has no output yet. When a tool use ID is provided, only ID-based
 // matching is used to avoid mispairing parallel calls with the same name.

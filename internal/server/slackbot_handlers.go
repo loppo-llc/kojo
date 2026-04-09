@@ -40,18 +40,16 @@ func (s *Server) handleGetSlackBot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := slackBotResponse{
-		// Defaults for when SlackBot is nil
-		RespondDM:      true,
-		RespondMention: true,
-		RespondThread:  true,
+	cfg := a.SlackBot
+	if cfg == nil {
+		cfg = &agent.SlackBotConfig{ThreadReplies: true}
 	}
-	if a.SlackBot != nil {
-		resp.Enabled = a.SlackBot.Enabled
-		resp.ThreadReplies = a.SlackBot.ThreadReplies
-		resp.RespondDM = a.SlackBot.ReactDM()
-		resp.RespondMention = a.SlackBot.ReactMention()
-		resp.RespondThread = a.SlackBot.ReactThread()
+	resp := slackBotResponse{
+		Enabled:        cfg.Enabled,
+		ThreadReplies:  cfg.ThreadReplies,
+		RespondDM:      cfg.ReactDM(),
+		RespondMention: cfg.ReactMention(),
+		RespondThread:  cfg.ReactThread(),
 	}
 
 	// Check if tokens exist

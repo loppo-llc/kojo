@@ -102,22 +102,11 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		// and emit a partial done event so the transcript is persisted.
 		if result.cancelled {
 			cmd.Wait()
-			msg := newAssistantMessage()
-			msg.Content = result.fullText
-			if msg.Content == "" {
-				msg.Content = result.lastAssistantText
+			content := result.fullText
+			if content == "" {
+				content = result.lastAssistantText
 			}
-			msg.Thinking = result.thinking
-			msg.ToolUses = result.toolUses
-			msg.Usage = result.usage
-			// Direct channel write (not send helper) since ctx is already cancelled.
-			// Channel buffer (64) guarantees this won't block.
-			ch <- ChatEvent{
-				Type:         "done",
-				Message:      msg,
-				Usage:        result.usage,
-				ErrorMessage: ErrMsgTimeout,
-			}
+			emitTimeoutDone(ch, content, result.thinking, result.toolUses, result.usage)
 			return
 		}
 

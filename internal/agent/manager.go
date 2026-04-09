@@ -581,11 +581,18 @@ func (m *Manager) HasCredentials() bool {
 	return m.creds != nil
 }
 
-// Chat sends a message to an agent and returns a channel of streaming events.
-// The role parameter controls how the input message is stored in the transcript
-// ("user" for interactive chat, "system" for cron-triggered messages).
-func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, role string, attachments []MessageAttachment) (<-chan ChatEvent, error) {
-	// Sync persona.md → Agent.Persona before chat
+// chatPrep holds the common setup result shared by Chat and ChatOneShot.
+type chatPrep struct {
+	agentCopy   Agent
+	backend     ChatBackend
+	useLMSProxy bool
+	sysPrompt   string
+}
+
+// prepareChat performs the common setup for Chat and ChatOneShot:
+// persona sync, agent snapshot, backend resolution, system prompt construction,
+// and memory context injection.
+func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool) (*chatPrep, error) {
 	m.syncPersona(agentID)
 
 	m.mu.Lock()
@@ -594,9 +601,50 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
 	}
-	// Copy agent data under lock
 	agentCopy := *a
 	m.mu.Unlock()
+
+	backend, useLMSProxy, err := m.resolveBackend(agentID, &agentCopy)
+	if err != nil {
+		return nil, err
+	}
+
+	var apiBase string
+	var groups []*GroupDM
+	if m.groupdms != nil {
+		apiBase = m.groupdms.APIBase()
+		groups = m.groupdms.GroupsForAgent(agentID)
+	}
+	if agentCopy.Tool == "claude" || useLMSProxy {
+		PrepareClaudeSettings(agentID, apiBase, m.logger)
+	}
+
+	sysPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
+
+	// Inject relevant memory context. IndexNewMessages is called for
+	// interactive chat (so the index is current) but skipped for one-shot
+	// chats which don't persist to the main transcript.
+	if idx := m.getOrOpenIndex(agentID); idx != nil {
+		idx.IndexFilesIfStale(agentID)
+		if indexNewMessages {
+			idx.IndexNewMessages(agentID)
+		}
+		if memCtx := idx.BuildContextFromQuery(query); memCtx != "" {
+			sysPrompt += "\n\n" + memCtx
+		}
+	}
+
+	return &chatPrep{agentCopy: agentCopy, backend: backend, useLMSProxy: useLMSProxy, sysPrompt: sysPrompt}, nil
+}
+
+// Chat sends a message to an agent and returns a channel of streaming events.
+// The role parameter controls how the input message is stored in the transcript
+// ("user" for interactive chat, "system" for cron-triggered messages).
+func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, role string, attachments []MessageAttachment) (<-chan ChatEvent, error) {
+	prep, err := m.prepareChat(agentID, userMessage, true)
+	if err != nil {
+		return nil, err
+	}
 
 	// Check if agent is busy or being reset
 	m.busyMu.Lock()
@@ -620,48 +668,12 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	// Notify any WebSocket clients watching this agent.
 	m.notifyChatStart(agentID)
 
-	// Resolve backend (may configure LMS proxy and clear agentCopy.Model)
-	backend, useLMSProxy, err := m.resolveBackend(agentID, &agentCopy)
-	if err != nil {
-		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
-		close(outCh)
-		m.clearBusy(agentID)
-		cancel()
-		return nil, err
-	}
-
-	atts := attachments
-
-	// Build system prompt with group DM context
-	var apiBase string
-	var groups []*GroupDM
-	if m.groupdms != nil {
-		apiBase = m.groupdms.APIBase()
-		groups = m.groupdms.GroupsForAgent(agentID)
-	}
-	// Prepare Claude settings (persona override + PreCompact hook) before backend starts
-	if agentCopy.Tool == "claude" || useLMSProxy {
-		PrepareClaudeSettings(agentID, apiBase, m.logger)
-	}
-
-	systemPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
-
-	// Update memory index and inject relevant context BEFORE saving input
-	// to avoid the current message appearing in search results (prompt injection).
-	if idx := m.getOrOpenIndex(agentID); idx != nil {
-		idx.IndexFilesIfStale(agentID)
-		idx.IndexNewMessages(agentID)
-		if memCtx := idx.BuildContextFromQuery(userMessage); memCtx != "" {
-			systemPrompt += "\n\n" + memCtx
-		}
-	}
-
 	// Save input message to transcript (after memory search to avoid self-injection)
 	var inputMsg *Message
 	if role == "system" {
 		inputMsg = newSystemMessage(userMessage)
 	} else {
-		inputMsg = newUserMessage(userMessage, atts)
+		inputMsg = newUserMessage(userMessage, attachments)
 	}
 	if err := appendMessage(agentID, inputMsg); err != nil {
 		m.logger.Warn("failed to save input message", "err", err)
@@ -677,12 +689,12 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	// When attachments are present, prepend file references so the CLI
 	// can access them (e.g. via Read tool for images/text).
 	effectiveMessage := userMessage
-	if len(atts) > 0 {
-		effectiveMessage = formatMessageWithAttachments(userMessage, atts)
+	if len(attachments) > 0 {
+		effectiveMessage = formatMessageWithAttachments(userMessage, attachments)
 	}
 
 	// Start chat
-	backendCh, err := backend.Chat(chatCtx, &agentCopy, effectiveMessage, systemPrompt, ChatOptions{})
+	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{})
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
@@ -712,16 +724,10 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 // platform conversations (Slack, Discord) that carry their own context.
 // Memory (MEMORY.md, diary) access is still available via system prompt.
 func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string) (<-chan ChatEvent, error) {
-	m.syncPersona(agentID)
-
-	m.mu.Lock()
-	a, ok := m.agents[agentID]
-	if !ok {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
+	prep, err := m.prepareChat(agentID, userMessage, false)
+	if err != nil {
+		return nil, err
 	}
-	agentCopy := *a
-	m.mu.Unlock()
 
 	m.busyMu.Lock()
 	if m.resetting[agentID] {
@@ -734,40 +740,9 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	osID := m.trackOneShot(agentID, cancel)
 	outCh := make(chan ChatEvent, 64)
 
-	backend, ok := m.backends[agentCopy.Tool]
-	if !ok {
-		err := fmt.Errorf("%w: %s", ErrUnsupportedTool, agentCopy.Tool)
-		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
-		close(outCh)
-		cancel()
-		m.untrackOneShot(agentID, osID)
-		return nil, err
-	}
-
-	// Build system prompt (same as Chat — includes memory, credentials, etc.)
-	var apiBase string
-	var groups []*GroupDM
-	if m.groupdms != nil {
-		apiBase = m.groupdms.APIBase()
-		groups = m.groupdms.GroupsForAgent(agentID)
-	}
-	if agentCopy.Tool == "claude" {
-		PrepareClaudeSettings(agentID, apiBase, m.logger)
-	}
-
-	systemPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
-
-	// Memory context injection (read-only query, no indexing of this message)
-	if idx := m.getOrOpenIndex(agentID); idx != nil {
-		idx.IndexFilesIfStale(agentID)
-		if memCtx := idx.BuildContextFromQuery(userMessage); memCtx != "" {
-			systemPrompt += "\n\n" + memCtx
-		}
-	}
-
 	// NOTE: No appendMessage — one-shot chats are not saved to transcript.
 
-	backendCh, err := backend.Chat(chatCtx, &agentCopy, userMessage, systemPrompt, ChatOptions{OneShot: true})
+	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, userMessage, prep.sysPrompt, ChatOptions{OneShot: true})
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
