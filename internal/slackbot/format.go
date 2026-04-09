@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // Slack mrkdwn uses different formatting from standard Markdown.
@@ -132,6 +133,11 @@ func SplitMessage(text string, maxLen int) []string {
 			cut = idx + 2
 		} else if idx := strings.LastIndex(text[:maxLen], "\n"); idx > maxLen/2 {
 			cut = idx + 1
+		}
+		// Ensure cut falls on a UTF-8 rune boundary to avoid splitting
+		// multi-byte characters (e.g. Japanese text at 3 bytes per char).
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
 		}
 		chunks = append(chunks, text[:cut])
 		text = text[cut:]

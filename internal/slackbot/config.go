@@ -50,12 +50,22 @@ const (
 )
 
 // StoreTokens saves the app and bot tokens to the credential store.
+// If the second write fails, the first is rolled back to its previous value
+// so the store never contains a half-updated pair.
 func StoreTokens(tp TokenProvider, agentID, appToken, botToken string) error {
 	noExpiry := time.Time{}
+
+	// Snapshot the current app token so we can restore it on partial failure.
+	oldAppToken, _ := tp.GetToken(tokenProvider, agentID, tokenSourceID, keyAppToken)
+
 	if err := tp.SetToken(tokenProvider, agentID, tokenSourceID, keyAppToken, appToken, noExpiry); err != nil {
 		return fmt.Errorf("store app token: %w", err)
 	}
 	if err := tp.SetToken(tokenProvider, agentID, tokenSourceID, keyBotToken, botToken, noExpiry); err != nil {
+		// Rollback: restore previous app token to avoid half-updated state.
+		if oldAppToken != "" {
+			_ = tp.SetToken(tokenProvider, agentID, tokenSourceID, keyAppToken, oldAppToken, noExpiry)
+		}
 		return fmt.Errorf("store bot token: %w", err)
 	}
 	return nil
