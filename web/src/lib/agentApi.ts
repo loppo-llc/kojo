@@ -28,6 +28,7 @@ export interface AgentInfo {
   publicProfileOverride: boolean;
   hasAvatar: boolean;
   avatarHash?: string;
+  allowedTools?: string[];
   notifySources?: NotifySourceConfig[];
   lastMessage?: {
     content: string;
@@ -51,6 +52,7 @@ export interface AgentConfig {
 export interface AgentUpdateParams extends Partial<AgentConfig> {
   publicProfile?: string;
   publicProfileOverride?: boolean;
+  allowedTools?: string[];
 }
 
 export interface AgentMessageAttachment {

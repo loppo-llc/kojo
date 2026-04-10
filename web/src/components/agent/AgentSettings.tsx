@@ -33,6 +33,7 @@ export function AgentSettings() {
   const [personaPrompt, setPersonaPrompt] = useState("");
   const [generatingPersona, setGeneratingPersona] = useState(false);
   const [lmsModels, setLmsModels] = useState<string[]>([]);
+  const [allowedTools, setAllowedTools] = useState<string[]>([]);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -56,6 +57,7 @@ export function AgentSettings() {
       setIntervalMinutes(a.intervalMinutes);
       setActiveStart(a.activeStart ?? "");
       setActiveEnd(a.activeEnd ?? "");
+      setAllowedTools(a.allowedTools ?? []);
     }).catch(() => navigate("/"));
   }, [id, navigate]);
 
@@ -76,6 +78,7 @@ export function AgentSettings() {
         intervalMinutes,
         activeStart,
         activeEnd,
+        allowedTools: tool === "lm-studio" ? allowedTools : undefined,
       });
       setAgent(updated);
       setPublicProfile(updated.publicProfile ?? "");
@@ -382,6 +385,42 @@ export function AgentSettings() {
             ))}
           </div>
         </div>
+
+        {/* Allowed Tools (lm-studio only) */}
+        {tool === "lm-studio" && (
+          <div>
+            <label className="block text-sm text-neutral-400 mb-2">
+              Allowed Tools
+              <span className="text-xs text-neutral-600 ml-2">(empty = all)</span>
+            </label>
+            <div className="grid grid-cols-2 gap-1.5">
+              {["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Skill", "WebFetch", "WebSearch", "Agent", "NotebookEdit"].map((t) => (
+                <label key={t} className="flex items-center gap-2 px-2 py-1.5 bg-neutral-900 rounded text-xs font-mono cursor-pointer hover:bg-neutral-800">
+                  <input
+                    type="checkbox"
+                    checked={allowedTools.length === 0 || allowedTools.includes(t)}
+                    onChange={(e) => {
+                      if (allowedTools.length === 0) {
+                        // Switching from "all" to explicit: start with all checked except this one
+                        if (!e.target.checked) {
+                          setAllowedTools(["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Skill", "WebFetch", "WebSearch", "Agent", "NotebookEdit"].filter((x) => x !== t));
+                        }
+                      } else {
+                        if (e.target.checked) {
+                          setAllowedTools([...allowedTools, t]);
+                        } else {
+                          setAllowedTools(allowedTools.filter((x) => x !== t));
+                        }
+                      }
+                    }}
+                    className="accent-neutral-400"
+                  />
+                  {t}
+                </label>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* File Storage */}
         <div>

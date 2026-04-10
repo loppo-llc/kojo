@@ -106,6 +106,11 @@ type Agent struct {
 	PublicProfile         string `json:"publicProfile,omitempty"`
 	PublicProfileOverride bool   `json:"publicProfileOverride,omitempty"`
 
+	// AllowedTools is a whitelist of tool names for the LMS proxy.
+	// If non-empty, only listed tools are forwarded to the local model.
+	// If empty, all tools are forwarded.
+	AllowedTools []string `json:"allowedTools,omitempty"`
+
 	// NotifySources holds notification source configurations for this agent.
 	NotifySources []notifysource.Config `json:"notifySources,omitempty"`
 
@@ -152,8 +157,9 @@ type AgentUpdateConfig struct {
 	Tool                  *string `json:"tool"`
 	WorkDir               *string `json:"workDir"`
 	IntervalMinutes       *int    `json:"intervalMinutes"`
-	ActiveStart           *string `json:"activeStart"`
-	ActiveEnd             *string `json:"activeEnd"`
+	ActiveStart           *string   `json:"activeStart"`
+	ActiveEnd             *string   `json:"activeEnd"`
+	AllowedTools          []string  `json:"allowedTools"`
 }
 
 func generateID() string {
