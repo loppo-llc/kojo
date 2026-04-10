@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -195,7 +194,6 @@ type StreamConverter struct {
 	w       http.ResponseWriter
 	flusher http.Flusher
 	model   string
-	logger  *slog.Logger
 
 	// State tracking.
 	responseID    string
@@ -203,9 +201,6 @@ type StreamConverter struct {
 	hasToolUse    bool
 	argsDeltaSent bool // whether any function_call_arguments.delta was sent for current block
 }
-
-// SetLogger enables debug logging of all emitted SSE events.
-func (c *StreamConverter) SetLogger(l *slog.Logger) { c.logger = l }
 
 // NewStreamConverter creates a converter that writes Anthropic SSE to w.
 func NewStreamConverter(w http.ResponseWriter, model string) *StreamConverter {
@@ -362,9 +357,6 @@ func (c *StreamConverter) writeSSE(event string, payload interface{}) error {
 	if err != nil {
 		return err
 	}
-	if c.logger != nil {
-		c.logger.Info("proxy SSE out", "event", event, "data", string(data))
-	}
 	_, err = fmt.Fprintf(c.w, "event: %s\ndata: %s\n\n", event, data)
 	if c.flusher != nil {
 		c.flusher.Flush()
@@ -466,6 +458,159 @@ func anthropicUsage(inputTokens, outputTokens int) map[string]interface{} {
 		"service_tier": nil,
 		"speed":        nil,
 	}
+}
+
+// AccumulatedMessage holds the result of consuming an OAI SSE stream
+// and converting it into a single Anthropic Messages API response.
+type AccumulatedMessage struct {
+	ResponseID string
+	Message    map[string]interface{}
+}
+
+// AccumulateResponse reads an OAI Responses SSE stream to completion and
+// returns a single Anthropic Messages API Message object. Used when the
+// client sends stream=false (e.g. Claude CLI's non-streaming fallback).
+func AccumulateResponse(body io.Reader, model string) (*AccumulatedMessage, error) {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+
+	var (
+		eventType    string
+		responseID   string
+		contentBlocks []interface{}
+		hasToolUse   bool
+		stopReason   = "end_turn"
+		inputTokens  int
+		outputTokens int
+		// Current tool_use state
+		currentToolID   string
+		currentToolName string
+		currentToolArgs strings.Builder
+	)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "event: ") {
+			eventType = strings.TrimPrefix(line, "event: ")
+			continue
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		raw := []byte(data)
+
+		switch eventType {
+		case "response.created":
+			var evt OAIResponseCreated
+			if json.Unmarshal(raw, &evt) == nil {
+				responseID = evt.Response.ID
+			}
+
+		case "response.content_part.added":
+			// Will be filled by text deltas.
+
+		case "response.output_text.delta":
+			var evt OAIOutputTextDelta
+			if json.Unmarshal(raw, &evt) == nil {
+				// Append to last text block or create one.
+				if n := len(contentBlocks); n > 0 {
+					if tb, ok := contentBlocks[n-1].(map[string]interface{}); ok && tb["type"] == "text" {
+						tb["text"] = tb["text"].(string) + evt.Delta
+						continue
+					}
+				}
+				contentBlocks = append(contentBlocks, map[string]interface{}{
+					"type": "text",
+					"text": evt.Delta,
+				})
+			}
+
+		case "response.output_text.done":
+			// Already accumulated.
+
+		case "response.output_item.added":
+			var evt OAIOutputItemAdded
+			if json.Unmarshal(raw, &evt) == nil && evt.Item.Type == "function_call" {
+				hasToolUse = true
+				currentToolID = evt.Item.ID
+				currentToolName = evt.Item.Name
+				currentToolArgs.Reset()
+			}
+
+		case "response.function_call_arguments.delta":
+			var evt OAIFuncCallArgsDelta
+			if json.Unmarshal(raw, &evt) == nil {
+				currentToolArgs.WriteString(evt.Delta)
+			}
+
+		case "response.function_call_arguments.done":
+			var evt OAIFuncCallArgsDone
+			if json.Unmarshal(raw, &evt) == nil {
+				args := currentToolArgs.String()
+				if args == "" {
+					args = evt.Arguments
+				}
+				var inputObj interface{}
+				if json.Unmarshal([]byte(args), &inputObj) != nil {
+					inputObj = map[string]interface{}{}
+				}
+				// Prefer state from output_item.added, fall back to done event fields.
+				toolID := currentToolID
+				if toolID == "" {
+					toolID = evt.CallID
+				}
+				toolName := currentToolName
+				if toolName == "" {
+					toolName = evt.Name
+				}
+				contentBlocks = append(contentBlocks, map[string]interface{}{
+					"type":  "tool_use",
+					"id":    toolID,
+					"name":  toolName,
+					"input": inputObj,
+				})
+				currentToolID = ""
+				currentToolName = ""
+				currentToolArgs.Reset()
+			}
+
+		case "response.completed":
+			var evt OAIResponseCompleted
+			if json.Unmarshal(raw, &evt) == nil {
+				responseID = evt.Response.ID
+				if evt.Response.Usage != nil {
+					inputTokens = evt.Response.Usage.InputTokens
+					outputTokens = evt.Response.Usage.OutputTokens
+				}
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	if hasToolUse {
+		stopReason = "tool_use"
+	}
+
+	msg := map[string]interface{}{
+		"id":            responseID,
+		"type":          "message",
+		"role":          "assistant",
+		"model":         model,
+		"content":       contentBlocks,
+		"stop_reason":   stopReason,
+		"stop_sequence": nil,
+		"usage":         anthropicUsage(inputTokens, outputTokens),
+	}
+
+	return &AccumulatedMessage{ResponseID: responseID, Message: msg}, nil
 }
 
 func (c *StreamConverter) writeError(msg string) error {

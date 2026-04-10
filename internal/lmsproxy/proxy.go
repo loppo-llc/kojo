@@ -117,22 +117,35 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicErrorResponse(w, oaiResp.StatusCode, "api_error", string(body))
 		return
 	}
-	// Stream SSE conversion.
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	if req.Stream {
+		// Stream SSE conversion.
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
 
-	converter := NewStreamConverter(w, req.Model)
-	converter.SetLogger(p.logger)
-	if err := converter.Process(oaiResp.Body); err != nil {
-		p.logger.Error("stream conversion error", "err", err)
-		return
-	}
+		converter := NewStreamConverter(w, req.Model)
+		if err := converter.Process(oaiResp.Body); err != nil {
+			p.logger.Error("stream conversion error", "err", err)
+			return
+		}
 
-	// Store session for next request.
-	if rid := converter.ResponseID(); rid != "" {
-		p.session.Store(sessionID, req.Model, rid)
-		p.logger.Debug("session stored", "session", sessionID, "model", req.Model, "responseID", rid)
+		// Store session for next request.
+		if rid := converter.ResponseID(); rid != "" {
+			p.session.Store(sessionID, req.Model, rid)
+			p.logger.Debug("session stored", "session", sessionID, "model", req.Model, "responseID", rid)
+		}
+	} else {
+		// Non-streaming: accumulate the OAI SSE into a single Anthropic Message JSON.
+		msg, err := AccumulateResponse(oaiResp.Body, req.Model)
+		if err != nil {
+			writeAnthropicErrorResponse(w, http.StatusBadGateway, "api_error", "stream accumulation failed: "+err.Error())
+			return
+		}
+		if msg.ResponseID != "" {
+			p.session.Store(sessionID, req.Model, msg.ResponseID)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(msg.Message)
 	}
 }
 
