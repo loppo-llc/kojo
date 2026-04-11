@@ -16,28 +16,35 @@ import (
 const geminiModel = "gemini-2.5-flash"
 const geminiAPI = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s"
 
-// runClaude executes a prompt via claude CLI (stdin) and returns the output.
-// Uses --setting-sources user to ignore project-level CLAUDE.local.md (persona),
-// --system-prompt to enforce neutral output, and --tools "" to disable all tools.
-func runClaude(prompt string) (string, error) {
+// runCLIGenerate executes a CLI tool with a prompt on stdin and returns the
+// stripped output. The tool is run with a 120-second timeout. workDir defaults
+// to the current directory if empty.
+func runCLIGenerate(toolName string, args []string, workDir string, prompt string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "claude", "-p",
-		"--setting-sources", "user",
-		"--system-prompt", "You are a helpful assistant. Follow the user's instructions exactly. Output only what is requested, with no preamble or commentary.",
-		"--tools", "",
-	)
+	cmd := exec.CommandContext(ctx, toolName, args...)
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
 	cmd.Stdin = strings.NewReader(prompt)
 	output, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("claude: %w", err)
+		return "", fmt.Errorf("%s: %w", toolName, err)
 	}
 	return stripCodeFence(string(output)), nil
 }
 
+// runClaude executes a prompt via claude CLI (stdin) and returns the output.
+func runClaude(prompt string) (string, error) {
+	return runCLIGenerate("claude", []string{
+		"-p",
+		"--setting-sources", "user",
+		"--system-prompt", "You are a helpful assistant. Follow the user's instructions exactly. Output only what is requested, with no preamble or commentary.",
+		"--tools", "",
+	}, "", prompt)
+}
+
 // runCodex executes a prompt via codex CLI (stdin → -o output file).
-// Uses -s read-only to prevent file modifications, reads prompt from stdin,
-// and runs in os.TempDir() to avoid picking up project-level config/docs.
 func runCodex(prompt string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -68,19 +75,10 @@ func runCodex(prompt string) (string, error) {
 }
 
 // runGemini executes a prompt via gemini CLI (stdin to -p) and returns the output.
-// Runs in os.TempDir() to avoid picking up project-level GEMINI.md or persona config.
 func runGemini(prompt string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-	// gemini -p requires a string arg; pass a short trigger and feed real prompt via stdin
-	cmd := exec.CommandContext(ctx, "gemini", "-p", "Follow the instructions from stdin.")
-	cmd.Dir = os.TempDir()
-	cmd.Stdin = strings.NewReader(prompt)
-	output, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("gemini: %w", err)
-	}
-	return stripCodeFence(string(output)), nil
+	return runCLIGenerate("gemini", []string{
+		"-p", "Follow the instructions from stdin.",
+	}, os.TempDir(), prompt)
 }
 
 // stripCodeFence removes a single outer markdown code fence that LLMs sometimes
