@@ -89,7 +89,10 @@ export function NotifySourcesEditor({ agentId }: Props) {
 
   return (
     <div>
-      <label className="block text-sm text-neutral-400 mb-2">Notifications</label>
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-sm font-semibold text-neutral-300">Notifications</h2>
+        <span className="text-xs text-neutral-600">Auto-saved</span>
+      </div>
 
       {sources.length === 0 && availableTypes.length === 0 && (
         <p className="text-xs text-neutral-600">No notification sources available</p>
