@@ -652,15 +652,15 @@ func (m *Manager) resolveLMSProxy(tool string, args []string, sessionID string) 
 	result.actualTool = "claude"
 	result.modelOverride = defaultModel
 
-	// Extract --model from args.
-	outArgs := make([]string, 0, len(args))
-	for i := 0; i < len(args); i++ {
-		if (args[i] == "--model" || args[i] == "-m") && i+1 < len(args) {
-			result.modelOverride = args[i+1]
-			i++ // skip value
-			continue
+	// Extract the first --model/-m from args (matches original Create behavior).
+	outArgs := make([]string, len(args))
+	copy(outArgs, args)
+	for i, a := range outArgs {
+		if (a == "--model" || a == "-m") && i+1 < len(outArgs) {
+			result.modelOverride = outArgs[i+1]
+			outArgs = append(outArgs[:i], outArgs[i+2:]...)
+			break
 		}
-		outArgs = append(outArgs, args[i])
 	}
 	result.args = outArgs
 
