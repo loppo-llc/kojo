@@ -564,6 +564,20 @@ func (m *Manager) UpdateSlackBot(id string, cfg *SlackBotConfig) error {
 	return nil
 }
 
+// loadSlackBotToken retrieves the Slack bot token for an agent from the
+// credential store.  Returns "" if Slack bot is not configured/enabled or
+// the token is unavailable.
+func (m *Manager) loadSlackBotToken(agentID string, a *Agent) string {
+	if a.SlackBot == nil || !a.SlackBot.Enabled || m.creds == nil {
+		return ""
+	}
+	botToken, err := m.creds.GetToken("slack", agentID, "", "bot_token")
+	if err != nil || botToken == "" {
+		return ""
+	}
+	return botToken
+}
+
 // Credentials returns the credential store. Returns nil if the store failed to initialize.
 func (m *Manager) Credentials() *CredentialStore {
 	return m.creds
@@ -576,9 +590,10 @@ func (m *Manager) HasCredentials() bool {
 
 // chatPrep holds the common setup result shared by Chat and ChatOneShot.
 type chatPrep struct {
-	agentCopy Agent
-	backend   ChatBackend
-	sysPrompt string
+	agentCopy  Agent
+	backend    ChatBackend
+	sysPrompt  string
+	mcpServers map[string]mcpServerEntry
 }
 
 // prepareChat performs the common setup for Chat and ChatOneShot:
@@ -615,6 +630,16 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool, skip
 		PrepareClaudeSettings(agentID, apiBase, m.logger)
 	}
 
+	// Build MCP server list (backend-agnostic, URL-based).
+	hasSlackBot := m.loadSlackBotToken(agentID, &agentCopy) != ""
+	mcpServers := BuildMCPServers(agentID, apiBase, hasSlackBot)
+
+	// Codex reads project-level .codex/config.toml for MCP servers.
+	// Claude and Gemini are handled in their respective backends.
+	if agentCopy.Tool == "codex" {
+		WriteCodexMCPConfig(agentDir(agentID), mcpServers, m.logger)
+	}
+
 	sysPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
 
 	// Inject relevant memory context. IndexNewMessages is called for
@@ -632,7 +657,7 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool, skip
 		}
 	}
 
-	return &chatPrep{agentCopy: agentCopy, backend: backend, sysPrompt: sysPrompt}, nil
+	return &chatPrep{agentCopy: agentCopy, backend: backend, sysPrompt: sysPrompt, mcpServers: mcpServers}, nil
 }
 
 // Chat sends a message to an agent and returns a channel of streaming events.
@@ -696,7 +721,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	}
 
 	// Start chat
-	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{})
+	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{MCPServers: prep.mcpServers})
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
@@ -754,7 +779,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 
 	// NOTE: No appendMessage — one-shot chats are not saved to transcript.
 
-	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, userMessage, prep.sysPrompt, ChatOptions{OneShot: true})
+	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, userMessage, prep.sysPrompt, ChatOptions{OneShot: true, MCPServers: prep.mcpServers})
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)

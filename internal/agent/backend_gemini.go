@@ -41,7 +41,7 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	os.MkdirAll(dir, 0o755)
 
 	// Override global persona and inject system-level instructions via GEMINI.md.
-	if err := prepareGeminiDir(dir, systemPrompt != "", b.logger); err != nil {
+	if err := prepareGeminiDir(dir, systemPrompt != "", opts.MCPServers, b.logger); err != nil {
 		return nil, fmt.Errorf("prepare gemini dir: %w", err)
 	}
 
@@ -224,16 +224,26 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 // CLI's @import parsing that would interpret @-prefixed text as file imports.
 //
 // hasSystemPrompt indicates whether a system prompt will be provided via stdin.
-func prepareGeminiDir(dir string, hasSystemPrompt bool, logger *slog.Logger) error {
+// mcpServers, when non-empty, is written into settings.json so Gemini CLI
+// discovers the MCP tool servers for this session.
+func prepareGeminiDir(dir string, hasSystemPrompt bool, mcpServers map[string]mcpServerEntry, logger *slog.Logger) error {
 	geminiDir := filepath.Join(dir, ".gemini")
 	personasDir := filepath.Join(geminiDir, "personas")
 	if err := os.MkdirAll(personasDir, 0o755); err != nil {
 		return fmt.Errorf("create .gemini/personas: %w", err)
 	}
 
-	// Local settings.json overrides global persona setting.
+	// Local settings.json overrides global persona setting and includes MCP servers.
+	settings := map[string]any{"persona": "kojo-managed"}
+	if len(mcpServers) > 0 {
+		settings["mcpServers"] = mcpServers
+	}
+	settingsData, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal .gemini/settings.json: %w", err)
+	}
 	settingsPath := filepath.Join(geminiDir, "settings.json")
-	if err := os.WriteFile(settingsPath, []byte("{\"persona\":\"kojo-managed\"}\n"), 0o644); err != nil {
+	if err := os.WriteFile(settingsPath, append(settingsData, '\n'), 0o644); err != nil {
 		return fmt.Errorf("write .gemini/settings.json: %w", err)
 	}
 

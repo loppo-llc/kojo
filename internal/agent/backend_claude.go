@@ -50,7 +50,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
 
-	args := b.buildClaudeArgs(agent, systemPrompt, dir, opts.OneShot)
+	args := b.buildClaudeArgs(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers)
 
 	cmd := exec.CommandContext(ctx, claudePath, args...)
 	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
@@ -166,7 +166,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 }
 
 // buildClaudeArgs constructs the CLI arguments for a Claude chat invocation.
-func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir string, oneShot bool) []string {
+func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir string, oneShot bool, mcpServers map[string]mcpServerEntry) []string {
 	args := []string{
 		"-p",
 		"--output-format", "stream-json",
@@ -186,6 +186,15 @@ func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir s
 	}
 	if len(agent.AllowedTools) > 0 {
 		args = append(args, "--allowedTools", strings.Join(agent.AllowedTools, ","))
+	}
+
+	// Inject MCP servers via --mcp-config inline JSON (session-scoped, no files).
+	if len(mcpServers) > 0 {
+		if cfg, err := mcpConfigJSON(mcpServers); err == nil {
+			args = append(args, "--mcp-config", cfg)
+		} else {
+			b.logger.Warn("failed to marshal MCP config for Claude", "err", err)
+		}
 	}
 
 	// Remove CLAUDE.local.md to prevent persona autoload hook from
