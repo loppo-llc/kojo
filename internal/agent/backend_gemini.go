@@ -135,9 +135,31 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 			case "message":
 				if event.Role == "assistant" && event.Content != "" {
-					fullText.WriteString(event.Content)
-					if !send(ChatEvent{Type: "text", Delta: event.Content}) {
-						break
+					content := event.Content
+					isThought := false
+					// Gemini CLI bug: thinking tokens leak into stream-json
+					// content with literal "[Thought: true]" prefix
+					// (see github.com/google-gemini/gemini-cli/issues/24583).
+					// Strip the prefix and emit as thinking event.
+					for strings.HasPrefix(content, "[Thought: ") {
+						end := strings.Index(content, "]")
+						if end < 0 {
+							break
+						}
+						content = content[end+1:]
+						isThought = true
+					}
+					if isThought {
+						if content != "" {
+							if !send(ChatEvent{Type: "thinking", Delta: content}) {
+								break
+							}
+						}
+					} else {
+						fullText.WriteString(content)
+						if !send(ChatEvent{Type: "text", Delta: content}) {
+							break
+						}
 					}
 				}
 
@@ -236,7 +258,13 @@ func prepareGeminiDir(dir string, hasSystemPrompt bool, mcpServers map[string]mc
 	// Local settings.json overrides global persona setting and includes MCP servers.
 	settings := map[string]any{"persona": "kojo-managed"}
 	if len(mcpServers) > 0 {
-		settings["mcpServers"] = mcpServers
+		// Gemini CLI uses "httpUrl" (not "url") for HTTP Streamable transport.
+		// See https://geminicli.com/docs/tools/mcp-server/
+		geminiMCP := make(map[string]map[string]string, len(mcpServers))
+		for name, srv := range mcpServers {
+			geminiMCP[name] = map[string]string{"httpUrl": srv.URL}
+		}
+		settings["mcpServers"] = geminiMCP
 	}
 	settingsData, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {

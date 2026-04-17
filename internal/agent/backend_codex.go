@@ -43,7 +43,11 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, codexPath, "app-server")
+	args := []string{"app-server"}
+	for name, srv := range opts.MCPServers {
+		args = append(args, "-c", fmt.Sprintf("mcp_servers.%s.url=%q", name, srv.URL))
+	}
+	cmd := exec.CommandContext(ctx, codexPath, args...)
 	cmd.Dir = dir
 	cmd.Env = filterEnv([]string{"AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
 

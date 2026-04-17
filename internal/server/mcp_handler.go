@@ -164,7 +164,7 @@ func slackPostMessageHandler(agents *agent.Manager) mcpserver.ToolHandlerFunc {
 func resolveSlackChannel(ctx context.Context, api *slack.Client, channel string) (string, error) {
 	channel = strings.TrimPrefix(channel, "#")
 
-	if len(channel) > 0 && (channel[0] == 'C' || channel[0] == 'G' || channel[0] == 'D') && !strings.Contains(channel, " ") && len(channel) >= 9 {
+	if len(channel) > 0 && (channel[0] == 'C' || channel[0] == 'G' || channel[0] == 'D' || channel[0] == 'U' || channel[0] == 'W') && !strings.Contains(channel, " ") && len(channel) >= 9 {
 		return channel, nil
 	}
 

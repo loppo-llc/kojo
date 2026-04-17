@@ -634,11 +634,10 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool, skip
 	hasSlackBot := m.loadSlackBotToken(agentID, &agentCopy) != ""
 	mcpServers := BuildMCPServers(agentID, apiBase, hasSlackBot)
 
-	// Codex reads project-level .codex/config.toml for MCP servers.
-	// Claude and Gemini are handled in their respective backends.
-	if agentCopy.Tool == "codex" {
-		WriteCodexMCPConfig(agentDir(agentID), mcpServers, m.logger)
-	}
+	// MCP servers are injected per-backend:
+	// - Claude: --mcp-config CLI arg (in backend_claude.go)
+	// - Codex: -c flag override (in backend_codex.go)
+	// - Gemini: .gemini/settings.json mcpServers (in backend_gemini.go)
 
 	sysPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
 

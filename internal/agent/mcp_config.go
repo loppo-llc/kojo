@@ -3,10 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log/slog"
-	"os"
-	"path/filepath"
-	"strings"
 )
 
 // mcpServerEntry represents one MCP server configuration.
@@ -48,31 +44,3 @@ func mcpConfigJSON(servers map[string]mcpServerEntry) (string, error) {
 	return string(data), nil
 }
 
-// WriteCodexMCPConfig writes .codex/config.toml with [mcp_servers.*] sections
-// for Codex CLI's project-level MCP configuration.
-// Codex reads this file from the working directory on startup.
-// If servers is empty, the file is removed.
-func WriteCodexMCPConfig(dir string, servers map[string]mcpServerEntry, logger *slog.Logger) {
-	codexDir := filepath.Join(dir, ".codex")
-	configPath := filepath.Join(codexDir, "config.toml")
-
-	if len(servers) == 0 {
-		os.Remove(configPath)
-		return
-	}
-
-	if err := os.MkdirAll(codexDir, 0o755); err != nil {
-		logger.Warn("failed to create .codex dir", "err", err)
-		return
-	}
-
-	var b strings.Builder
-	for name, s := range servers {
-		fmt.Fprintf(&b, "[mcp_servers.%s]\n", name)
-		fmt.Fprintf(&b, "url = %q\n\n", s.URL)
-	}
-
-	if err := os.WriteFile(configPath, []byte(b.String()), 0o644); err != nil {
-		logger.Warn("failed to write .codex/config.toml", "err", err)
-	}
-}
