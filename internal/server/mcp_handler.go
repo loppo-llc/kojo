@@ -41,7 +41,10 @@ func newMCPHandler(agents *agent.Manager, logger *slog.Logger) http.Handler {
 
 	// --- slack_list_channels ---
 	listTool := mcp.NewTool("slack_list_channels",
-		mcp.WithDescription("List Slack channels the bot can access. Returns channel ID, name, topic, and member count."),
+		mcp.WithDescription("List Slack channels the bot can access. Returns channel ID, name, topic, and member count. By default returns only channels the bot has joined. Use member_only=false to include all visible channels (may be slow for large workspaces)."),
+		mcp.WithNumber("limit", mcp.Description("Maximum number of channels to return (default 200, max 1000)")),
+		mcp.WithString("name_contains", mcp.Description("Filter channels whose name contains this substring (case-insensitive)")),
+		mcp.WithBoolean("member_only", mcp.Description("If true (default), only return channels the bot has joined")),
 	)
 	srv.AddTool(listTool, slackListChannelsHandler(agents, logger))
 
@@ -199,7 +202,27 @@ func slackListChannelsHandler(agents *agent.Manager, logger *slog.Logger) mcpser
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		reqID := reqIDFromCtx(ctx)
 		agentID, _ := ctx.Value(mcpAgentIDKey).(string)
-		logger.Info("mcp tool invoked", "reqID", reqID, "agent", agentID, "tool", "slack_list_channels")
+		args := req.GetArguments()
+
+		// Parse optional parameters.
+		limit := 200
+		if v, ok := args["limit"].(float64); ok && v > 0 {
+			limit = int(v)
+			if limit > 1000 {
+				limit = 1000
+			}
+		}
+		nameFilter := ""
+		if v, ok := args["name_contains"].(string); ok {
+			nameFilter = strings.ToLower(v)
+		}
+		memberOnly := true
+		if v, ok := args["member_only"].(bool); ok {
+			memberOnly = v
+		}
+
+		logger.Info("mcp tool invoked", "reqID", reqID, "agent", agentID, "tool", "slack_list_channels",
+			"limit", limit, "nameFilter", nameFilter, "memberOnly", memberOnly)
 
 		api, errMsg := getSlackClient(ctx, agents)
 		if api == nil {
@@ -218,7 +241,10 @@ func slackListChannelsHandler(agents *agent.Manager, logger *slog.Logger) mcpser
 
 		var channels []channelInfo
 		cursor := ""
-		for {
+		// Cap pagination to avoid exhausting Slack Tier 2 rate limits.
+		// Large workspaces can have thousands of channels across 20+ pages.
+		const maxPages = 5
+		for page := 0; page < maxPages; page++ {
 			params := &slack.GetConversationsParameters{
 				Types:           []string{"public_channel", "private_channel"},
 				Limit:           200,
@@ -227,10 +253,23 @@ func slackListChannelsHandler(agents *agent.Manager, logger *slog.Logger) mcpser
 			}
 			chs, nextCursor, err := api.GetConversationsContext(ctx, params)
 			if err != nil {
+				// If we already collected some channels, return them with a warning
+				// instead of failing completely.
+				if len(channels) > 0 {
+					logger.Warn("mcp tool partial", "reqID", reqID, "agent", agentID,
+						"tool", "slack_list_channels", "err", err, "collected", len(channels))
+					break
+				}
 				logger.Warn("mcp tool error", "reqID", reqID, "agent", agentID, "tool", "slack_list_channels", "err", err)
 				return mcp.NewToolResultError(fmt.Sprintf("Slack API error: %v", err)), nil
 			}
 			for _, ch := range chs {
+				if memberOnly && !ch.IsMember {
+					continue
+				}
+				if nameFilter != "" && !strings.Contains(strings.ToLower(ch.Name), nameFilter) {
+					continue
+				}
 				channels = append(channels, channelInfo{
 					ID:         ch.ID,
 					Name:       ch.Name,
@@ -239,11 +278,19 @@ func slackListChannelsHandler(agents *agent.Manager, logger *slog.Logger) mcpser
 					NumMembers: ch.NumMembers,
 					IsMember:   ch.IsMember,
 				})
+				if len(channels) >= limit {
+					break
+				}
 			}
-			if nextCursor == "" {
+			if len(channels) >= limit || nextCursor == "" {
 				break
 			}
 			cursor = nextCursor
+		}
+
+		// Truncate to exact limit.
+		if len(channels) > limit {
+			channels = channels[:limit]
 		}
 
 		data, _ := json.MarshalIndent(channels, "", "  ")
