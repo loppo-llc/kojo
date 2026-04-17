@@ -1,11 +1,17 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
@@ -16,13 +22,19 @@ import (
 
 type contextKey int
 
-const mcpAgentIDKey contextKey = iota
+const (
+	mcpAgentIDKey contextKey = iota
+	mcpReqIDKey
+)
 
 // newMCPHandler creates the MCP HTTP handler that serves Slack tools.
 // A single MCPServer + StreamableHTTPServer is shared across all agents;
 // the agent ID is injected into the request context via the URL path value
 // and used to resolve agent-specific credentials at call time.
-func newMCPHandler(agents *agent.Manager) http.Handler {
+func newMCPHandler(agents *agent.Manager, logger *slog.Logger) http.Handler {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	srv := mcpserver.NewMCPServer("kojo-tools", "1.0.0",
 		mcpserver.WithToolCapabilities(true),
 	)
@@ -31,7 +43,7 @@ func newMCPHandler(agents *agent.Manager) http.Handler {
 	listTool := mcp.NewTool("slack_list_channels",
 		mcp.WithDescription("List Slack channels the bot can access. Returns channel ID, name, topic, and member count."),
 	)
-	srv.AddTool(listTool, slackListChannelsHandler(agents))
+	srv.AddTool(listTool, slackListChannelsHandler(agents, logger))
 
 	// --- slack_post_message ---
 	postTool := mcp.NewTool("slack_post_message",
@@ -39,17 +51,126 @@ func newMCPHandler(agents *agent.Manager) http.Handler {
 		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel ID or #channel-name to post to")),
 		mcp.WithString("text", mcp.Required(), mcp.Description("Message text (supports Slack mrkdwn formatting)")),
 	)
-	srv.AddTool(postTool, slackPostMessageHandler(agents))
+	srv.AddTool(postTool, slackPostMessageHandler(agents, logger))
 
 	httpSrv := mcpserver.NewStreamableHTTPServer(srv,
 		mcpserver.WithStateLess(true),
 		mcpserver.WithHTTPContextFunc(func(ctx context.Context, r *http.Request) context.Context {
 			agentID := r.PathValue("id")
-			return context.WithValue(ctx, mcpAgentIDKey, agentID)
+			ctx = context.WithValue(ctx, mcpAgentIDKey, agentID)
+			if reqID, ok := r.Context().Value(mcpReqIDKey).(string); ok {
+				ctx = context.WithValue(ctx, mcpReqIDKey, reqID)
+			}
+			return ctx
 		}),
 	)
 
-	return httpSrv
+	// Wrap with logging middleware: request/response + body peek.
+	return logMCPMiddleware(httpSrv, logger)
+}
+
+// statusRecorder captures HTTP status and bytes written for logging.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+	head   []byte // first 200 bytes for logging
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if len(r.head) < 200 {
+		room := 200 - len(r.head)
+		if room > len(b) {
+			room = len(b)
+		}
+		r.head = append(r.head, b[:room]...)
+	}
+	n, err := r.ResponseWriter.Write(b)
+	r.bytes += n
+	return n, err
+}
+
+// Flush passes through to the underlying ResponseWriter if it supports flushing.
+// This is required for SSE/streaming responses (MCP StreamableHTTP uses them).
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func logMCPMiddleware(next http.Handler, logger *slog.Logger) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := newReqID()
+		agentID := r.PathValue("id")
+
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+
+		// Peek JSON-RPC method name if body looks like JSON.
+		rpcMethod := ""
+		if len(body) > 0 && body[0] == '{' {
+			var peek struct {
+				Method string          `json:"method"`
+				ID     json.RawMessage `json:"id"`
+			}
+			if err := json.Unmarshal(body, &peek); err == nil {
+				rpcMethod = peek.Method
+			}
+		}
+
+		logger.Info("mcp request",
+			"reqID", reqID,
+			"agent", agentID,
+			"method", r.Method,
+			"rpcMethod", rpcMethod,
+			"bodySize", len(body),
+			"bodyHead", headString(body, 300),
+			"ua", r.Header.Get("User-Agent"),
+		)
+
+		ctx := context.WithValue(r.Context(), mcpReqIDKey, reqID)
+		r = r.WithContext(ctx)
+
+		rw := &statusRecorder{ResponseWriter: w, status: 200}
+		start := time.Now()
+		next.ServeHTTP(rw, r)
+		dur := time.Since(start)
+
+		logger.Info("mcp response",
+			"reqID", reqID,
+			"agent", agentID,
+			"rpcMethod", rpcMethod,
+			"status", rw.status,
+			"bytes", rw.bytes,
+			"ms", dur.Milliseconds(),
+			"respHead", headString(rw.head, 300),
+		)
+	})
+}
+
+func newReqID() string {
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+func headString(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[:n]) + "…"
+}
+
+func reqIDFromCtx(ctx context.Context) string {
+	if v, ok := ctx.Value(mcpReqIDKey).(string); ok {
+		return v
+	}
+	return ""
 }
 
 // getSlackClient resolves the Slack bot token for the agent in context
@@ -74,10 +195,15 @@ func getSlackClient(ctx context.Context, agents *agent.Manager) (*slack.Client, 
 	return slack.New(token), ""
 }
 
-func slackListChannelsHandler(agents *agent.Manager) mcpserver.ToolHandlerFunc {
+func slackListChannelsHandler(agents *agent.Manager, logger *slog.Logger) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		reqID := reqIDFromCtx(ctx)
+		agentID, _ := ctx.Value(mcpAgentIDKey).(string)
+		logger.Info("mcp tool invoked", "reqID", reqID, "agent", agentID, "tool", "slack_list_channels")
+
 		api, errMsg := getSlackClient(ctx, agents)
 		if api == nil {
+			logger.Warn("mcp tool aborted", "reqID", reqID, "agent", agentID, "tool", "slack_list_channels", "err", errMsg)
 			return mcp.NewToolResultError(errMsg), nil
 		}
 
@@ -101,6 +227,7 @@ func slackListChannelsHandler(agents *agent.Manager) mcpserver.ToolHandlerFunc {
 			}
 			chs, nextCursor, err := api.GetConversationsContext(ctx, params)
 			if err != nil {
+				logger.Warn("mcp tool error", "reqID", reqID, "agent", agentID, "tool", "slack_list_channels", "err", err)
 				return mcp.NewToolResultError(fmt.Sprintf("Slack API error: %v", err)), nil
 			}
 			for _, ch := range chs {
@@ -120,34 +247,50 @@ func slackListChannelsHandler(agents *agent.Manager) mcpserver.ToolHandlerFunc {
 		}
 
 		data, _ := json.MarshalIndent(channels, "", "  ")
+		logger.Info("mcp tool result", "reqID", reqID, "agent", agentID, "tool", "slack_list_channels", "channelCount", len(channels))
 		return mcp.NewToolResultText(string(data)), nil
 	}
 }
 
-func slackPostMessageHandler(agents *agent.Manager) mcpserver.ToolHandlerFunc {
+func slackPostMessageHandler(agents *agent.Manager, logger *slog.Logger) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		api, errMsg := getSlackClient(ctx, agents)
-		if api == nil {
-			return mcp.NewToolResultError(errMsg), nil
-		}
-
+		reqID := reqIDFromCtx(ctx)
+		agentID, _ := ctx.Value(mcpAgentIDKey).(string)
 		args := req.GetArguments()
 		channel, _ := args["channel"].(string)
 		text, _ := args["text"].(string)
+		logger.Info("mcp tool invoked",
+			"reqID", reqID, "agent", agentID, "tool", "slack_post_message",
+			"channel", channel, "textLen", len(text),
+		)
+
+		api, errMsg := getSlackClient(ctx, agents)
+		if api == nil {
+			logger.Warn("mcp tool aborted", "reqID", reqID, "agent", agentID, "tool", "slack_post_message", "err", errMsg)
+			return mcp.NewToolResultError(errMsg), nil
+		}
 
 		if channel == "" || text == "" {
+			logger.Warn("mcp tool missing args", "reqID", reqID, "agent", agentID, "tool", "slack_post_message", "channelEmpty", channel == "", "textEmpty", text == "")
 			return mcp.NewToolResultError("both 'channel' and 'text' are required"), nil
 		}
 
 		resolvedChannel, err := resolveSlackChannel(ctx, api, channel)
 		if err != nil {
+			logger.Warn("mcp tool resolve failed", "reqID", reqID, "agent", agentID, "tool", "slack_post_message", "channel", channel, "err", err)
 			return mcp.NewToolResultError(fmt.Sprintf("failed to resolve channel %q: %v", channel, err)), nil
 		}
 
 		_, ts, err := api.PostMessageContext(ctx, resolvedChannel, slack.MsgOptionText(text, false))
 		if err != nil {
+			logger.Warn("mcp tool post failed", "reqID", reqID, "agent", agentID, "tool", "slack_post_message", "channel", resolvedChannel, "err", err)
 			return mcp.NewToolResultError(fmt.Sprintf("failed to post message: %v", err)), nil
 		}
+
+		logger.Info("mcp tool result",
+			"reqID", reqID, "agent", agentID, "tool", "slack_post_message",
+			"channel", resolvedChannel, "ts", ts,
+		)
 
 		result := map[string]string{
 			"channel":   resolvedChannel,
