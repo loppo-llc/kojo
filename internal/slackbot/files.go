@@ -8,9 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/slack-go/slack"
 )
+
+// uploadDir matches the WebUI upload directory (file_handlers.go).
+var uploadDir = filepath.Join(os.TempDir(), "kojo", "upload")
 
 // maxFileSize is the maximum file size (20 MB) the bot will download.
 const maxFileSize = 20 * 1024 * 1024
@@ -27,13 +31,12 @@ type downloadedFile struct {
 // directory and returns metadata for each successfully downloaded file.
 // Files that are too large or fail to download are logged and skipped.
 func (b *Bot) downloadSlackFiles(ctx context.Context, files []slack.File) []downloadedFile {
-	if b.agentDataDir == "" || len(files) == 0 {
+	if len(files) == 0 {
 		return nil
 	}
 
-	dir := filepath.Join(b.agentDataDir, "slack-files")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		b.logger.Warn("failed to create slack-files dir", "err", err)
+	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
+		b.logger.Warn("failed to create upload dir", "err", err)
 		return nil
 	}
 
@@ -50,7 +53,7 @@ func (b *Bot) downloadSlackFiles(ctx context.Context, files []slack.File) []down
 			continue
 		}
 
-		localPath, err := b.downloadOneFile(ctx, dir, &f)
+		localPath, err := b.downloadOneFile(ctx, uploadDir, &f)
 		if err != nil {
 			b.logger.Warn("failed to download slack file",
 				"fileID", f.ID, "name", f.Name, "err", err)
@@ -70,11 +73,10 @@ func (b *Bot) downloadSlackFiles(ctx context.Context, files []slack.File) []down
 }
 
 // downloadOneFile downloads a single Slack file and saves it locally.
-// The filename includes the Slack file ID prefix to avoid collisions.
+// The filename uses {unixnano}_{original_name} to match the WebUI upload convention.
 func (b *Bot) downloadOneFile(ctx context.Context, dir string, f *slack.File) (string, error) {
-	// Build safe filename: "{fileID}_{original_name}"
 	safeName := sanitizeFilename(f.Name)
-	localName := fmt.Sprintf("%s_%s", f.ID, safeName)
+	localName := fmt.Sprintf("%d_%s", time.Now().UnixNano(), safeName)
 	localPath := filepath.Join(dir, localName)
 
 	// Slack private URLs require bot token in Authorization header.
