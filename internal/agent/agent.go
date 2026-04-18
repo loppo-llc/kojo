@@ -98,6 +98,23 @@ func ValidEffort(effort string) bool {
 	return allowedEfforts[effort]
 }
 
+var allowedThinkingModes = map[string]bool{
+	"": true, "on": true, "off": true, "auto": true,
+}
+
+// ValidThinkingMode returns true if the given thinking mode is valid.
+func ValidThinkingMode(mode string) bool {
+	return allowedThinkingModes[mode]
+}
+
+// NormalizeThinkingMode normalizes "auto" to "" for storage.
+func NormalizeThinkingMode(mode string) string {
+	if mode == "auto" {
+		return ""
+	}
+	return mode
+}
+
 // xhighModels lists models that support the "xhigh" effort level.
 var xhighModels = map[string]bool{
 	"opus": true, "claude-opus-4-7": true,
@@ -165,6 +182,10 @@ type Agent struct {
 	// If empty, all tools are forwarded.
 	AllowedTools []string `json:"allowedTools,omitempty"`
 
+	// ThinkingMode controls reasoning/thinking for llama.cpp backend.
+	// "on" = enable, "off" = disable, "" = server default.
+	ThinkingMode string `json:"thinkingMode,omitempty"`
+
 	// NotifySources holds notification source configurations for this agent.
 	NotifySources []notifysource.Config `json:"notifySources,omitempty"`
 
@@ -197,6 +218,7 @@ type AgentConfig struct {
 	Effort          string  `json:"effort"`
 	Tool            string  `json:"tool"`
 	CustomBaseURL   string  `json:"customBaseURL"`
+	ThinkingMode    string  `json:"thinkingMode"`
 	WorkDir         string  `json:"workDir"`
 	IntervalMinutes *int    `json:"intervalMinutes"` // nil = use default (30)
 	TimeoutMinutes  *int    `json:"timeoutMinutes"`  // nil = use default (0 = 10 min)
@@ -220,6 +242,7 @@ type AgentUpdateConfig struct {
 	ActiveStart           *string   `json:"activeStart"`
 	ActiveEnd             *string   `json:"activeEnd"`
 	CustomBaseURL         *string   `json:"customBaseURL"`
+	ThinkingMode          *string   `json:"thinkingMode"`
 	AllowedTools          []string  `json:"allowedTools"`
 }
 
@@ -259,6 +282,9 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	if (cfg.Tool == "custom" || cfg.Tool == "llama.cpp") && cfg.CustomBaseURL == "" {
 		return nil, fmt.Errorf("customBaseURL is required for %s tool", cfg.Tool)
 	}
+	if !ValidThinkingMode(cfg.ThinkingMode) {
+		return nil, fmt.Errorf("unsupported thinkingMode: %q", cfg.ThinkingMode)
+	}
 	if cfg.WorkDir != "" {
 		if !filepath.IsAbs(cfg.WorkDir) {
 			return nil, fmt.Errorf("workDir must be an absolute path: %s", cfg.WorkDir)
@@ -275,6 +301,7 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		Effort:          cfg.Effort,
 		Tool:            cfg.Tool,
 		CustomBaseURL:   cfg.CustomBaseURL,
+		ThinkingMode:    NormalizeThinkingMode(cfg.ThinkingMode),
 		WorkDir:         cfg.WorkDir,
 		IntervalMinutes: interval,
 		TimeoutMinutes:  timeoutMin,

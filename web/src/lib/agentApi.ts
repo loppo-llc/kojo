@@ -41,6 +41,7 @@ export interface AgentInfo {
   hasAvatar: boolean;
   avatarHash?: string;
   allowedTools?: string[];
+  thinkingMode?: string;
   notifySources?: NotifySourceConfig[];
   lastMessage?: {
     content: string;
@@ -56,6 +57,7 @@ export interface AgentConfig {
   effort?: string;
   tool?: string;
   customBaseURL?: string;
+  thinkingMode?: string;
   workDir?: string;
   intervalMinutes?: number;
   timeoutMinutes?: number;
@@ -67,6 +69,7 @@ export interface AgentUpdateParams extends Partial<AgentConfig> {
   publicProfile?: string;
   publicProfileOverride?: boolean;
   allowedTools?: string[];
+  thinkingMode?: string;
 }
 
 export interface AgentMessageAttachment {

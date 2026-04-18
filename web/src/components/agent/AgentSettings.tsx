@@ -21,6 +21,7 @@ export function AgentSettings() {
   const [tool, setTool] = useState("");
   const [customBaseURL, setCustomBaseURL] = useState("http://localhost:8080");
   const [customModels, setCustomModels] = useState<string[]>([]);
+  const [thinkingMode, setThinkingMode] = useState("");
   const [workDir, setWorkDir] = useState("");
   const [intervalMinutes, setIntervalMinutes] = useState(30);
   const [timeoutMinutes, setTimeoutMinutes] = useState(10);
@@ -51,6 +52,7 @@ export function AgentSettings() {
       setEffort(a.effort || "");
       setTool(a.tool);
       setCustomBaseURL(a.customBaseURL ?? "http://localhost:8080");
+      setThinkingMode(a.thinkingMode ?? "");
       setWorkDir(a.workDir ?? "");
       setIntervalMinutes(a.intervalMinutes);
       setTimeoutMinutes(a.timeoutMinutes || 10);
@@ -91,6 +93,7 @@ export function AgentSettings() {
         effort: supportsEffort(tool) ? effort : undefined,
         tool: tool.trim(),
         customBaseURL: needsCustomURL ? customBaseURL.trim() : undefined,
+        thinkingMode: tool === "llama.cpp" ? thinkingMode : undefined,
         workDir: workDir.trim(),
         intervalMinutes,
         timeoutMinutes,
@@ -466,6 +469,22 @@ export function AgentSettings() {
                 </label>
               ))}
             </div>
+          </div>
+        )}
+
+        {/* Thinking Mode (llama.cpp only) */}
+        {tool === "llama.cpp" && (
+          <div>
+            <label className="block text-sm text-neutral-400 mb-2">Thinking</label>
+            <select
+              value={thinkingMode}
+              onChange={(e) => setThinkingMode(e.target.value)}
+              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+            >
+              <option value="">auto (server default)</option>
+              <option value="on">on</option>
+              <option value="off">off</option>
+            </select>
           </div>
         )}
 

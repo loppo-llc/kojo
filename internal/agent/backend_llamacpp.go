@@ -42,9 +42,19 @@ func (b *LlamaCppBackend) Chat(ctx context.Context, agent *Agent, userMessage st
 		return nil, fmt.Errorf("llama.cpp customBaseURL: %w", err)
 	}
 
+	effectivePrompt := systemPrompt
+	if agent.ThinkingMode == "off" {
+		const noThinkDirective = "Do not use <think> tags. Respond directly without showing your reasoning."
+		if effectivePrompt != "" {
+			effectivePrompt = noThinkDirective + "\n\n" + effectivePrompt
+		} else {
+			effectivePrompt = noThinkDirective
+		}
+	}
+
 	messages := []llamaCppMessage{}
-	if systemPrompt != "" {
-		messages = append(messages, llamaCppMessage{Role: "system", Content: systemPrompt})
+	if effectivePrompt != "" {
+		messages = append(messages, llamaCppMessage{Role: "system", Content: effectivePrompt})
 	}
 	messages = append(messages, llamaCppMessage{Role: "user", Content: userMessage})
 
@@ -56,6 +66,16 @@ func (b *LlamaCppBackend) Chat(ctx context.Context, agent *Agent, userMessage st
 			IncludeUsage: true,
 		},
 	}
+
+	switch agent.ThinkingMode {
+	case "off":
+		reqBody.ChatTemplateKwargs = map[string]any{"enable_thinking": false}
+	case "on":
+		reqBody.ChatTemplateKwargs = map[string]any{"enable_thinking": true}
+		reqBody.ReasoningFormat = "deepseek"
+	}
+
+	thinkOff := agent.ThinkingMode == "off"
 
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
@@ -85,7 +105,7 @@ func (b *LlamaCppBackend) Chat(ctx context.Context, agent *Agent, userMessage st
 	go func() {
 		defer close(ch)
 		defer resp.Body.Close()
-		b.streamSSE(ctx, ch, resp.Body)
+		b.streamSSE(ctx, ch, resp.Body, thinkOff)
 	}()
 
 	return ch, nil
@@ -108,7 +128,7 @@ func validateLoopbackURL(rawURL string) error {
 	return nil
 }
 
-func (b *LlamaCppBackend) streamSSE(ctx context.Context, ch chan<- ChatEvent, body io.Reader) {
+func (b *LlamaCppBackend) streamSSE(ctx context.Context, ch chan<- ChatEvent, body io.Reader, thinkOff bool) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 256*1024)
 
@@ -116,6 +136,11 @@ func (b *LlamaCppBackend) streamSSE(ctx context.Context, ch chan<- ChatEvent, bo
 	var thinking strings.Builder
 	var usage *Usage
 	started := false
+
+	var stripper *thinkStripper
+	if thinkOff {
+		stripper = &thinkStripper{}
+	}
 
 	send := func(e ChatEvent) bool {
 		select {
@@ -126,12 +151,21 @@ func (b *LlamaCppBackend) streamSSE(ctx context.Context, ch chan<- ChatEvent, bo
 		}
 	}
 
+	emitText := func(text string) bool {
+		if stripper != nil {
+			text = stripper.Process(text)
+		}
+		if text == "" {
+			return true
+		}
+		content.WriteString(text)
+		return send(ChatEvent{Type: "text", Delta: text})
+	}
+
 	// SSE spec: events are delimited by blank lines.
 	// Each event may have multiple "data:" lines that are concatenated with "\n".
 	var dataBuf strings.Builder
 
-	// dispatch processes an accumulated SSE data buffer.
-	// Returns: done (true if stream finished), cancelled (true if context was cancelled).
 	dispatch := func(data string) (done, cancelled bool) {
 		if data == "[DONE]" {
 			return true, false
@@ -162,7 +196,7 @@ func (b *LlamaCppBackend) streamSSE(ctx context.Context, ch chan<- ChatEvent, bo
 			started = true
 		}
 
-		if delta.ReasoningContent != "" {
+		if delta.ReasoningContent != "" && !thinkOff {
 			thinking.WriteString(delta.ReasoningContent)
 			if !send(ChatEvent{Type: "thinking", Delta: delta.ReasoningContent}) {
 				return false, true
@@ -170,8 +204,7 @@ func (b *LlamaCppBackend) streamSSE(ctx context.Context, ch chan<- ChatEvent, bo
 		}
 
 		if delta.Content != "" {
-			content.WriteString(delta.Content)
-			if !send(ChatEvent{Type: "text", Delta: delta.Content}) {
+			if !emitText(delta.Content) {
 				return false, true
 			}
 		}
@@ -202,7 +235,6 @@ func (b *LlamaCppBackend) streamSSE(ctx context.Context, ch chan<- ChatEvent, bo
 			continue
 		}
 
-		// Accumulate data fields (handle both "data: " and "data:" per SSE spec)
 		if strings.HasPrefix(line, "data:") {
 			val := line[5:]
 			if len(val) > 0 && val[0] == ' ' {
@@ -215,13 +247,20 @@ func (b *LlamaCppBackend) streamSSE(ctx context.Context, ch chan<- ChatEvent, bo
 		}
 	}
 
-	// Flush any remaining buffered data (stream closed without trailing blank line)
 	if !streamDone && dataBuf.Len() > 0 {
 		data := dataBuf.String()
 		_, cancelled := dispatch(data)
 		if cancelled {
 			emitCancelDone(ctx, ch, content.String(), thinking.String(), nil, usage)
 			return
+		}
+	}
+
+	// Flush any buffered content from the think stripper
+	if stripper != nil {
+		if remaining := stripper.Flush(); remaining != "" {
+			content.WriteString(remaining)
+			send(ChatEvent{Type: "text", Delta: remaining})
 		}
 	}
 
@@ -249,6 +288,172 @@ func (b *LlamaCppBackend) streamSSE(ctx context.Context, ch chan<- ChatEvent, bo
 	}
 }
 
+// thinkStripper filters out thinking-related markers from streamed content.
+// Handles Gemma-style channel markers and DeepSeek-style <think> blocks.
+// Uses a tail buffer to handle tags split across chunk boundaries.
+type thinkStripper struct {
+	prefixBuf  strings.Builder
+	prefixDone bool
+	inBlock    bool            // inside <think>...</think>
+	tailBuf    strings.Builder // suffix that might be part of a tag
+}
+
+var thinkChannelMarkers = []string{
+	"<|channel>thought<channel|>",
+	"<|channel>response<channel|>",
+	"<|/channel|>",
+}
+
+var allThinkPatterns = []string{
+	"<think>",
+	"</think>",
+	"<|channel>thought<channel|>",
+	"<|channel>response<channel|>",
+	"<|/channel|>",
+}
+
+func (s *thinkStripper) Process(delta string) string {
+	if !s.prefixDone {
+		return s.checkPrefix(delta)
+	}
+	return s.filter(delta)
+}
+
+func (s *thinkStripper) checkPrefix(delta string) string {
+	s.prefixBuf.WriteString(delta)
+	text := s.prefixBuf.String()
+
+	for _, m := range thinkChannelMarkers {
+		if strings.HasPrefix(text, m) {
+			s.prefixDone = true
+			s.prefixBuf.Reset()
+			return s.filter(text[len(m):])
+		}
+		if len(text) < len(m) && strings.HasPrefix(m, text) {
+			return ""
+		}
+	}
+	const thinkOpen = "<think>"
+	if strings.HasPrefix(text, thinkOpen) {
+		s.prefixDone = true
+		s.prefixBuf.Reset()
+		s.inBlock = true
+		return s.filter(text[len(thinkOpen):])
+	}
+	if len(text) < len(thinkOpen) && strings.HasPrefix(thinkOpen, text) {
+		return ""
+	}
+
+	s.prefixDone = true
+	s.prefixBuf.Reset()
+	return s.filter(text)
+}
+
+func (s *thinkStripper) filter(delta string) string {
+	if delta == "" && s.tailBuf.Len() == 0 {
+		return ""
+	}
+
+	var text string
+	if s.tailBuf.Len() > 0 {
+		text = s.tailBuf.String() + delta
+		s.tailBuf.Reset()
+	} else {
+		text = delta
+	}
+
+	for _, m := range thinkChannelMarkers {
+		text = strings.ReplaceAll(text, m, "")
+	}
+	if text == "" {
+		return ""
+	}
+
+	var result strings.Builder
+	for len(text) > 0 {
+		if s.inBlock {
+			idx := strings.Index(text, "</think>")
+			if idx >= 0 {
+				text = text[idx+len("</think>"):]
+				s.inBlock = false
+				continue
+			}
+			if n := partialTagSuffix(text, "</think>"); n > 0 {
+				s.tailBuf.WriteString(text[len(text)-n:])
+			}
+			break
+		}
+
+		idx := strings.Index(text, "<think>")
+		if idx >= 0 {
+			result.WriteString(text[:idx])
+			text = text[idx+len("<think>"):]
+			s.inBlock = true
+			continue
+		}
+
+		if n := longestPartialTag(text); n > 0 {
+			result.WriteString(text[:len(text)-n])
+			s.tailBuf.WriteString(text[len(text)-n:])
+		} else {
+			result.WriteString(text)
+		}
+		break
+	}
+
+	return result.String()
+}
+
+// longestPartialTag returns the length of the longest suffix of text
+// that is a proper prefix of any known think-related tag.
+func longestPartialTag(text string) int {
+	best := 0
+	for _, pat := range allThinkPatterns {
+		maxN := len(pat) - 1
+		if maxN > len(text) {
+			maxN = len(text)
+		}
+		for n := maxN; n > best; n-- {
+			if text[len(text)-n:] == pat[:n] {
+				best = n
+				break
+			}
+		}
+	}
+	return best
+}
+
+func partialTagSuffix(text, tag string) int {
+	maxN := len(tag) - 1
+	if maxN > len(text) {
+		maxN = len(text)
+	}
+	for n := maxN; n > 0; n-- {
+		if text[len(text)-n:] == tag[:n] {
+			return n
+		}
+	}
+	return 0
+}
+
+func (s *thinkStripper) Flush() string {
+	var result strings.Builder
+	if !s.prefixDone && s.prefixBuf.Len() > 0 {
+		s.prefixDone = true
+		text := s.prefixBuf.String()
+		s.prefixBuf.Reset()
+		result.WriteString(s.filter(text))
+	}
+	if s.tailBuf.Len() > 0 {
+		tail := s.tailBuf.String()
+		s.tailBuf.Reset()
+		if !s.inBlock {
+			result.WriteString(tail)
+		}
+	}
+	return result.String()
+}
+
 // --- Request/Response types ---
 
 type llamaCppMessage struct {
@@ -261,10 +466,12 @@ type llamaCppStreamOptions struct {
 }
 
 type llamaCppRequest struct {
-	Model         string                 `json:"model"`
-	Messages      []llamaCppMessage      `json:"messages"`
-	Stream        bool                   `json:"stream"`
-	StreamOptions *llamaCppStreamOptions `json:"stream_options,omitempty"`
+	Model              string                 `json:"model"`
+	Messages           []llamaCppMessage      `json:"messages"`
+	Stream             bool                   `json:"stream"`
+	StreamOptions      *llamaCppStreamOptions `json:"stream_options,omitempty"`
+	ChatTemplateKwargs map[string]any         `json:"chat_template_kwargs,omitempty"`
+	ReasoningFormat    string                 `json:"reasoning_format,omitempty"`
 }
 
 type llamaCppChunk struct {

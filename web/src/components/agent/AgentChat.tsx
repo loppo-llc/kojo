@@ -408,6 +408,29 @@ export function AgentChat() {
             {connected ? (streaming ? "typing..." : "online") : "connecting..."}
           </div>
         </div>
+        {agent.tool === "llama.cpp" && (
+          <button
+            onClick={async () => {
+              const modes = ["", "on", "off"] as const;
+              const idx = modes.indexOf((agent.thinkingMode ?? "") as typeof modes[number]);
+              const next = modes[(idx + 1) % modes.length];
+              try {
+                const updated = await agentApi.update(agent.id, { thinkingMode: next });
+                setAgent(updated);
+              } catch {}
+            }}
+            className={`px-2 py-1 rounded text-xs font-mono ${
+              agent.thinkingMode === "on"
+                ? "bg-blue-900/50 text-blue-300 border border-blue-700"
+                : agent.thinkingMode === "off"
+                  ? "bg-neutral-800 text-neutral-500 border border-neutral-700"
+                  : "bg-neutral-800 text-neutral-400 border border-neutral-700"
+            }`}
+            title={`Thinking: ${agent.thinkingMode || "auto"}`}
+          >
+            {agent.thinkingMode === "on" ? "think:on" : agent.thinkingMode === "off" ? "think:off" : "think:auto"}
+          </button>
+        )}
         <button
           onClick={() => navigate(`/agents/${agent.id}/settings`)}
           className="p-2 text-neutral-500 hover:text-neutral-300 rounded"

@@ -491,6 +491,13 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.AllowedTools != nil {
 		a.AllowedTools = cfg.AllowedTools
 	}
+	if cfg.ThinkingMode != nil {
+		if !ValidThinkingMode(*cfg.ThinkingMode) {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("unsupported thinkingMode: %q", *cfg.ThinkingMode)
+		}
+		a.ThinkingMode = NormalizeThinkingMode(*cfg.ThinkingMode)
+	}
 	newInterval := a.IntervalMinutes
 	a.UpdatedAt = time.Now().Format(time.RFC3339)
 	applyAvatarMeta(a, avHas, avHash)
