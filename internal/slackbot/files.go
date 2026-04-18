@@ -27,29 +27,43 @@ type downloadedFile struct {
 	Size int    // file size in bytes
 }
 
+// fileError holds metadata about a file that failed to download.
+type fileError struct {
+	Name string // original filename
+	Err  string // human-readable error
+}
+
 // downloadSlackFiles downloads Slack file attachments to the agent's data
 // directory and returns metadata for each successfully downloaded file.
-// Files that are too large or fail to download are logged and skipped.
-func (b *Bot) downloadSlackFiles(ctx context.Context, files []slack.File) []downloadedFile {
+// Files that are too large or fail to download are recorded in errors
+// so the caller can inform the agent.
+func (b *Bot) downloadSlackFiles(ctx context.Context, files []slack.File) ([]downloadedFile, []fileError) {
 	if len(files) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
 		b.logger.Warn("failed to create upload dir", "err", err)
-		return nil
+		var errs []fileError
+		for _, f := range files {
+			errs = append(errs, fileError{Name: f.Name, Err: fmt.Sprintf("upload dir not writable: %v", err)})
+		}
+		return nil, errs
 	}
 
 	var result []downloadedFile
+	var errs []fileError
 	for _, f := range files {
 		if f.Size > maxFileSize {
 			b.logger.Warn("slack file too large, skipping",
 				"fileID", f.ID, "name", f.Name, "size", f.Size)
+			errs = append(errs, fileError{Name: f.Name, Err: fmt.Sprintf("file too large (%d bytes, max %d)", f.Size, maxFileSize)})
 			continue
 		}
 		if f.URLPrivateDownload == "" {
 			b.logger.Debug("slack file has no download URL, skipping",
 				"fileID", f.ID, "name", f.Name)
+			errs = append(errs, fileError{Name: f.Name, Err: "no download URL available"})
 			continue
 		}
 
@@ -57,6 +71,7 @@ func (b *Bot) downloadSlackFiles(ctx context.Context, files []slack.File) []down
 		if err != nil {
 			b.logger.Warn("failed to download slack file",
 				"fileID", f.ID, "name", f.Name, "err", err)
+			errs = append(errs, fileError{Name: f.Name, Err: err.Error()})
 			continue
 		}
 
@@ -69,7 +84,7 @@ func (b *Bot) downloadSlackFiles(ctx context.Context, files []slack.File) []down
 		b.logger.Info("downloaded slack file",
 			"fileID", f.ID, "name", f.Name, "path", localPath, "size", f.Size)
 	}
-	return result
+	return result, errs
 }
 
 // downloadOneFile downloads a single Slack file and saves it locally.
@@ -110,17 +125,28 @@ func (b *Bot) downloadOneFile(ctx context.Context, dir string, f *slack.File) (s
 	return localPath, nil
 }
 
-// appendFilePaths appends downloaded file paths to the message text so the
-// agent knows about the files and can read them with its file tools.
-func appendFilePaths(text string, files []downloadedFile) string {
+// appendFileInfo appends downloaded file paths and any errors to the message
+// text so the agent knows about the files and can read them with its file tools.
+func appendFileInfo(text string, files []downloadedFile, errs []fileError) string {
+	if len(files) == 0 && len(errs) == 0 {
+		return text
+	}
 	var sb strings.Builder
 	sb.WriteString(text)
 	if text != "" {
 		sb.WriteString("\n\n")
 	}
-	sb.WriteString("[Attached files]\n")
-	for _, f := range files {
-		sb.WriteString(fmt.Sprintf("- %s (%s, %d bytes): %s\n", f.Name, f.Mime, f.Size, f.Path))
+	if len(files) > 0 {
+		sb.WriteString("[Attached files]\n")
+		for _, f := range files {
+			sb.WriteString(fmt.Sprintf("- %s (%s, %d bytes): %s\n", f.Name, f.Mime, f.Size, f.Path))
+		}
+	}
+	if len(errs) > 0 {
+		sb.WriteString("[File download errors]\n")
+		for _, e := range errs {
+			sb.WriteString(fmt.Sprintf("- %s: %s\n", e.Name, e.Err))
+		}
 	}
 	return sb.String()
 }

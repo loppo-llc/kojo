@@ -200,16 +200,16 @@ func (b *Bot) handleMessageEvent(ctx context.Context, ev *slackevents.MessageEve
 	}
 	// Ignore edits, deletes, and other meta subtypes — but allow file_share.
 	if ev.SubType != "" && ev.SubType != "file_share" {
+		b.logger.Debug("slack message ignored", "subType", ev.SubType, "user", ev.User)
 		return
 	}
 
 	// Extract files from the message (populated by UnmarshalJSON into ev.Message).
 	text := ev.Text
 	if ev.Message != nil && len(ev.Message.Files) > 0 {
-		downloaded := b.downloadSlackFiles(ctx, ev.Message.Files)
-		if len(downloaded) > 0 {
-			text = appendFilePaths(text, downloaded)
-		}
+		b.logger.Debug("slack files attached", "count", len(ev.Message.Files))
+		downloaded, errs := b.downloadSlackFiles(ctx, ev.Message.Files)
+		text = appendFileInfo(text, downloaded, errs)
 	}
 
 	// Direct messages
