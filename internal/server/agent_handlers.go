@@ -338,7 +338,7 @@ func (s *Server) handleGenerateAvatar(w http.ResponseWriter, r *http.Request) {
 		cleanupTempAvatar(req.PreviousPath)
 	}
 
-	avatarPath, err := agent.GenerateAvatarWithAI("", req.Persona, req.Name, req.Prompt, s.logger)
+	avatarPath, err := agent.GenerateAvatarWithAI(r.Context(), "", req.Persona, req.Name, req.Prompt, s.logger)
 	if err != nil {
 		s.logger.Warn("AI avatar generation failed, using SVG fallback", "err", err)
 		svgPath, svgErr := agent.GenerateSVGAvatarFile(req.Name)

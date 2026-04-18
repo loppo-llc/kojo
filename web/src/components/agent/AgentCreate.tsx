@@ -413,21 +413,38 @@ export function AgentCreate() {
           </div>
         </div>
 
-        {/* Generate All */}
-        <button
-          onClick={handleGenerateAll}
-          disabled={isGenerating || !persona.trim()}
-          className="w-full py-2.5 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded-lg text-sm font-medium disabled:opacity-40 flex items-center justify-center gap-2"
-        >
-          {genPhase.startsWith("all-") ? (
-            <>
-              <span className="animate-spin">↻</span>
-              {genStatusText}
-            </>
-          ) : (
-            <>✨ Generate Name & Avatar</>
-          )}
-        </button>
+        {/* Generate All / Avatar only */}
+        <div className="flex gap-2">
+          <button
+            onClick={handleGenerateAll}
+            disabled={isGenerating || !persona.trim()}
+            className="flex-1 py-2.5 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded-lg text-sm font-medium disabled:opacity-40 flex items-center justify-center gap-2"
+          >
+            {genPhase.startsWith("all-") ? (
+              <>
+                <span className="animate-spin">↻</span>
+                {genStatusText}
+              </>
+            ) : (
+              <>✨ Name & Avatar</>
+            )}
+          </button>
+          <button
+            onClick={() => handleGenerateAvatar()}
+            disabled={isGenerating || !persona.trim() || !name.trim()}
+            className="px-4 py-2.5 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded-lg text-sm font-medium disabled:opacity-40 flex items-center justify-center gap-2"
+            title={!name.trim() ? "Set a name first" : "Generate avatar only"}
+          >
+            {genPhase === "avatar" ? (
+              <>
+                <span className="animate-spin">↻</span>
+                Avatar...
+              </>
+            ) : (
+              <>✨ Avatar</>
+            )}
+          </button>
+        </div>
 
         {/* Tool */}
         <div>

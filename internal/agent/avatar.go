@@ -1,16 +1,20 @@
 package agent
 
 import (
+	"bytes"
+	"context"
 	"crypto/md5"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Sentinel errors for ValidateTempAvatarPath, allowing callers to map to
@@ -134,17 +138,52 @@ func ValidateTempAvatarPath(avatarPath string) (string, error) {
 	return absPath, nil
 }
 
-// GenerateAvatarWithAI generates an avatar using nanobanana.sh.
-func GenerateAvatarWithAI(agentID string, persona string, name string, prompt string, logger *slog.Logger) (string, error) {
-	scriptPath := filepath.Join(os.Getenv("HOME"), ".claude", "skills", "nanobanana", "scripts", "nanobanana.sh")
-	if _, err := os.Stat(scriptPath); err != nil {
-		return "", fmt.Errorf("nanobanana.sh not found at %s", scriptPath)
+// geminiImageModel is the default image-output Gemini model.
+// Override via KOJO_GEMINI_IMAGE_MODEL.
+const geminiImageModel = "gemini-3.1-flash-image-preview"
+
+// resolveGeminiAPIKey returns an API key from env vars or legacy
+// nanobanana credentials file, or "" if none is configured.
+func resolveGeminiAPIKey() string {
+	for _, v := range []string{"KOJO_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"} {
+		if key := strings.TrimSpace(os.Getenv(v)); key != "" {
+			return key
+		}
+	}
+	credPath := filepath.Join(os.Getenv("HOME"), ".config", "nanobanana", "credentials")
+	if b, err := os.ReadFile(credPath); err == nil {
+		if key := strings.TrimSpace(string(b)); key != "" {
+			return key
+		}
+	}
+	return ""
+}
+
+func extFromMimeType(mime string) string {
+	switch strings.ToLower(strings.TrimSpace(strings.SplitN(mime, ";", 2)[0])) {
+	case "image/png":
+		return ".png"
+	case "image/jpeg", "image/jpg":
+		return ".jpg"
+	case "image/webp":
+		return ".webp"
+	default:
+		return ""
+	}
+}
+
+// GenerateAvatarWithAI generates an avatar by calling the Gemini image
+// generation API directly. Returns the path to an image file inside a
+// kojo-avatar-* temp dir.
+func GenerateAvatarWithAI(ctx context.Context, agentID string, persona string, name string, prompt string, logger *slog.Logger) (string, error) {
+	apiKey := resolveGeminiAPIKey()
+	if apiKey == "" {
+		return "", fmt.Errorf("no Gemini API key configured (set GEMINI_API_KEY)")
 	}
 
 	// Build image generation prompt
 	imagePrompt := fmt.Sprintf("Character portrait avatar of %s, ", name)
 	if persona != "" {
-		// Extract key traits from persona (first 100 runes to avoid breaking UTF-8)
 		runes := []rune(persona)
 		if len(runes) > 100 {
 			runes = runes[:100]
@@ -156,42 +195,127 @@ func GenerateAvatarWithAI(agentID string, persona string, name string, prompt st
 	}
 	imagePrompt += "flat illustration style, clean background, centered face, square format"
 
-	// Create temp dir for output
+	model := geminiImageModel
+	if m := strings.TrimSpace(os.Getenv("KOJO_GEMINI_IMAGE_MODEL")); m != "" {
+		model = m
+	}
+
+	reqBody := map[string]any{
+		"contents": []any{
+			map[string]any{
+				"parts": []any{
+					map[string]any{"text": imagePrompt},
+				},
+			},
+		},
+		"generationConfig": map[string]any{
+			"responseModalities": []string{"IMAGE"},
+			"imageConfig": map[string]any{
+				"aspectRatio": "1:1",
+				"imageSize":   "1K",
+			},
+		},
+	}
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal payload: %w", err)
+	}
+
+	endpoint := "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent"
+	reqCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-goog-api-key", apiKey)
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("gemini request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		var apiErr struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(body, &apiErr)
+		msg := apiErr.Error.Message
+		if msg == "" {
+			msg = string(body)
+			if len(msg) > 300 {
+				msg = msg[:300]
+			}
+		}
+		logger.Debug("gemini API error", "status", resp.StatusCode, "body", string(body))
+		return "", fmt.Errorf("gemini API HTTP %d: %s", resp.StatusCode, msg)
+	}
+
+	var parsed struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					InlineData *struct {
+						MimeType string `json:"mimeType"`
+						Data     string `json:"data"`
+					} `json:"inlineData"`
+				} `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
+		PromptFeedback struct {
+			BlockReason string `json:"blockReason"`
+		} `json:"promptFeedback"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", fmt.Errorf("parse response: %w", err)
+	}
+	if len(parsed.Candidates) == 0 {
+		if parsed.PromptFeedback.BlockReason != "" {
+			return "", fmt.Errorf("gemini blocked: %s", parsed.PromptFeedback.BlockReason)
+		}
+		return "", fmt.Errorf("no candidates in response")
+	}
+
+	var mimeType, b64 string
+	for _, p := range parsed.Candidates[0].Content.Parts {
+		if p.InlineData != nil && p.InlineData.Data != "" {
+			mimeType = p.InlineData.MimeType
+			b64 = p.InlineData.Data
+			break
+		}
+	}
+	if b64 == "" {
+		return "", fmt.Errorf("no image data in response")
+	}
+	ext := extFromMimeType(mimeType)
+	if ext == "" {
+		return "", fmt.Errorf("unsupported mime type: %s", mimeType)
+	}
+
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return "", fmt.Errorf("decode image: %w", err)
+	}
+
 	tmpDir, err := os.MkdirTemp("", "kojo-avatar-*")
 	if err != nil {
 		return "", err
 	}
-
-	cmd := exec.Command("bash", scriptPath, "generate",
-		"--aspect", "1:1",
-		"--size", "512px",
-		"--output", tmpDir,
-		imagePrompt,
-	)
-	cmd.Env = os.Environ()
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		logger.Debug("nanobanana.sh failed", "output", string(output), "err", err)
-		return "", fmt.Errorf("avatar generation failed: %w", err)
+	outPath := filepath.Join(tmpDir, "avatar"+ext)
+	if err := os.WriteFile(outPath, raw, 0o644); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", fmt.Errorf("write image: %w", err)
 	}
-
-	// Find the generated image
-	entries, err := os.ReadDir(tmpDir)
-	if err != nil || len(entries) == 0 {
-		return "", fmt.Errorf("no image generated")
-	}
-
-	// Return path to first image file
-	for _, e := range entries {
-		if !e.IsDir() {
-			ext := strings.ToLower(filepath.Ext(e.Name()))
-			if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp" {
-				return filepath.Join(tmpDir, e.Name()), nil
-			}
-		}
-	}
-	return "", fmt.Errorf("no image file found in output")
+	return outPath, nil
 }
 
 // GenerateSVGAvatarFile creates an SVG avatar file in a temp directory and returns its path.
