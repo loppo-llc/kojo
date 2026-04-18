@@ -33,6 +33,7 @@ type Bot struct {
 	mgr          ChatManager
 	logger       *slog.Logger
 	botUserID    string
+	botToken     string // stored for file downloads (slack.Client.token is private)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -86,6 +87,7 @@ func NewBot(parentCtx context.Context, agentID string, agentDataDir string, cfg 
 		sm:           sm,
 		mgr:          mgr,
 		logger:       logger.With("component", "slackbot", "agent", agentID),
+		botToken:     botToken,
 		ctx:          ctx,
 		cancel:       cancel,
 		done:        make(chan struct{}),
@@ -192,9 +194,22 @@ func (b *Bot) handleCallbackEvent(ctx context.Context, inner slackevents.EventsA
 }
 
 func (b *Bot) handleMessageEvent(ctx context.Context, ev *slackevents.MessageEvent) {
-	// Ignore bot's own messages and message edits/deletes
-	if ev.User == b.botUserID || ev.User == "" || ev.SubType != "" {
+	// Ignore bot's own messages
+	if ev.User == b.botUserID || ev.User == "" {
 		return
+	}
+	// Ignore edits, deletes, and other meta subtypes — but allow file_share.
+	if ev.SubType != "" && ev.SubType != "file_share" {
+		return
+	}
+
+	// Extract files from the message (populated by UnmarshalJSON into ev.Message).
+	text := ev.Text
+	if ev.Message != nil && len(ev.Message.Files) > 0 {
+		downloaded := b.downloadSlackFiles(ctx, ev.Message.Files)
+		if len(downloaded) > 0 {
+			text = appendFilePaths(text, downloaded)
+		}
 	}
 
 	// Direct messages
@@ -202,7 +217,7 @@ func (b *Bot) handleMessageEvent(ctx context.Context, ev *slackevents.MessageEve
 		if !b.config.ReactDM() {
 			return
 		}
-		b.processIncoming(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.Text, ev.User)
+		b.processIncoming(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text, ev.User)
 		return
 	}
 
@@ -210,7 +225,7 @@ func (b *Bot) handleMessageEvent(ctx context.Context, ev *slackevents.MessageEve
 	// we've previously participated in (history exists), the last message
 	// in history was from us, and the new message doesn't mention someone else.
 	if b.config.ReactThread() && ev.ThreadTimeStamp != "" && b.shouldAutoReply(ev.Channel, ev.ThreadTimeStamp, ev.Text) {
-		b.processIncoming(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.Text, ev.User)
+		b.processIncoming(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text, ev.User)
 	}
 }
 
