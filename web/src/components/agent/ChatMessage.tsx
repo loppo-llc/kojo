@@ -489,12 +489,8 @@ function MessageContent({
       {onRegenerate && (
         <button
           onClick={async () => {
-            try {
-              await onRegenerate(messageId);
-            } catch (e) {
-              console.error(e);
-              alert("Failed to regenerate");
-            }
+            // Parent surfaces errors inline; just await here.
+            await onRegenerate(messageId);
           }}
           className={btnCls}
           title="Regenerate"

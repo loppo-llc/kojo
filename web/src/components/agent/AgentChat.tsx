@@ -522,9 +522,21 @@ export function AgentChat() {
                       try {
                         await agentApi.regenerateMessage(agent.id, msgId);
                       } catch (e) {
-                        setMessages(snapshot);
+                        // Server rejected before regen started (400/404/409/5xx).
+                        // Roll back optimistic state and show the error inline
+                        // — the backend never streamed, so no WS error will
+                        // arrive.
+                        const errorContent = `⚠️ Error: ${e instanceof Error ? e.message : String(e)}`;
+                        setMessages([
+                          ...snapshot,
+                          {
+                            id: "error_" + Date.now(),
+                            role: "system",
+                            content: errorContent,
+                            timestamp: localRFC3339(),
+                          },
+                        ]);
                         resetStream();
-                        throw e;
                       }
                     }
                   : undefined

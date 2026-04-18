@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -1126,8 +1127,10 @@ func (m *Manager) DeleteMessage(agentID, msgID string) error {
 // user message is re-sent. If msgID is a user message, all subsequent
 // messages are removed and msgID itself is re-sent.
 //
-// The chat runs in the background; events are delivered to WebSocket
-// subscribers via the usual chat-start notification.
+// Returns after truncation and busy-slot registration so reloading clients
+// can immediately see the in-progress chat. The backend request and event
+// streaming run in the background; any backend.Chat failure is surfaced as
+// an error event on the broadcaster (and persisted as a system message).
 func (m *Manager) Regenerate(agentID, msgID string) error {
 	release, err := m.acquireTranscriptEdit(agentID)
 	if err != nil {
@@ -1159,38 +1162,51 @@ func (m *Manager) Regenerate(agentID, msgID string) error {
 		effectiveMessage = formatMessageWithAttachments(target.Content, target.Attachments)
 	}
 
-	// Start the backend chat BEFORE truncating the transcript so that a
-	// connection failure leaves history intact.
-	chatCtx, cancel := context.WithCancel(context.Background())
-	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{})
-	if err != nil {
-		cancel()
-		return err
-	}
-
-	// Commit the truncation now that the backend is streaming.
+	// Truncate synchronously so that any client reloading during the
+	// regeneration reads a consistent transcript via GET /messages.
 	if err := truncateMessagesTo(agentID, keepCount); err != nil {
-		cancel()
 		return err
 	}
 	m.refreshLastMessage(agentID)
 
+	chatCtx, cancel := context.WithCancel(context.Background())
 	outCh := make(chan ChatEvent, 64)
 	bc := newChatBroadcaster(outCh)
 
-	// Hand off editing → busy atomically so no chat can slip in between.
+	// Register busy BEFORE backend.Chat so that a reloading client can
+	// subscribe to the ongoing chat and see the "thinking" state while the
+	// backend request is in flight.
 	m.busyMu.Lock()
 	delete(m.editing, agentID)
 	editingReleased = true
 	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc}
 	m.busyMu.Unlock()
-
 	m.notifyChatStart(agentID)
 
 	go func() {
 		defer close(outCh)
 		defer m.clearBusy(agentID)
 		defer cancel()
+
+		backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{})
+		if err != nil {
+			// Abort before the stream started is not a failure —
+			// exit silently so no error surfaces in the transcript.
+			if errors.Is(err, context.Canceled) || chatCtx.Err() != nil {
+				return
+			}
+			// Persist as a system message and fan out via the
+			// broadcaster so subscribers see the failure.
+			errMsg := newSystemMessage("⚠️ Error: " + err.Error())
+			if appendErr := appendMessage(agentID, errMsg); appendErr != nil {
+				m.logger.Warn("failed to persist regenerate error", "err", appendErr)
+			}
+			select {
+			case outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}:
+			case <-chatCtx.Done():
+			}
+			return
+		}
 		m.processChatEvents(chatCtx, agentID, backendCh, outCh)
 		m.updatePostChatIndex(agentID)
 	}()
