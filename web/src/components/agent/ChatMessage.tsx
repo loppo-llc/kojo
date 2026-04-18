@@ -27,6 +27,9 @@ interface ChatMessageProps {
   agentName: string;
   agentId: string;
   avatarHash?: string;
+  onEdit?: (msgId: string, content: string) => Promise<void>;
+  onDelete?: (msgId: string) => Promise<void>;
+  onRegenerate?: (msgId: string) => Promise<void>;
 }
 
 export const ChatMessage = memo(function ChatMessage({
@@ -34,6 +37,9 @@ export const ChatMessage = memo(function ChatMessage({
   agentName,
   agentId,
   avatarHash,
+  onEdit,
+  onDelete,
+  onRegenerate,
 }: ChatMessageProps) {
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
@@ -62,7 +68,15 @@ export const ChatMessage = memo(function ChatMessage({
         {message.attachments && message.attachments.length > 0 && (
           <AttachmentList attachments={message.attachments} isUser={isUser} />
         )}
-        <MessageContent content={message.content} isUser={isUser} timestamp={message.timestamp} />
+        <MessageContent
+          messageId={message.id}
+          content={message.content}
+          isUser={isUser}
+          timestamp={message.timestamp}
+          onEdit={onEdit}
+          onDelete={onDelete}
+          onRegenerate={onRegenerate}
+        />
 
         {/* Tool uses — collapsed by default for completed messages */}
         {message.toolUses && message.toolUses.length > 0 && (
@@ -320,10 +334,41 @@ function actionBtnClass(isUser: boolean): string {
 }
 
 /** Renders text with markdown or plain text, plus copy/toggle buttons */
-function MessageContent({ content, isUser, timestamp }: { content: string; isUser: boolean; timestamp: string }) {
+function MessageContent({
+  messageId,
+  content,
+  isUser,
+  timestamp,
+  onEdit,
+  onDelete,
+  onRegenerate,
+}: {
+  messageId: string;
+  content: string;
+  isUser: boolean;
+  timestamp: string;
+  onEdit?: (msgId: string, content: string) => Promise<void>;
+  onDelete?: (msgId: string) => Promise<void>;
+  onRegenerate?: (msgId: string) => Promise<void>;
+}) {
   const [preview, setPreview] = useState<{ path: string; type: "image" | "video" } | null>(null);
   const [viewMode, setViewMode] = useState<"markdown" | "plain">("markdown");
   const [copied, setCopied] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(content);
+  const [saving, setSaving] = useState(false);
+  const editRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (!editing) return;
+    const el = editRef.current;
+    if (!el) return;
+    el.focus();
+    el.style.height = "auto";
+    el.style.height = el.scrollHeight + "px";
+    const len = el.value.length;
+    el.setSelectionRange(len, len);
+  }, [editing]);
 
   const parts = useMemo(() => splitFilePaths(content), [content]);
   const hasFiles = parts.length > 1 || (parts.length === 1 && parts[0].type === "file");
@@ -404,8 +449,124 @@ function MessageContent({ content, isUser, timestamp }: { content: string; isUse
           </>
         )}
       </button>}
+
+      {/* Edit / Delete (llama.cpp only — parent gates via handler presence) */}
+      {onEdit && (
+        <button
+          onClick={() => {
+            setDraft(content);
+            setEditing(true);
+          }}
+          className={btnCls}
+          title="Edit"
+        >
+          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931zm0 0L19.5 7.125" />
+          </svg>
+          Edit
+        </button>
+      )}
+      {onDelete && (
+        <button
+          onClick={async () => {
+            if (!window.confirm("Delete this message?")) return;
+            try {
+              await onDelete(messageId);
+            } catch (e) {
+              console.error(e);
+              alert("Failed to delete message");
+            }
+          }}
+          className={btnCls}
+          title="Delete"
+        >
+          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
+          </svg>
+          Delete
+        </button>
+      )}
+      {onRegenerate && (
+        <button
+          onClick={async () => {
+            try {
+              await onRegenerate(messageId);
+            } catch (e) {
+              console.error(e);
+              alert("Failed to regenerate");
+            }
+          }}
+          className={btnCls}
+          title="Regenerate"
+        >
+          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
+          </svg>
+          Regenerate
+        </button>
+      )}
     </div>
   );
+
+  // Edit mode
+  if (editing) {
+    const handleSave = async () => {
+      if (!onEdit || saving) return;
+      setSaving(true);
+      try {
+        await onEdit(messageId, draft);
+        setEditing(false);
+      } catch (e) {
+        console.error(e);
+        alert("Failed to save message");
+      } finally {
+        setSaving(false);
+      }
+    };
+    const handleCancel = () => {
+      setEditing(false);
+      setDraft(content);
+    };
+    return (
+      <>
+        <textarea
+          ref={editRef}
+          value={draft}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            const el = e.currentTarget;
+            el.style.height = "auto";
+            el.style.height = el.scrollHeight + "px";
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") handleCancel();
+            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+              e.preventDefault();
+              handleSave();
+            }
+          }}
+          className={`w-full min-w-[200px] px-2 py-1.5 text-sm rounded-lg resize-none focus:outline-none ${
+            isUser
+              ? "bg-blue-700/60 text-white placeholder-blue-200/50 border border-blue-400/40 focus:border-blue-300"
+              : "bg-neutral-900 text-neutral-200 border border-neutral-600 focus:border-neutral-400"
+          }`}
+          rows={1}
+        />
+        <div className={`flex items-center gap-1 mt-1.5 ${isUser ? "justify-end" : "justify-start"}`}>
+          <button onClick={handleCancel} disabled={saving} className={btnCls}>
+            Cancel
+          </button>
+          <button
+            onClick={handleSave}
+            disabled={saving || draft === content}
+            className={`${btnCls} disabled:opacity-40`}
+          >
+            {saving ? "Saving..." : "Save"}
+          </button>
+        </div>
+      </>
+    );
+  }
 
   // Plain text mode
   if (viewMode === "plain") {

@@ -217,6 +217,64 @@ func (s *Server) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, map[string]any{"messages": msgs, "hasMore": hasMore})
 }
 
+func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	msgID := r.PathValue("msgId")
+
+	var body struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+
+	msg, err := s.agents.UpdateMessageContent(id, msgID, body.Content)
+	if err != nil {
+		writeTranscriptEditError(w, err, msgID)
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, msg)
+}
+
+func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	msgID := r.PathValue("msgId")
+
+	if err := s.agents.DeleteMessage(id, msgID); err != nil {
+		writeTranscriptEditError(w, err, msgID)
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleRegenerateMessage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	msgID := r.PathValue("msgId")
+	if err := s.agents.Regenerate(id, msgID); err != nil {
+		writeTranscriptEditError(w, err, msgID)
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func writeTranscriptEditError(w http.ResponseWriter, err error, msgID string) {
+	switch {
+	case errors.Is(err, agent.ErrAgentNotFound):
+		writeError(w, http.StatusNotFound, "not_found", err.Error())
+	case errors.Is(err, agent.ErrMessageNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "message not found: "+msgID)
+	case errors.Is(err, agent.ErrInvalidRegenerate):
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+	case errors.Is(err, agent.ErrUnsupportedTool):
+		writeError(w, http.StatusForbidden, "forbidden", err.Error())
+	case errors.Is(err, agent.ErrAgentBusy), errors.Is(err, agent.ErrAgentResetting):
+		writeError(w, http.StatusConflict, "busy", err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+	}
+}
+
 // --- Generate Handlers ---
 
 func (s *Server) handleGeneratePersona(w http.ResponseWriter, r *http.Request) {

@@ -40,6 +40,10 @@ type Manager struct {
 	// resetting tracks agents currently being reset (blocks new chats).
 	resetting map[string]bool
 
+	// editing tracks agents whose transcript is being edited; blocks new
+	// chats but is invisible to chat WebSocket subscribers.
+	editing map[string]bool
+
 	// profileGen tracks agents with in-flight publicProfile generation.
 	profileGen map[string]bool
 
@@ -91,6 +95,7 @@ func NewManager(logger *slog.Logger) *Manager {
 		logger:       logger,
 		busy:         make(map[string]busyEntry),
 		resetting:    make(map[string]bool),
+		editing:      make(map[string]bool),
 		profileGen:   make(map[string]bool),
 		memIndexes:   make(map[string]*MemoryIndex),
 		chatWatchers:   make(map[string]map[*chatWatcher]struct{}),
@@ -579,7 +584,11 @@ type chatPrep struct {
 // prepareChat performs the common setup for Chat and ChatOneShot:
 // persona sync, agent snapshot, backend resolution, system prompt construction,
 // and memory context injection.
-func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool) (*chatPrep, error) {
+//
+// skipMemoryContext disables query-based memory hints. Use when the transcript
+// is about to be truncated (e.g. regenerate), since the index would still
+// contain entries from messages that are being removed.
+func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool, skipMemoryContext bool) (*chatPrep, error) {
 	m.syncPersona(agentID)
 
 	m.mu.Lock()
@@ -616,8 +625,10 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool) (*ch
 		if indexNewMessages {
 			idx.IndexNewMessages(agentID)
 		}
-		if memCtx := idx.BuildContextFromQuery(query); memCtx != "" {
-			sysPrompt += "\n\n" + memCtx
+		if !skipMemoryContext {
+			if memCtx := idx.BuildContextFromQuery(query); memCtx != "" {
+				sysPrompt += "\n\n" + memCtx
+			}
 		}
 	}
 
@@ -628,16 +639,20 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool) (*ch
 // The role parameter controls how the input message is stored in the transcript
 // ("user" for interactive chat, "system" for cron-triggered messages).
 func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, role string, attachments []MessageAttachment) (<-chan ChatEvent, error) {
-	prep, err := m.prepareChat(agentID, userMessage, true)
+	prep, err := m.prepareChat(agentID, userMessage, true, false)
 	if err != nil {
 		return nil, err
 	}
 
-	// Check if agent is busy or being reset
+	// Check if agent is busy, editing, or being reset
 	m.busyMu.Lock()
 	if m.resetting[agentID] {
 		m.busyMu.Unlock()
 		return nil, ErrAgentResetting
+	}
+	if m.editing[agentID] {
+		m.busyMu.Unlock()
+		return nil, ErrAgentBusy
 	}
 	if _, busy := m.busy[agentID]; busy {
 		m.busyMu.Unlock()
@@ -711,7 +726,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 // platform conversations (Slack, Discord) that carry their own context.
 // Memory (MEMORY.md, diary) access is still available via system prompt.
 func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string) (<-chan ChatEvent, error) {
-	prep, err := m.prepareChat(agentID, userMessage, false)
+	prep, err := m.prepareChat(agentID, userMessage, false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1070,6 +1085,191 @@ func (m *Manager) Messages(agentID string, limit int) ([]*Message, error) {
 // MessagesPaginated returns messages with cursor-based pagination.
 func (m *Manager) MessagesPaginated(agentID string, limit int, before string) ([]*Message, bool, error) {
 	return loadMessagesPaginated(agentID, limit, before)
+}
+
+// UpdateMessageContent replaces the content of a single message in the transcript.
+// Only supported for the llama.cpp backend. Rejected with ErrAgentBusy while the
+// agent has an active chat.
+func (m *Manager) UpdateMessageContent(agentID, msgID, content string) (*Message, error) {
+	release, err := m.acquireTranscriptEdit(agentID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	msg, err := updateMessageContent(agentID, msgID, content)
+	if err != nil {
+		return nil, err
+	}
+	m.refreshLastMessage(agentID)
+	return msg, nil
+}
+
+// DeleteMessage removes a single message from the transcript.
+// Only supported for the llama.cpp backend. Rejected with ErrAgentBusy while the
+// agent has an active chat.
+func (m *Manager) DeleteMessage(agentID, msgID string) error {
+	release, err := m.acquireTranscriptEdit(agentID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := deleteMessage(agentID, msgID); err != nil {
+		return err
+	}
+	m.refreshLastMessage(agentID)
+	return nil
+}
+
+// Regenerate truncates the transcript at msgID and re-runs the associated
+// user message through the llama.cpp backend. If msgID is an assistant
+// message, msgID and all subsequent messages are removed and the preceding
+// user message is re-sent. If msgID is a user message, all subsequent
+// messages are removed and msgID itself is re-sent.
+//
+// The chat runs in the background; events are delivered to WebSocket
+// subscribers via the usual chat-start notification.
+func (m *Manager) Regenerate(agentID, msgID string) error {
+	release, err := m.acquireTranscriptEdit(agentID)
+	if err != nil {
+		return err
+	}
+	editingReleased := false
+	defer func() {
+		if !editingReleased {
+			release()
+		}
+	}()
+
+	target, keepCount, err := findRegenerateTarget(agentID, msgID)
+	if err != nil {
+		return err
+	}
+
+	// Prepare chat (system prompt, backend resolution) before touching the
+	// transcript so a setup failure leaves history intact. Memory context
+	// injection is skipped — the index still contains entries for messages
+	// about to be truncated, which would otherwise leak into the prompt.
+	prep, err := m.prepareChat(agentID, target.Content, true, true)
+	if err != nil {
+		return err
+	}
+
+	effectiveMessage := target.Content
+	if len(target.Attachments) > 0 {
+		effectiveMessage = formatMessageWithAttachments(target.Content, target.Attachments)
+	}
+
+	// Start the backend chat BEFORE truncating the transcript so that a
+	// connection failure leaves history intact.
+	chatCtx, cancel := context.WithCancel(context.Background())
+	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{})
+	if err != nil {
+		cancel()
+		return err
+	}
+
+	// Commit the truncation now that the backend is streaming.
+	if err := truncateMessagesTo(agentID, keepCount); err != nil {
+		cancel()
+		return err
+	}
+	m.refreshLastMessage(agentID)
+
+	outCh := make(chan ChatEvent, 64)
+	bc := newChatBroadcaster(outCh)
+
+	// Hand off editing → busy atomically so no chat can slip in between.
+	m.busyMu.Lock()
+	delete(m.editing, agentID)
+	editingReleased = true
+	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc}
+	m.busyMu.Unlock()
+
+	m.notifyChatStart(agentID)
+
+	go func() {
+		defer close(outCh)
+		defer m.clearBusy(agentID)
+		defer cancel()
+		m.processChatEvents(chatCtx, agentID, backendCh, outCh)
+		m.updatePostChatIndex(agentID)
+	}()
+	return nil
+}
+
+// acquireTranscriptEdit verifies the agent exists and uses the llama.cpp
+// backend, then reserves the agent's busy slot so no Chat can start during
+// the edit. Returns ErrAgentBusy if a chat or reset is already in progress.
+// The returned release func must always be called.
+func (m *Manager) acquireTranscriptEdit(agentID string) (func(), error) {
+	m.mu.Lock()
+	a, ok := m.agents[agentID]
+	if !ok {
+		m.mu.Unlock()
+		return nil, ErrAgentNotFound
+	}
+	if a.Tool != "llama.cpp" {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: only llama.cpp backend supports transcript editing", ErrUnsupportedTool)
+	}
+	// Hold m.mu while taking busyMu to close the TOCTOU window with Update()
+	// (which changes Tool while holding m.mu). Chat acquires busyMu without
+	// holding m.mu, so this ordering is safe.
+	m.busyMu.Lock()
+	if m.resetting[agentID] {
+		m.busyMu.Unlock()
+		m.mu.Unlock()
+		return nil, ErrAgentResetting
+	}
+	if m.editing[agentID] {
+		m.busyMu.Unlock()
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w, try again later", ErrAgentBusy)
+	}
+	if _, busy := m.busy[agentID]; busy {
+		m.busyMu.Unlock()
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w, try again later", ErrAgentBusy)
+	}
+	m.editing[agentID] = true
+	m.busyMu.Unlock()
+	m.mu.Unlock()
+
+	release := func() {
+		m.busyMu.Lock()
+		delete(m.editing, agentID)
+		m.busyMu.Unlock()
+	}
+	return release, nil
+}
+
+// refreshLastMessage recomputes the LastMessage preview from the transcript
+// tail. Safe to call after an edit/delete that may have affected the last row.
+func (m *Manager) refreshLastMessage(agentID string) {
+	msgs, err := loadMessages(agentID, 1)
+	if err != nil {
+		m.logger.Warn("failed to refresh last message", "agent", agentID, "err", err)
+		return
+	}
+	m.mu.Lock()
+	a, ok := m.agents[agentID]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	if len(msgs) == 0 {
+		a.LastMessage = nil
+	} else {
+		last := msgs[len(msgs)-1]
+		a.LastMessage = &MessagePreview{
+			Content:   truncatePreview(last.Content, 100),
+			Role:      last.Role,
+			Timestamp: last.Timestamp,
+		}
+	}
+	a.UpdatedAt = time.Now().Format(time.RFC3339)
+	m.mu.Unlock()
+	m.save()
 }
 
 // BackendAvailability returns which agent backends are available.

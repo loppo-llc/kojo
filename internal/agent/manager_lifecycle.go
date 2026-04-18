@@ -179,11 +179,15 @@ func (m *Manager) ResetSession(agentID string) error {
 	tool := a.Tool
 	m.mu.Unlock()
 
-	// Block if agent is busy or being reset
+	// Block if agent is busy, editing, or being reset
 	m.busyMu.Lock()
 	if _, busy := m.busy[agentID]; busy {
 		m.busyMu.Unlock()
 		return ErrAgentBusy
+	}
+	if m.editing[agentID] {
+		m.busyMu.Unlock()
+		return fmt.Errorf("%w, try again later", ErrAgentBusy)
 	}
 	if m.resetting[agentID] {
 		m.busyMu.Unlock()

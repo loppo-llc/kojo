@@ -239,6 +239,15 @@ export const agentApi = {
     ).then((r) => ({ messages: r.messages ?? [], hasMore: r.hasMore ?? false }));
   },
 
+  updateMessage: (agentId: string, msgId: string, content: string) =>
+    patch<AgentMessage>(`/api/v1/agents/${agentId}/messages/${msgId}`, { content }),
+
+  deleteMessage: (agentId: string, msgId: string) =>
+    del<{ ok: boolean }>(`/api/v1/agents/${agentId}/messages/${msgId}`),
+
+  regenerateMessage: (agentId: string, msgId: string) =>
+    post<{ ok: boolean }>(`/api/v1/agents/${agentId}/messages/${msgId}/regenerate`),
+
   generatePersona: (currentPersona: string, prompt: string) =>
     post<{ persona: string }>("/api/v1/agents/generate-persona", { currentPersona, prompt }),
 

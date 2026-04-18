@@ -469,15 +469,69 @@ export function AgentChat() {
             <p className="text-sm">Send a message to start chatting</p>
           </div>
         )}
-        {messages.map((msg) => (
-          <ChatMessage
-            key={msg.id}
-            message={msg}
-            agentName={agent.name}
-            agentId={agent.id}
-            avatarHash={agent.avatarHash}
-          />
-        ))}
+        {messages.map((msg) => {
+          const editable =
+            agent.tool === "llama.cpp" &&
+            !streaming &&
+            !msg.id.startsWith("pending_") &&
+            !msg.id.startsWith("error_") &&
+            !msg.id.startsWith("aborted_");
+          const regeneratable =
+            editable && (msg.role === "user" || msg.role === "assistant");
+          return (
+            <ChatMessage
+              key={msg.id}
+              message={msg}
+              agentName={agent.name}
+              agentId={agent.id}
+              avatarHash={agent.avatarHash}
+              onEdit={
+                editable
+                  ? async (msgId, content) => {
+                      const updated = await agentApi.updateMessage(agent.id, msgId, content);
+                      setMessages((prev) => prev.map((m) => (m.id === msgId ? { ...m, ...updated } : m)));
+                    }
+                  : undefined
+              }
+              onDelete={
+                editable
+                  ? async (msgId) => {
+                      await agentApi.deleteMessage(agent.id, msgId);
+                      setMessages((prev) => prev.filter((m) => m.id !== msgId));
+                    }
+                  : undefined
+              }
+              onRegenerate={
+                regeneratable
+                  ? async (msgId) => {
+                      // Snapshot for rollback — apply optimistic truncation +
+                      // streaming state immediately so WS events (which may
+                      // arrive before the HTTP response) don't race with the
+                      // local slice.
+                      const snapshot = messages;
+                      const idx = snapshot.findIndex((m) => m.id === msgId);
+                      if (idx < 0) return;
+                      const keepCount = msg.role === "assistant" ? idx : idx + 1;
+                      setMessages(snapshot.slice(0, keepCount));
+                      setStreaming(true);
+                      setStreamText("");
+                      setStreamThinking("");
+                      setStreamTools([]);
+                      setStreamStatus("thinking");
+                      setStreamStartTime(Date.now());
+                      try {
+                        await agentApi.regenerateMessage(agent.id, msgId);
+                      } catch (e) {
+                        setMessages(snapshot);
+                        resetStream();
+                        throw e;
+                      }
+                    }
+                  : undefined
+              }
+            />
+          );
+        })}
         {streaming && (
           <StreamingMessage
             text={streamText}

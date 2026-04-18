@@ -84,6 +84,10 @@ func (m *Manager) acquireResetGuard(agentID string) (func(), error) {
 		m.busyMu.Unlock()
 		return nil, fmt.Errorf("%w, try again later", ErrAgentBusy)
 	}
+	if m.editing[agentID] {
+		m.busyMu.Unlock()
+		return nil, fmt.Errorf("%w, try again later", ErrAgentBusy)
+	}
 	m.resetting[agentID] = true
 	if entry, busy := m.busy[agentID]; busy {
 		entry.cancel()
