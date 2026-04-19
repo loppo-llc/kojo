@@ -377,7 +377,7 @@ export function AgentChat() {
   const [enterSends] = useEnterSends();
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter") {
+    if (e.key === "Enter" && !e.nativeEvent.isComposing) {
       if (enterSends ? !e.shiftKey : e.shiftKey) {
         e.preventDefault();
         handleSend();

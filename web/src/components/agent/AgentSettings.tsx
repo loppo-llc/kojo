@@ -276,7 +276,7 @@ export function AgentSettings() {
               value={personaPrompt}
               onChange={(e) => setPersonaPrompt(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey && !generatingPersona) {
+                if (e.key === "Enter" && !e.nativeEvent.isComposing && !e.shiftKey && !generatingPersona) {
                   e.preventDefault();
                   handleGeneratePersona();
                 }

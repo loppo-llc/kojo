@@ -353,7 +353,7 @@ export function SessionPage() {
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter" && (enterSends ? !e.shiftKey : e.shiftKey)) {
+                    if (e.key === "Enter" && !e.nativeEvent.isComposing && (enterSends ? !e.shiftKey : e.shiftKey)) {
                       e.preventDefault();
                       handleSend();
                     }

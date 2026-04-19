@@ -315,7 +315,7 @@ export function GitPanel({ embedded, workDir: propWorkDir }: GitPanelProps = {})
         <input
           value={cmdInput}
           onChange={(e) => setCmdInput(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") runCmd(); }}
+          onKeyDown={(e) => { if (e.key === "Enter" && !e.nativeEvent.isComposing) runCmd(); }}
           placeholder="command..."
           className="flex-1 px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm font-mono focus:outline-none focus:border-neutral-500"
         />

@@ -536,7 +536,7 @@ function MessageContent({
           }}
           onKeyDown={(e) => {
             if (e.key === "Escape") handleCancel();
-            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+            if (e.key === "Enter" && !e.nativeEvent.isComposing && (e.metaKey || e.ctrlKey)) {
               e.preventDefault();
               handleSave();
             }
