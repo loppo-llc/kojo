@@ -40,6 +40,7 @@ export function GroupDMChat() {
   const suppressAutoScrollRef = useRef(false);
 
   const [notFound, setNotFound] = useState(false);
+  const [showStyleMenu, setShowStyleMenu] = useState(false);
   const [editingCooldown, setEditingCooldown] = useState(false);
   const [cooldownInput, setCooldownInput] = useState("");
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
@@ -192,23 +193,42 @@ export function GroupDMChat() {
           </div>
         </div>
         {/* Style selector */}
-        <select
-          value={group.style || "efficient"}
-          onChange={async (e) => {
-            const next = e.target.value as GroupDMStyle;
-            try {
-              const updated = await groupdmApi.setStyle(group.id, next);
-              setGroup(updated);
-            } catch (err) {
-              console.error("Failed to set style", err);
-            }
-          }}
-          className="shrink-0 text-xs bg-neutral-800 border border-neutral-700 text-neutral-400 rounded px-1.5 py-0.5 cursor-pointer hover:text-neutral-200"
-          title="Communication style"
-        >
-          <option value="efficient">⚡ Efficient</option>
-          <option value="expressive">💬 Expressive</option>
-        </select>
+        <div className="shrink-0 relative">
+          <button
+            onClick={() => setShowStyleMenu((v) => !v)}
+            className="text-base leading-none px-1 py-0.5 rounded hover:bg-neutral-700 cursor-pointer"
+            title={`Style: ${group.style || "efficient"}`}
+          >
+            {(group.style || "efficient") === "efficient" ? "⚡" : "💬"}
+          </button>
+          {showStyleMenu && (
+            <>
+              <div className="fixed inset-0 z-10" onClick={() => setShowStyleMenu(false)} />
+              <div className="absolute right-0 top-full mt-1 z-20 bg-neutral-800 border border-neutral-700 rounded shadow-lg py-1 min-w-[140px]">
+                {([["efficient", "⚡ Efficient"], ["expressive", "💬 Expressive"]] as const).map(([value, label]) => (
+                  <button
+                    key={value}
+                    onClick={async () => {
+                      setShowStyleMenu(false);
+                      if (value === (group.style || "efficient")) return;
+                      try {
+                        const updated = await groupdmApi.setStyle(group.id, value as GroupDMStyle);
+                        setGroup(updated);
+                      } catch (err) {
+                        console.error("Failed to set style", err);
+                      }
+                    }}
+                    className={`w-full text-left px-3 py-1.5 text-xs hover:bg-neutral-700 cursor-pointer ${
+                      value === (group.style || "efficient") ? "text-white" : "text-neutral-400"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
         {/* Cooldown setting */}
         <div className="shrink-0">
           {editingCooldown ? (
