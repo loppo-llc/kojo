@@ -185,8 +185,10 @@ export function GroupDMChat() {
         </div>
         <div className="flex-1 min-w-0">
           <div className="font-medium text-sm truncate">{group.name}</div>
-          <div className="text-xs text-neutral-500">
-            {group.members.map((m) => m.agentName).join(", ")}
+          <div className="text-xs text-neutral-500 truncate">
+            {group.members.length <= 3
+              ? group.members.map((m) => m.agentName).join(", ")
+              : group.members.slice(0, 2).map((m) => m.agentName).join(", ") + `, +${group.members.length - 2}`}
           </div>
         </div>
         {/* Style selector */}

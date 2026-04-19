@@ -115,36 +115,34 @@ html, body, #root {
   white-space: pre;
   color: #d4d4d4;
 }
+.md-code-header {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.3em;
+  padding: 0.15em 0.4em;
+  user-select: none;
+  min-height: 1.4em;
+}
 .md-code-lang {
-  position: absolute;
-  top: 0;
-  right: 0;
-  padding: 0.15em 0.5em;
   font-size: 0.65em;
   font-family: "SF Mono", ui-monospace, monospace;
   color: #666;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  user-select: none;
+  margin-right: auto;
 }
 .md-code-copy {
-  position: absolute;
-  top: 0.3em;
-  right: 0.4em;
-  padding: 0.25em;
+  padding: 0.2em;
   border-radius: 4px;
   color: #666;
   background: transparent;
   border: none;
   cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.15s, color 0.15s, background 0.15s;
+  transition: color 0.15s, background 0.15s;
   line-height: 0;
 }
-.md-code-wrap:hover .md-code-copy { opacity: 1; }
 .md-code-copy:hover { color: #ccc; background: rgba(255, 255, 255, 0.08); }
-/* When lang label is present, shift copy button left */
-.md-code-wrap:has(.md-code-lang) .md-code-copy { right: auto; left: 0.4em; }
 
 /* Tables */
 .md-content table {

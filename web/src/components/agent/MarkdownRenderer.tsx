@@ -66,8 +66,12 @@ export function MarkdownRenderer({ content, processText }: MarkdownRendererProps
           return (
             <InsidePreCtx.Provider value={true}>
               <div className="md-code-wrap">
-                {lang && <div className="md-code-lang">{lang}</div>}
-                {codeText && <CodeCopyButton text={codeText} />}
+                {(lang || codeText) && (
+                  <div className="md-code-header">
+                    {lang && <div className="md-code-lang">{lang}</div>}
+                    {codeText && <CodeCopyButton text={codeText} />}
+                  </div>
+                )}
                 <pre {...props}>{children}</pre>
               </div>
             </InsidePreCtx.Provider>
