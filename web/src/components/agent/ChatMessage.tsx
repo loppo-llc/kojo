@@ -9,12 +9,12 @@ import { formatSize } from "../../lib/utils";
 const IMAGE_EXTS = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
 const VIDEO_EXTS = /\.(mp4|webm|mov|avi|mkv|ogv|m4v|flv|wmv)$/i;
 
-// Match absolute file paths (Unix or Windows-style) with any file extension (1-10 chars).
-// Unix: starts with /, Windows: starts with drive letter like C:\
+// Match absolute file paths (Unix, ~/-relative, or Windows-style) with any file extension (1-10 chars).
+// Unix: starts with / or ~/, Windows: starts with drive letter like C:\
 // Path segments: exclude only delimiters that indicate end-of-path (comma, semicolon, quotes, newline, slash).
 // This allows Unicode, spaces, parens, apostrophes, etc. in filenames.
 const FILE_PATH_RE =
-  /(?:(?:\/[^,;:"<>\n/][^,;:"<>\n/]*)+|[A-Z]:\\(?:[^,;:"<>\n\\]+\\)*[^,;:"<>\n\\]+)\.[a-zA-Z0-9]{1,10}\b/gi;
+  /(?:~?(?:\/[^,;:"<>\n/][^,;:"<>\n/]*)+|[A-Z]:\\(?:[^,;:"<>\n\\]+\\)*[^,;:"<>\n\\]+)\.[a-zA-Z0-9]{1,10}\b/gi;
 
 function getFileType(path: string): "image" | "video" | "other" {
   if (IMAGE_EXTS.test(path)) return "image";

@@ -79,13 +79,37 @@ type ListResult struct {
 	Entries []DirEntry `json:"entries"`
 }
 
+// expandHome replaces a leading "~/" (or "~" alone) with the user's home
+// directory. Other "~"-prefixed forms like "~user/..." are rejected rather
+// than left to resolve against the CWD.
+func expandHome(path string) (string, error) {
+	if path == "" || path[0] != '~' {
+		return path, nil
+	}
+	if path != "~" && path[1] != '/' && path[1] != filepath.Separator {
+		return "", fmt.Errorf("invalid path: ~user/ form is not supported")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "", fmt.Errorf("cannot determine home directory")
+	}
+	if path == "~" {
+		return home, nil
+	}
+	return filepath.Join(home, path[2:]), nil
+}
+
 func (b *Browser) List(dir string, hidden bool) (*ListResult, error) {
 	if dir == "" {
 		home, _ := os.UserHomeDir()
 		dir = home
 	}
 
-	dir, err := filepath.Abs(dir)
+	dir, err := expandHome(dir)
+	if err != nil {
+		return nil, err
+	}
+	dir, err = filepath.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("invalid path: %w", err)
 	}
@@ -138,7 +162,11 @@ type FileView struct {
 }
 
 func (b *Browser) View(path string) (*FileView, error) {
-	path, err := filepath.Abs(path)
+	path, err := expandHome(path)
+	if err != nil {
+		return nil, err
+	}
+	path, err = filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("invalid path: %w", err)
 	}
@@ -196,6 +224,11 @@ func (b *Browser) View(path string) (*FileView, error) {
 }
 
 func (b *Browser) ServeRaw(w http.ResponseWriter, r *http.Request, path string) {
+	path, err := expandHome(path)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		http.Error(w, "invalid path", http.StatusBadRequest)
@@ -210,6 +243,10 @@ func (b *Browser) ServeRaw(w http.ResponseWriter, r *http.Request, path string) 
 
 // ValidatePath checks that the given path is under an allowed root directory.
 func (b *Browser) ValidatePath(path string) error {
+	path, err := expandHome(path)
+	if err != nil {
+		return err
+	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return fmt.Errorf("invalid path: %w", err)
