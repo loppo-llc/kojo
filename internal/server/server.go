@@ -268,6 +268,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 
 	// Embedding model setting
 	mux.HandleFunc("PUT /api/v1/embedding-model", s.handleSetEmbeddingModel)
+	mux.HandleFunc("GET /api/v1/embedding-models", s.handleListEmbeddingModels)
 
 	// Notify source types
 	mux.HandleFunc("GET /api/v1/notify-source-types", s.handleListNotifySourceTypes)

@@ -117,6 +117,15 @@ func NewCredentialStore() (*CredentialStore, error) {
 		return nil, fmt.Errorf("create token table: %w", err)
 	}
 
+	// Create global settings table
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS settings (
+		key   TEXT PRIMARY KEY,
+		value TEXT NOT NULL
+	)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create settings table: %w", err)
+	}
+
 	// Migrate legacy credentials.json files
 	s.migrateLegacy()
 
@@ -547,4 +556,28 @@ func (s *CredentialStore) migrateLegacy() {
 			tx.Rollback()
 		}
 	}
+}
+
+// GetSetting retrieves a global setting value. Returns "" if not found.
+func (s *CredentialStore) GetSetting(key string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var val string
+	if err := s.db.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&val); err != nil {
+		return ""
+	}
+	return val
+}
+
+// SetSetting stores a global setting value.
+func (s *CredentialStore) SetSetting(key, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(
+		"INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+		key, value,
+	)
+	return err
 }

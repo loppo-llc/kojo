@@ -322,7 +322,7 @@ func loadGeminiAPIKey(creds *CredentialStore) (string, error) {
 // Falls back to defaultEmbeddingModel if not set.
 func loadEmbeddingModel(creds *CredentialStore) string {
 	if creds != nil {
-		if model, err := creds.GetToken("gemini", "", "", "embedding_model"); err == nil && model != "" {
+		if model := creds.GetSetting("embedding_model"); model != "" {
 			return model
 		}
 	}

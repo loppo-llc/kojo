@@ -391,6 +391,8 @@ export const agentApi = {
   embeddingModel: {
     set: (model: string) =>
       put<{ ok: boolean; model: string; embeddingsCleared: boolean }>(`/api/v1/embedding-model`, { model }),
+    list: () =>
+      get<{ models: string[] }>(`/api/v1/embedding-models`).then((r) => r.models ?? []),
   },
 
   notifySourceTypes: () =>

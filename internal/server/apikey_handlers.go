@@ -2,9 +2,12 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -39,9 +42,9 @@ func (s *Server) handleGetAPIKey(w http.ResponseWriter, r *http.Request) {
 
 	// Include embedding model setting for gemini
 	if provider == "gemini" {
-		embModel := "gemini-embedding-001" // default
-		if m, err := creds.GetToken("gemini", "", "", "embedding_model"); err == nil && m != "" {
-			embModel = m
+		embModel := creds.GetSetting("embedding_model")
+		if embModel == "" {
+			embModel = "gemini-embedding-001"
 		}
 		resp["embeddingModel"] = embModel
 	}
@@ -102,10 +105,10 @@ func (s *Server) handleSetEmbeddingModel(w http.ResponseWriter, r *http.Request)
 	creds := s.agents.Credentials()
 
 	// Check if model changed
-	oldModel, _ := creds.GetToken("gemini", "", "", "embedding_model")
+	oldModel := creds.GetSetting("embedding_model")
 	modelChanged := oldModel != "" && oldModel != req.Model
 
-	if err := creds.SetToken("gemini", "", "", "embedding_model", req.Model, time.Time{}); err != nil {
+	if err := creds.SetSetting("embedding_model", req.Model); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "failed to save: "+err.Error())
 		return
 	}
@@ -133,4 +136,71 @@ func (s *Server) handleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleListEmbeddingModels fetches available embedding models from the Gemini API.
+func (s *Server) handleListEmbeddingModels(w http.ResponseWriter, r *http.Request) {
+	if !s.agents.HasCredentials() {
+		writeError(w, http.StatusServiceUnavailable, "unavailable", "credential store not available")
+		return
+	}
+
+	creds := s.agents.Credentials()
+	apiKey, err := creds.GetToken("gemini", "", "", "api_key")
+	if err != nil || apiKey == "" {
+		writeError(w, http.StatusBadRequest, "no_api_key", "Gemini API key not configured")
+		return
+	}
+
+	models, err := fetchGeminiEmbeddingModels(apiKey)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "api_error", err.Error())
+		return
+	}
+
+	writeJSONResponse(w, http.StatusOK, map[string]any{"models": models})
+}
+
+// fetchGeminiEmbeddingModels calls the Gemini ListModels API and returns
+// model names that support embedContent.
+func fetchGeminiEmbeddingModels(apiKey string) ([]string, error) {
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models?key=%s&pageSize=100", apiKey)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Models []struct {
+			Name                     string   `json:"name"`
+			SupportedGenerationMethods []string `json:"supportedGenerationMethods"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode error: %w", err)
+	}
+
+	var models []string
+	for _, m := range result.Models {
+		for _, method := range m.SupportedGenerationMethods {
+			if method == "embedContent" {
+				// Strip "models/" prefix
+				name := m.Name
+				if strings.HasPrefix(name, "models/") {
+					name = name[len("models/"):]
+				}
+				models = append(models, name)
+				break
+			}
+		}
+	}
+
+	sort.Strings(models)
+	return models, nil
 }

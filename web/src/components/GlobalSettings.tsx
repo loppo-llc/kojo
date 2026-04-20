@@ -24,7 +24,8 @@ export function GlobalSettings() {
 
   // Embedding model state
   const [embeddingModel, setEmbeddingModel] = useState("");
-  const [embeddingModelInput, setEmbeddingModelInput] = useState("");
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [loadingModels, setLoadingModels] = useState(false);
   const [savingModel, setSavingModel] = useState(false);
 
   useEffect(() => {
@@ -34,7 +35,14 @@ export function GlobalSettings() {
       setGeminiHasFallback(r.hasFallback ?? false);
       if (r.embeddingModel) {
         setEmbeddingModel(r.embeddingModel);
-        setEmbeddingModelInput(r.embeddingModel);
+      }
+      // Fetch available models if API key is configured
+      if (r.configured) {
+        setLoadingModels(true);
+        agentApi.embeddingModel.list()
+          .then(setAvailableModels)
+          .catch(() => {})
+          .finally(() => setLoadingModels(false));
       }
     }).catch(() => {});
   }, []);
@@ -90,9 +98,8 @@ export function GlobalSettings() {
     }
   };
 
-  const handleSaveEmbeddingModel = async () => {
-    const model = embeddingModelInput.trim();
-    if (!model) return;
+  const handleChangeEmbeddingModel = async (model: string) => {
+    if (!model || model === embeddingModel) return;
     setSavingModel(true);
     setError("");
     try {
@@ -200,25 +207,25 @@ export function GlobalSettings() {
 
             <div className="mt-3 border-t border-neutral-800 pt-3">
               <div className="text-xs text-neutral-500 mb-1.5">Embedding Model</div>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={embeddingModelInput}
-                  onChange={(e) => setEmbeddingModelInput(e.target.value)}
-                  placeholder="gemini-embedding-001"
-                  className="flex-1 px-3 py-1.5 bg-neutral-800 border border-neutral-700 rounded text-xs font-mono focus:outline-none focus:border-neutral-500"
-                />
-                <button
-                  onClick={handleSaveEmbeddingModel}
-                  disabled={savingModel || !embeddingModelInput.trim() || embeddingModelInput.trim() === embeddingModel}
-                  className="px-3 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-xs font-medium disabled:opacity-40"
+              {loadingModels ? (
+                <div className="text-xs text-neutral-600">Loading models...</div>
+              ) : availableModels.length > 0 ? (
+                <select
+                  value={embeddingModel}
+                  onChange={(e) => handleChangeEmbeddingModel(e.target.value)}
+                  disabled={savingModel}
+                  className="w-full px-3 py-1.5 bg-neutral-800 border border-neutral-700 rounded text-xs font-mono focus:outline-none focus:border-neutral-500 disabled:opacity-40"
                 >
-                  {savingModel ? "..." : "Save"}
-                </button>
-              </div>
-              {embeddingModelInput.trim() && embeddingModelInput.trim() !== embeddingModel && embeddingModel && (
-                <div className="text-xs text-amber-500 mt-1">
-                  Changing model will clear existing embeddings
+                  {!availableModels.includes(embeddingModel) && embeddingModel && (
+                    <option value={embeddingModel}>{embeddingModel} (unavailable)</option>
+                  )}
+                  {availableModels.map((m) => (
+                    <option key={m} value={m}>{m}</option>
+                  ))}
+                </select>
+              ) : (
+                <div className="text-xs text-neutral-600">
+                  {geminiKeyConfigured ? "Failed to load models" : "Configure API key to see available models"}
                 </div>
               )}
             </div>
