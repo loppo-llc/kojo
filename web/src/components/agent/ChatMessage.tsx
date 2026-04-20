@@ -705,14 +705,8 @@ export function MediaOverlay({
   );
 }
 
-/** Split text into text parts and file path parts.
- *  dropTrailing: drop a match that touches end-of-text — used during streaming
- *  so a half-arrived path (e.g. ".py" still growing to ".pyc") is not chipped
- *  until a trailing delimiter confirms it. */
-export function splitFilePaths(
-  text: string,
-  dropTrailing = false,
-): Array<{ type: "text" | "file"; value: string }> {
+/** Split text into text parts and file path parts */
+export function splitFilePaths(text: string): Array<{ type: "text" | "file"; value: string }> {
   const parts: Array<{ type: "text" | "file"; value: string }> = [];
   let lastIndex = 0;
 
@@ -725,7 +719,6 @@ export function splitFilePaths(
       const prev = text[match.index - 1];
       if (" \t\n\r`\"'".indexOf(prev) === -1) continue;
     }
-    if (dropTrailing && match.index + match[0].length === text.length) continue;
     if (match.index > lastIndex) {
       parts.push({ type: "text", value: text.slice(lastIndex, match.index) });
     }
@@ -850,7 +843,7 @@ export function StreamingMessage({
 
   const processText = useCallback(
     (t: string): React.ReactNode => {
-      const segs = splitFilePaths(t, true);
+      const segs = splitFilePaths(t);
       if (segs.length === 1 && segs[0].type === "text") return t;
       return segs.map((seg, i) =>
         seg.type === "text" ? (
