@@ -177,6 +177,12 @@ function FilePathChip({
   const rawUrl = `/api/v1/files/raw?path=${encodeURIComponent(path)}`;
   const fileName = path.split(/[/\\]/).pop() || path;
 
+  // Reset fetch state when path changes (e.g. streaming token extends path)
+  useEffect(() => {
+    fetchedRef.current = false;
+    setFileSize(null);
+  }, [path]);
+
   // Fetch file size on first hover (for non-image files)
   useEffect(() => {
     if (!hover || fileType === "image" || fetchedRef.current) return;
@@ -699,8 +705,14 @@ export function MediaOverlay({
   );
 }
 
-/** Split text into text parts and file path parts */
-export function splitFilePaths(text: string): Array<{ type: "text" | "file"; value: string }> {
+/** Split text into text parts and file path parts.
+ *  dropTrailing: drop a match that touches end-of-text — used during streaming
+ *  so a half-arrived path (e.g. ".py" still growing to ".pyc") is not chipped
+ *  until a trailing delimiter confirms it. */
+export function splitFilePaths(
+  text: string,
+  dropTrailing = false,
+): Array<{ type: "text" | "file"; value: string }> {
   const parts: Array<{ type: "text" | "file"; value: string }> = [];
   let lastIndex = 0;
 
@@ -713,6 +725,7 @@ export function splitFilePaths(text: string): Array<{ type: "text" | "file"; val
       const prev = text[match.index - 1];
       if (" \t\n\r`\"'".indexOf(prev) === -1) continue;
     }
+    if (dropTrailing && match.index + match[0].length === text.length) continue;
     if (match.index > lastIndex) {
       parts.push({ type: "text", value: text.slice(lastIndex, match.index) });
     }
@@ -833,6 +846,22 @@ export function StreamingMessage({
   avatarHash,
   startTime,
 }: StreamingMessageProps) {
+  const [preview, setPreview] = useState<{ path: string; type: "image" | "video" } | null>(null);
+
+  const processText = useCallback(
+    (t: string): React.ReactNode => {
+      const segs = splitFilePaths(t, true);
+      if (segs.length === 1 && segs[0].type === "text") return t;
+      return segs.map((seg, i) =>
+        seg.type === "text" ? (
+          seg.value
+        ) : (
+          <FilePathChip key={i} path={seg.value} onPreview={setPreview} />
+        ),
+      );
+    },
+    [],
+  );
 
   let activeTool: string | null = null;
   for (let i = toolUses.length - 1; i >= 0; i--) {
@@ -857,7 +886,7 @@ export function StreamingMessage({
         {thinking && <ThinkingBlock text={thinking} streaming={!text} />}
         {text && (
           <div className="relative">
-            <MarkdownRenderer content={text} />
+            <MarkdownRenderer content={text} processText={processText} />
             <span className="inline-block w-0.5 h-4 bg-neutral-400 animate-pulse ml-0.5 align-text-bottom" />
           </div>
         )}
@@ -881,6 +910,13 @@ export function StreamingMessage({
           </div>
         )}
       </div>
+      {preview && (
+        <MediaOverlay
+          path={preview.path}
+          type={preview.type}
+          onClose={() => setPreview(null)}
+        />
+      )}
     </div>
   );
 }
