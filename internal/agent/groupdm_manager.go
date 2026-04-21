@@ -18,7 +18,7 @@ import (
 const groupdmsFile = "groups.json"
 
 // notifyTimeout is the maximum time allowed for a notification-triggered chat.
-const notifyTimeout = 30 * time.Minute
+const notifyTimeout = 60 * time.Minute
 
 // defaultNotifyCooldown is the minimum interval between notifications to the same agent
 // for the same group. This prevents sequential ping-pong loops.
