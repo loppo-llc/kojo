@@ -3,6 +3,7 @@ import { useParams, useNavigate } from "react-router";
 import { agentApi, type AgentInfo, type AgentMessage, type AgentMessageAttachment, type ChatEvent } from "../../lib/agentApi";
 import { api } from "../../lib/api";
 import { localRFC3339 } from "../../lib/utils";
+import { useEnterSends } from "../../lib/preferences";
 import { useAgentWebSocket } from "../../hooks/useAgentWebSocket";
 import { ChatMessage, StreamingMessage } from "./ChatMessage";
 import { AgentAvatar } from "./AgentAvatar";
@@ -374,11 +375,14 @@ export function AgentChat() {
     }
   };
 
+  const [enterSends] = useEnterSends();
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    // Shift+Enter to send (matching session input pattern)
-    if (e.key === "Enter" && e.shiftKey) {
-      e.preventDefault();
-      handleSend();
+    if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+      if (enterSends ? !e.shiftKey : e.shiftKey) {
+        e.preventDefault();
+        handleSend();
+      }
     }
   };
 
@@ -663,7 +667,7 @@ export function AgentChat() {
           )}
         </div>
         <div className="text-[10px] text-neutral-600 mt-1 text-center">
-          Shift+Enter to send, Enter for newline
+          {enterSends ? "Enter to send, Shift+Enter for newline" : "Shift+Enter to send, Enter for newline"}
         </div>
       </div>
     </div>

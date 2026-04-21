@@ -300,7 +300,7 @@ export function AgentCreate() {
               value={personaPrompt}
               onChange={(e) => setPersonaPrompt(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey && !isGenerating) {
+                if (e.key === "Enter" && !e.nativeEvent.isComposing && !e.shiftKey && !isGenerating) {
                   e.preventDefault();
                   handleGeneratePersona();
                 }

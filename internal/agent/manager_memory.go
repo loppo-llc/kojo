@@ -43,6 +43,17 @@ func (m *Manager) closeIndex(agentID string) {
 	}
 }
 
+// ClearAllEmbeddings resets embeddings to NULL for all cached indexes.
+// Called when the embedding model changes (dimensions may differ).
+func (m *Manager) ClearAllEmbeddings() {
+	m.memIndexesMu.Lock()
+	defer m.memIndexesMu.Unlock()
+
+	for _, idx := range m.memIndexes {
+		idx.ClearEmbeddings()
+	}
+}
+
 // CloseAllIndexes closes all cached MemoryIndex instances.
 func (m *Manager) CloseAllIndexes() {
 	m.memIndexesMu.Lock()

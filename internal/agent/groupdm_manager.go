@@ -684,6 +684,12 @@ func (m *GroupDMManager) copyGroup(g *GroupDM) *GroupDM {
 	cp := *g
 	cp.Members = make([]GroupMember, len(g.Members))
 	copy(cp.Members, g.Members)
+	// Resolve current agent names (stored names may be stale after rename).
+	for i, mem := range cp.Members {
+		if a, ok := m.agentMgr.Get(mem.AgentID); ok {
+			cp.Members[i].AgentName = a.Name
+		}
+	}
 	return &cp
 }
 

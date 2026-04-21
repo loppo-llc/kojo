@@ -385,13 +385,20 @@ export const agentApi = {
 
   apiKeys: {
     get: (provider: string) =>
-      get<{ provider: string; configured: boolean }>(`/api/v1/api-keys/${provider}`),
+      get<{ provider: string; configured: boolean; hasFallback?: boolean; embeddingModel?: string }>(`/api/v1/api-keys/${provider}`),
 
     set: (provider: string, apiKey: string) =>
       put<{ ok: boolean }>(`/api/v1/api-keys/${provider}`, { apiKey }),
 
     delete: (provider: string) =>
       del<unknown>(`/api/v1/api-keys/${provider}`),
+  },
+
+  embeddingModel: {
+    set: (model: string) =>
+      put<{ ok: boolean; model: string; embeddingsCleared: boolean }>(`/api/v1/embedding-model`, { model }),
+    list: () =>
+      get<{ models: string[] }>(`/api/v1/embedding-models`).then((r) => r.models ?? []),
   },
 
   notifySourceTypes: () =>

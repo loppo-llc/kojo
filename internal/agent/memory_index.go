@@ -122,6 +122,23 @@ func (idx *MemoryIndex) Close() error {
 	return idx.db.Close()
 }
 
+// ClearEmbeddings resets all embeddings to NULL and clears the embedding cache.
+// Called when the embedding model changes (dimensions may differ).
+// Errors are logged rather than returned because callers are best-effort
+// (an HTTP handler invalidating state on config change), but silent failure
+// would leave the index in an inconsistent state.
+func (idx *MemoryIndex) ClearEmbeddings() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	if _, err := idx.db.Exec("UPDATE chunks SET embedding = NULL"); err != nil {
+		idx.logger.Warn("ClearEmbeddings: failed to null chunks.embedding", "err", err)
+	}
+	if _, err := idx.db.Exec("DELETE FROM embedding_cache"); err != nil {
+		idx.logger.Warn("ClearEmbeddings: failed to clear embedding_cache", "err", err)
+	}
+}
+
 // indexWriter wraps prepared FTS and chunk insert statements to eliminate
 // duplicated prepare/exec/close patterns across indexing methods.
 type indexWriter struct {
@@ -507,15 +524,17 @@ func (idx *MemoryIndex) hybridSearch(query string, limit int) []SearchResult {
 		return nil // no API key, skip vector search
 	}
 
+	model := loadEmbeddingModel(idx.creds)
+
 	// Generate query embedding
-	queryEmb, err := getEmbedding(apiKey, query)
+	queryEmb, err := getEmbedding(apiKey, model, query)
 	if err != nil {
 		idx.logger.Debug("query embedding failed", "err", err)
 		return nil
 	}
 
 	// Embed any pending chunks while we're at it
-	idx.embedPendingChunks(apiKey)
+	idx.embedPendingChunks(apiKey, model)
 
 	// Vector search: brute force cosine similarity
 	vecResults := idx.vectorSearch(queryEmb, limit*4) // get extra candidates
@@ -653,7 +672,7 @@ func (idx *MemoryIndex) vectorSearch(queryEmb []float32, limit int) []SearchResu
 }
 
 // embedPendingChunks batch-embeds chunks that don't have embeddings yet.
-func (idx *MemoryIndex) embedPendingChunks(apiKey string) {
+func (idx *MemoryIndex) embedPendingChunks(apiKey, model string) {
 	idx.mu.Lock()
 
 	rows, err := idx.db.Query("SELECT id, content, content_hash FROM chunks WHERE embedding IS NULL LIMIT 100")
@@ -703,7 +722,7 @@ func (idx *MemoryIndex) embedPendingChunks(apiKey string) {
 	}
 
 	// Network call outside lock
-	embeddings, err := getBatchEmbeddings(apiKey, texts)
+	embeddings, err := getBatchEmbeddings(apiKey, model, texts)
 	if err != nil {
 		idx.logger.Debug("batch embedding failed", "err", err)
 		// Revert marks so they can be retried

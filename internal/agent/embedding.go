@@ -13,17 +13,21 @@ import (
 )
 
 const (
-	embeddingModel    = "text-embedding-004"
-	embeddingDims     = 768
-	embeddingAPI      = "https://generativelanguage.googleapis.com/v1beta/models/%s:embedContent?key=%s"
-	batchEmbedAPI     = "https://generativelanguage.googleapis.com/v1beta/models/%s:batchEmbedContents?key=%s"
-	maxEmbedInputChars = 8000 // ~2048 tokens safe limit
-	maxBatchSize       = 100  // Gemini batch limit
+	// DefaultEmbeddingModel is the Gemini embedding model used when no model
+	// has been explicitly configured. Exported so HTTP handlers can present
+	// the same fallback without duplicating the string.
+	DefaultEmbeddingModel = "gemini-embedding-001"
+	// defaultEmbeddingModel is kept for internal readability.
+	defaultEmbeddingModel = DefaultEmbeddingModel
+	embeddingAPI          = "https://generativelanguage.googleapis.com/v1beta/models/%s:embedContent?key=%s"
+	batchEmbedAPI         = "https://generativelanguage.googleapis.com/v1beta/models/%s:batchEmbedContents?key=%s"
+	maxEmbedInputChars    = 8000 // ~2048 tokens safe limit
+	maxBatchSize          = 100  // Gemini batch limit
 )
 
 // getEmbedding generates an embedding vector for the given text using Gemini API.
-func getEmbedding(apiKey string, text string) ([]float32, error) {
-	vecs, err := getBatchEmbeddings(apiKey, []string{text})
+func getEmbedding(apiKey, model, text string) ([]float32, error) {
+	vecs, err := getBatchEmbeddings(apiKey, model, []string{text})
 	if err != nil {
 		return nil, err
 	}
@@ -35,7 +39,7 @@ func getEmbedding(apiKey string, text string) ([]float32, error) {
 
 // getBatchEmbeddings generates embeddings for multiple texts in one API call.
 // Automatically splits into batches of maxBatchSize.
-func getBatchEmbeddings(apiKey string, texts []string) ([][]float32, error) {
+func getBatchEmbeddings(apiKey, model string, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
 	}
@@ -46,7 +50,7 @@ func getBatchEmbeddings(apiKey string, texts []string) ([][]float32, error) {
 		if end > len(texts) {
 			end = len(texts)
 		}
-		batch, err := batchEmbedCall(apiKey, texts[i:end])
+		batch, err := batchEmbedCall(apiKey, model, texts[i:end])
 		if err != nil {
 			return nil, err
 		}
@@ -55,8 +59,8 @@ func getBatchEmbeddings(apiKey string, texts []string) ([][]float32, error) {
 	return all, nil
 }
 
-func batchEmbedCall(apiKey string, texts []string) ([][]float32, error) {
-	url := fmt.Sprintf(batchEmbedAPI, embeddingModel, apiKey)
+func batchEmbedCall(apiKey, model string, texts []string) ([][]float32, error) {
+	url := fmt.Sprintf(batchEmbedAPI, model, apiKey)
 
 	requests := make([]map[string]any, len(texts))
 	for i, text := range texts {
@@ -65,7 +69,7 @@ func batchEmbedCall(apiKey string, texts []string) ([][]float32, error) {
 			text = string([]rune(text)[:maxEmbedInputChars])
 		}
 		requests[i] = map[string]any{
-			"model": "models/" + embeddingModel,
+			"model": "models/" + model,
 			"content": map[string]any{
 				"parts": []map[string]string{
 					{"text": text},
@@ -75,7 +79,15 @@ func batchEmbedCall(apiKey string, texts []string) ([][]float32, error) {
 	}
 
 	body, _ := json.Marshal(map[string]any{"requests": requests})
-	resp, err := http.Post(url, "application/json", strings.NewReader(string(body)))
+	// Use the shared Gemini HTTP client so embedding requests inherit a
+	// timeout instead of inheriting http.DefaultClient's (no-timeout) default
+	// and hanging indefinitely on a stuck upstream.
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, fmt.Errorf("embedding API build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := geminiHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("embedding API request: %w", err)
 	}

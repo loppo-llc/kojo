@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 import { agentApi, type OAuthClientInfo } from "../lib/agentApi";
+import { useEnterSends } from "../lib/preferences";
 
 export function GlobalSettings() {
   const navigate = useNavigate();
@@ -12,6 +13,8 @@ export function GlobalSettings() {
   const [error, setError] = useState("");
   const [success, setSuccess] = useState(false);
 
+  const [enterSends, setEnterSends] = useEnterSends();
+
   // API Keys state
   const [geminiKeyConfigured, setGeminiKeyConfigured] = useState(false);
   const [geminiHasFallback, setGeminiHasFallback] = useState(false);
@@ -19,11 +22,28 @@ export function GlobalSettings() {
   const [geminiKeyInput, setGeminiKeyInput] = useState("");
   const [savingKey, setSavingKey] = useState(false);
 
+  // Embedding model state
+  const [embeddingModel, setEmbeddingModel] = useState("");
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [savingModel, setSavingModel] = useState(false);
+
   useEffect(() => {
     agentApi.oauthClients.list().then(setClients).catch(() => {});
-    agentApi.apiKeys.get("gemini").then((r: { configured: boolean; hasFallback?: boolean }) => {
+    agentApi.apiKeys.get("gemini").then((r: { configured: boolean; hasFallback?: boolean; embeddingModel?: string }) => {
       setGeminiKeyConfigured(r.configured);
       setGeminiHasFallback(r.hasFallback ?? false);
+      if (r.embeddingModel) {
+        setEmbeddingModel(r.embeddingModel);
+      }
+      // Fetch available models if API key is configured
+      if (r.configured) {
+        setLoadingModels(true);
+        agentApi.embeddingModel.list()
+          .then(setAvailableModels)
+          .catch(() => {})
+          .finally(() => setLoadingModels(false));
+      }
     }).catch(() => {});
   }, []);
 
@@ -71,10 +91,37 @@ export function GlobalSettings() {
       setGeminiKeyInput("");
       setSuccess(true);
       setTimeout(() => setSuccess(false), 2000);
+
+      // The page may have loaded with no key configured, in which case we
+      // never fetched the model list on mount. Fetch it now so the
+      // Embedding Model dropdown appears without requiring a manual refresh.
+      setAvailableModels([]);
+      setLoadingModels(true);
+      agentApi.embeddingModel
+        .list()
+        .then(setAvailableModels)
+        .catch(() => {})
+        .finally(() => setLoadingModels(false));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSavingKey(false);
+    }
+  };
+
+  const handleChangeEmbeddingModel = async (model: string) => {
+    if (!model || model === embeddingModel) return;
+    setSavingModel(true);
+    setError("");
+    try {
+      await agentApi.embeddingModel.set(model);
+      setEmbeddingModel(model);
+      setSuccess(true);
+      setTimeout(() => setSuccess(false), 2000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingModel(false);
     }
   };
 
@@ -168,6 +215,31 @@ export function GlobalSettings() {
                 </button>
               </div>
             )}
+
+            <div className="mt-3 border-t border-neutral-800 pt-3">
+              <div className="text-xs text-neutral-500 mb-1.5">Embedding Model</div>
+              {loadingModels ? (
+                <div className="text-xs text-neutral-600">Loading models...</div>
+              ) : availableModels.length > 0 ? (
+                <select
+                  value={embeddingModel}
+                  onChange={(e) => handleChangeEmbeddingModel(e.target.value)}
+                  disabled={savingModel}
+                  className="w-full px-3 py-1.5 bg-neutral-800 border border-neutral-700 rounded text-xs font-mono focus:outline-none focus:border-neutral-500 disabled:opacity-40"
+                >
+                  {!availableModels.includes(embeddingModel) && embeddingModel && (
+                    <option value={embeddingModel}>{embeddingModel} (unavailable)</option>
+                  )}
+                  {availableModels.map((m) => (
+                    <option key={m} value={m}>{m}</option>
+                  ))}
+                </select>
+              ) : (
+                <div className="text-xs text-neutral-600">
+                  {geminiKeyConfigured ? "Failed to load models" : "Configure API key to see available models"}
+                </div>
+              )}
+            </div>
           </div>
         </div>
 
@@ -250,6 +322,33 @@ export function GlobalSettings() {
               )}
             </div>
           ))}
+        </div>
+
+        {/* Chat Preferences */}
+        <div>
+          <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider mb-3">
+            Chat
+          </h2>
+          <div className="p-3 bg-neutral-900 border border-neutral-800 rounded-lg">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm font-medium">Send with Enter</div>
+                <div className="text-xs text-neutral-500 mt-0.5">
+                  {enterSends
+                    ? "Enter to send, Shift+Enter for newline"
+                    : "Shift+Enter to send, Enter for newline"}
+                </div>
+              </div>
+              <button
+                onClick={() => setEnterSends(!enterSends)}
+                className={`relative w-10 h-5 rounded-full transition-colors ${enterSends ? "bg-blue-600" : "bg-neutral-700"}`}
+                role="switch"
+                aria-checked={enterSends}
+              >
+                <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${enterSends ? "translate-x-5" : ""}`} />
+              </button>
+            </div>
+          </div>
         </div>
 
         {error && (

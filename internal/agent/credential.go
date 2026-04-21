@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -101,6 +102,15 @@ func NewCredentialStore() (*CredentialStore, error) {
 	if err := createTokenTable(s); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create token table: %w", err)
+	}
+
+	// Create global settings table
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS settings (
+		key   TEXT PRIMARY KEY,
+		value TEXT NOT NULL
+	)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create settings table: %w", err)
 	}
 
 	// Migrate legacy credentials.json files
@@ -533,4 +543,36 @@ func (s *CredentialStore) migrateLegacy() {
 			tx.Rollback()
 		}
 	}
+}
+
+// GetSetting retrieves a global setting value. Returns "" if the key is not
+// found. Unexpected database errors (connection issues, schema drift, etc.)
+// are logged rather than silently swallowed so they don't masquerade as a
+// missing value.
+func (s *CredentialStore) GetSetting(key string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var val string
+	err := s.db.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&val)
+	if err == nil {
+		return val
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return ""
+	}
+	slog.Warn("GetSetting: unexpected db error", "key", key, "err", err)
+	return ""
+}
+
+// SetSetting stores a global setting value.
+func (s *CredentialStore) SetSetting(key, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(
+		"INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+		key, value,
+	)
+	return err
 }

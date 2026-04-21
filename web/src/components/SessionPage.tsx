@@ -3,6 +3,7 @@ import { useParams, useNavigate, useLocation } from "react-router";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { useTerminal } from "../hooks/useTerminal";
 import { api, type SessionInfo, type Attachment } from "../lib/api";
+import { useEnterSends } from "../lib/preferences";
 import { restoreScrollback, base64ToBytes } from "../lib/utils";
 import { useSpecialKeys } from "../hooks/useSpecialKeys";
 import { FileBrowser } from "./FileBrowser";
@@ -28,6 +29,7 @@ export function SessionPage() {
   const termContainerRef = useRef<HTMLDivElement>(null);
   const [session, setSession] = useState<SessionInfo>();
   const [input, setInput] = useState("");
+  const [enterSends] = useEnterSends();
   const [exited, setExited] = useState(false);
   const yoloTailRef = useRef<string | null>(null);
   const yoloOverlayRef = useRef<HTMLButtonElement>(null);
@@ -351,12 +353,12 @@ export function SessionPage() {
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter" && e.shiftKey) {
+                    if (e.key === "Enter" && !e.nativeEvent.isComposing && (enterSends ? !e.shiftKey : e.shiftKey)) {
                       e.preventDefault();
                       handleSend();
                     }
                   }}
-                  placeholder="Type here... (Shift+Enter to send)"
+                  placeholder={enterSends ? "Type here... (Enter to send)" : "Type here... (Shift+Enter to send)"}
                   rows={Math.min(input.split("\n").length, 5)}
                   className="flex-1 px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500 resize-none"
                 />

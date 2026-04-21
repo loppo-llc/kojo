@@ -47,6 +47,23 @@ func main() {
 	if *dev {
 		logLevel = slog.LevelDebug
 	}
+	if lvl := os.Getenv("KOJO_LOG_LEVEL"); lvl != "" {
+		switch strings.ToLower(lvl) {
+		case "debug":
+			logLevel = slog.LevelDebug
+		case "info":
+			logLevel = slog.LevelInfo
+		case "warn", "warning":
+			logLevel = slog.LevelWarn
+		case "error":
+			logLevel = slog.LevelError
+		default:
+			// Defer logging the invalid value until the logger exists, so
+			// operators notice the misconfiguration instead of silently
+			// getting the default level.
+			fmt.Fprintf(os.Stderr, "kojo: ignoring invalid KOJO_LOG_LEVEL=%q (valid: debug|info|warn|warning|error)\n", lvl)
+		}
+	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: logLevel,
 	}))
