@@ -115,6 +115,35 @@ func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+func (s *Server) handleForkAgent(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var body struct {
+		Name              string `json:"name"`
+		IncludeTranscript bool   `json:"includeTranscript"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	if strings.TrimSpace(body.Name) == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "name is required")
+		return
+	}
+	a, err := s.agents.Fork(id, agent.ForkOptions{Name: body.Name, IncludeTranscript: body.IncludeTranscript})
+	if err != nil {
+		switch {
+		case errors.Is(err, agent.ErrAgentNotFound):
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		case errors.Is(err, agent.ErrAgentBusy), errors.Is(err, agent.ErrAgentResetting):
+			writeError(w, http.StatusConflict, "conflict", err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, a)
+}
+
 func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	// Stop Slack bot before deleting the agent so it doesn't keep running.

@@ -210,6 +210,9 @@ export const agentApi = {
 
   resetSession: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/reset-session`),
 
+  fork: (id: string, params: { name: string; includeTranscript: boolean }) =>
+    post<AgentInfo>(`/api/v1/agents/${id}/fork`, params),
+
   tasks: {
     list: (agentId: string) =>
       get<{ tasks: AgentTask[] }>(`/api/v1/agents/${agentId}/tasks`).then(

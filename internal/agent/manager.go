@@ -1020,10 +1020,15 @@ func (m *Manager) untrackOneShot(agentID string, id int64) {
 }
 
 // cancelOneShots cancels all in-flight one-shot chats for an agent.
+// The map entry is left intact so callers that need to wait for the
+// goroutines to finish (see waitOneShotClear) can observe completion as
+// each goroutine removes itself via untrackOneShot.
 func (m *Manager) cancelOneShots(agentID string) {
 	m.oneShotCancelsMu.Lock()
-	cancels := m.oneShotCancels[agentID]
-	delete(m.oneShotCancels, agentID)
+	cancels := make([]context.CancelFunc, 0, len(m.oneShotCancels[agentID]))
+	for _, cancel := range m.oneShotCancels[agentID] {
+		cancels = append(cancels, cancel)
+	}
 	m.oneShotCancelsMu.Unlock()
 	for _, cancel := range cancels {
 		cancel()

@@ -208,6 +208,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGetAgent)
 	mux.HandleFunc("PATCH /api/v1/agents/{id}", s.handleUpdateAgent)
 	mux.HandleFunc("POST /api/v1/agents/{id}/reset", s.handleResetAgentData)
+	mux.HandleFunc("POST /api/v1/agents/{id}/fork", s.handleForkAgent)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}", s.handleDeleteAgent)
 	mux.HandleFunc("GET /api/v1/agents/{id}/avatar", s.handleGetAvatar)
 	mux.HandleFunc("POST /api/v1/agents/{id}/avatar", s.handleUploadAvatar)

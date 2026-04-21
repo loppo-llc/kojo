@@ -39,6 +39,11 @@ export function AgentSettings() {
   const [generatingPersona, setGeneratingPersona] = useState(false);
   const [allowedTools, setAllowedTools] = useState<string[]>([]);
   const [allowProtectedPaths, setAllowProtectedPaths] = useState<string[]>([]);
+  const [showForkDialog, setShowForkDialog] = useState(false);
+  const [forkName, setForkName] = useState("");
+  const [forkIncludeTranscript, setForkIncludeTranscript] = useState(false);
+  const [forking, setForking] = useState(false);
+  const [forkError, setForkError] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -143,6 +148,32 @@ export function AgentSettings() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setResetting(false);
+    }
+  };
+
+  const openForkDialog = () => {
+    setForkName(agent ? `${agent.name} (fork)` : "");
+    setForkIncludeTranscript(false);
+    setForkError("");
+    setShowForkDialog(true);
+  };
+
+  const handleFork = async () => {
+    const trimmed = forkName.trim();
+    if (!trimmed) {
+      setForkError("Name is required");
+      return;
+    }
+    setForking(true);
+    setForkError("");
+    try {
+      const forked = await agentApi.fork(id!, { name: trimmed, includeTranscript: forkIncludeTranscript });
+      setShowForkDialog(false);
+      navigate(`/agents/${forked.id}/settings`);
+    } catch (err) {
+      setForkError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setForking(false);
     }
   };
 
@@ -588,6 +619,19 @@ export function AgentSettings() {
           </button>
         </section>
 
+        {/* ── Actions ── */}
+        <section className="rounded-xl border border-neutral-800 p-5">
+          <button
+            onClick={openForkDialog}
+            className="w-full py-3 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm font-medium"
+          >
+            Fork Agent
+          </button>
+          <p className="text-xs text-neutral-600 mt-1">
+            Create a copy with persona and memory carried over. Slack, notifications, and credentials are not transferred.
+          </p>
+        </section>
+
         {/* ── Danger Zone ── */}
         <section className="rounded-xl border border-red-900/30 bg-red-950/10 p-5 space-y-4">
           <h2 className="text-sm font-semibold text-red-400/80">Danger Zone</h2>
@@ -630,6 +674,64 @@ export function AgentSettings() {
           <div>Created: {new Date(agent.createdAt).toLocaleString()}</div>
         </div>
       </main>
+
+      {showForkDialog && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 outline-none"
+          onClick={(e) => { if (e.target === e.currentTarget && !forking) setShowForkDialog(false); }}
+          onKeyDown={(e) => { if (e.key === "Escape" && !forking) setShowForkDialog(false); }}
+        >
+          <div className="bg-neutral-900 border border-neutral-700 rounded-lg p-5 w-[22rem] shadow-xl">
+            <h3 className="text-sm font-medium text-neutral-200 mb-3">Fork agent</h3>
+            <label className="block text-xs text-neutral-400 mb-1">Name</label>
+            <input
+              type="text"
+              value={forkName}
+              onChange={(e) => setForkName(e.target.value)}
+              disabled={forking}
+              autoFocus
+              className="w-full px-2 py-1.5 text-sm bg-neutral-800 border border-neutral-700 rounded text-neutral-200 focus:outline-none focus:ring-1 focus:ring-blue-500/50 mb-3"
+            />
+            <label className="flex items-start gap-2 text-sm text-neutral-400 mb-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={forkIncludeTranscript}
+                onChange={(e) => setForkIncludeTranscript(e.target.checked)}
+                disabled={forking}
+                className="mt-0.5 rounded border-neutral-600 bg-neutral-800 text-blue-500 focus:ring-blue-500/30"
+              />
+              <span>
+                Include conversation history
+                <span className="block text-xs text-neutral-600">Persona and memory are always copied.</span>
+              </span>
+            </label>
+            <p className="text-xs text-neutral-600 mb-4">
+              Slack bot, notification sources, and credentials are not transferred.
+            </p>
+            {forkError && (
+              <p className="text-xs text-red-400 mb-3">{forkError}</p>
+            )}
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setShowForkDialog(false)}
+                disabled={forking}
+                className="px-3 py-1.5 text-xs text-neutral-400 hover:text-neutral-200 rounded disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleFork}
+                disabled={forking || !forkName.trim()}
+                className="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 text-white rounded disabled:opacity-50"
+              >
+                {forking ? "Forking…" : "Fork"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

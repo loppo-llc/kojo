@@ -75,6 +75,25 @@ func (m *Manager) waitBusyClear(agentID string) error {
 	return nil
 }
 
+// waitOneShotClear waits up to 5 seconds for the agent's in-flight one-shot
+// chats (Slack, Discord, Group DM) to drain. Call cancelOneShots first so the
+// goroutines are actively winding down. Returns ErrAgentBusy if not drained.
+func (m *Manager) waitOneShotClear(agentID string) error {
+	for i := 0; i < 50; i++ {
+		m.oneShotCancelsMu.Lock()
+		n := len(m.oneShotCancels[agentID])
+		m.oneShotCancelsMu.Unlock()
+		if n == 0 {
+			return nil
+		}
+		if i == 49 {
+			return fmt.Errorf("%w, try again later", ErrAgentBusy)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return nil
+}
+
 // acquireResetGuard marks the agent as resetting, cancels any active chat,
 // and returns a cleanup function that removes the resetting flag.
 // Returns ErrAgentBusy if the agent is already being reset.
