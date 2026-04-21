@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/slack-go/slack"
 )
@@ -66,6 +67,45 @@ func TestAppendFileInfo(t *testing.T) {
 		}
 		if !strings.Contains(got, "big.bin") || !strings.Contains(got, "file too large") {
 			t.Errorf("error metadata missing: %q", got)
+		}
+	})
+}
+
+func TestPreflightSlackFile(t *testing.T) {
+	t.Run("oversize rejected", func(t *testing.T) {
+		err := preflightSlackFile(slack.File{Size: maxFileSize + 1, URLPrivateDownload: "https://x"})
+		if err == nil || !strings.Contains(err.Error(), "too large") {
+			t.Errorf("got err=%v, want too-large error", err)
+		}
+	})
+	t.Run("missing URL rejected", func(t *testing.T) {
+		err := preflightSlackFile(slack.File{Size: 10})
+		if err == nil || !strings.Contains(err.Error(), "no download URL") {
+			t.Errorf("got err=%v, want missing-url error", err)
+		}
+	})
+	t.Run("ok when size and URL are valid", func(t *testing.T) {
+		err := preflightSlackFile(slack.File{Size: 10, URLPrivateDownload: "https://x"})
+		if err != nil {
+			t.Errorf("unexpected err: %v", err)
+		}
+	})
+}
+
+func TestBuildLocalPath(t *testing.T) {
+	now := time.Unix(1_700_000_000, 1234)
+	t.Run("sanitizes path traversal", func(t *testing.T) {
+		got := buildLocalPath("/tmp", now, "../etc/passwd")
+		want := fmt.Sprintf("/tmp/%d_passwd", now.UnixNano())
+		if got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+	t.Run("preserves ordinary filename", func(t *testing.T) {
+		got := buildLocalPath("/tmp", now, "photo.png")
+		want := fmt.Sprintf("/tmp/%d_photo.png", now.UnixNano())
+		if got != want {
+			t.Errorf("got %q, want %q", got, want)
 		}
 	})
 }

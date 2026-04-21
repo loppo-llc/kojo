@@ -19,6 +19,34 @@ var uploadDir = filepath.Join(os.TempDir(), "kojo", "upload")
 // maxFileSize is the maximum file size (20 MB) the bot will download.
 const maxFileSize = 20 * 1024 * 1024
 
+// fileDownloadTimeout caps how long a single Slack attachment download may
+// take. Using http.DefaultClient directly would allow a hung upstream to
+// block the handler goroutine indefinitely.
+const fileDownloadTimeout = 60 * time.Second
+
+// slackFileHTTPClient is the HTTP client used for Slack file downloads.
+// Exposed as a package variable so tests can swap it (e.g. to route through
+// httptest.Server with a short timeout).
+var slackFileHTTPClient = &http.Client{Timeout: fileDownloadTimeout}
+
+// preflightSlackFile validates a Slack file descriptor before we spend any
+// I/O on it. Returns a nil error when the file is eligible for download.
+func preflightSlackFile(f slack.File) error {
+	if f.Size > maxFileSize {
+		return fmt.Errorf("file too large (%d bytes, max %d)", f.Size, maxFileSize)
+	}
+	if f.URLPrivateDownload == "" {
+		return fmt.Errorf("no download URL available")
+	}
+	return nil
+}
+
+// buildLocalPath returns the destination path for a Slack attachment using
+// the WebUI upload convention {unixnano}_{sanitized_original_name}. Pure.
+func buildLocalPath(dir string, now time.Time, originalName string) string {
+	return filepath.Join(dir, fmt.Sprintf("%d_%s", now.UnixNano(), sanitizeFilename(originalName)))
+}
+
 // downloadedFile holds metadata about a successfully downloaded Slack file.
 type downloadedFile struct {
 	Path string // local filesystem path
@@ -55,16 +83,9 @@ func (b *Bot) downloadSlackFiles(ctx context.Context, files []slack.File) ([]dow
 	var result []downloadedFile
 	var errs []fileError
 	for _, f := range files {
-		if f.Size > maxFileSize {
-			b.logger.Warn("slack file too large, skipping",
-				"fileID", f.ID, "name", f.Name, "size", f.Size)
-			errs = append(errs, fileError{Name: f.Name, Err: fmt.Sprintf("file too large (%d bytes, max %d)", f.Size, maxFileSize)})
-			continue
-		}
-		if f.URLPrivateDownload == "" {
-			b.logger.Debug("slack file has no download URL, skipping",
-				"fileID", f.ID, "name", f.Name)
-			errs = append(errs, fileError{Name: f.Name, Err: "no download URL available"})
+		if err := preflightSlackFile(f); err != nil {
+			b.logger.Warn("slack file skipped", "fileID", f.ID, "name", f.Name, "err", err)
+			errs = append(errs, fileError{Name: f.Name, Err: err.Error()})
 			continue
 		}
 
@@ -91,9 +112,7 @@ func (b *Bot) downloadSlackFiles(ctx context.Context, files []slack.File) ([]dow
 // downloadOneFile downloads a single Slack file and saves it locally.
 // The filename uses {unixnano}_{original_name} to match the WebUI upload convention.
 func (b *Bot) downloadOneFile(ctx context.Context, dir string, f *slack.File) (string, error) {
-	safeName := sanitizeFilename(f.Name)
-	localName := fmt.Sprintf("%d_%s", time.Now().UnixNano(), safeName)
-	localPath := filepath.Join(dir, localName)
+	localPath := buildLocalPath(dir, time.Now(), f.Name)
 
 	// Slack private URLs require bot token in Authorization header.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.URLPrivateDownload, nil)
@@ -102,7 +121,9 @@ func (b *Bot) downloadOneFile(ctx context.Context, dir string, f *slack.File) (s
 	}
 	req.Header.Set("Authorization", "Bearer "+b.botToken)
 
-	resp, err := http.DefaultClient.Do(req)
+	// Use the package-level client so downloads can't hang forever on a
+	// stuck upstream (http.DefaultClient has no timeout).
+	resp, err := slackFileHTTPClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("download: %w", err)
 	}
