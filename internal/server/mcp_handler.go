@@ -223,31 +223,150 @@ func getSlackClient(ctx context.Context, agents *agent.Manager) (*slack.Client, 
 	return slack.New(token), ""
 }
 
+// listChannelsDefaults centralizes the tunables for slack_list_channels so
+// they're easy to find and reason about (and so tests can depend on the
+// named constants instead of the raw numbers).
+const (
+	// listChannelsDefaultLimit is the default cap on returned channels when
+	// the caller doesn't specify one.
+	listChannelsDefaultLimit = 200
+	// listChannelsMaxLimit clamps the caller-supplied limit. Anything larger
+	// is silently reduced to this value.
+	listChannelsMaxLimit = 1000
+	// listChannelsPageSize is the per-request page size sent to Slack. 200 is
+	// the Slack-recommended tier-2 page size.
+	listChannelsPageSize = 200
+	// listChannelsMaxPages caps pagination to avoid exhausting Slack Tier 2
+	// rate limits in large workspaces that span many hundreds of channels.
+	listChannelsMaxPages = 5
+)
+
+// listChannelsArgs is the parsed representation of slack_list_channels
+// MCP tool arguments.
+type listChannelsArgs struct {
+	Limit      int
+	NameFilter string // already lowercased
+	MemberOnly bool
+}
+
+// parseListChannelsArgs converts the loose MCP argument map into a typed
+// struct, applying defaults and clamping the limit.
+func parseListChannelsArgs(args map[string]any) listChannelsArgs {
+	out := listChannelsArgs{
+		Limit:      listChannelsDefaultLimit,
+		MemberOnly: true,
+	}
+	if v, ok := args["limit"].(float64); ok && v > 0 {
+		out.Limit = int(v)
+		if out.Limit > listChannelsMaxLimit {
+			out.Limit = listChannelsMaxLimit
+		}
+	}
+	if v, ok := args["name_contains"].(string); ok {
+		out.NameFilter = strings.ToLower(v)
+	}
+	if v, ok := args["member_only"].(bool); ok {
+		out.MemberOnly = v
+	}
+	return out
+}
+
+// channelInfo is the JSON shape returned by slack_list_channels.
+type channelInfo struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Topic      string `json:"topic,omitempty"`
+	Purpose    string `json:"purpose,omitempty"`
+	NumMembers int    `json:"numMembers"`
+	IsMember   bool   `json:"isMember"`
+}
+
+// matchChannel returns (info, true) if ch passes the filters in opts, or
+// (zero, false) otherwise. Pure on its inputs — no I/O.
+func matchChannel(ch slack.Channel, opts listChannelsArgs) (channelInfo, bool) {
+	if opts.MemberOnly && !ch.IsMember {
+		return channelInfo{}, false
+	}
+	if opts.NameFilter != "" && !strings.Contains(strings.ToLower(ch.Name), opts.NameFilter) {
+		return channelInfo{}, false
+	}
+	return channelInfo{
+		ID:         ch.ID,
+		Name:       ch.Name,
+		Topic:      ch.Topic.Value,
+		Purpose:    ch.Purpose.Value,
+		NumMembers: ch.NumMembers,
+		IsMember:   ch.IsMember,
+	}, true
+}
+
+// slackConversationLister is the small subset of slack.Client that the
+// channel-listing logic needs. Declared here so tests can inject a fake.
+type slackConversationLister interface {
+	GetConversationsContext(ctx context.Context, params *slack.GetConversationsParameters) ([]slack.Channel, string, error)
+}
+
+// listSlackChannels paginates through Slack's conversations.list API and
+// applies opts. It is wired up to a real *slack.Client in production, but
+// tests can inject any slackConversationLister.
+//
+// Partial-success semantics: if we've already collected at least one channel
+// and a subsequent page fails, the error is reported to the caller (logged)
+// and the channels collected so far are returned.
+func listSlackChannels(
+	ctx context.Context,
+	api slackConversationLister,
+	opts listChannelsArgs,
+	onPartial func(err error, collected int),
+) ([]channelInfo, error) {
+	var channels []channelInfo
+	cursor := ""
+	for page := 0; page < listChannelsMaxPages; page++ {
+		params := &slack.GetConversationsParameters{
+			Types:           []string{"public_channel", "private_channel"},
+			Limit:           listChannelsPageSize,
+			Cursor:          cursor,
+			ExcludeArchived: true,
+		}
+		chs, nextCursor, err := api.GetConversationsContext(ctx, params)
+		if err != nil {
+			if len(channels) > 0 {
+				if onPartial != nil {
+					onPartial(err, len(channels))
+				}
+				break
+			}
+			return nil, err
+		}
+		for _, ch := range chs {
+			info, ok := matchChannel(ch, opts)
+			if !ok {
+				continue
+			}
+			channels = append(channels, info)
+			if len(channels) >= opts.Limit {
+				break
+			}
+		}
+		if len(channels) >= opts.Limit || nextCursor == "" {
+			break
+		}
+		cursor = nextCursor
+	}
+	if len(channels) > opts.Limit {
+		channels = channels[:opts.Limit]
+	}
+	return channels, nil
+}
+
 func slackListChannelsHandler(agents *agent.Manager, logger *slog.Logger) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		reqID := reqIDFromCtx(ctx)
 		agentID, _ := ctx.Value(mcpAgentIDKey).(string)
-		args := req.GetArguments()
-
-		// Parse optional parameters.
-		limit := 200
-		if v, ok := args["limit"].(float64); ok && v > 0 {
-			limit = int(v)
-			if limit > 1000 {
-				limit = 1000
-			}
-		}
-		nameFilter := ""
-		if v, ok := args["name_contains"].(string); ok {
-			nameFilter = strings.ToLower(v)
-		}
-		memberOnly := true
-		if v, ok := args["member_only"].(bool); ok {
-			memberOnly = v
-		}
+		opts := parseListChannelsArgs(req.GetArguments())
 
 		logger.Info("mcp tool invoked", "reqID", reqID, "agent", agentID, "tool", "slack_list_channels",
-			"limit", limit, "nameFilter", nameFilter, "memberOnly", memberOnly)
+			"limit", opts.Limit, "nameFilter", opts.NameFilter, "memberOnly", opts.MemberOnly)
 
 		api, errMsg := getSlackClient(ctx, agents)
 		if api == nil {
@@ -255,67 +374,13 @@ func slackListChannelsHandler(agents *agent.Manager, logger *slog.Logger) mcpser
 			return mcp.NewToolResultError(errMsg), nil
 		}
 
-		type channelInfo struct {
-			ID         string `json:"id"`
-			Name       string `json:"name"`
-			Topic      string `json:"topic,omitempty"`
-			Purpose    string `json:"purpose,omitempty"`
-			NumMembers int    `json:"numMembers"`
-			IsMember   bool   `json:"isMember"`
-		}
-
-		var channels []channelInfo
-		cursor := ""
-		// Cap pagination to avoid exhausting Slack Tier 2 rate limits.
-		// Large workspaces can have thousands of channels across 20+ pages.
-		const maxPages = 5
-		for page := 0; page < maxPages; page++ {
-			params := &slack.GetConversationsParameters{
-				Types:           []string{"public_channel", "private_channel"},
-				Limit:           200,
-				Cursor:          cursor,
-				ExcludeArchived: true,
-			}
-			chs, nextCursor, err := api.GetConversationsContext(ctx, params)
-			if err != nil {
-				// If we already collected some channels, return them with a warning
-				// instead of failing completely.
-				if len(channels) > 0 {
-					logger.Warn("mcp tool partial", "reqID", reqID, "agent", agentID,
-						"tool", "slack_list_channels", "err", err, "collected", len(channels))
-					break
-				}
-				logger.Warn("mcp tool error", "reqID", reqID, "agent", agentID, "tool", "slack_list_channels", "err", err)
-				return mcp.NewToolResultError(fmt.Sprintf("Slack API error: %v", err)), nil
-			}
-			for _, ch := range chs {
-				if memberOnly && !ch.IsMember {
-					continue
-				}
-				if nameFilter != "" && !strings.Contains(strings.ToLower(ch.Name), nameFilter) {
-					continue
-				}
-				channels = append(channels, channelInfo{
-					ID:         ch.ID,
-					Name:       ch.Name,
-					Topic:      ch.Topic.Value,
-					Purpose:    ch.Purpose.Value,
-					NumMembers: ch.NumMembers,
-					IsMember:   ch.IsMember,
-				})
-				if len(channels) >= limit {
-					break
-				}
-			}
-			if len(channels) >= limit || nextCursor == "" {
-				break
-			}
-			cursor = nextCursor
-		}
-
-		// Truncate to exact limit.
-		if len(channels) > limit {
-			channels = channels[:limit]
+		channels, err := listSlackChannels(ctx, api, opts, func(err error, collected int) {
+			logger.Warn("mcp tool partial", "reqID", reqID, "agent", agentID,
+				"tool", "slack_list_channels", "err", err, "collected", collected)
+		})
+		if err != nil {
+			logger.Warn("mcp tool error", "reqID", reqID, "agent", agentID, "tool", "slack_list_channels", "err", err)
+			return mcp.NewToolResultError(fmt.Sprintf("Slack API error: %v", err)), nil
 		}
 
 		data, _ := json.MarshalIndent(channels, "", "  ")
