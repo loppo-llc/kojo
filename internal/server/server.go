@@ -270,6 +270,10 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	// Notify source types
 	mux.HandleFunc("GET /api/v1/notify-source-types", s.handleListNotifySourceTypes)
 
+	// MCP tool server (Streamable HTTP transport)
+	mcpHandler := newMCPHandler(s.agents, s.logger)
+	mux.Handle("/api/v1/agents/{id}/mcp", mcpHandler)
+
 	if s.groupdms != nil {
 		mux.HandleFunc("GET /api/v1/groupdms", s.handleListGroupDMs)
 		mux.HandleFunc("POST /api/v1/groupdms", s.handleCreateGroupDM)

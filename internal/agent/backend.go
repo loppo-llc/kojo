@@ -21,6 +21,11 @@ type ChatOptions struct {
 	// Used for Slack and other external platform conversations that have
 	// their own conversation context.
 	OneShot bool
+
+	// MCPServers is the set of MCP tool servers to make available for this
+	// chat session. Each backend injects them in its own way (CLI args,
+	// config files, etc.). May be nil if no MCP servers are configured.
+	MCPServers map[string]mcpServerEntry
 }
 
 // ChatBackend abstracts a CLI tool for agent chat.
