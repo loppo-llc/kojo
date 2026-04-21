@@ -33,10 +33,11 @@ type fileError struct {
 	Err  string // human-readable error
 }
 
-// downloadSlackFiles downloads Slack file attachments to the agent's data
-// directory and returns metadata for each successfully downloaded file.
-// Files that are too large or fail to download are recorded in errors
-// so the caller can inform the agent.
+// downloadSlackFiles downloads Slack file attachments to the shared upload
+// directory ({os.TempDir()}/kojo/upload, same as the WebUI) and returns
+// metadata for each successfully downloaded file. Files that are too large
+// or fail to download are recorded in errors so the caller can inform the
+// agent.
 func (b *Bot) downloadSlackFiles(ctx context.Context, files []slack.File) ([]downloadedFile, []fileError) {
 	if len(files) == 0 {
 		return nil, nil
@@ -111,15 +112,35 @@ func (b *Bot) downloadOneFile(ctx context.Context, dir string, f *slack.File) (s
 		return "", fmt.Errorf("download returned status %d", resp.StatusCode)
 	}
 
-	out, err := os.Create(localPath)
+	// Use an explicit restrictive permission (0600) so downloaded attachments
+	// are not readable by other local users in the shared temp directory.
+	out, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("create file: %w", err)
 	}
-	defer out.Close()
 
-	if _, err := io.Copy(out, io.LimitReader(resp.Body, maxFileSize+1)); err != nil {
-		os.Remove(localPath)
-		return "", fmt.Errorf("write file: %w", err)
+	// Cap the download size. io.LimitReader silently truncates, so we read
+	// up to maxFileSize+1 and reject the result if it exceeds the limit.
+	n, copyErr := io.Copy(out, io.LimitReader(resp.Body, maxFileSize+1))
+	// Close before any removal attempt — on Windows an open handle blocks
+	// os.Remove, leaving a partial file behind.
+	closeErr := out.Close()
+	switch {
+	case copyErr != nil:
+		if rmErr := os.Remove(localPath); rmErr != nil {
+			b.logger.Warn("failed to remove partial download", "path", localPath, "err", rmErr)
+		}
+		return "", fmt.Errorf("write file: %w", copyErr)
+	case n > maxFileSize:
+		if rmErr := os.Remove(localPath); rmErr != nil {
+			b.logger.Warn("failed to remove oversize download", "path", localPath, "err", rmErr)
+		}
+		return "", fmt.Errorf("file exceeds max size (%d bytes, max %d)", n, maxFileSize)
+	case closeErr != nil:
+		if rmErr := os.Remove(localPath); rmErr != nil {
+			b.logger.Warn("failed to remove after close error", "path", localPath, "err", rmErr)
+		}
+		return "", fmt.Errorf("close file: %w", closeErr)
 	}
 
 	return localPath, nil

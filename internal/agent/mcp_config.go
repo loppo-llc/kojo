@@ -32,8 +32,12 @@ func BuildMCPServers(agentID, apiBase string, hasSlackBot bool) map[string]mcpSe
 }
 
 // mcpConfigJSON returns inline JSON for Claude's --mcp-config flag.
-// Claude Code uses {"mcpServers": {...}} format.
+// Claude Code uses {"mcpServers": {...}} format and expects mcpServers to be
+// an object (never null), so a nil input map is normalized to an empty map.
 func mcpConfigJSON(servers map[string]mcpServerEntry) (string, error) {
+	if servers == nil {
+		servers = map[string]mcpServerEntry{}
+	}
 	cfg := struct {
 		MCPServers map[string]mcpServerEntry `json:"mcpServers"`
 	}{MCPServers: servers}

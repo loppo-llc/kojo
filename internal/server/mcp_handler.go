@@ -73,11 +73,13 @@ func newMCPHandler(agents *agent.Manager, logger *slog.Logger) http.Handler {
 }
 
 // statusRecorder captures HTTP status and bytes written for logging.
+// Request/response bodies are intentionally NOT captured here, because MCP
+// tool arguments/results may contain sensitive data (Slack tokens, channel
+// contents, user messages) that must not leak into logs.
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
 	bytes  int
-	head   []byte // first 200 bytes for logging
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
@@ -86,13 +88,6 @@ func (r *statusRecorder) WriteHeader(code int) {
 }
 
 func (r *statusRecorder) Write(b []byte) (int, error) {
-	if len(r.head) < 200 {
-		room := 200 - len(r.head)
-		if room > len(b) {
-			room = len(b)
-		}
-		r.head = append(r.head, b[:room]...)
-	}
 	n, err := r.ResponseWriter.Write(b)
 	r.bytes += n
 	return n, err
@@ -106,22 +101,59 @@ func (r *statusRecorder) Flush() {
 	}
 }
 
+// maxMCPBodyBytes caps how much of the request body we buffer for rpcMethod
+// peeking. MCP JSON-RPC envelopes are small; anything larger is almost
+// certainly tool-call arguments we don't want to parse ourselves, and a cap
+// prevents a malicious client from forcing us to allocate unbounded memory.
+const maxMCPBodyBytes = 1 << 20 // 1 MiB
+
+// readCloser pairs an arbitrary reader with an explicit close function.
+// Used when splicing a peek buffer in front of an existing body so we can
+// still propagate Close() to the underlying body.
+type readCloser struct {
+	io.Reader
+	close func() error
+}
+
+func (rc *readCloser) Close() error {
+	if rc.close == nil {
+		return nil
+	}
+	return rc.close()
+}
+
 func logMCPMiddleware(next http.Handler, logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID := newReqID()
 		agentID := r.PathValue("id")
 
-		body, _ := io.ReadAll(r.Body)
-		r.Body = io.NopCloser(bytes.NewReader(body))
+		// Read at most maxMCPBodyBytes so we can peek the JSON-RPC method name.
+		// Anything larger is passed through untouched.
+		origBody := r.Body
+		limited := io.LimitReader(origBody, maxMCPBodyBytes+1)
+		peekBuf, _ := io.ReadAll(limited)
+		if len(peekBuf) > maxMCPBodyBytes {
+			// We hit the cap; splice the remaining body back so the MCP server
+			// still sees the full request. Keep delegating Close to the
+			// original body so the underlying connection is not leaked.
+			r.Body = &readCloser{
+				Reader: io.MultiReader(bytes.NewReader(peekBuf), origBody),
+				close:  origBody.Close,
+			}
+		} else {
+			_ = origBody.Close()
+			r.Body = io.NopCloser(bytes.NewReader(peekBuf))
+		}
 
-		// Peek JSON-RPC method name if body looks like JSON.
+		// Peek JSON-RPC method name if body looks like JSON. The body itself
+		// is NOT logged — MCP tool arguments can contain sensitive data.
 		rpcMethod := ""
-		if len(body) > 0 && body[0] == '{' {
+		if len(peekBuf) > 0 && len(peekBuf) <= maxMCPBodyBytes && peekBuf[0] == '{' {
 			var peek struct {
 				Method string          `json:"method"`
 				ID     json.RawMessage `json:"id"`
 			}
-			if err := json.Unmarshal(body, &peek); err == nil {
+			if err := json.Unmarshal(peekBuf, &peek); err == nil {
 				rpcMethod = peek.Method
 			}
 		}
@@ -131,8 +163,7 @@ func logMCPMiddleware(next http.Handler, logger *slog.Logger) http.Handler {
 			"agent", agentID,
 			"method", r.Method,
 			"rpcMethod", rpcMethod,
-			"bodySize", len(body),
-			"bodyHead", headString(body, 300),
+			"bodySize", len(peekBuf),
 			"ua", r.Header.Get("User-Agent"),
 		)
 
@@ -144,6 +175,8 @@ func logMCPMiddleware(next http.Handler, logger *slog.Logger) http.Handler {
 		next.ServeHTTP(rw, r)
 		dur := time.Since(start)
 
+		// Response body is NOT logged — it may contain Slack data (channel
+		// names, topics, message contents) returned by tool calls.
 		logger.Info("mcp response",
 			"reqID", reqID,
 			"agent", agentID,
@@ -151,7 +184,6 @@ func logMCPMiddleware(next http.Handler, logger *slog.Logger) http.Handler {
 			"status", rw.status,
 			"bytes", rw.bytes,
 			"ms", dur.Milliseconds(),
-			"respHead", headString(rw.head, 300),
 		)
 	})
 }
@@ -160,13 +192,6 @@ func newReqID() string {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
-}
-
-func headString(b []byte, n int) string {
-	if len(b) <= n {
-		return string(b)
-	}
-	return string(b[:n]) + "…"
 }
 
 func reqIDFromCtx(ctx context.Context) string {
@@ -350,12 +375,19 @@ func slackPostMessageHandler(agents *agent.Manager, logger *slog.Logger) mcpserv
 }
 
 // resolveSlackChannel converts a #channel-name to a channel ID.
-// If the input already looks like a channel ID (starts with C/G/D), it's returned as-is.
+// If the input already looks like a conversation ID (starts with C/G/D),
+// it's returned as-is. User IDs (U/W prefix) are NOT accepted here —
+// chat.postMessage expects a conversation ID, not a user ID, so passing a
+// user ID would fail at Slack. Callers who want to DM a user must open a
+// conversation first and pass the resulting D... ID.
 func resolveSlackChannel(ctx context.Context, api *slack.Client, channel string) (string, error) {
 	channel = strings.TrimPrefix(channel, "#")
 
-	if len(channel) > 0 && (channel[0] == 'C' || channel[0] == 'G' || channel[0] == 'D' || channel[0] == 'U' || channel[0] == 'W') && !strings.Contains(channel, " ") && len(channel) >= 9 {
-		return channel, nil
+	if len(channel) >= 9 && !strings.Contains(channel, " ") {
+		switch channel[0] {
+		case 'C', 'G', 'D':
+			return channel, nil
+		}
 	}
 
 	cursor := ""
