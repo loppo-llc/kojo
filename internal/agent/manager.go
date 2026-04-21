@@ -497,6 +497,9 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.AllowedTools != nil {
 		a.AllowedTools = cfg.AllowedTools
 	}
+	if cfg.AllowProtectedPaths != nil {
+		a.AllowProtectedPaths = normalizeAllowProtectedPaths(*cfg.AllowProtectedPaths)
+	}
 	if cfg.ThinkingMode != nil {
 		if !ValidThinkingMode(*cfg.ThinkingMode) {
 			m.mu.Unlock()
@@ -613,7 +616,7 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool, skip
 		groups = m.groupdms.GroupsForAgent(agentID)
 	}
 	if agentCopy.Tool == "claude" || agentCopy.Tool == "custom" {
-		PrepareClaudeSettings(agentID, apiBase, m.logger)
+		PrepareClaudeSettings(agentID, apiBase, agentCopy.AllowProtectedPaths, m.logger)
 	}
 
 	sysPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)

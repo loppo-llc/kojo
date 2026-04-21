@@ -182,6 +182,12 @@ type Agent struct {
 	// If empty, all tools are forwarded.
 	AllowedTools []string `json:"allowedTools,omitempty"`
 
+	// AllowProtectedPaths lists protected directory names (claude, git, husky)
+	// for which Edit/Write/MultiEdit prompts should be suppressed. Recent
+	// claude-code versions guard these dirs even under bypassPermissions —
+	// explicit permissions.allow rules are the only bypass.
+	AllowProtectedPaths []string `json:"allowProtectedPaths,omitempty"`
+
 	// ThinkingMode controls reasoning/thinking for llama.cpp backend.
 	// "on" = enable, "off" = disable, "" = server default.
 	ThinkingMode string `json:"thinkingMode,omitempty"`
@@ -244,6 +250,7 @@ type AgentUpdateConfig struct {
 	CustomBaseURL         *string   `json:"customBaseURL"`
 	ThinkingMode          *string   `json:"thinkingMode"`
 	AllowedTools          []string  `json:"allowedTools"`
+	AllowProtectedPaths   *[]string `json:"allowProtectedPaths"`
 }
 
 func generateID() string {

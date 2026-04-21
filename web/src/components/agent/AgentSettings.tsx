@@ -38,6 +38,7 @@ export function AgentSettings() {
   const [personaPrompt, setPersonaPrompt] = useState("");
   const [generatingPersona, setGeneratingPersona] = useState(false);
   const [allowedTools, setAllowedTools] = useState<string[]>([]);
+  const [allowProtectedPaths, setAllowProtectedPaths] = useState<string[]>([]);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -59,6 +60,7 @@ export function AgentSettings() {
       setActiveStart(a.activeStart ?? "");
       setActiveEnd(a.activeEnd ?? "");
       setAllowedTools(a.allowedTools ?? []);
+      setAllowProtectedPaths(a.allowProtectedPaths ?? []);
     }).catch(() => navigate("/"));
   }, [id, navigate]);
 
@@ -100,6 +102,7 @@ export function AgentSettings() {
         activeStart,
         activeEnd,
         allowedTools: (tool === "custom") ? allowedTools : undefined,
+        allowProtectedPaths: (tool === "claude" || tool === "custom") ? allowProtectedPaths : undefined,
       });
       setAgent(updated);
       setPublicProfile(updated.publicProfile ?? "");
@@ -469,6 +472,38 @@ export function AgentSettings() {
                 </label>
               ))}
             </div>
+          </div>
+        )}
+
+        {/* Protected Path Allow (claude / custom) */}
+        {(tool === "claude" || tool === "custom") && (
+          <div>
+            <label className="block text-sm text-neutral-400 mb-2">
+              Allow Edits in Protected Paths
+              <span className="text-xs text-neutral-600 ml-2">(bypass claude-code guard)</span>
+            </label>
+            <div className="grid grid-cols-3 gap-1.5">
+              {["claude", "git", "husky"].map((p) => (
+                <label key={p} className="flex items-center gap-2 px-2 py-1.5 bg-neutral-900 rounded text-xs font-mono cursor-pointer hover:bg-neutral-800">
+                  <input
+                    type="checkbox"
+                    checked={allowProtectedPaths.includes(p)}
+                    onChange={(e) => {
+                      if (e.target.checked) {
+                        setAllowProtectedPaths([...allowProtectedPaths, p]);
+                      } else {
+                        setAllowProtectedPaths(allowProtectedPaths.filter((x) => x !== p));
+                      }
+                    }}
+                    className="accent-neutral-400"
+                  />
+                  .{p}
+                </label>
+              ))}
+            </div>
+            <p className="text-xs text-neutral-600 mt-1">
+              Recent claude-code versions prompt on Edit/Write to .claude, .git, .husky even with bypassPermissions. Check to suppress.
+            </p>
           </div>
         )}
 

@@ -42,6 +42,7 @@ export interface AgentInfo {
   hasAvatar: boolean;
   avatarHash?: string;
   allowedTools?: string[];
+  allowProtectedPaths?: string[];
   thinkingMode?: string;
   notifySources?: NotifySourceConfig[];
   lastMessage?: {
@@ -70,6 +71,7 @@ export interface AgentUpdateParams extends Partial<AgentConfig> {
   publicProfile?: string;
   publicProfileOverride?: boolean;
   allowedTools?: string[];
+  allowProtectedPaths?: string[];
   thinkingMode?: string;
 }
 

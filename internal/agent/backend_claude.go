@@ -173,6 +173,11 @@ func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir s
 		"--verbose",
 		"--include-partial-messages",
 		"--dangerously-skip-permissions",
+		// Recent claude-code versions added an "auto" permission classifier
+		// that can still prompt for Edit/Write despite --dangerously-skip-permissions.
+		// Setting permission-mode explicitly forces bypass regardless of the
+		// default mode the CLI resolves to.
+		"--permission-mode", "bypassPermissions",
 		// Scheduling tools don't make sense in kojo's non-interactive agent
 		// context — the scheduled job would fire against the user's claude,
 		// not this agent's session.
@@ -738,12 +743,57 @@ func clearClaudeSession(agentID string) {
 	}
 }
 
+// allowedProtectedPaths is the set of protected directory names for which
+// per-agent permission bypass may be granted. Claude guards these dirs even
+// under bypassPermissions, so explicit permissions.allow rules are the only
+// way to suppress prompts for headless agents.
+var allowedProtectedPaths = map[string]bool{
+	"claude": true,
+	"git":    true,
+	"husky":  true,
+}
+
+// normalizeAllowProtectedPaths filters a slice to the known-valid set and
+// deduplicates entries while preserving caller-provided order.
+func normalizeAllowProtectedPaths(paths []string) []string {
+	seen := make(map[string]bool, len(paths))
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if !allowedProtectedPaths[p] || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
+}
+
+// buildProtectedPathAllowRules emits permissions.allow rule strings for the
+// given protected directory names (e.g. "claude" → Edit/Write/MultiEdit for
+// any **/.claude/** path). Returns a JSON array body (without the surrounding
+// brackets) suitable for inlining into settings.local.json.
+func buildProtectedPathAllowRules(paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	var rules []string
+	for _, name := range paths {
+		if !allowedProtectedPaths[name] {
+			continue
+		}
+		for _, tool := range []string{"Edit", "Write", "MultiEdit"} {
+			rules = append(rules, fmt.Sprintf(`"%s(**/.%s/**)"`, tool, name))
+		}
+	}
+	return strings.Join(rules, ",")
+}
+
 // PrepareClaudeSettings writes .claude/settings.local.json with persona
 // override and (when apiBase is available) a PreCompact hook that calls
 // kojo's API to save a conversation summary before Claude compacts context.
 // Called from Manager.Chat before backend.Chat to ensure settings are in
 // place before the Claude process reads them.
-func PrepareClaudeSettings(agentID, apiBase string, logger *slog.Logger) {
+func PrepareClaudeSettings(agentID, apiBase string, allowProtectedPaths []string, logger *slog.Logger) {
 	dir := agentDir(agentID)
 	claudeDir := filepath.Join(dir, ".claude")
 	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
@@ -751,10 +801,12 @@ func PrepareClaudeSettings(agentID, apiBase string, logger *slog.Logger) {
 		return
 	}
 
+	allowRules := buildProtectedPathAllowRules(allowProtectedPaths)
+
 	var settings string
 	if apiBase == "" {
 		// No API base — just disable persona hook
-		settings = "{\"persona\":\"agent-managed\"}\n"
+		settings = `{"persona":"agent-managed","permissions":{"defaultMode":"bypassPermissions","allow":[` + allowRules + `]}}` + "\n"
 	} else {
 		curlFlags := "-s"
 		if strings.HasPrefix(apiBase, "https://") {
@@ -762,6 +814,10 @@ func PrepareClaudeSettings(agentID, apiBase string, logger *slog.Logger) {
 		}
 		settings = fmt.Sprintf(`{
   "persona": "agent-managed",
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "allow": [%s]
+  },
   "hooks": {
     "PreCompact": [
       {
@@ -776,7 +832,7 @@ func PrepareClaudeSettings(agentID, apiBase string, logger *slog.Logger) {
     ]
   }
 }
-`, curlFlags, apiBase, agentID)
+`, allowRules, curlFlags, apiBase, agentID)
 	}
 
 	settingsPath := filepath.Join(claudeDir, "settings.local.json")
