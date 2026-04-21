@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -113,11 +114,12 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Tool     string   `json:"tool"`
-		WorkDir  string   `json:"workDir"`
-		Args     []string `json:"args"`
-		YoloMode bool     `json:"yoloMode"`
-		ParentID string   `json:"parentId"`
+		Tool               string   `json:"tool"`
+		WorkDir            string   `json:"workDir"`
+		Args               []string `json:"args"`
+		YoloMode           bool     `json:"yoloMode"`
+		SimpleSystemPrompt bool     `json:"simpleSystemPrompt"`
+		ParentID           string   `json:"parentId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
@@ -130,6 +132,22 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if req.WorkDir == "" {
 		home, _ := os.UserHomeDir()
 		req.WorkDir = home
+	}
+
+	if req.SimpleSystemPrompt && (req.Tool == "claude" || req.Tool == "custom") {
+		hasSystemPrompt := false
+		for _, a := range req.Args {
+			if a == "--system-prompt" ||
+				strings.HasPrefix(a, "--system-prompt=") ||
+				strings.HasPrefix(a, "--system-prompt ") {
+				hasSystemPrompt = true
+				break
+			}
+		}
+		if !hasSystemPrompt {
+			prompt := "Current working directory: " + strconv.Quote(req.WorkDir)
+			req.Args = append(req.Args, "--system-prompt", prompt)
+		}
 	}
 
 	sess, err := s.sessions.Create(req.Tool, req.WorkDir, req.Args, req.YoloMode, req.ParentID)

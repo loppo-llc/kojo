@@ -11,6 +11,7 @@ export function NewSession() {
   const [workDir, setWorkDir] = useState("");
   const [args, setArgs] = useState("");
   const [yoloMode, setYoloMode] = useState(false);
+  const [simpleSystemPrompt, setSimpleSystemPrompt] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [suggestions, setSuggestions] = useState<string[]>([]);
@@ -79,7 +80,7 @@ export function NewSession() {
       if (model && !parsedArgs.includes("--model")) {
         parsedArgs = ["--model", model, ...parsedArgs];
       }
-      const session = await api.sessions.create({ tool, workDir, args: parsedArgs.length > 0 ? parsedArgs : undefined, yoloMode });
+      const session = await api.sessions.create({ tool, workDir, args: parsedArgs.length > 0 ? parsedArgs : undefined, yoloMode, simpleSystemPrompt });
       navigate(`/session/${session.id}`, { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -185,6 +186,25 @@ export function NewSession() {
           <span>&#x26A1; Yolo Mode</span>
           <span className="text-xs text-neutral-500 ml-auto">{yoloMode ? "ON" : "OFF"}</span>
         </label>
+
+        {/* Minimal system prompt (claude / custom only) */}
+        {(tool === "claude" || tool === "custom") && (
+          <div>
+            <label className="flex items-center gap-3 p-3 bg-neutral-900 rounded-lg border border-neutral-800 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={simpleSystemPrompt}
+                onChange={(e) => setSimpleSystemPrompt(e.target.checked)}
+                className="accent-neutral-400"
+              />
+              <span>Minimal System Prompt</span>
+              <span className="text-xs text-neutral-500 ml-auto">{simpleSystemPrompt ? "ON" : "OFF"}</span>
+            </label>
+            <p className="text-xs text-neutral-500 mt-1 px-1">
+              Override claude&apos;s default system prompt with just a working-directory note (<code>--system-prompt</code>).
+            </p>
+          </div>
+        )}
 
         {error && (
           <div className="p-3 bg-red-950 border border-red-800 rounded-lg text-sm text-red-300">
