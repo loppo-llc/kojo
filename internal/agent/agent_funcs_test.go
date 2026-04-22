@@ -1,6 +1,9 @@
 package agent
 
 import (
+	"log/slog"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -170,6 +173,35 @@ func TestValidModelEffort(t *testing.T) {
 	for _, e := range []string{"", "low", "medium", "high", "max"} {
 		if !ValidModelEffort("sonnet", e) {
 			t.Errorf("expected %q to be valid for sonnet", e)
+		}
+	}
+}
+
+// TestBuildSystemPrompt_MemoryWriteDirective guards against accidentally
+// softening the mandatory memory-write instructions. Persona instructions
+// alone have proven unreliable — agents skip writes when they judge a turn
+// "not important enough" — so the system prompt must contain an explicit,
+// MANDATORY directive that names the diary file, covers short turns, and
+// frames memory files as the only state that survives conversation reset.
+func TestBuildSystemPrompt_MemoryWriteDirective(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	a := &Agent{ID: "ag_test_prompt"}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	prompt := buildSystemPrompt(a, logger, "", nil, false)
+
+	today := time.Now().In(jst).Format("2006-01-02")
+	mustContain := []string{
+		"Memory Write — MANDATORY",
+		"kojo will reset it automatically",
+		"memory/" + today + ".md",
+		"Short exchanges count",
+		"MEMORY.md",
+	}
+	for _, s := range mustContain {
+		if !strings.Contains(prompt, s) {
+			t.Errorf("system prompt missing mandatory directive fragment %q", s)
 		}
 	}
 }
