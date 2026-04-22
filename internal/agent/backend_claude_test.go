@@ -2,12 +2,14 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAgentIDToUUID(t *testing.T) {
@@ -417,4 +419,296 @@ func TestRecoverFromSession_scannerError(t *testing.T) {
 	if got != "" {
 		t.Errorf("expected empty on scanner error, got %d chars", len(got))
 	}
+}
+
+func TestLastSessionContextTokens(t *testing.T) {
+	t.Run("returns untrusted for missing file", func(t *testing.T) {
+		n, ok := lastSessionContextTokens("/nonexistent/session.jsonl")
+		if ok || n != 0 {
+			t.Errorf("expected (0,false) for missing file, got (%d,%v)", n, ok)
+		}
+	})
+
+	t.Run("returns 0 trusted for file without usage", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "session.jsonl")
+		os.WriteFile(path, []byte(`{"type":"user","message":{"content":"hi"}}`+"\n"), 0o644)
+		n, ok := lastSessionContextTokens(path)
+		if !ok || n != 0 {
+			t.Errorf("expected (0,true) for entry without usage, got (%d,%v)", n, ok)
+		}
+	})
+
+	t.Run("returns last usage sum", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "session.jsonl")
+		entries := []string{
+			`{"type":"assistant","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":1000,"cache_creation_input_tokens":500}}}`,
+			`{"type":"user","message":{"content":"next"}}`,
+			`{"type":"assistant","message":{"usage":{"input_tokens":5,"cache_read_input_tokens":2000,"cache_creation_input_tokens":100}}}`,
+		}
+		os.WriteFile(path, []byte(strings.Join(entries, "\n")+"\n"), 0o644)
+		want := 5 + 2000 + 100
+		n, ok := lastSessionContextTokens(path)
+		if !ok || n != want {
+			t.Errorf("expected (%d,true), got (%d,%v)", want, n, ok)
+		}
+	})
+
+	t.Run("skips malformed lines", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "session.jsonl")
+		data := `{"type":"assistant","message":{"usage":{"input_tokens":7,"cache_read_input_tokens":3,"cache_creation_input_tokens":0}}}` + "\n" +
+			`not valid json` + "\n"
+		os.WriteFile(path, []byte(data), 0o644)
+		n, ok := lastSessionContextTokens(path)
+		if !ok || n != 10 {
+			t.Errorf("expected (10,true), got (%d,%v)", n, ok)
+		}
+	})
+
+	t.Run("tails huge session and picks up only the last usage", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "session.jsonl")
+
+		// Produce a session file that dwarfs sessionTailReadBytes. Every
+		// line embeds a distinct "old" usage record; only the final entry
+		// carries the value we expect to recover, proving the reader
+		// really is bounded to the tail window.
+		filler := strings.Repeat("x", 16*1024)
+		var b strings.Builder
+		for i := 0; i < 200; i++ {
+			fmt.Fprintf(&b,
+				`{"type":"assistant","message":{"usage":{"input_tokens":1,"cache_read_input_tokens":%d,"cache_creation_input_tokens":0}},"filler":"%s"}`+"\n",
+				i, filler)
+		}
+		final := `{"type":"assistant","message":{"usage":{"input_tokens":9,"cache_read_input_tokens":11,"cache_creation_input_tokens":13}}}` + "\n"
+		b.WriteString(final)
+
+		os.WriteFile(path, []byte(b.String()), 0o644)
+
+		n, ok := lastSessionContextTokens(path)
+		if !ok || n != 9+11+13 {
+			t.Errorf("expected (%d,true) from tail window, got (%d,%v)", 9+11+13, n, ok)
+		}
+	})
+
+	t.Run("returns untrusted when last usage straddles tail boundary", func(t *testing.T) {
+		// Simulate a session whose only usage-bearing line sits far enough
+		// before EOF that our tail window starts inside it. The leading
+		// partial line gets dropped (as intended), so no usage is recovered
+		// from the window — we must surface this as untrusted instead of
+		// returning (0, true), which would suppress a legitimate reset.
+		dir := t.TempDir()
+		path := filepath.Join(dir, "session.jsonl")
+
+		// Single giant usage line (~1.5MiB) with no trailing lines.
+		giant := `{"type":"assistant","message":{"usage":{"input_tokens":50000,"cache_read_input_tokens":50000,"cache_creation_input_tokens":50000}},"filler":"` +
+			strings.Repeat("x", int(sessionTailReadBytes)+512*1024) + `"}`
+		os.WriteFile(path, []byte(giant+"\n"), 0o644)
+
+		n, ok := lastSessionContextTokens(path)
+		if ok {
+			t.Errorf("expected untrusted when last usage line straddles window, got (%d,true)", n)
+		}
+	})
+
+}
+
+func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	aDir := filepath.Join(home, ".config", "kojo", "agents", "ag_threshold_test")
+	os.MkdirAll(aDir, 0o755)
+
+	absDir, _ := filepath.Abs(aDir)
+	encoded := strings.NewReplacer(
+		string(filepath.Separator), "-",
+		".", "-",
+		"_", "-",
+	).Replace(absDir)
+	projectDir := filepath.Join(home, ".claude", "projects", encoded)
+	os.MkdirAll(projectDir, 0o755)
+
+	sessionID := "deadbeef-1234-3abc-8def-000000000001"
+	sessionFile := filepath.Join(projectDir, sessionID+".jsonl")
+
+	t.Run("usable below threshold", func(t *testing.T) {
+		entry := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":50000,"cache_creation_input_tokens":1000}}}`
+		os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644)
+		if !sessionFileUsable(aDir, sessionID, false, "", nil) {
+			t.Error("expected usable for small context")
+		}
+		if _, err := os.Stat(sessionFile); err != nil {
+			t.Error("expected file to still exist")
+		}
+	})
+
+	t.Run("not usable and removed when over threshold", func(t *testing.T) {
+		entry := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":160000,"cache_creation_input_tokens":1000}}}`
+		os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644)
+		// Age past idle window so the reset path actually fires (the
+		// active-chat guard is covered in a dedicated subtest).
+		old := time.Now().Add(-2 * sessionResetMinIdleDuration)
+		if err := os.Chtimes(sessionFile, old, old); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+		if sessionFileUsable(aDir, sessionID, false, "", nil) {
+			t.Error("expected not usable for oversized context")
+		}
+		if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+			t.Error("expected file to be removed after threshold breach")
+		}
+	})
+
+	t.Run("keeps session when remove fails", func(t *testing.T) {
+		// Make the project directory read-only so os.Remove on the
+		// session file fails. sessionFileUsable must then fall back to
+		// --resume (return true) rather than report the file gone.
+		entry := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":200000,"cache_creation_input_tokens":0}}}`
+		os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644)
+		old := time.Now().Add(-2 * sessionResetMinIdleDuration)
+		if err := os.Chtimes(sessionFile, old, old); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+
+		if err := os.Chmod(projectDir, 0o555); err != nil {
+			t.Fatalf("chmod project dir: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(projectDir, 0o755) })
+
+		if !sessionFileUsable(aDir, sessionID, false, "", nil) {
+			t.Error("expected fallback to true when remove fails")
+		}
+		if _, err := os.Stat(sessionFile); err != nil {
+			t.Error("expected file to remain when remove fails")
+		}
+	})
+
+	t.Run("keeps session when over threshold but recently active", func(t *testing.T) {
+		// Short interactive turns rack up cache_read fast without writing
+		// to MEMORY.md; a mid-conversation reset would drop context the
+		// agent can't recover from disk. As long as the session file was
+		// touched within sessionResetMinIdleDuration, we defer to
+		// claude's own auto-compact instead of pulling the rug out.
+		entry := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":160000,"cache_creation_input_tokens":1000}}}`
+		os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644)
+		// Default write sets mtime to now — already "active".
+		if !sessionFileUsable(aDir, sessionID, false, "", nil) {
+			t.Error("expected active session to survive threshold")
+		}
+		if _, err := os.Stat(sessionFile); err != nil {
+			t.Error("expected active session file to remain")
+		}
+	})
+
+	t.Run("resets over threshold once idle window elapsed", func(t *testing.T) {
+		entry := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":160000,"cache_creation_input_tokens":1000}}}`
+		os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644)
+		// Age the file well past the idle window.
+		old := time.Now().Add(-2 * sessionResetMinIdleDuration)
+		if err := os.Chtimes(sessionFile, old, old); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+		if sessionFileUsable(aDir, sessionID, false, "", nil) {
+			t.Error("expected idle over-threshold session to reset")
+		}
+		if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+			t.Error("expected idle session file to be removed")
+		}
+	})
+
+	t.Run("automated trigger bypasses idle guard", func(t *testing.T) {
+		// Cron / groupdm / notify fires pass automatedTrigger=true to signal
+		// there's no interactive conversation to protect. With a fresh
+		// mtime (which would normally block the reset), the session must
+		// still be wiped when the token threshold is breached.
+		entry := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":160000,"cache_creation_input_tokens":1000}}}`
+		os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644)
+		// mtime = now; idle guard would block this for interactive callers.
+		if sessionFileUsable(aDir, sessionID, true, "", nil) {
+			t.Error("expected automated trigger to reset over-threshold session regardless of idle")
+		}
+		if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+			t.Error("expected file to be removed under automated trigger")
+		}
+	})
+
+	t.Run("invokes pre-reset summary hook before deleting session", func(t *testing.T) {
+		// Regression guard for the "agent didn't write MEMORY.md" failure
+		// mode: before we unlink the JSONL, we MUST call the summary hook
+		// so recent turns make it into the agent's diary. Skipping this
+		// would silently amputate context on every over-threshold reset.
+		entry := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":160000,"cache_creation_input_tokens":1000}}}`
+		os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644)
+		old := time.Now().Add(-2 * sessionResetMinIdleDuration)
+		os.Chtimes(sessionFile, old, old)
+
+		var calledAgent, calledTool string
+		orig := preResetSummarize
+		preResetSummarize = func(agentID, tool string, _ *slog.Logger) error {
+			calledAgent = agentID
+			calledTool = tool
+			return nil
+		}
+		t.Cleanup(func() { preResetSummarize = orig })
+
+		if sessionFileUsable(aDir, sessionID, false, "ag_summary_probe", nil) {
+			t.Error("expected reset to proceed")
+		}
+		if calledAgent != "ag_summary_probe" {
+			t.Errorf("summary hook called with agent=%q, want ag_summary_probe", calledAgent)
+		}
+		if calledTool != "claude" {
+			t.Errorf("summary hook called with tool=%q, want claude", calledTool)
+		}
+		if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+			t.Error("expected session file removed after successful summary")
+		}
+	})
+
+	t.Run("aborts reset when summary hook fails", func(t *testing.T) {
+		// If we can't capture a summary, deleting the JSONL would discard
+		// context with no breadcrumb. Safer to let the session run one
+		// more turn (claude's auto-compact still bounds growth) than to
+		// silently lose state.
+		entry := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":160000,"cache_creation_input_tokens":1000}}}`
+		os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644)
+		old := time.Now().Add(-2 * sessionResetMinIdleDuration)
+		os.Chtimes(sessionFile, old, old)
+
+		orig := preResetSummarize
+		preResetSummarize = func(_, _ string, _ *slog.Logger) error {
+			return fmt.Errorf("simulated summary failure")
+		}
+		t.Cleanup(func() { preResetSummarize = orig })
+
+		if !sessionFileUsable(aDir, sessionID, false, "ag_summary_fail", nil) {
+			t.Error("expected reset to be aborted when summary fails")
+		}
+		if _, err := os.Stat(sessionFile); err != nil {
+			t.Error("expected session file to be preserved when summary fails")
+		}
+	})
+
+	t.Run("keeps empty session when remove fails", func(t *testing.T) {
+		// Parallel to the threshold-remove case: a zero-byte session file
+		// whose delete fails must not then be advertised as "fresh" to
+		// the caller, or a subsequent --session-id invocation would race
+		// with the same-UUID leftover.
+		os.WriteFile(sessionFile, []byte{}, 0o644)
+
+		if err := os.Chmod(projectDir, 0o555); err != nil {
+			t.Fatalf("chmod project dir: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(projectDir, 0o755) })
+
+		if !sessionFileUsable(aDir, sessionID, false, "", nil) {
+			t.Error("expected fallback to true on empty-file remove failure")
+		}
+		if _, err := os.Stat(sessionFile); err != nil {
+			t.Error("expected empty file to remain when remove fails")
+		}
+	})
 }

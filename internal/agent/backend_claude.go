@@ -50,10 +50,21 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
 
-	args := b.buildClaudeArgs(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers)
+	args := b.buildClaudeArgs(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers, opts.AutomatedTrigger)
 
 	cmd := exec.CommandContext(ctx, claudePath, args...)
 	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
+	// Token conservation: agents persist state in files (MEMORY.md, memory/),
+	// not in Claude's conversation history. 1M context only inflates
+	// cache_read/cache_creation across runs without adding real value, and its
+	// write cost is 2x input (vs 1.25x for 5m cache). Force 200k and rely on
+	// kojo's own session-reset logic (sessionFileUsable) for history pruning.
+	// Auto-compact stays enabled as a late safety net but threshold is
+	// tightened so that if reset misses, claude compacts before pricing spikes.
+	cmd.Env = append(cmd.Env,
+		"CLAUDE_CODE_DISABLE_1M_CONTEXT=1",
+		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=85",
+	)
 	if b.proxyURL != "" {
 		cmd.Env = append(cmd.Env, "ANTHROPIC_BASE_URL="+b.proxyURL)
 		if os.Getenv("ANTHROPIC_API_KEY") == "" {
@@ -166,7 +177,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 }
 
 // buildClaudeArgs constructs the CLI arguments for a Claude chat invocation.
-func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir string, oneShot bool, mcpServers map[string]mcpServerEntry) []string {
+func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir string, oneShot bool, mcpServers map[string]mcpServerEntry, automatedTrigger bool) []string {
 	args := []string{
 		"-p",
 		"--output-format", "stream-json",
@@ -222,7 +233,7 @@ func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir s
 	// running a fresh ephemeral session each time.
 	if !oneShot {
 		sessionID := agentIDToUUID(agent.ID)
-		if sessionFileUsable(dir, sessionID) {
+		if sessionFileUsable(dir, sessionID, automatedTrigger, agent.ID, b.logger) {
 			args = append(args, "--resume", sessionID)
 		} else {
 			args = append(args, "--session-id", sessionID)
@@ -576,10 +587,75 @@ func hasSessionFile(agentDir string, sessionID string) bool {
 	return false
 }
 
+// sessionResetThresholdTokens is the cumulative context size (input +
+// cache_read + cache_creation) at which kojo abandons --resume and starts a
+// fresh claude session. Chosen below claude's 200k model limit and below the
+// CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=85 threshold (~170k) so that kojo's reset
+// fires first and claude's compaction stays a safety net.
+//
+// Why reset instead of compact: kojo persists long-term state in agent files
+// (MEMORY.md, memory/, data/), so the conversation JSONL is just an ephemeral
+// work log. /compact would spend output tokens to summarize history that will
+// be re-derived from files on the next turn anyway — pure waste for
+// interval-driven agents. Resetting is cheaper and keeps context tight.
+const sessionResetThresholdTokens = 150_000
+
+// sessionTailReadBytes caps how much of the session JSONL is read when
+// measuring the last recorded context size. Chosen to fit at least one full
+// assistant turn (tool_result payloads can reach several hundred KiB) so the
+// latest usage record is within the window even for multi-hundred-MB session
+// logs. When the last record happens to straddle the window boundary and
+// gets discarded as a leading partial line, lastSessionContextTokens marks
+// the read as untrusted so the reset retries on the next chat.
+const sessionTailReadBytes = 1 * 1024 * 1024
+
+// preResetSummarize is the summarization hook invoked by sessionFileUsable
+// right before it deletes a session file. Defaults to PreCompactSummarize,
+// which writes a diary entry from the live session JSONL. Exposed as a
+// package variable so tests can substitute a deterministic fake instead of
+// spawning a real claude CLI process.
+var preResetSummarize = func(agentID, tool string, logger *slog.Logger) error {
+	return PreCompactSummarize(agentID, tool, logger)
+}
+
+// sessionResetMinIdleDuration suppresses threshold-based resets when the
+// session was updated within this window. Rationale: an active chat produces
+// many short turns that never reach the autosummary / MEMORY.md path, so
+// resetting mid-conversation would discard recent context the agent can't
+// recover from files. The interval-driven agents we're actually trying to
+// curb fire every 10+ minutes and always fall well outside this window, so
+// the gate only protects interactive users. 5 minutes also happens to match
+// Anthropic's default prompt cache TTL, keeping cache warm across back-to-
+// back turns. If an active chat genuinely blows past the token threshold,
+// claude's auto-compact (CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=85) still fires as
+// a safety net.
+const sessionResetMinIdleDuration = 5 * time.Minute
+
 // sessionFileUsable checks whether the deterministic session file exists and
-// is minimally valid (non-empty). If the file is corrupt or empty, it is
-// removed so that the caller can create a fresh session with --session-id.
-func sessionFileUsable(agentDir string, sessionID string) bool {
+// is minimally valid. Returns false (and removes the file) when the file is
+// empty or the last recorded usage exceeds sessionResetThresholdTokens —
+// forcing the caller to start a fresh session with --session-id instead of
+// --resume.
+//
+// When the usage cannot be read reliably (e.g. the claude process is mid-write
+// or the scanner tripped on an oversized line), we conservatively return true
+// without touching the file: resetting on uncertainty would race with a live
+// writer and could discard a healthy session. The check will run again on the
+// next chat.
+//
+// automatedTrigger disables the interactive-chat idle guard. Pass true when
+// the caller is a non-interactive trigger (cron fire, groupdm notification,
+// notify poller) — there is no human conversation to protect and the guard
+// would otherwise prevent resets on agents whose interval is shorter than
+// sessionResetMinIdleDuration.
+//
+// agentID and logger are used to summarize the session into the agent's
+// diary (via PreCompactSummarize) just before a reset fires. This is kojo's
+// system-level guarantee that recent turns aren't lost simply because the
+// agent forgot to update MEMORY.md itself — production experience has shown
+// that persona / system-prompt instructions to "write to MEMORY.md" are not
+// reliable, so the reset path writes a summary regardless.
+func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool, agentID string, logger *slog.Logger) bool {
 	absDir, err := filepath.Abs(agentDir)
 	if err != nil {
 		return false
@@ -590,10 +666,142 @@ func sessionFileUsable(agentDir string, sessionID string) bool {
 		return false
 	}
 	if info.Size() == 0 {
-		os.Remove(path)
+		if err := os.Remove(path); err != nil {
+			// Same rationale as the threshold branch below — a file we
+			// can't delete but also can't --resume (empty) is best left
+			// alone; next chat will retry.
+			slog.Warn("empty session remove failed, keeping as --resume fallback",
+				"path", path, "err", err)
+			return true
+		}
 		return false
 	}
-	return true
+	ctx, ok := lastSessionContextTokens(path)
+	if !ok {
+		// Couldn't trust the tail read — keep the session for now and
+		// re-evaluate on the next chat.
+		return true
+	}
+	if ctx <= sessionResetThresholdTokens {
+		return true
+	}
+	if !automatedTrigger {
+		if idle := time.Since(info.ModTime()); idle < sessionResetMinIdleDuration {
+			slog.Debug("claude session over threshold but recently active, keeping",
+				"path", path, "contextTokens", ctx,
+				"idle", idle)
+			return true
+		}
+	}
+
+	// Summarize the session into the agent's diary BEFORE we delete its
+	// JSONL. PreCompactSummarize reads the live session file (which we're
+	// about to remove), so ordering matters. If the summary fails we
+	// abort the reset — losing context silently would be worse than
+	// carrying a slightly-over-threshold session for one more turn.
+	if agentID != "" {
+		if err := preResetSummarize(agentID, "claude", logger); err != nil {
+			slog.Warn("pre-reset summary failed, keeping session to avoid context loss",
+				"path", path, "agent", agentID, "err", err)
+			return true
+		}
+	}
+
+	slog.Info("claude session context over threshold, resetting",
+		"path", path, "contextTokens", ctx,
+		"threshold", sessionResetThresholdTokens,
+		"automatedTrigger", automatedTrigger)
+	if err := os.Remove(path); err != nil {
+		// Couldn't delete the session file — don't lie to the caller by
+		// returning false. With our deterministic session ID, a subsequent
+		// --session-id <id> invocation would either resurrect the existing
+		// session or fail, neither of which is what we want. Keep using
+		// --resume; the next run will retry the reset.
+		slog.Warn("session reset: remove failed, keeping session",
+			"path", path, "err", err)
+		return true
+	}
+	return false
+}
+
+// lastSessionContextTokens returns (contextTokens, trusted). contextTokens is
+// the approximate claude context size (input + cache_read + cache_creation)
+// taken from the most recent usage record in the session JSONL. trusted is
+// false when the read cannot be relied upon (missing file, seek error,
+// oversized line, concurrent mid-write). Callers should treat untrusted reads
+// as "skip reset this round" — never as "reset immediately" — to avoid racing
+// with a live claude writer.
+//
+// Only the tail of the file (sessionTailReadBytes) is scanned; session logs
+// for long-lived agents routinely reach tens to hundreds of MiB and the last
+// usage record is always near the end, so a full-file scan on every Chat()
+// call would add non-trivial latency for no benefit.
+func lastSessionContextTokens(sessionPath string) (int, bool) {
+	f, err := os.Open(sessionPath)
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return 0, false
+	}
+
+	var startOffset int64
+	if info.Size() > sessionTailReadBytes {
+		startOffset = info.Size() - sessionTailReadBytes
+	}
+	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+		return 0, false
+	}
+
+	scanner := bufio.NewScanner(f)
+	// 1 MiB is the largest single JSONL line we've observed in practice;
+	// anything larger gets reported via scanner.Err() and we mark the read
+	// as untrusted.
+	scanner.Buffer(make([]byte, 0, 64*1024), 1*1024*1024)
+
+	// If we seeked into the middle of the file, the first partial line is
+	// unparseable — drop it before accumulating.
+	if startOffset > 0 {
+		scanner.Scan()
+	}
+
+	last := 0
+	for scanner.Scan() {
+		var entry struct {
+			Message struct {
+				Usage struct {
+					InputTokens              int `json:"input_tokens"`
+					CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+					CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+				} `json:"usage"`
+			} `json:"message"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			continue
+		}
+		u := entry.Message.Usage
+		ctx := u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
+		if ctx > 0 {
+			last = ctx
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		// Oversized line or a transient read error (possibly mid-write from
+		// a live claude process). Refuse to make a decision.
+		return 0, false
+	}
+	// Tail read guarantees a conclusive result only when we either scanned
+	// from the start of the file or found at least one usage record in the
+	// tail window. Otherwise the single line that straddled the window start
+	// may have carried the most recent usage — we can't tell, so leave the
+	// decision to the next run rather than return a falsely low (0, true).
+	if last == 0 && startOffset > 0 {
+		return 0, false
+	}
+	return last, true
 }
 
 // agentIDToUUID converts an agent ID (e.g. "ag_8cf247118ad856e8") to a

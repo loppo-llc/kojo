@@ -723,8 +723,14 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		effectiveMessage = formatMessageWithAttachments(userMessage, attachments)
 	}
 
-	// Start chat
-	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{MCPServers: prep.mcpServers})
+	// Start chat. role=="system" marks automated triggers (cron, groupdm,
+	// notify poller) where there is no interactive user waiting on the
+	// previous turn — backends may drop idle-window protections and prefer
+	// aggressive session reset for token conservation.
+	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
+		MCPServers:       prep.mcpServers,
+		AutomatedTrigger: role == "system",
+	})
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
