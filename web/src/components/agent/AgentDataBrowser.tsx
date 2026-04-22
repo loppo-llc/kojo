@@ -4,6 +4,7 @@ import { agentApi, type AgentInfo } from "../../lib/agentApi";
 import type { DirEntry, FileView } from "../../lib/api";
 import { formatSize, timeAgo } from "../../lib/utils";
 import { AgentAvatar } from "./AgentAvatar";
+import { MarkdownRenderer } from "./MarkdownRenderer";
 
 type SortKey = "name" | "size" | "modified";
 type SortDir = "asc" | "desc";
@@ -563,6 +564,13 @@ function FileViewer({
   }, [onClose]);
 
   const { view, error, loading, name, relPath } = state;
+  const isMarkdown = view?.type === "text" && view.language === "markdown";
+  // Markdown default = rendered. Toggle also covers future text languages
+  // if we ever want previews beyond markdown. Reset when the file changes.
+  const [mdView, setMdView] = useState<"rendered" | "raw">("rendered");
+  useEffect(() => {
+    setMdView("rendered");
+  }, [relPath]);
 
   return (
     <div className="absolute inset-0 bg-neutral-950 z-10 flex flex-col">
@@ -579,6 +587,32 @@ function FileViewer({
             </div>
           )}
         </div>
+        {isMarkdown && (
+          <div className="flex items-center rounded border border-neutral-800 overflow-hidden shrink-0">
+            <button
+              onClick={() => setMdView("rendered")}
+              className={`text-[11px] px-2 py-1 ${
+                mdView === "rendered"
+                  ? "bg-neutral-800 text-neutral-200"
+                  : "bg-neutral-900 text-neutral-500 hover:text-neutral-300"
+              }`}
+              title="Render markdown"
+            >
+              md
+            </button>
+            <button
+              onClick={() => setMdView("raw")}
+              className={`text-[11px] px-2 py-1 border-l border-neutral-800 ${
+                mdView === "raw"
+                  ? "bg-neutral-800 text-neutral-200"
+                  : "bg-neutral-900 text-neutral-500 hover:text-neutral-300"
+              }`}
+              title="Show raw source"
+            >
+              raw
+            </button>
+          </div>
+        )}
         <button
           onClick={onCopyPath}
           className="text-[11px] px-2 py-1 rounded bg-neutral-900 hover:bg-neutral-800 text-neutral-400 border border-neutral-800"
@@ -605,6 +639,10 @@ function FileViewer({
             >
               Download instead
             </a>
+          </div>
+        ) : isMarkdown && mdView === "rendered" ? (
+          <div className="px-4 py-4 text-sm">
+            <MarkdownRenderer content={view!.content ?? ""} />
           </div>
         ) : view?.type === "text" ? (
           <pre className="text-[12px] leading-relaxed font-mono p-4 whitespace-pre-wrap break-words text-neutral-200">
