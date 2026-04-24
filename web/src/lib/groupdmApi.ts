@@ -2,6 +2,9 @@ import { get, post, del, patch } from "./httpClient";
 
 export type GroupDMStyle = "efficient" | "expressive";
 
+/** Reserved agentId used for messages posted by the human user (operator). */
+export const USER_SENDER_ID = "user";
+
 export interface GroupDMInfo {
   id: string;
   name: string;
@@ -62,6 +65,9 @@ export const groupdmApi = {
 
   postMessage: (groupId: string, agentId: string, content: string) =>
     post<GroupMessage>(`/api/v1/groupdms/${groupId}/messages`, { agentId, content }),
+
+  postUserMessage: (groupId: string, content: string) =>
+    post<GroupMessage>(`/api/v1/groupdms/${groupId}/user-messages`, { content }),
 
   forAgent: (agentId: string) =>
     get<{ groups: GroupDMInfo[] }>(`/api/v1/agents/${agentId}/groups`).then(

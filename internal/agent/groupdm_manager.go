@@ -25,6 +25,14 @@ const notifyTimeout = 60 * time.Minute
 // Individual groups can override this via GroupDM.Cooldown.
 const defaultNotifyCooldown = 50 * time.Second
 
+// UserSenderID is the reserved agent ID used for messages posted by the
+// human user (operator) through the Web UI. It is never assigned to a real
+// agent and is distinguished from agent senders by notifyState.senderIsUser.
+const UserSenderID = "user"
+
+// UserSenderName is the display name recorded for user-authored messages.
+const UserSenderName = "User"
+
 // notifyState tracks cooldown and deferred notification state per (groupID, agentID).
 type notifyState struct {
 	lastSent time.Time   // when the last notification was successfully sent
@@ -33,12 +41,13 @@ type notifyState struct {
 	inFlight bool        // true while a delivery is in progress (prevents concurrent sends)
 
 	// deferred notification payload
-	agentID    string
-	groupID    string
-	groupName  string
-	sender     string
-	msgTime    string // original message timestamp (RFC3339)
-	hasPending bool
+	agentID      string
+	groupID      string
+	groupName    string
+	sender       string
+	msgTime      string // original message timestamp (RFC3339)
+	senderIsUser bool   // true when the pending notification was triggered by a user message
+	hasPending   bool
 }
 
 // GroupDMManager manages group DM CRUD, message posting, and notifications.
@@ -298,7 +307,12 @@ func (m *GroupDMManager) notifyGroupDeleted(agentID, groupID, groupName string) 
 // PostMessage posts a message to a group and optionally notifies other members.
 // If notify is true, other members receive a system notification in their 1:1 chat.
 // Set notify=false for messages sent from notification-triggered chats to prevent loops.
+// The reserved UserSenderID ("user") must go through PostUserMessage; calls with
+// that agentID are rejected so no agent can impersonate a human-user message.
 func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, content string, notify bool) (*GroupMessage, error) {
+	if agentID == UserSenderID {
+		return nil, fmt.Errorf("agent id %q is reserved for the human user", agentID)
+	}
 	m.mu.Lock()
 	g, ok := m.groups[groupID]
 	if !ok {
@@ -349,7 +363,45 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 	if notify {
 		msgTime := msg.Timestamp
 		for _, r := range recipients {
-			go m.notifyAgent(r.AgentID, groupID, groupName, senderName, msgTime)
+			go m.notifyAgent(r.AgentID, groupID, groupName, senderName, msgTime, false)
+		}
+	}
+
+	return msg, nil
+}
+
+// PostUserMessage posts a message from the human user (operator) to a group
+// and notifies every member. Unlike PostMessage it bypasses membership checks
+// because the human user is not a group member, and it never excludes anyone
+// from the notification fan-out.
+func (m *GroupDMManager) PostUserMessage(ctx context.Context, groupID, content string, notify bool) (*GroupMessage, error) {
+	m.mu.Lock()
+	g, ok := m.groups[groupID]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
+	}
+	recipients := make([]GroupMember, len(g.Members))
+	copy(recipients, g.Members)
+	groupName := g.Name
+	m.mu.Unlock()
+
+	msg := newGroupMessage(UserSenderID, UserSenderName, content)
+	if err := appendGroupMessage(groupID, msg); err != nil {
+		return nil, fmt.Errorf("store message: %w", err)
+	}
+
+	m.mu.Lock()
+	if g, ok := m.groups[groupID]; ok {
+		g.UpdatedAt = time.Now().Format(time.RFC3339)
+	}
+	m.mu.Unlock()
+	m.save()
+
+	if notify {
+		msgTime := msg.Timestamp
+		for _, r := range recipients {
+			go m.notifyAgent(r.AgentID, groupID, groupName, UserSenderName, msgTime, true)
 		}
 	}
 
@@ -490,7 +542,9 @@ func (m *GroupDMManager) notifyRename(agentID, groupID, groupName, oldName, newN
 // The notification only says there's a new message — no untrusted content is injected.
 // The agent reads the actual messages via the API.
 // Enforces a per-(group, agent) cooldown to prevent ping-pong loops.
-func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName, senderName, msgTime string) {
+// senderIsUser=true marks notifications triggered by a human-user message so
+// the delivered system prompt can flag the sender as a human operator.
+func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName, senderName, msgTime string, senderIsUser bool) {
 	key := groupID + ":" + agentID
 	cooldown := m.groupCooldown(groupID)
 
@@ -509,6 +563,7 @@ func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName, senderName, ms
 		ns.groupName = groupName
 		ns.sender = senderName
 		ns.msgTime = msgTime
+		ns.senderIsUser = senderIsUser
 		ns.hasPending = true
 
 		if ns.timer == nil && !ns.inFlight {
@@ -533,7 +588,7 @@ func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName, senderName, ms
 	ns.inFlight = true
 	m.notifyMu.Unlock()
 
-	m.deliverNotification(key, gen, agentID, groupID, groupName, senderName, msgTime)
+	m.deliverNotification(key, gen, agentID, groupID, groupName, senderName, msgTime, senderIsUser)
 }
 
 // firePending delivers the most recent deferred notification for the key.
@@ -554,18 +609,19 @@ func (m *GroupDMManager) firePending(key string, gen uint64) {
 	groupName := ns.groupName
 	sender := ns.sender
 	msgTime := ns.msgTime
+	senderIsUser := ns.senderIsUser
 	ns.hasPending = false
 	ns.timer = nil
 	ns.inFlight = true
 	m.notifyMu.Unlock()
 
-	m.deliverNotification(key, gen, agentID, groupID, groupName, sender, msgTime)
+	m.deliverNotification(key, gen, agentID, groupID, groupName, sender, msgTime, senderIsUser)
 }
 
 // deliverNotification sends a notification to the agent immediately.
 // On transient failure (agent busy), it re-defers for retry after cooldown.
 // The gen parameter prevents operating on state that was cleaned up.
-func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, groupID, groupName, senderName, msgTime string) { //nolint:gocognit
+func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, groupID, groupName, senderName, msgTime string, senderIsUser bool) { //nolint:gocognit
 	cooldown := m.groupCooldown(groupID)
 	apiBase := m.APIBase()
 	curlFlags := "-s"
@@ -580,12 +636,16 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 	default:
 		styleHint = "Style: efficient — EXTREME token saving. No greetings, no filler, no acknowledgements. Bare facts only. One-word replies preferred. Do NOT reply if you have nothing substantive to add."
 	}
+	senderLabel := senderName
+	if senderIsUser {
+		senderLabel = senderName + " (human operator)"
+	}
 	notification := fmt.Sprintf(
 		"[Group DM: %s] New message from %s at %s.\n"+
 			"%s\n"+
 			"Read: curl %s '%s/api/v1/groupdms/%s/messages?limit=20'\n"+
 			"Reply: curl %s -X POST '%s/api/v1/groupdms/%s/messages' -H 'Content-Type: application/json' -d '{\"agentId\":\"%s\",\"content\":\"your reply\"}'",
-		groupName, senderName, msgTime,
+		groupName, senderLabel, msgTime,
 		styleHint,
 		curlFlags, apiBase, groupID,
 		curlFlags, apiBase, groupID, agentID,
@@ -618,6 +678,7 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 				ns.groupName = groupName
 				ns.sender = senderName
 				ns.msgTime = msgTime
+				ns.senderIsUser = senderIsUser
 				ns.hasPending = true
 			}
 			if ns.timer == nil {
@@ -655,10 +716,16 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 }
 
 // resolveMembers validates member IDs and resolves their names.
+// The reserved UserSenderID is rejected to prevent a stray agent record
+// (e.g. from hand-edited agents.json) from being added as a group member
+// and colliding with human-user messages in the transcript.
 func (m *GroupDMManager) resolveMembers(ids []string) ([]GroupMember, error) {
 	seen := make(map[string]bool, len(ids))
 	var members []GroupMember
 	for _, id := range ids {
+		if id == UserSenderID {
+			return nil, fmt.Errorf("agent id %q is reserved for the human user", id)
+		}
 		if seen[id] {
 			continue
 		}
@@ -696,6 +763,9 @@ func (m *GroupDMManager) copyGroup(g *GroupDM) *GroupDM {
 // AddMember adds an agent to an existing group DM. callerAgentID must be a current member.
 // Notifies existing members about the new addition.
 func (m *GroupDMManager) AddMember(id, newAgentID, callerAgentID string) (*GroupDM, error) {
+	if newAgentID == UserSenderID {
+		return nil, fmt.Errorf("agent id %q is reserved for the human user", newAgentID)
+	}
 	// Resolve the new member first (outside lock)
 	a, ok := m.agentMgr.Get(newAgentID)
 	if !ok {
@@ -915,6 +985,7 @@ func (m *GroupDMManager) load() {
 		m.logger.Warn("failed to unmarshal groups", "err", err)
 		return
 	}
+	dirty := false
 	for _, g := range groups {
 		g.CreatedAt = normalizeTimestamp(g.CreatedAt)
 		g.UpdatedAt = normalizeTimestamp(g.UpdatedAt)
@@ -922,6 +993,38 @@ func (m *GroupDMManager) load() {
 		if g.Style == "" || !ValidGroupDMStyles[g.Style] {
 			g.Style = GroupDMStyleEfficient
 		}
+		// Strip any legacy/hand-edited members that collide with the reserved
+		// UserSenderID ("user"). They could impersonate human-user messages in
+		// the UI and break PostMessage membership resolution.
+		if m.stripReservedMembers(g) {
+			dirty = true
+		}
 		m.groups[g.ID] = g
 	}
+	// Persist migration so the reject only runs once; groups reduced below the
+	// 2-member floor are kept as-is (read-only) — Delete is the user's call.
+	if dirty {
+		// save() takes m.mu; load() is called from NewGroupDMManager before
+		// the manager is published, so we can flush without recursion concerns.
+		go m.save()
+	}
+}
+
+// stripReservedMembers removes members whose AgentID collides with the
+// reserved UserSenderID. Returns true if the group was modified.
+func (m *GroupDMManager) stripReservedMembers(g *GroupDM) bool {
+	filtered := g.Members[:0:0]
+	removed := false
+	for _, mem := range g.Members {
+		if mem.AgentID == UserSenderID {
+			m.logger.Warn("dropping reserved user-id member from loaded group", "group", g.ID, "name", mem.AgentName)
+			removed = true
+			continue
+		}
+		filtered = append(filtered, mem)
+	}
+	if removed {
+		g.Members = filtered
+	}
+	return removed
 }

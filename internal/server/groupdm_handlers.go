@@ -173,11 +173,42 @@ func (s *Server) handlePostGroupMessage(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "bad_request", "content is required")
 		return
 	}
+	// The reserved "user" sender is not a group member and must go through
+	// the dedicated user-messages endpoint.
+	if req.AgentID == agent.UserSenderID {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"agentId \"user\" is reserved; use POST /api/v1/groupdms/{id}/user-messages")
+		return
+	}
 
 	// Always notify on API-initiated messages (user or agent-initiated).
 	// Notifications trigger chats that may produce follow-up messages,
 	// but the busy check in Manager.Chat naturally breaks infinite loops.
 	msg, err := s.groupdms.PostMessage(r.Context(), id, req.AgentID, req.Content, true)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, msg)
+}
+
+// handlePostGroupUserMessage posts a message from the human user (operator)
+// to a group and notifies every member. Unlike agent-authored messages this
+// endpoint takes no agentId — the sender is always the reserved "user" ID.
+func (s *Server) handlePostGroupUserMessage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	if req.Content == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "content is required")
+		return
+	}
+	msg, err := s.groupdms.PostUserMessage(r.Context(), id, req.Content, true)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
