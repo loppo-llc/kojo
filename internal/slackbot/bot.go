@@ -272,6 +272,14 @@ func (b *Bot) handleAppMentionEvent(ctx context.Context, ev *slackevents.AppMent
 	}
 	// Strip the bot mention from the message
 	text := StripBotMention(ev.Text, b.botUserID)
+
+	// Download attached files (same as DM handling in handleMessageEvent)
+	if len(ev.Files) > 0 {
+		b.logger.Debug("slack files attached to mention", "count", len(ev.Files))
+		downloaded, errs := b.downloadSlackFiles(ctx, ev.Files)
+		text = appendFileInfo(text, downloaded, errs)
+	}
+
 	b.processIncoming(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text, ev.User)
 }
 
