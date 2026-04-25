@@ -5,6 +5,8 @@ import {
   USER_SENDER_ID,
   type GroupDMInfo,
   type GroupDMStyle,
+  type GroupDMVenue,
+  DEFAULT_GROUPDM_VENUE,
   type GroupMessage,
 } from "../../lib/groupdmApi";
 import { useEnterSends } from "../../lib/preferences";
@@ -48,6 +50,7 @@ export function GroupDMChat() {
 
   const [notFound, setNotFound] = useState(false);
   const [showStyleMenu, setShowStyleMenu] = useState(false);
+  const [showVenueMenu, setShowVenueMenu] = useState(false);
   const [editingCooldown, setEditingCooldown] = useState(false);
   const [cooldownInput, setCooldownInput] = useState("");
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
@@ -302,6 +305,50 @@ export function GroupDMChat() {
                     }`}
                   >
                     {label}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+        {/* Venue selector — physical-setting hint that calibrates how members
+            should speak (text-only chatroom vs. co-located in-person). */}
+        <div className="shrink-0 relative">
+          <button
+            onClick={() => setShowVenueMenu((v) => !v)}
+            className="text-base leading-none px-1 py-0.5 rounded hover:bg-neutral-700 cursor-pointer"
+            title={`Venue: ${group.venue || DEFAULT_GROUPDM_VENUE}`}
+          >
+            {(group.venue || DEFAULT_GROUPDM_VENUE) === "colocated" ? "🏠" : "💻"}
+          </button>
+          {showVenueMenu && (
+            <>
+              <div className="fixed inset-0 z-10" onClick={() => setShowVenueMenu(false)} />
+              <div className="absolute right-0 top-full mt-1 z-20 bg-neutral-800 border border-neutral-700 rounded shadow-lg py-1 min-w-[200px]">
+                {(
+                  [
+                    ["chatroom", "💻 Closed chat room", "Text-only, not co-present"],
+                    ["colocated", "🏠 Same physical space", "Members are co-present in real space"],
+                  ] as const
+                ).map(([value, label, hint]) => (
+                  <button
+                    key={value}
+                    onClick={async () => {
+                      setShowVenueMenu(false);
+                      if (value === (group.venue || DEFAULT_GROUPDM_VENUE)) return;
+                      try {
+                        const updated = await groupdmApi.setVenue(group.id, value as GroupDMVenue);
+                        setGroup(updated);
+                      } catch (err) {
+                        console.error("Failed to set venue", err);
+                      }
+                    }}
+                    className={`w-full text-left px-3 py-1.5 text-xs hover:bg-neutral-700 cursor-pointer ${
+                      value === (group.venue || DEFAULT_GROUPDM_VENUE) ? "text-white" : "text-neutral-400"
+                    }`}
+                  >
+                    <div>{label}</div>
+                    <div className="text-[10px] text-neutral-500">{hint}</div>
                   </button>
                 ))}
               </div>

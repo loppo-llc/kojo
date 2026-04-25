@@ -76,7 +76,7 @@ func newTestManager(t *testing.T) *Manager {
 func TestGroupDMManager_Create(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, err := gdm.Create("Test Group", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, err := gdm.Create("Test Group", []string{"ag_alice", "ag_bob"}, 0, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestGroupDMManager_Create(t *testing.T) {
 func TestGroupDMManager_CreateDefaultName(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, err := gdm.Create("", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, err := gdm.Create("", []string{"ag_alice", "ag_bob"}, 0, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestGroupDMManager_CreateDefaultName(t *testing.T) {
 func TestGroupDMManager_CreateTooFewMembers(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	_, err := gdm.Create("Solo", []string{"ag_alice"}, 0, "")
+	_, err := gdm.Create("Solo", []string{"ag_alice"}, 0, "", "")
 	if !errors.Is(err, ErrGroupTooFew) {
 		t.Errorf("expected ErrGroupTooFew, got %v", err)
 	}
@@ -116,7 +116,7 @@ func TestGroupDMManager_CreateTooFewMembers(t *testing.T) {
 func TestGroupDMManager_CreateNonexistentAgent(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	_, err := gdm.Create("Bad", []string{"ag_alice", "ag_nonexistent"}, 0, "")
+	_, err := gdm.Create("Bad", []string{"ag_alice", "ag_nonexistent"}, 0, "", "")
 	if !errors.Is(err, ErrAgentNotFound) {
 		t.Errorf("expected ErrAgentNotFound, got %v", err)
 	}
@@ -125,7 +125,7 @@ func TestGroupDMManager_CreateNonexistentAgent(t *testing.T) {
 func TestGroupDMManager_CreateDeduplicatesMembers(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	_, err := gdm.Create("Dup", []string{"ag_alice", "ag_alice"}, 0, "")
+	_, err := gdm.Create("Dup", []string{"ag_alice", "ag_alice"}, 0, "", "")
 	if !errors.Is(err, ErrGroupTooFew) {
 		t.Errorf("expected ErrGroupTooFew after dedup, got %v", err)
 	}
@@ -134,7 +134,7 @@ func TestGroupDMManager_CreateDeduplicatesMembers(t *testing.T) {
 func TestGroupDMManager_GetAndList(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	created, _ := gdm.Create("Group1", []string{"ag_alice", "ag_bob"}, 0, "")
+	created, _ := gdm.Create("Group1", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	got, ok := gdm.Get(created.ID)
 	if !ok {
@@ -162,7 +162,7 @@ func TestGroupDMManager_GetNotFound(t *testing.T) {
 func TestGroupDMManager_Delete(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, _ := gdm.Create("ToDelete", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("ToDelete", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	if err := gdm.Delete(g.ID, false); err != nil {
 		t.Fatal(err)
@@ -186,7 +186,7 @@ func TestGroupDMManager_DeleteNotFound(t *testing.T) {
 func TestGroupDMManager_SetCooldown(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, _ := gdm.Create("CD", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("CD", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	updated, err := gdm.SetCooldown(g.ID, 120)
 	if err != nil {
@@ -200,7 +200,7 @@ func TestGroupDMManager_SetCooldown(t *testing.T) {
 func TestGroupDMManager_SetCooldownClamped(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, _ := gdm.Create("CD", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("CD", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	updated, err := gdm.SetCooldown(g.ID, 9999)
 	if err != nil {
@@ -214,7 +214,7 @@ func TestGroupDMManager_SetCooldownClamped(t *testing.T) {
 func TestGroupDMManager_Rename(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, _ := gdm.Create("Old Name", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("Old Name", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	renamed, err := gdm.Rename(g.ID, "New Name", "ag_alice")
 	if err != nil {
@@ -228,7 +228,7 @@ func TestGroupDMManager_Rename(t *testing.T) {
 func TestGroupDMManager_RenameNotMember(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	_, err := gdm.Rename(g.ID, "New", "ag_charlie")
 	if !errors.Is(err, ErrGroupNotMember) {
@@ -248,7 +248,7 @@ func TestGroupDMManager_RenameNotFound(t *testing.T) {
 func TestGroupDMManager_AddMember(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	updated, err := gdm.AddMember(g.ID, "ag_charlie", "ag_alice")
 	if err != nil {
@@ -262,7 +262,7 @@ func TestGroupDMManager_AddMember(t *testing.T) {
 func TestGroupDMManager_AddMemberDuplicate(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	_, err := gdm.AddMember(g.ID, "ag_alice", "ag_bob")
 	if !errors.Is(err, ErrGroupAlreadyMember) {
@@ -273,7 +273,7 @@ func TestGroupDMManager_AddMemberDuplicate(t *testing.T) {
 func TestGroupDMManager_AddMemberNotMember(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	_, err := gdm.AddMember(g.ID, "ag_charlie", "ag_charlie")
 	if !errors.Is(err, ErrGroupNotMember) {
@@ -284,7 +284,7 @@ func TestGroupDMManager_AddMemberNotMember(t *testing.T) {
 func TestGroupDMManager_LeaveGroup(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob", "ag_charlie"}, 0, "")
+	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob", "ag_charlie"}, 0, "", "")
 
 	if err := gdm.LeaveGroup(g.ID, "ag_charlie"); err != nil {
 		t.Fatal(err)
@@ -302,7 +302,7 @@ func TestGroupDMManager_LeaveGroup(t *testing.T) {
 func TestGroupDMManager_LeaveGroupNotMember(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	err := gdm.LeaveGroup(g.ID, "ag_charlie")
 	if !errors.Is(err, ErrGroupNotMember) {
@@ -313,7 +313,7 @@ func TestGroupDMManager_LeaveGroupNotMember(t *testing.T) {
 func TestGroupDMManager_LeaveGroupDissolvesWithTwoMembers(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	if err := gdm.LeaveGroup(g.ID, "ag_bob"); err != nil {
 		t.Fatal(err)
@@ -328,8 +328,8 @@ func TestGroupDMManager_LeaveGroupDissolvesWithTwoMembers(t *testing.T) {
 func TestGroupDMManager_GroupsForAgent(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	gdm.Create("G1", []string{"ag_alice", "ag_bob"}, 0, "")
-	gdm.Create("G2", []string{"ag_bob", "ag_charlie"}, 0, "")
+	gdm.Create("G1", []string{"ag_alice", "ag_bob"}, 0, "", "")
+	gdm.Create("G2", []string{"ag_bob", "ag_charlie"}, 0, "", "")
 
 	aliceGroups := gdm.GroupsForAgent("ag_alice")
 	if len(aliceGroups) != 1 {
@@ -345,8 +345,8 @@ func TestGroupDMManager_GroupsForAgent(t *testing.T) {
 func TestGroupDMManager_RemoveAgent(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	gdm.Create("G1", []string{"ag_alice", "ag_bob", "ag_charlie"}, 0, "")
-	gdm.Create("G2", []string{"ag_alice", "ag_bob"}, 0, "")
+	gdm.Create("G1", []string{"ag_alice", "ag_bob", "ag_charlie"}, 0, "", "")
+	gdm.Create("G2", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	gdm.RemoveAgent("ag_alice")
 
@@ -371,7 +371,7 @@ func TestGroupDMManager_RemoveAgent(t *testing.T) {
 func TestGroupDMManager_CopyIsolation(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	// Mutating the returned copy should not affect the internal state
 	g.Name = "Mutated"
@@ -389,7 +389,7 @@ func TestGroupDMManager_CopyIsolation(t *testing.T) {
 func TestGroupDMManager_CreateWithStyle(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, err := gdm.Create("Styled", []string{"ag_alice", "ag_bob"}, 0, "expressive")
+	g, err := gdm.Create("Styled", []string{"ag_alice", "ag_bob"}, 0, "expressive", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,7 +401,7 @@ func TestGroupDMManager_CreateWithStyle(t *testing.T) {
 func TestGroupDMManager_CreateDefaultStyle(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, err := gdm.Create("Default", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, err := gdm.Create("Default", []string{"ag_alice", "ag_bob"}, 0, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +413,7 @@ func TestGroupDMManager_CreateDefaultStyle(t *testing.T) {
 func TestGroupDMManager_CreateInvalidStyle(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	_, err := gdm.Create("Bad", []string{"ag_alice", "ag_bob"}, 0, "invalid")
+	_, err := gdm.Create("Bad", []string{"ag_alice", "ag_bob"}, 0, "invalid", "")
 	if err == nil {
 		t.Error("expected error for invalid style")
 	}
@@ -422,7 +422,7 @@ func TestGroupDMManager_CreateInvalidStyle(t *testing.T) {
 func TestGroupDMManager_SetStyle(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	updated, err := gdm.SetStyle(g.ID, "expressive", "ag_alice")
 	if err != nil {
@@ -442,7 +442,7 @@ func TestGroupDMManager_SetStyle(t *testing.T) {
 func TestGroupDMManager_SetStyleInvalid(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	_, err := gdm.SetStyle(g.ID, "bogus", "ag_alice")
 	if err == nil {
@@ -453,7 +453,7 @@ func TestGroupDMManager_SetStyleInvalid(t *testing.T) {
 func TestGroupDMManager_SetStyleNotMember(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	_, err := gdm.SetStyle(g.ID, "expressive", "ag_charlie")
 	if !errors.Is(err, ErrGroupNotMember) {
@@ -464,7 +464,7 @@ func TestGroupDMManager_SetStyleNotMember(t *testing.T) {
 func TestGroupDMManager_SetStyleNoCallerSkipsCheck(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("Group", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	// Empty callerAgentID should skip membership check (admin/UI call)
 	updated, err := gdm.SetStyle(g.ID, "expressive", "")
@@ -478,7 +478,7 @@ func TestGroupDMManager_SetStyleNoCallerSkipsCheck(t *testing.T) {
 
 func TestGroupDMManager_SetMemberNotifyMode(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
-	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	updated, err := gdm.SetMemberNotifyMode(g.ID, "ag_alice", NotifyDigest, 600)
 	if err != nil {
@@ -509,7 +509,7 @@ func TestGroupDMManager_SetMemberNotifyMode(t *testing.T) {
 
 func TestGroupDMManager_SetMemberNotifyModeInvalid(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
-	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	if _, err := gdm.SetMemberNotifyMode(g.ID, "ag_alice", "bogus", 0); err == nil {
 		t.Error("expected error for invalid mode")
@@ -518,7 +518,7 @@ func TestGroupDMManager_SetMemberNotifyModeInvalid(t *testing.T) {
 
 func TestGroupDMManager_SetMemberNotifyModeNotMember(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
-	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	_, err := gdm.SetMemberNotifyMode(g.ID, "ag_charlie", NotifyMuted, 0)
 	if !errors.Is(err, ErrGroupNotMember) {
@@ -537,7 +537,7 @@ func TestGroupDMManager_SetMemberNotifyModeNotFound(t *testing.T) {
 
 func TestGroupDMManager_SetMemberNotifyModeDigestWindowClamped(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
-	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	// Oversized window is clamped to maxDigestWindow; negative goes to 0.
 	updated, err := gdm.SetMemberNotifyMode(g.ID, "ag_alice", NotifyDigest, 99999)
@@ -563,7 +563,7 @@ func TestGroupDMManager_SetMemberNotifyModeDigestWindowClamped(t *testing.T) {
 
 func TestGroupDMManager_MemberNotifySettingsDefault(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
-	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	mode, window := gdm.memberNotifySettings(g.ID, "ag_alice")
 	if mode != NotifyRealtime {
@@ -582,7 +582,7 @@ func TestGroupDMManager_MemberNotifySettingsDefault(t *testing.T) {
 
 func TestGroupDMManager_MutedMemberDropsNotification(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
-	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	if _, err := gdm.SetMemberNotifyMode(g.ID, "ag_alice", NotifyMuted, 0); err != nil {
 		t.Fatal(err)
@@ -602,7 +602,7 @@ func TestGroupDMManager_MutedMemberDropsNotification(t *testing.T) {
 
 func TestGroupDMManager_EffectiveCooldown(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
-	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 120, "")
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 120, "", "")
 
 	// Realtime respects group cooldown.
 	if got := gdm.effectiveCooldown(g.ID, NotifyRealtime, 0); got != 120*time.Second {
@@ -618,7 +618,7 @@ func TestGroupDMManager_EffectiveCooldown(t *testing.T) {
 	}
 
 	// Digest with zero window falls back to defaultDigestWindow.
-	g2, _ := gdm.Create("G2", []string{"ag_alice", "ag_bob"}, 0, "")
+	g2, _ := gdm.Create("G2", []string{"ag_alice", "ag_bob"}, 0, "", "")
 	want := time.Duration(defaultDigestWindow) * time.Second
 	if got := gdm.effectiveCooldown(g2.ID, NotifyDigest, 0); got != want {
 		t.Errorf("digest zero-window = %v, want %v", got, want)
@@ -627,7 +627,7 @@ func TestGroupDMManager_EffectiveCooldown(t *testing.T) {
 
 func TestGroupDMManager_RenderNotificationInlinesContent(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
-	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 	gdm.SetAPIBase("https://example/ts.net")
 
 	pending := []pendingMsg{
@@ -658,7 +658,7 @@ func TestGroupDMManager_RenderNotificationHeaderHasLatestSender(t *testing.T) {
 	// Web UI can extract the latest sender without parsing the untrusted
 	// message block. Verify both agent senders and human-user senders.
 	gdm, _ := setupGroupDMTest(t)
-	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	pending := []pendingMsg{
 		{sender: "Old", content: "first", timestamp: "t"},
@@ -685,7 +685,7 @@ func TestGroupDMManager_RenderNotificationLargeMessageInlinedFully(t *testing.T)
 	// inlined verbatim — the per-message char cap was removed because
 	// truncating defeats the inlining win (agent has to curl anyway).
 	gdm, _ := setupGroupDMTest(t)
-	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 	gdm.SetAPIBase("http://localhost:8080")
 
 	const size = 3000 // > old 500-cap, < notifyMaxSingleContent and < batch budget
@@ -711,7 +711,7 @@ func TestGroupDMManager_RenderNotificationDropsOldWhenBatchTooBig(t *testing.T) 
 	// total exceeds notifyMaxBatchBytes, the oldest messages are dropped
 	// (whole-message) rather than each being truncated mid-content.
 	gdm, _ := setupGroupDMTest(t)
-	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	// Each message ~2KB; 12 of them (~24KB) overflow the 16KB budget.
 	chunk := strings.Repeat("y", 2000)
@@ -748,7 +748,7 @@ func TestGroupDMManager_RenderNotificationSingleHugeMessageClipped(t *testing.T)
 	// budget. We still inline it (clipped to notifyMaxSingleContent) so
 	// the agent has *something* to react to without a curl round-trip.
 	gdm, _ := setupGroupDMTest(t)
-	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	huge := strings.Repeat("z", notifyMaxBatchBytes+5000)
 	pending := []pendingMsg{{sender: "Bob", content: huge, timestamp: "t"}}
@@ -773,7 +773,7 @@ func TestGroupDMManager_RenderNotificationSingleHugeMessageClipped(t *testing.T)
 // too small for the current header/footer text and needs to grow.
 func TestGroupDMManager_RenderedSizeRespectsBudget(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
-	g, _ := gdm.Create("Long Realistic Group Name For Headroom", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("Long Realistic Group Name For Headroom", []string{"ag_alice", "ag_bob"}, 0, "", "")
 	gdm.SetAPIBase("https://kojo.tail451b50.ts.net:8080")
 
 	// Build a queue that selectBatch is likely to fill: lots of medium-sized
@@ -803,7 +803,7 @@ func TestGroupDMManager_RenderedSizeRespectsBudget(t *testing.T) {
 
 func TestGroupDMManager_RenderNotificationBatchLimit(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
-	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	many := make([]pendingMsg, notifyMaxBatch+5)
 	for i := range many {
@@ -859,7 +859,7 @@ func TestCapPending(t *testing.T) {
 
 func TestGroupDMManager_PendingBufferCap(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
-	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	// Put the (group, agent) key into a state that defers all further
 	// notifyAgent calls without actually invoking the agent backend: mark
@@ -894,6 +894,112 @@ func TestGroupDMManager_PendingBufferCap(t *testing.T) {
 	wantLast := fmt.Sprintf("msg-%d", notifyMaxPending*2-1)
 	if last != wantLast {
 		t.Errorf("newest kept = %q, want %q", last, wantLast)
+	}
+}
+
+func TestGroupDMManager_CreateDefaultVenue(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, err := gdm.Create("V", []string{"ag_alice", "ag_bob"}, 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.Venue != GroupDMVenueChatroom {
+		t.Errorf("default venue = %q, want %q", g.Venue, GroupDMVenueChatroom)
+	}
+}
+
+func TestGroupDMManager_CreateColocatedVenue(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, err := gdm.Create("V", []string{"ag_alice", "ag_bob"}, 0, "", GroupDMVenueColocated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.Venue != GroupDMVenueColocated {
+		t.Errorf("venue = %q, want %q", g.Venue, GroupDMVenueColocated)
+	}
+}
+
+func TestGroupDMManager_CreateInvalidVenue(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	_, err := gdm.Create("V", []string{"ag_alice", "ag_bob"}, 0, "", "elsewhere")
+	if err == nil {
+		t.Error("expected error for invalid venue")
+	}
+}
+
+func TestGroupDMManager_SetVenue(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("V", []string{"ag_alice", "ag_bob"}, 0, "", "")
+
+	updated, err := gdm.SetVenue(g.ID, GroupDMVenueColocated, "ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Venue != GroupDMVenueColocated {
+		t.Errorf("venue = %q, want %q", updated.Venue, GroupDMVenueColocated)
+	}
+	got, _ := gdm.Get(g.ID)
+	if got.Venue != GroupDMVenueColocated {
+		t.Errorf("persisted venue = %q, want %q", got.Venue, GroupDMVenueColocated)
+	}
+}
+
+func TestGroupDMManager_SetVenueInvalid(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("V", []string{"ag_alice", "ag_bob"}, 0, "", "")
+	if _, err := gdm.SetVenue(g.ID, "elsewhere", "ag_alice"); err == nil {
+		t.Error("expected error for invalid venue")
+	}
+}
+
+func TestGroupDMManager_SetVenueNotMember(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("V", []string{"ag_alice", "ag_bob"}, 0, "", "")
+	_, err := gdm.SetVenue(g.ID, GroupDMVenueColocated, "ag_charlie")
+	if !errors.Is(err, ErrGroupNotMember) {
+		t.Errorf("expected ErrGroupNotMember, got %v", err)
+	}
+}
+
+func TestGroupDMManager_GroupVenueDefaultsForLegacy(t *testing.T) {
+	// A group loaded from disk without a venue field (legacy on-disk JSON
+	// from before this feature shipped) must read back as defaultGroupDMVenue
+	// without rewriting the on-disk file.
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("V", []string{"ag_alice", "ag_bob"}, 0, "", "")
+	// Force venue back to empty (simulating legacy JSON).
+	gdm.mu.Lock()
+	gdm.groups[g.ID].Venue = ""
+	gdm.mu.Unlock()
+
+	if v := gdm.groupVenue(g.ID); v != defaultGroupDMVenue {
+		t.Errorf("groupVenue for legacy = %q, want %q", v, defaultGroupDMVenue)
+	}
+}
+
+func TestGroupDMManager_RenderNotificationVenueHint(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	gdm.SetAPIBase("http://localhost:8080")
+
+	// Default (chatroom) venue should yield the chat-room hint.
+	gChat, _ := gdm.Create("Chat", []string{"ag_alice", "ag_bob"}, 0, "", "")
+	pending := []pendingMsg{{sender: "Bob", content: "hi", timestamp: "t"}}
+	out := gdm.renderNotification("ag_alice", gChat.ID, gChat.Name, pending)
+	if !strings.Contains(out, "Venue: closed online chat room") {
+		t.Errorf("missing chatroom venue hint: %s", out)
+	}
+	if strings.Contains(out, "Venue: same physical space") {
+		t.Errorf("chatroom group must not include colocated hint: %s", out)
+	}
+
+	// Colocated venue should yield the co-presence hint.
+	gCo, _ := gdm.Create("Co", []string{"ag_alice", "ag_bob"}, 0, "", GroupDMVenueColocated)
+	out = gdm.renderNotification("ag_alice", gCo.ID, gCo.Name, pending)
+	if !strings.Contains(out, "Venue: same physical space") {
+		t.Errorf("missing colocated venue hint: %s", out)
+	}
+	if strings.Contains(out, "Venue: closed online chat room") {
+		t.Errorf("colocated group must not include chatroom hint: %s", out)
 	}
 }
 

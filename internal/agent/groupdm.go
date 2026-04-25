@@ -52,14 +52,46 @@ const defaultDigestWindow = 300 // 5 minutes
 // maxDigestWindow caps the digest window to 1 hour.
 const maxDigestWindow = 3600
 
+// GroupDMVenue is the physical/virtual setting that hosts the conversation.
+// Agents use this hint to calibrate speech style: a co-located venue invites
+// references to shared surroundings and gestures, while a chat room
+// constrains everything to the text channel.
+//
+//   - "chatroom" (default): closed online chat room. Members are not
+//     physically together; the only shared context is what is sent here.
+//   - "colocated": same physical space. Members are co-present in real
+//     time and may reference ambient cues, gestures, deictic ('this',
+//     'over there') language.
+type GroupDMVenue string
+
+const (
+	GroupDMVenueChatroom  GroupDMVenue = "chatroom"
+	GroupDMVenueColocated GroupDMVenue = "colocated"
+)
+
+// ValidGroupDMVenues is the set of accepted venue values.
+var ValidGroupDMVenues = map[GroupDMVenue]bool{
+	GroupDMVenueChatroom:  true,
+	GroupDMVenueColocated: true,
+}
+
+// defaultGroupDMVenue is what gets stamped onto a group when the field is
+// empty (legacy data, callers omitting the parameter, etc.). We default to
+// chatroom because that matches the existing token-saving DM design — a
+// co-located venue is opt-in.
+const defaultGroupDMVenue = GroupDMVenueChatroom
+
 type GroupDM struct {
-	ID        string        `json:"id"`
-	Name      string        `json:"name"`
-	Members   []GroupMember `json:"members"`
-	Cooldown  int           `json:"cooldown"` // notification cooldown in seconds (0 = use default)
-	Style     GroupDMStyle  `json:"style"`    // communication style: "efficient" or "expressive"
-	CreatedAt string        `json:"createdAt"`
-	UpdatedAt string        `json:"updatedAt"`
+	ID       string        `json:"id"`
+	Name     string        `json:"name"`
+	Members  []GroupMember `json:"members"`
+	Cooldown int           `json:"cooldown"` // notification cooldown in seconds (0 = use default)
+	Style    GroupDMStyle  `json:"style"`    // communication style: "efficient" or "expressive"
+	// Venue is the physical setting hint. "chatroom" (default) for a closed
+	// online chat, "colocated" when members are co-present in real space.
+	Venue     GroupDMVenue `json:"venue,omitempty"`
+	CreatedAt string       `json:"createdAt"`
+	UpdatedAt string       `json:"updatedAt"`
 }
 
 // GroupMember is a participant in a group DM.

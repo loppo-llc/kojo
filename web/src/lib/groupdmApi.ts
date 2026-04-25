@@ -2,6 +2,16 @@ import { get, post, del, patch } from "./httpClient";
 
 export type GroupDMStyle = "efficient" | "expressive";
 
+/** Physical-setting hint that calibrates how members should speak.
+ * "chatroom" (default): closed online chat — text-only, no co-presence.
+ * "colocated": same physical space — members can reference shared
+ * surroundings, gestures, and use deictic language.
+ *
+ * Server emits "" (omitempty) for legacy groups created before this
+ * feature shipped; treat empty as "chatroom" on read. */
+export type GroupDMVenue = "chatroom" | "colocated";
+export const DEFAULT_GROUPDM_VENUE: GroupDMVenue = "chatroom";
+
 /** Reserved agentId used for messages posted by the human user (operator). */
 export const USER_SENDER_ID = "user";
 
@@ -11,6 +21,9 @@ export interface GroupDMInfo {
   members: GroupMember[];
   cooldown: number; // notification cooldown in seconds (0 = default 50s)
   style: GroupDMStyle; // communication style
+  /** Physical-setting hint. Server may omit this for legacy groups; UI
+   * should fall back to DEFAULT_GROUPDM_VENUE when undefined or empty. */
+  venue?: GroupDMVenue;
   createdAt: string;
   updatedAt: string;
 }
@@ -34,8 +47,12 @@ export const groupdmApi = {
 
   get: (id: string) => get<GroupDMInfo>(`/api/v1/groupdms/${id}`),
 
-  create: (name: string, memberIds: string[]) =>
-    post<GroupDMInfo>("/api/v1/groupdms", { name, memberIds }),
+  create: (
+    name: string,
+    memberIds: string[],
+    opts?: { style?: GroupDMStyle; venue?: GroupDMVenue; cooldown?: number },
+  ) =>
+    post<GroupDMInfo>("/api/v1/groupdms", { name, memberIds, ...(opts ?? {}) }),
 
   rename: (id: string, name: string) =>
     patch<GroupDMInfo>(`/api/v1/groupdms/${id}`, { name }),
@@ -45,6 +62,9 @@ export const groupdmApi = {
 
   setStyle: (id: string, style: GroupDMStyle) =>
     patch<GroupDMInfo>(`/api/v1/groupdms/${id}`, { style }),
+
+  setVenue: (id: string, venue: GroupDMVenue) =>
+    patch<GroupDMInfo>(`/api/v1/groupdms/${id}`, { venue }),
 
   addMember: (id: string, agentId: string, callerAgentId: string) =>
     post<GroupDMInfo>(`/api/v1/groupdms/${id}/members`, { agentId, callerAgentId }),

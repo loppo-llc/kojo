@@ -24,6 +24,7 @@ func (s *Server) handleCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 		MemberIDs []string `json:"memberIds"`
 		Cooldown  int      `json:"cooldown"`
 		Style     string   `json:"style"`
+		Venue     string   `json:"venue"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
@@ -33,7 +34,8 @@ func (s *Server) handleCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "at least 2 members required")
 		return
 	}
-	g, err := s.groupdms.Create(req.Name, req.MemberIDs, req.Cooldown, agent.GroupDMStyle(req.Style))
+	g, err := s.groupdms.Create(req.Name, req.MemberIDs, req.Cooldown,
+		agent.GroupDMStyle(req.Style), agent.GroupDMVenue(req.Venue))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
@@ -58,6 +60,7 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 		AgentID  string `json:"agentId"`
 		Cooldown *int   `json:"cooldown"`
 		Style    string `json:"style"`
+		Venue    string `json:"venue"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
@@ -65,13 +68,19 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate all fields before applying any changes to avoid partial writes.
-	if req.Name == "" && req.Cooldown == nil && req.Style == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "name, cooldown, or style is required")
+	if req.Name == "" && req.Cooldown == nil && req.Style == "" && req.Venue == "" {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"name, cooldown, style, or venue is required")
 		return
 	}
 	if req.Style != "" && !agent.ValidGroupDMStyles[agent.GroupDMStyle(req.Style)] {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"invalid style: must be \"efficient\" or \"expressive\"")
+		return
+	}
+	if req.Venue != "" && !agent.ValidGroupDMVenues[agent.GroupDMVenue(req.Venue)] {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"invalid venue: must be \"chatroom\" or \"colocated\"")
 		return
 	}
 	// Rename requires agentId (membership authorization).
@@ -102,6 +111,16 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 	// Update style if provided
 	if req.Style != "" {
 		g, err := s.groupdms.SetStyle(id, agent.GroupDMStyle(req.Style), req.AgentID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		result = g
+	}
+
+	// Update venue if provided
+	if req.Venue != "" {
+		g, err := s.groupdms.SetVenue(id, agent.GroupDMVenue(req.Venue), req.AgentID)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 			return

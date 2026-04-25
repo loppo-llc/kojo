@@ -104,7 +104,8 @@ func (m *GroupDMManager) APIBase() string {
 // Create creates a new group DM with the given members.
 // cooldown is the notification cooldown in seconds (0 = use default).
 // style controls the communication style ("efficient" or "expressive"; empty = "efficient").
-func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int, style GroupDMStyle) (*GroupDM, error) {
+// venue is the physical-setting hint ("chatroom" or "colocated"; empty = defaultGroupDMVenue).
+func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int, style GroupDMStyle, venue GroupDMVenue) (*GroupDM, error) {
 	if len(memberIDs) < 2 {
 		return nil, ErrGroupTooFew
 	}
@@ -123,6 +124,13 @@ func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int, s
 	if !ValidGroupDMStyles[style] {
 		return nil, fmt.Errorf("invalid style: %q (must be %q or %q)", style, GroupDMStyleEfficient, GroupDMStyleExpressive)
 	}
+	if venue == "" {
+		venue = defaultGroupDMVenue
+	}
+	if !ValidGroupDMVenues[venue] {
+		return nil, fmt.Errorf("invalid venue: %q (must be %q or %q)",
+			venue, GroupDMVenueChatroom, GroupDMVenueColocated)
+	}
 
 	now := time.Now().Format(time.RFC3339)
 	g := &GroupDM{
@@ -131,6 +139,7 @@ func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int, s
 		Members:   members,
 		Cooldown:  clampCooldown(cooldown),
 		Style:     style,
+		Venue:     venue,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -472,6 +481,20 @@ func (m *GroupDMManager) groupStyle(groupID string) GroupDMStyle {
 	return GroupDMStyleEfficient
 }
 
+// groupVenue returns the venue hint for a group (defaults to chatroom).
+// Unknown / legacy values fall back to defaultGroupDMVenue rather than
+// erroring — venue is a soft hint for the LLM, not a correctness gate.
+func (m *GroupDMManager) groupVenue(groupID string) GroupDMVenue {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if g, ok := m.groups[groupID]; ok {
+		if ValidGroupDMVenues[g.Venue] {
+			return g.Venue
+		}
+	}
+	return defaultGroupDMVenue
+}
+
 // memberNotifySettings returns the effective notify mode and digest window
 // for a member, defaulting to realtime when unknown or unset.
 func (m *GroupDMManager) memberNotifySettings(groupID, agentID string) (NotifyMode, int) {
@@ -615,6 +638,45 @@ func (m *GroupDMManager) SetStyle(id string, style GroupDMStyle, callerAgentID s
 	m.mu.Unlock()
 	m.save()
 	m.logger.Info("group DM style updated", "id", id, "style", style)
+	return cp, nil
+}
+
+// SetVenue updates the venue hint (chatroom / colocated) for a group.
+// callerAgentID must be a member; empty skips the check (admin/UI). Mirrors
+// SetStyle's auth convention so both group-wide settings flip the same way.
+func (m *GroupDMManager) SetVenue(id string, venue GroupDMVenue, callerAgentID string) (*GroupDM, error) {
+	if venue == "" {
+		venue = defaultGroupDMVenue
+	}
+	if !ValidGroupDMVenues[venue] {
+		return nil, fmt.Errorf("invalid venue: %q (must be %q or %q)",
+			venue, GroupDMVenueChatroom, GroupDMVenueColocated)
+	}
+	m.mu.Lock()
+	g, ok := m.groups[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+	}
+	if callerAgentID != "" {
+		found := false
+		for _, mem := range g.Members {
+			if mem.AgentID == callerAgentID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, callerAgentID, id)
+		}
+	}
+	g.Venue = venue
+	g.UpdatedAt = time.Now().Format(time.RFC3339)
+	cp := m.copyGroup(g)
+	m.mu.Unlock()
+	m.save()
+	m.logger.Info("group DM venue updated", "id", id, "venue", venue)
 	return cp, nil
 }
 
@@ -892,6 +954,19 @@ func (m *GroupDMManager) renderNotification(agentID, groupID, groupName string, 
 		styleHint = "Style: efficient — EXTREME token saving. No greetings, no filler, no acknowledgements. Bare facts only. One-word replies preferred. Do NOT reply if you have nothing substantive to add."
 	}
 
+	venue := m.groupVenue(groupID)
+	var venueHint string
+	switch venue {
+	case GroupDMVenueColocated:
+		// "Same physical space" — tell the agent it can lean on shared
+		// surroundings, gestures, and deictic language. This unlocks a
+		// looser, more embodied register without changing the channel.
+		venueHint = "Venue: same physical space. Members are co-present in real time. You may reference shared surroundings, gestures, ambient sounds, and use deictic language ('this', 'over there'). Treat the chat as a record of an in-person conversation."
+	default:
+		// Default chatroom hint — no co-presence assumptions.
+		venueHint = "Venue: closed online chat room. Members are not co-present and only share what is sent here. No physical surroundings, gestures, or ambient cues exist between you — keep references to what fits a text-only async chat."
+	}
+
 	shown, omitted, clipSingle := selectBatch(pending)
 
 	// Latest sender is rendered into the header so trusted code (e.g. the
@@ -909,6 +984,8 @@ func (m *GroupDMManager) renderNotification(agentID, groupID, groupName string, 
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "[Group DM: %s] %d new message(s)%s.\n", groupName, len(pending), fromSuffix)
+	b.WriteString(venueHint)
+	b.WriteString("\n")
 	b.WriteString(styleHint)
 	b.WriteString("\n")
 	if omitted > 0 {
@@ -1306,6 +1383,21 @@ func (m *GroupDMManager) load() {
 		// Normalize legacy groups that predate the style field.
 		if g.Style == "" || !ValidGroupDMStyles[g.Style] {
 			g.Style = GroupDMStyleEfficient
+		}
+		// Normalize legacy groups that predate the venue field. Empty stays
+		// empty in JSON (omitempty) but every read goes through groupVenue
+		// which falls back to defaultGroupDMVenue, so we don't force-write
+		// the field — that keeps legacy on-disk JSON byte-identical until
+		// the user actually changes a venue.
+		//
+		// Hand-edited / corrupted values are flipped back to "" *and* the
+		// group is marked dirty so the rewrite happens once. Without
+		// dirty=true the in-memory fix would be lost on the next load and
+		// we'd re-validate the same bad value every restart.
+		if g.Venue != "" && !ValidGroupDMVenues[g.Venue] {
+			m.logger.Warn("dropping unknown venue from loaded group", "group", g.ID, "venue", g.Venue)
+			g.Venue = ""
+			dirty = true
 		}
 		// Strip any legacy/hand-edited members that collide with the reserved
 		// UserSenderID ("user"). They could impersonate human-user messages in
