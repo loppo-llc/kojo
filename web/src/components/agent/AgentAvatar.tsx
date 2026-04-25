@@ -81,7 +81,7 @@ export function AgentAvatar({
   return (
     <div
       ref={ref}
-      className={`relative shrink-0 ${className}`}
+      className={`relative shrink-0 ${sizes[size]} ${className}`}
       onMouseEnter={handleEnter}
       onMouseLeave={handleLeave}
     >
