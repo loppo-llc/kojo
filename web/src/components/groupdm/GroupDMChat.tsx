@@ -588,7 +588,7 @@ function GroupMessageContent({ content }: { content: string }) {
 
   if (!hasFiles) {
     return (
-      <div className="text-sm text-neutral-300 whitespace-pre-wrap break-words leading-relaxed mt-0.5">
+      <div className="text-sm text-neutral-300 whitespace-pre-wrap wrap-anywhere leading-relaxed mt-0.5">
         {content}
       </div>
     );

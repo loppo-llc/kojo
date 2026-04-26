@@ -30,10 +30,26 @@ html, body, #root {
 }
 
 /* ── Markdown content styling ── */
+/*
+ * overflow-wrap:anywhere (vs overflow-wrap:break-word, which is what
+ * Tailwind's `break-words` utility produces) is the key piece for keeping
+ * chat bubbles from blowing out horizontally. `break-word` only affects
+ * *visual* line breaks — when the browser computes the element's
+ * intrinsic min-content size for flex/grid layout, a long unbreakable
+ * token (e.g. a bare URL that wasn't autolinked, or any long ASCII path)
+ * still counts as one piece, which forces the flex item to grow past its
+ * `max-w-[80%]` constraint and breaks the entire row layout.
+ *
+ * `overflow-wrap: anywhere` instead allows the soft-break opportunity to
+ * count toward min-content, so the bubble's intrinsic min collapses to
+ * roughly one glyph and the max-width clamp actually wins. Prose still
+ * prefers wrapping at spaces — `anywhere` only kicks in when nothing else
+ * fits.
+ */
 .md-content {
   font-size: 0.875rem;
   line-height: 1.65;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 .md-content > :first-child { margin-top: 0; }
 .md-content > :last-child { margin-bottom: 0; }

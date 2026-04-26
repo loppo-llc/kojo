@@ -55,9 +55,12 @@ export const ChatMessage = memo(function ChatMessage({
         <AgentAvatar agentId={agentId} name={agentName} size="sm" className="mt-1" cacheBust={avatarHash} />
       )}
 
-      {/* Bubble */}
+      {/* Bubble — min-w-0 lets max-w-[80%] actually clamp the flex item even
+          when an inline child (e.g. a long file-path chip or anything else
+          with no soft-break opportunities) would otherwise inflate the
+          flex item's `min-width: auto` past the cap. */}
       <div
-        className={`max-w-[80%] ${
+        className={`max-w-[80%] min-w-0 ${
           isUser
             ? "bg-blue-600/90 text-white rounded-2xl rounded-tr-sm"
             : "bg-neutral-800/80 text-neutral-200 rounded-2xl rounded-tl-sm"
@@ -210,7 +213,7 @@ function FilePathChip({
 
   return (
     <span
-      className="relative inline-flex"
+      className="relative inline-flex max-w-full min-w-0 align-bottom"
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
     >
@@ -314,7 +317,7 @@ function GroupDMNotificationPill({
           </svg>
         </button>
         {expanded && (
-          <pre className="mt-1.5 w-full px-3 py-2 rounded bg-neutral-900/80 border border-neutral-800 text-[10px] leading-relaxed text-neutral-400 whitespace-pre-wrap break-words overflow-x-auto">
+          <pre className="mt-1.5 w-full min-w-0 px-3 py-2 rounded bg-neutral-900/80 border border-neutral-800 text-[10px] leading-relaxed text-neutral-400 whitespace-pre-wrap wrap-anywhere overflow-x-auto">
             {message.content}
           </pre>
         )}
@@ -391,7 +394,7 @@ function SystemMessage({ message }: { message: AgentMessage }) {
               />
             </svg>
           )}
-          <span className="whitespace-pre-wrap break-words">{content}</span>
+          <span className="whitespace-pre-wrap wrap-anywhere">{content}</span>
         </div>
         <div className="text-[10px] text-neutral-600 mt-1.5 text-right">
           {formatTime(message.timestamp)}
@@ -647,7 +650,7 @@ function MessageContent({
         {hasFiles ? (
           <FileTextContent parts={parts} onPreview={setPreview} />
         ) : (
-          <div className="text-sm whitespace-pre-wrap break-words leading-relaxed">
+          <div className="text-sm whitespace-pre-wrap wrap-anywhere leading-relaxed">
             {content}
           </div>
         )}
@@ -690,7 +693,7 @@ export function FileTextContent({
   onPreview: (p: { path: string; type: "image" | "video" }) => void;
 }) {
   return (
-    <div className="text-sm whitespace-pre-wrap break-words leading-relaxed">
+    <div className="text-sm whitespace-pre-wrap wrap-anywhere leading-relaxed">
       {parts.map((part, i) => {
         if (part.type === "text") return <span key={i}>{part.value}</span>;
         return <FilePathChip key={i} path={part.value} onPreview={onPreview} />;
@@ -879,7 +882,7 @@ function ThinkingBlock({ text, streaming = false }: { text: string; streaming?: 
         )}
       </button>
       {expanded && (
-        <div className="mt-1 pl-4 border-l border-neutral-700/50 text-xs text-neutral-500 leading-relaxed whitespace-pre-wrap">
+        <div className="mt-1 pl-4 border-l border-neutral-700/50 text-xs text-neutral-500 leading-relaxed whitespace-pre-wrap wrap-anywhere">
           {text}
         </div>
       )}
@@ -948,7 +951,7 @@ export function StreamingMessage({
   return (
     <div className="flex gap-3 flex-row">
       <AgentAvatar agentId={agentId} name={agentName} size="sm" className="mt-1" cacheBust={avatarHash} />
-      <div className="max-w-[80%] bg-neutral-800/80 text-neutral-200 rounded-2xl rounded-tl-sm px-3.5 py-2.5">
+      <div className="max-w-[80%] min-w-0 bg-neutral-800/80 text-neutral-200 rounded-2xl rounded-tl-sm px-3.5 py-2.5">
         {status === "thinking" && !text && !thinking && toolUses.length === 0 && (
           <div className="flex items-center gap-1.5 py-1">
             <span className="w-1.5 h-1.5 bg-neutral-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
