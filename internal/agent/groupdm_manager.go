@@ -908,6 +908,22 @@ func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName string, msg *Gr
 	if msg == nil {
 		return
 	}
+	// Self-notification guard: an agent must never be notified about a
+	// message they themselves posted. PostMessage already filters the
+	// sender out of its fan-out, but this defensive check prevents
+	// future callers (or duplicate-member states reconstructed from disk)
+	// from leaking the sender's own message back into their inbox.
+	// The `senderIsUser` flag does not need to gate this: the reserved
+	// UserSenderID ("user") is rejected by resolveMembers and so can
+	// never appear as a recipient agentID, meaning a user-authored
+	// message can never satisfy `msg.AgentID == agentID` against a real
+	// member. A debug log here helps detect real-world fan-out bugs that
+	// this guard would otherwise mask.
+	if msg.AgentID == agentID {
+		m.logger.Debug("groupdm self-notification suppressed",
+			"group", groupID, "agent", agentID, "messageID", msg.ID, "senderIsUser", senderIsUser)
+		return
+	}
 	mode, digestWindow := m.memberNotifySettings(groupID, agentID)
 	if mode == NotifyMuted {
 		return

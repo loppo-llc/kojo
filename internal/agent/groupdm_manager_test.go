@@ -601,6 +601,36 @@ func TestGroupDMManager_MutedMemberDropsNotification(t *testing.T) {
 	}
 }
 
+func TestGroupDMManager_SelfNotificationDropped(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
+
+	// Sender == recipient: must be dropped without ever creating a notify
+	// state entry, even if some future caller mis-routes the fan-out.
+	msg := newGroupMessage("ag_alice", "Alice", "self")
+	gdm.notifyAgent("ag_alice", g.ID, g.Name, msg, false)
+
+	gdm.notifyMu.Lock()
+	_, exists := gdm.notify[g.ID+":ag_alice"]
+	gdm.notifyMu.Unlock()
+	if exists {
+		t.Error("self-notification should not create notify state")
+	}
+
+	// PostUserMessage path: the human operator posts and every agent
+	// member is notified (msg.AgentID is the reserved "user" sender,
+	// which can never match a real member's ID). The guard must not
+	// block this real-world path.
+	userMsg := newGroupMessage(UserSenderID, UserSenderName, "ping")
+	gdm.notifyAgent("ag_alice", g.ID, g.Name, userMsg, true)
+	gdm.notifyMu.Lock()
+	_, userExists := gdm.notify[g.ID+":ag_alice"]
+	gdm.notifyMu.Unlock()
+	if !userExists {
+		t.Error("user-authored notification to a real member must not be dropped")
+	}
+}
+
 func TestGroupDMManager_EffectiveCooldown(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 120, "", "")
