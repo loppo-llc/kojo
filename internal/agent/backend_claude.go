@@ -233,7 +233,7 @@ func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir s
 	// running a fresh ephemeral session each time.
 	if !oneShot {
 		sessionID := agentIDToUUID(agent.ID)
-		if sessionFileUsable(dir, sessionID, automatedTrigger, agent.ID, b.logger) {
+		if sessionFileUsable(dir, sessionID, automatedTrigger, agent.ID, agent.ResumeIdleDuration(), b.logger) {
 			args = append(args, "--resume", sessionID)
 		} else {
 			args = append(args, "--session-id", sessionID)
@@ -251,7 +251,7 @@ type streamParseResult struct {
 	streamSessionID   string
 	toolUses          []ToolUse
 	usage             *Usage
-	cancelled bool // true if send returned false (context cancelled)
+	cancelled         bool // true if send returned false (context cancelled)
 }
 
 // parseClaudeStream reads Claude's stream-json output from r and emits ChatEvents
@@ -528,7 +528,6 @@ func (lw *limitedWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-
 // claudeEncodePath encodes a directory path using Claude's project path scheme:
 // "/" (or separator), ".", "_" are all replaced with "-".
 func claudeEncodePath(dir string) string {
@@ -618,18 +617,22 @@ var preResetSummarize = func(agentID, tool string, logger *slog.Logger) error {
 	return PreCompactSummarize(agentID, tool, logger)
 }
 
-// sessionResetMinIdleDuration suppresses threshold-based resets when the
-// session was updated within this window. Rationale: an active chat produces
-// many short turns that never reach the autosummary / MEMORY.md path, so
-// resetting mid-conversation would discard recent context the agent can't
-// recover from files. The interval-driven agents we're actually trying to
-// curb fire every 10+ minutes and always fall well outside this window, so
-// the gate only protects interactive users. 5 minutes also happens to match
-// Anthropic's default prompt cache TTL, keeping cache warm across back-to-
-// back turns. If an active chat genuinely blows past the token threshold,
-// claude's auto-compact (CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=85) still fires as
-// a safety net.
-const sessionResetMinIdleDuration = 5 * time.Minute
+// sessionResetMinIdleDuration is the package-default idle window used when
+// a caller doesn't supply a per-agent override (legacy callers and tests).
+// Per-agent override comes through Agent.ResumeIdleMinutes →
+// Agent.ResumeIdleDuration().
+//
+// Rationale for the 5-minute default: an active chat produces many short
+// turns that never reach the autosummary / MEMORY.md path, so resetting
+// mid-conversation would discard recent context the agent can't recover
+// from files. The interval-driven agents we're actually trying to curb
+// fire every 10+ minutes and always fall well outside this window, so the
+// gate only protects interactive users. 5 minutes also matches Anthropic's
+// default prompt cache TTL, keeping cache warm across back-to-back turns.
+// If an active chat genuinely blows past the token threshold, claude's
+// auto-compact (CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=85) still fires as a
+// safety net.
+const sessionResetMinIdleDuration = defaultResumeIdleDuration
 
 // sessionFileUsable checks whether the deterministic session file exists and
 // is minimally valid. Returns false (and removes the file) when the file is
@@ -647,7 +650,10 @@ const sessionResetMinIdleDuration = 5 * time.Minute
 // the caller is a non-interactive trigger (cron fire, groupdm notification,
 // notify poller) — there is no human conversation to protect and the guard
 // would otherwise prevent resets on agents whose interval is shorter than
-// sessionResetMinIdleDuration.
+// the idle window.
+//
+// idleThreshold is the per-agent active-chat protection window. Pass
+// agent.ResumeIdleDuration(); pass <=0 to fall back to sessionResetMinIdleDuration.
 //
 // agentID and logger are used to summarize the session into the agent's
 // diary (via PreCompactSummarize) just before a reset fires. This is kojo's
@@ -655,7 +661,7 @@ const sessionResetMinIdleDuration = 5 * time.Minute
 // agent forgot to update MEMORY.md itself — production experience has shown
 // that persona / system-prompt instructions to "write to MEMORY.md" are not
 // reliable, so the reset path writes a summary regardless.
-func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool, agentID string, logger *slog.Logger) bool {
+func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool, agentID string, idleThreshold time.Duration, logger *slog.Logger) bool {
 	absDir, err := filepath.Abs(agentDir)
 	if err != nil {
 		return false
@@ -686,10 +692,14 @@ func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool,
 		return true
 	}
 	if !automatedTrigger {
-		if idle := time.Since(info.ModTime()); idle < sessionResetMinIdleDuration {
+		threshold := idleThreshold
+		if threshold <= 0 {
+			threshold = sessionResetMinIdleDuration
+		}
+		if idle := time.Since(info.ModTime()); idle < threshold {
 			slog.Debug("claude session over threshold but recently active, keeping",
 				"path", path, "contextTokens", ctx,
-				"idle", idle)
+				"idle", idle, "idleThreshold", threshold)
 			return true
 		}
 	}
@@ -931,7 +941,6 @@ func findSessionFile(projectDir string, sessionID string) string {
 	}
 	return best
 }
-
 
 // clearClaudeSession removes Claude session JSONL files from the global
 // config store for the given agent, forcing the next chat to start fresh.

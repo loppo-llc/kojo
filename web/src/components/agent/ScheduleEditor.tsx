@@ -1,11 +1,17 @@
 import { useState, useEffect } from "react";
-import { INTERVAL_PRESETS, TIMEOUT_PRESETS } from "../../lib/agentApi";
+import { INTERVAL_PRESETS, TIMEOUT_PRESETS, RESUME_IDLE_PRESETS } from "../../lib/agentApi";
 
 interface Props {
   intervalMinutes: number;
   onIntervalChange: (v: number) => void;
   timeoutMinutes: number;
   onTimeoutChange: (v: number) => void;
+  // claude-only: idle window before kojo abandons --resume on an
+  // over-token-threshold session. 0 = use server default (5m). Pass `tool`
+  // so we hide the control for non-claude backends where it has no effect.
+  resumeIdleMinutes?: number;
+  onResumeIdleChange?: (v: number) => void;
+  tool?: string;
   activeStart: string;
   activeEnd: string;
   onActiveStartChange: (v: string) => void;
@@ -50,6 +56,9 @@ export function ScheduleEditor({
   onIntervalChange,
   timeoutMinutes,
   onTimeoutChange,
+  resumeIdleMinutes,
+  onResumeIdleChange,
+  tool,
   activeStart,
   activeEnd,
   onActiveStartChange,
@@ -57,6 +66,8 @@ export function ScheduleEditor({
   cronMessage,
   onCronMessageChange,
 }: Props) {
+  const showResumeIdle =
+    onResumeIdleChange !== undefined && (tool === undefined || tool === "claude");
   // Separate enabled state so toggling off doesn't hide inputs mid-edit
   const [enabled, setEnabled] = useState(activeStart !== "" && activeEnd !== "");
 
@@ -128,6 +139,37 @@ export function ScheduleEditor({
           </div>
           <p className="mt-1.5 text-[11px] text-neutral-600">
             Max duration for each scheduled run.
+          </p>
+        </div>
+      )}
+
+      {/* Resume Idle (claude only) */}
+      {showResumeIdle && (
+        <div>
+          <label className="block text-sm text-neutral-400 mb-2">
+            Resume Window
+            <span className="text-xs text-neutral-600 ml-2">(claude session reset threshold)</span>
+          </label>
+          <div className="flex gap-1.5 flex-wrap">
+            {RESUME_IDLE_PRESETS.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => onResumeIdleChange?.(opt.value)}
+                className={`px-3 py-1.5 rounded text-sm transition-colors ${
+                  (resumeIdleMinutes ?? 0) === opt.value
+                    ? "bg-amber-900/60 border border-amber-700/80 text-amber-200"
+                    : "bg-neutral-900 border border-neutral-800 text-neutral-400 hover:border-neutral-600"
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-1.5 text-[11px] text-neutral-600">
+            How long an over-context session keeps being resumed after the last
+            interactive turn. Smaller resets sooner; larger keeps context across
+            longer pauses. Default matches Anthropic's prompt-cache TTL.
           </p>
         </div>
       )}

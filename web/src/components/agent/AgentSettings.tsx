@@ -25,6 +25,7 @@ export function AgentSettings() {
   const [workDir, setWorkDir] = useState("");
   const [intervalMinutes, setIntervalMinutes] = useState(30);
   const [timeoutMinutes, setTimeoutMinutes] = useState(10);
+  const [resumeIdleMinutes, setResumeIdleMinutes] = useState(0);
   const [activeStart, setActiveStart] = useState("");
   const [activeEnd, setActiveEnd] = useState("");
   const [cronMessage, setCronMessage] = useState("");
@@ -63,6 +64,7 @@ export function AgentSettings() {
       setWorkDir(a.workDir ?? "");
       setIntervalMinutes(a.intervalMinutes);
       setTimeoutMinutes(a.timeoutMinutes || 10);
+      setResumeIdleMinutes(a.resumeIdleMinutes ?? 0);
       setActiveStart(a.activeStart ?? "");
       setActiveEnd(a.activeEnd ?? "");
       setCronMessage(a.cronMessage ?? "");
@@ -106,6 +108,7 @@ export function AgentSettings() {
         workDir: workDir.trim(),
         intervalMinutes,
         timeoutMinutes,
+        resumeIdleMinutes,
         activeStart,
         activeEnd,
         cronMessage,
@@ -576,6 +579,9 @@ export function AgentSettings() {
           onIntervalChange={setIntervalMinutes}
           timeoutMinutes={timeoutMinutes}
           onTimeoutChange={setTimeoutMinutes}
+          resumeIdleMinutes={resumeIdleMinutes}
+          onResumeIdleChange={setResumeIdleMinutes}
+          tool={tool}
           activeStart={activeStart}
           activeEnd={activeEnd}
           onActiveStartChange={setActiveStart}

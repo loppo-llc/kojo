@@ -87,6 +87,16 @@ func (st *store) Load() ([]*Agent, error) {
 			a.IntervalMinutes = 0
 			needsSave = true
 		}
+		// Validate loaded resumeIdleMinutes — clamp invalid values to 0
+		// (the default sentinel). Without this, a hand-edited or schema-
+		// drifted agents.json would surface the bad value in the UI and
+		// then bounce the user's PATCH because the whitelist would reject
+		// the round-tripped read-modify-write.
+		if !ValidResumeIdle(a.ResumeIdleMinutes) {
+			st.logger.Warn("invalid resumeIdleMinutes in stored data, resetting to default", "agent", a.ID, "value", a.ResumeIdleMinutes)
+			a.ResumeIdleMinutes = 0
+			needsSave = true
+		}
 		// Validate loaded active hours — clear invalid values
 		if err := ValidActiveHours(a.ActiveStart, a.ActiveEnd); err != nil {
 			st.logger.Warn("invalid active hours in stored data, clearing", "agent", a.ID, "start", a.ActiveStart, "end", a.ActiveEnd, "err", err)

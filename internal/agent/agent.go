@@ -19,8 +19,8 @@ type SlackBotConfig struct {
 	// Reaction patterns — which message types the bot responds to.
 	// All default to true for backwards compatibility.
 	RespondDM      *bool `json:"respondDM,omitempty"`      // respond to direct messages
-	RespondMention *bool `json:"respondMention,omitempty"`  // respond to @mentions in channels
-	RespondThread  *bool `json:"respondThread,omitempty"`   // auto-reply in threads with history
+	RespondMention *bool `json:"respondMention,omitempty"` // respond to @mentions in channels
+	RespondThread  *bool `json:"respondThread,omitempty"`  // auto-reply in threads with history
 }
 
 // ReactDM returns whether the bot should respond to direct messages.
@@ -161,25 +161,51 @@ func ValidTimeout(minutes int) bool {
 	return allowedTimeouts[minutes]
 }
 
+// allowedResumeIdles defines the valid resumeIdleMinutes values.
+// 0 means "use default" (5 minutes at runtime, matching Anthropic's prompt
+// cache TTL). Per-agent override lets high-frequency cron agents reset more
+// aggressively, and lets long-form interactive agents extend the protection
+// window before kojo abandons --resume on an over-token-threshold session.
+var allowedResumeIdles = map[int]bool{
+	0: true, 1: true, 3: true, 5: true, 10: true, 15: true, 30: true, 60: true,
+}
+
+// ValidResumeIdle returns true if the given resume-idle window is in the
+// allowed set.
+func ValidResumeIdle(minutes int) bool {
+	return allowedResumeIdles[minutes]
+}
+
+// defaultResumeIdleDuration is the fallback window when ResumeIdleMinutes
+// is 0 (unset). Mirrors the original sessionResetMinIdleDuration constant —
+// chosen to match Anthropic's prompt cache TTL so back-to-back interactive
+// turns stay cache-warm.
+const defaultResumeIdleDuration = 5 * time.Minute
+
 // Agent represents a persistent AI persona (friend).
 type Agent struct {
 	ID              string `json:"id"`
 	Name            string `json:"name"`
-	Persona         string `json:"persona"`         // persona description (markdown)
-	Model           string `json:"model"`           // e.g. "sonnet", "opus"
-	Effort          string `json:"effort,omitempty"` // claude only: "low", "medium", "high", "xhigh", "max"
-	Tool            string `json:"tool"`            // CLI tool: "claude", "codex", "gemini"
+	Persona         string `json:"persona"`           // persona description (markdown)
+	Model           string `json:"model"`             // e.g. "sonnet", "opus"
+	Effort          string `json:"effort,omitempty"`  // claude only: "low", "medium", "high", "xhigh", "max"
+	Tool            string `json:"tool"`              // CLI tool: "claude", "codex", "gemini"
 	WorkDir         string `json:"workDir,omitempty"` // file storage directory (empty = agentDir)
-	IntervalMinutes int    `json:"intervalMinutes"` // periodic execution interval in minutes (0 = disabled)
-	TimeoutMinutes  int    `json:"timeoutMinutes"`  // max duration per cron run in minutes (0 = default 10)
-	ActiveStart     string `json:"activeStart,omitempty"` // HH:MM — start of active window (empty = no restriction)
-	ActiveEnd       string `json:"activeEnd,omitempty"`   // HH:MM — end of active window (empty = no restriction)
+	IntervalMinutes int    `json:"intervalMinutes"`   // periodic execution interval in minutes (0 = disabled)
+	TimeoutMinutes  int    `json:"timeoutMinutes"`    // max duration per cron run in minutes (0 = default 10)
+	// ResumeIdleMinutes is the idle-window threshold (in minutes) below
+	// which kojo keeps an over-token-threshold claude session via --resume
+	// instead of resetting. 0 = use defaultResumeIdleDuration (5 min).
+	// claude-only; ignored by other backends.
+	ResumeIdleMinutes int    `json:"resumeIdleMinutes,omitempty"`
+	ActiveStart       string `json:"activeStart,omitempty"` // HH:MM — start of active window (empty = no restriction)
+	ActiveEnd         string `json:"activeEnd,omitempty"`   // HH:MM — end of active window (empty = no restriction)
 	// CronMessage overrides the trailing instruction in the periodic check-in
 	// prompt. Empty = use the default ("最近の出来事や気づきがあれば memory/...md に記録し、必要なタスクを実行してください。").
 	// The literal string "{date}" is replaced with today's date in YYYY-MM-DD form.
 	CronMessage string `json:"cronMessage,omitempty"`
-	CreatedAt       string `json:"createdAt"`       // RFC3339
-	UpdatedAt       string `json:"updatedAt"`       // RFC3339
+	CreatedAt   string `json:"createdAt"` // RFC3339
+	UpdatedAt   string `json:"updatedAt"` // RFC3339
 
 	// Legacy field — only used during migration from cronExpr-based configs.
 	// Not included in JSON output; consumed by store.Load migration.
@@ -224,6 +250,20 @@ type Agent struct {
 	LastMessage *MessagePreview `json:"lastMessage,omitempty"`
 }
 
+// ResumeIdleDuration returns the configured idle window for keeping an
+// over-token-threshold claude session via --resume. ResumeIdleMinutes==0
+// (the default for legacy agents) maps to defaultResumeIdleDuration so
+// existing behavior is preserved. Values outside the validated whitelist
+// (e.g. left over from a hand-edited agents.json or a future schema) also
+// fall back to the default — the API layer's whitelist must not be the
+// only line of defence.
+func (a *Agent) ResumeIdleDuration() time.Duration {
+	if a == nil || !ValidResumeIdle(a.ResumeIdleMinutes) || a.ResumeIdleMinutes <= 0 {
+		return defaultResumeIdleDuration
+	}
+	return time.Duration(a.ResumeIdleMinutes) * time.Minute
+}
+
 // MessagePreview is a short summary for agent list display.
 type MessagePreview struct {
 	Content   string `json:"content"`
@@ -240,19 +280,22 @@ type DirectoryEntry struct {
 
 // AgentConfig is the request body for creating an agent.
 type AgentConfig struct {
-	Name            string  `json:"name"`
-	Persona         string  `json:"persona"`
-	Model           string  `json:"model"`
-	Effort          string  `json:"effort"`
-	Tool            string  `json:"tool"`
-	CustomBaseURL   string  `json:"customBaseURL"`
-	ThinkingMode    string  `json:"thinkingMode"`
-	WorkDir         string  `json:"workDir"`
-	IntervalMinutes *int    `json:"intervalMinutes"` // nil = use default (30)
-	TimeoutMinutes  *int    `json:"timeoutMinutes"`  // nil = use default (0 = 10 min)
-	ActiveStart     *string `json:"activeStart"`     // HH:MM or empty
-	ActiveEnd       *string `json:"activeEnd"`       // HH:MM or empty
-	CronMessage     *string `json:"cronMessage"`     // nil/empty = use default trailing instruction
+	Name            string `json:"name"`
+	Persona         string `json:"persona"`
+	Model           string `json:"model"`
+	Effort          string `json:"effort"`
+	Tool            string `json:"tool"`
+	CustomBaseURL   string `json:"customBaseURL"`
+	ThinkingMode    string `json:"thinkingMode"`
+	WorkDir         string `json:"workDir"`
+	IntervalMinutes *int   `json:"intervalMinutes"` // nil = use default (30)
+	TimeoutMinutes  *int   `json:"timeoutMinutes"`  // nil = use default (0 = 10 min)
+	// ResumeIdleMinutes overrides the per-agent claude --resume idle window.
+	// nil/0 = use defaultResumeIdleDuration (5 min).
+	ResumeIdleMinutes *int    `json:"resumeIdleMinutes"`
+	ActiveStart       *string `json:"activeStart"` // HH:MM or empty
+	ActiveEnd         *string `json:"activeEnd"`   // HH:MM or empty
+	CronMessage       *string `json:"cronMessage"` // nil/empty = use default trailing instruction
 }
 
 // AgentUpdateConfig is the request body for PATCH updates.
@@ -267,17 +310,18 @@ type AgentUpdateConfig struct {
 	Tool                  *string `json:"tool"`
 	WorkDir               *string `json:"workDir"`
 	IntervalMinutes       *int    `json:"intervalMinutes"`
-	TimeoutMinutes        *int      `json:"timeoutMinutes"`
-	ActiveStart           *string   `json:"activeStart"`
-	ActiveEnd             *string   `json:"activeEnd"`
+	TimeoutMinutes        *int    `json:"timeoutMinutes"`
+	ResumeIdleMinutes     *int    `json:"resumeIdleMinutes"`
+	ActiveStart           *string `json:"activeStart"`
+	ActiveEnd             *string `json:"activeEnd"`
 	// CronMessage follows the standard *string PATCH convention used by every
 	// other field on this struct: nil/omitted = leave unchanged, "" = clear
 	// back to the built-in default trailing instruction.
-	CronMessage           *string   `json:"cronMessage"`
-	CustomBaseURL         *string   `json:"customBaseURL"`
-	ThinkingMode          *string   `json:"thinkingMode"`
-	AllowedTools          []string  `json:"allowedTools"`
-	AllowProtectedPaths   *[]string `json:"allowProtectedPaths"`
+	CronMessage         *string   `json:"cronMessage"`
+	CustomBaseURL       *string   `json:"customBaseURL"`
+	ThinkingMode        *string   `json:"thinkingMode"`
+	AllowedTools        []string  `json:"allowedTools"`
+	AllowProtectedPaths *[]string `json:"allowProtectedPaths"`
 }
 
 func generateID() string {
@@ -299,6 +343,13 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	}
 	if !ValidTimeout(timeoutMin) {
 		return nil, fmt.Errorf("unsupported timeout: %d minutes", timeoutMin)
+	}
+	resumeIdleMin := 0 // default (= 5 min at runtime)
+	if cfg.ResumeIdleMinutes != nil {
+		resumeIdleMin = *cfg.ResumeIdleMinutes
+	}
+	if !ValidResumeIdle(resumeIdleMin) {
+		return nil, fmt.Errorf("unsupported resumeIdle: %d minutes", resumeIdleMin)
 	}
 	var activeStart, activeEnd string
 	if cfg.ActiveStart != nil {
@@ -336,22 +387,23 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		}
 	}
 	a := &Agent{
-		ID:              generateID(),
-		Name:            cfg.Name,
-		Persona:         cfg.Persona,
-		Model:           cfg.Model,
-		Effort:          cfg.Effort,
-		Tool:            cfg.Tool,
-		CustomBaseURL:   cfg.CustomBaseURL,
-		ThinkingMode:    NormalizeThinkingMode(cfg.ThinkingMode),
-		WorkDir:         cfg.WorkDir,
-		IntervalMinutes: interval,
-		TimeoutMinutes:  timeoutMin,
-		ActiveStart:     activeStart,
-		ActiveEnd:       activeEnd,
-		CronMessage:     cronMessage,
-		CreatedAt:       now,
-		UpdatedAt:       now,
+		ID:                generateID(),
+		Name:              cfg.Name,
+		Persona:           cfg.Persona,
+		Model:             cfg.Model,
+		Effort:            cfg.Effort,
+		Tool:              cfg.Tool,
+		CustomBaseURL:     cfg.CustomBaseURL,
+		ThinkingMode:      NormalizeThinkingMode(cfg.ThinkingMode),
+		WorkDir:           cfg.WorkDir,
+		IntervalMinutes:   interval,
+		TimeoutMinutes:    timeoutMin,
+		ResumeIdleMinutes: resumeIdleMin,
+		ActiveStart:       activeStart,
+		ActiveEnd:         activeEnd,
+		CronMessage:       cronMessage,
+		CreatedAt:         now,
+		UpdatedAt:         now,
 	}
 	if a.Tool == "" {
 		a.Tool = "claude"

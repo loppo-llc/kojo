@@ -537,7 +537,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 	t.Run("usable below threshold", func(t *testing.T) {
 		entry := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":50000,"cache_creation_input_tokens":1000}}}`
 		os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644)
-		if !sessionFileUsable(aDir, sessionID, false, "", nil) {
+		if !sessionFileUsable(aDir, sessionID, false, "", sessionResetMinIdleDuration, nil) {
 			t.Error("expected usable for small context")
 		}
 		if _, err := os.Stat(sessionFile); err != nil {
@@ -554,7 +554,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		if err := os.Chtimes(sessionFile, old, old); err != nil {
 			t.Fatalf("chtimes: %v", err)
 		}
-		if sessionFileUsable(aDir, sessionID, false, "", nil) {
+		if sessionFileUsable(aDir, sessionID, false, "", sessionResetMinIdleDuration, nil) {
 			t.Error("expected not usable for oversized context")
 		}
 		if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
@@ -578,7 +578,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = os.Chmod(projectDir, 0o755) })
 
-		if !sessionFileUsable(aDir, sessionID, false, "", nil) {
+		if !sessionFileUsable(aDir, sessionID, false, "", sessionResetMinIdleDuration, nil) {
 			t.Error("expected fallback to true when remove fails")
 		}
 		if _, err := os.Stat(sessionFile); err != nil {
@@ -595,7 +595,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		entry := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":160000,"cache_creation_input_tokens":1000}}}`
 		os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644)
 		// Default write sets mtime to now — already "active".
-		if !sessionFileUsable(aDir, sessionID, false, "", nil) {
+		if !sessionFileUsable(aDir, sessionID, false, "", sessionResetMinIdleDuration, nil) {
 			t.Error("expected active session to survive threshold")
 		}
 		if _, err := os.Stat(sessionFile); err != nil {
@@ -611,7 +611,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		if err := os.Chtimes(sessionFile, old, old); err != nil {
 			t.Fatalf("chtimes: %v", err)
 		}
-		if sessionFileUsable(aDir, sessionID, false, "", nil) {
+		if sessionFileUsable(aDir, sessionID, false, "", sessionResetMinIdleDuration, nil) {
 			t.Error("expected idle over-threshold session to reset")
 		}
 		if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
@@ -627,7 +627,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		entry := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":160000,"cache_creation_input_tokens":1000}}}`
 		os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644)
 		// mtime = now; idle guard would block this for interactive callers.
-		if sessionFileUsable(aDir, sessionID, true, "", nil) {
+		if sessionFileUsable(aDir, sessionID, true, "", sessionResetMinIdleDuration, nil) {
 			t.Error("expected automated trigger to reset over-threshold session regardless of idle")
 		}
 		if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
@@ -654,7 +654,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		}
 		t.Cleanup(func() { preResetSummarize = orig })
 
-		if sessionFileUsable(aDir, sessionID, false, "ag_summary_probe", nil) {
+		if sessionFileUsable(aDir, sessionID, false, "ag_summary_probe", sessionResetMinIdleDuration, nil) {
 			t.Error("expected reset to proceed")
 		}
 		if calledAgent != "ag_summary_probe" {
@@ -684,7 +684,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		}
 		t.Cleanup(func() { preResetSummarize = orig })
 
-		if !sessionFileUsable(aDir, sessionID, false, "ag_summary_fail", nil) {
+		if !sessionFileUsable(aDir, sessionID, false, "ag_summary_fail", sessionResetMinIdleDuration, nil) {
 			t.Error("expected reset to be aborted when summary fails")
 		}
 		if _, err := os.Stat(sessionFile); err != nil {
@@ -704,11 +704,81 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = os.Chmod(projectDir, 0o755) })
 
-		if !sessionFileUsable(aDir, sessionID, false, "", nil) {
+		if !sessionFileUsable(aDir, sessionID, false, "", sessionResetMinIdleDuration, nil) {
 			t.Error("expected fallback to true on empty-file remove failure")
 		}
 		if _, err := os.Stat(sessionFile); err != nil {
 			t.Error("expected empty file to remain when remove fails")
 		}
 	})
+
+	t.Run("per-agent idleThreshold shrinks the active-chat guard", func(t *testing.T) {
+		// A 1-minute override should let a session that was modified 90s ago
+		// (still well inside the package default of 5m) be reset, proving
+		// the threshold parameter is honored end-to-end.
+		entry := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":160000,"cache_creation_input_tokens":1000}}}`
+		os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644)
+		recent := time.Now().Add(-90 * time.Second)
+		if err := os.Chtimes(sessionFile, recent, recent); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+		// Stub the summary hook so the reset path can complete without
+		// spawning a real claude subprocess.
+		orig := preResetSummarize
+		preResetSummarize = func(_, _ string, _ *slog.Logger) error { return nil }
+		t.Cleanup(func() { preResetSummarize = orig })
+
+		if sessionFileUsable(aDir, sessionID, false, "ag_per_agent_idle", 1*time.Minute, nil) {
+			t.Error("expected reset under shorter per-agent idle window")
+		}
+		if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+			t.Error("expected session file removed under shorter idle window")
+		}
+	})
+
+	t.Run("non-positive idleThreshold falls back to package default", func(t *testing.T) {
+		// Defensive: ResumeIdleDuration() will not return <=0 in practice,
+		// but a 0/negative value passed by a caller must not turn the guard
+		// off entirely — that would be indistinguishable from automated
+		// trigger and would let interactive sessions get reset mid-turn.
+		entry := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":160000,"cache_creation_input_tokens":1000}}}`
+		os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644)
+		// mtime = now → inside the 5-minute default window.
+		if !sessionFileUsable(aDir, sessionID, false, "", 0, nil) {
+			t.Error("expected zero idleThreshold to fall back to default and keep active session")
+		}
+		if _, err := os.Stat(sessionFile); err != nil {
+			t.Error("expected session file to remain under default fallback")
+		}
+	})
+}
+
+// TestAgent_ResumeIdleDuration_Default covers the fallback contract callers
+// rely on: ResumeIdleMinutes==0 (the default for legacy / unset agents) MUST
+// resolve to defaultResumeIdleDuration so existing behavior is preserved.
+func TestAgent_ResumeIdleDuration_Default(t *testing.T) {
+	cases := []struct {
+		name string
+		a    *Agent
+		want time.Duration
+	}{
+		{"nil agent", nil, defaultResumeIdleDuration},
+		{"unset", &Agent{}, defaultResumeIdleDuration},
+		{"explicit 5", &Agent{ResumeIdleMinutes: 5}, 5 * time.Minute},
+		{"explicit 1", &Agent{ResumeIdleMinutes: 1}, 1 * time.Minute},
+		{"explicit 60", &Agent{ResumeIdleMinutes: 60}, 60 * time.Minute},
+		{"negative falls back", &Agent{ResumeIdleMinutes: -3}, defaultResumeIdleDuration},
+		// Off-whitelist positive values must not be honored — covers the
+		// store-layer-bypass case where a hand-edited agents.json carries
+		// e.g. 2 (legal int, not in allowedResumeIdles).
+		{"invalid positive falls back", &Agent{ResumeIdleMinutes: 2}, defaultResumeIdleDuration},
+		{"invalid large falls back", &Agent{ResumeIdleMinutes: 999}, defaultResumeIdleDuration},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.a.ResumeIdleDuration(); got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
 }

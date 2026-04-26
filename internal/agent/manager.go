@@ -91,14 +91,14 @@ func NewManager(logger *slog.Logger) *Manager {
 			"custom":    NewCustomBackend(logger),
 			"llama.cpp": NewLlamaCppBackend(logger),
 		},
-		store:        newStore(logger),
-		creds:        creds,
-		logger:       logger,
-		busy:         make(map[string]busyEntry),
-		resetting:    make(map[string]bool),
-		editing:      make(map[string]bool),
-		profileGen:   make(map[string]bool),
-		memIndexes:   make(map[string]*MemoryIndex),
+		store:          newStore(logger),
+		creds:          creds,
+		logger:         logger,
+		busy:           make(map[string]busyEntry),
+		resetting:      make(map[string]bool),
+		editing:        make(map[string]bool),
+		profileGen:     make(map[string]bool),
+		memIndexes:     make(map[string]*MemoryIndex),
 		chatWatchers:   make(map[string]map[*chatWatcher]struct{}),
 		oneShotCancels: make(map[string]map[int64]context.CancelFunc),
 	}
@@ -291,7 +291,10 @@ func (m *Manager) List() []*Agent {
 	}
 
 	// Pre-fetch avatar info outside lock (disk I/O)
-	type avInfo struct{ has bool; hash string }
+	type avInfo struct {
+		has  bool
+		hash string
+	}
 	avMap := make(map[string]avInfo, len(ids))
 	for _, id := range ids {
 		has, hash := avatarMeta(id)
@@ -390,6 +393,13 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		nextCronMessage = v
 		cronMessageDirty = true
 	}
+	// Reject invalid resume-idle presets up front so a malformed PATCH cannot
+	// land partial mutations (Persona / Name / Model are applied before the
+	// later validation block, so deferring this check would let a bad value
+	// still corrupt sibling fields on the in-memory Agent).
+	if cfg.ResumeIdleMinutes != nil && !ValidResumeIdle(*cfg.ResumeIdleMinutes) {
+		return nil, fmt.Errorf("unsupported resumeIdle: %d minutes", *cfg.ResumeIdleMinutes)
+	}
 
 	// Check agent exists before any file I/O
 	m.mu.Lock()
@@ -470,6 +480,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %d minutes", ErrUnsupportedTimeout, *cfg.TimeoutMinutes)
 	}
+	// ResumeIdleMinutes is validated up-front (before any I/O / mutation).
 	{
 		s, e := a.ActiveStart, a.ActiveEnd
 		if cfg.ActiveStart != nil {
@@ -489,6 +500,9 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 	if cfg.TimeoutMinutes != nil {
 		a.TimeoutMinutes = *cfg.TimeoutMinutes
+	}
+	if cfg.ResumeIdleMinutes != nil {
+		a.ResumeIdleMinutes = *cfg.ResumeIdleMinutes
 	}
 	if cfg.ActiveStart != nil {
 		a.ActiveStart = *cfg.ActiveStart
@@ -1453,9 +1467,9 @@ func isRateLimitMessage(msg *Message) bool {
 	lower := strings.ToLower(msg.Content)
 	// Specific phrases from known CLIs; intentionally narrow to reduce FP.
 	patterns := []string{
-		"hit your limit",      // Claude CLI
-		"rate limit exceeded",  // generic API error
-		"resource exhausted",  // Google/Gemini
+		"hit your limit",              // Claude CLI
+		"rate limit exceeded",         // generic API error
+		"resource exhausted",          // Google/Gemini
 		"exceeded your current quota", // OpenAI
 		"usage limit exceeded",
 	}

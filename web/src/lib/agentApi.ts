@@ -23,6 +23,22 @@ export const TIMEOUT_PRESETS = [
   { label: "1h", value: 60 },
 ] as const;
 
+// RESUME_IDLE_PRESETS: per-agent override for the claude-only idle window
+// that protects an over-token-threshold session from being reset out from
+// under an active interactive chat. 0 = default (5m, matching Anthropic's
+// prompt cache TTL). Smaller = reset more aggressively (fits high-frequency
+// agents); larger = keep context across longer pauses.
+export const RESUME_IDLE_PRESETS = [
+  { label: "default (5m)", value: 0 },
+  { label: "1m", value: 1 },
+  { label: "3m", value: 3 },
+  { label: "5m", value: 5 },
+  { label: "10m", value: 10 },
+  { label: "15m", value: 15 },
+  { label: "30m", value: 30 },
+  { label: "1h", value: 60 },
+] as const;
+
 export interface AgentInfo {
   id: string;
   name: string;
@@ -34,6 +50,7 @@ export interface AgentInfo {
   workDir: string;
   intervalMinutes: number;
   timeoutMinutes: number;
+  resumeIdleMinutes?: number;
   activeStart?: string;
   activeEnd?: string;
   cronMessage?: string;
@@ -65,6 +82,7 @@ export interface AgentConfig {
   workDir?: string;
   intervalMinutes?: number;
   timeoutMinutes?: number;
+  resumeIdleMinutes?: number;
   activeStart?: string;
   activeEnd?: string;
   cronMessage?: string;
