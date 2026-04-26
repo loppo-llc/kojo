@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -124,12 +123,11 @@ func newMCPHandler(agents *agent.Manager, logger *slog.Logger) http.Handler {
 
 	// --- slack_upload_file ---
 	uploadFileTool := mcp.NewTool("slack_upload_file",
-		mcp.WithDescription("Upload a file to a Slack channel. Provide the file via file_path (preferred for binary/large files), content (for text snippets), or base64_content. Only one source allowed."),
+		mcp.WithDescription("Upload a file to a Slack channel. Provide file_path (preferred for binary/large files) or content (for text snippets). Only one source allowed."),
 		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel ID or #channel-name to upload to")),
 		mcp.WithString("filename", mcp.Required(), mcp.Description("Name of the file (e.g. 'report.csv', 'image.png')")),
 		mcp.WithString("file_path", mcp.Description("Absolute path to a local file to upload. Preferred for binary and large files — avoids base64 overhead.")),
-		mcp.WithString("content", mcp.Description("Plain text content for the file (for text/code snippets). Use this OR file_path or base64_content.")),
-		mcp.WithString("base64_content", mcp.Description("Base64-encoded binary content (for images, PDFs, etc). Use this OR file_path or content.")),
+		mcp.WithString("content", mcp.Description("Plain text content for the file (for text/code snippets). Use this OR file_path.")),
 		mcp.WithString("title", mcp.Description("Title of the file (defaults to filename)")),
 		mcp.WithString("initial_comment", mcp.Description("Message to post alongside the file")),
 		mcp.WithString("thread_ts", mcp.Description("Thread timestamp to upload the file as a reply")),
@@ -1027,7 +1025,6 @@ func slackUploadFileHandler(agents *agent.Manager, logger *slog.Logger) mcpserve
 		filename, _ := args["filename"].(string)
 		filePath, _ := args["file_path"].(string)
 		content, _ := args["content"].(string)
-		b64Content, _ := args["base64_content"].(string)
 		title, _ := args["title"].(string)
 		initialComment, _ := args["initial_comment"].(string)
 		threadTS, _ := args["thread_ts"].(string)
@@ -1035,7 +1032,7 @@ func slackUploadFileHandler(agents *agent.Manager, logger *slog.Logger) mcpserve
 		logger.Info("mcp tool invoked",
 			"reqID", reqID, "agent", agentID, "tool", "slack_upload_file",
 			"channel", channel, "filename", filename, "filePath", filePath,
-			"contentLen", len(content), "b64Len", len(b64Content),
+			"contentLen", len(content),
 		)
 
 		api, errMsg := getSlackClient(ctx, agents)
@@ -1048,21 +1045,11 @@ func slackUploadFileHandler(agents *agent.Manager, logger *slog.Logger) mcpserve
 		}
 
 		// Exactly one source must be provided.
-		sources := 0
-		if filePath != "" {
-			sources++
+		if filePath == "" && content == "" {
+			return mcp.NewToolResultError("one of 'file_path' or 'content' is required"), nil
 		}
-		if content != "" {
-			sources++
-		}
-		if b64Content != "" {
-			sources++
-		}
-		if sources == 0 {
-			return mcp.NewToolResultError("one of 'file_path', 'content', or 'base64_content' is required"), nil
-		}
-		if sources > 1 {
-			return mcp.NewToolResultError("provide only one of 'file_path', 'content', or 'base64_content'"), nil
+		if filePath != "" && content != "" {
+			return mcp.NewToolResultError("provide only one of 'file_path' or 'content'"), nil
 		}
 
 		resolvedChannel, err := resolveSlackChannel(ctx, api, channel)
@@ -1082,22 +1069,14 @@ func slackUploadFileHandler(agents *agent.Manager, logger *slog.Logger) mcpserve
 			ThreadTimestamp: threadTS,
 		}
 
-		switch {
-		case filePath != "":
+		if filePath != "" {
 			info, err := os.Stat(filePath)
 			if err != nil {
 				return mcp.NewToolResultError(fmt.Sprintf("cannot access file %q: %v", filePath, err)), nil
 			}
 			params.File = filePath
 			params.FileSize = int(info.Size())
-		case b64Content != "":
-			decoded, err := base64.StdEncoding.DecodeString(b64Content)
-			if err != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("invalid base64_content: %v", err)), nil
-			}
-			params.Content = string(decoded)
-			params.FileSize = len(decoded)
-		default:
+		} else {
 			params.Content = content
 			params.FileSize = len(content)
 		}
