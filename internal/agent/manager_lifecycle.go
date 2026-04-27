@@ -67,6 +67,14 @@ func (m *Manager) ResetData(id string) error {
 		m.logger.Warn("reset: failed to remove autosummary marker", "agent", id, "err", err)
 	}
 
+	// Remove rolling short-term memory (memory/recent.md). The append-only
+	// daily diaries under memory/YYYY-MM-DD.md are kept as an audit trail
+	// — recent.md is just a derived rolling pointer, safe to drop on
+	// reset so the next session starts without stale short-term memory.
+	if err := os.Remove(filepath.Join(dir, "memory", recentSummaryFile)); err != nil && !os.IsNotExist(err) {
+		m.logger.Warn("reset: failed to remove recent summary", "agent", id, "err", err)
+	}
+
 	// Remove cron lock file
 	if err := os.Remove(filepath.Join(dir, cronLockFile)); err != nil && !os.IsNotExist(err) {
 		m.logger.Warn("reset: failed to remove cron lock", "agent", id, "err", err)
@@ -297,6 +305,10 @@ func (m *Manager) Delete(id string) error {
 
 	// Close cached memory index before removing directory
 	m.closeIndex(id)
+
+	// Drop the per-agent PreCompact lock so the global map doesn't
+	// accumulate dead entries over the process lifetime.
+	dropAgentPreCompactLock(id)
 
 	// Remove agent data directory (best-effort: credentials/cron/notify already cleaned up)
 	dir := agentDir(id)

@@ -126,6 +126,17 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 	if err := copyDirIfExists(filepath.Join(srcDir, "memory"), filepath.Join(dstDir, "memory")); err != nil {
 		return nil, fmt.Errorf("copy memory/: %w", err)
 	}
+	// memory/recent.md mirrors the last conversation's pre-compaction
+	// summary and is part of the transcript-derived short-term state,
+	// not the agent's long-term memory. When the caller opts out of
+	// transcript copy, drop this file so the fork starts with a clean
+	// short-term context. The append-only daily diary files are kept —
+	// they're the audit trail and not directly injected into prompts.
+	if !opts.IncludeTranscript {
+		if err := os.Remove(filepath.Join(dstDir, "memory", recentSummaryFile)); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("drop recent.md on fork: %w", err)
+		}
+	}
 
 	// MEMORY.md may be absent on very old agents — ensure it exists so the
 	// forked agent has somewhere to write.

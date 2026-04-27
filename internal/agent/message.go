@@ -33,9 +33,20 @@ type ToolUse struct {
 }
 
 // Usage tracks token consumption for a message.
+//
+// CacheReadInputTokens / CacheCreationInputTokens are surfaced from
+// Claude's stream so we can diagnose prompt-cache hit/miss patterns. A
+// high CacheCreation:CacheRead ratio across consecutive turns indicates
+// the system prompt or message prefix is changing between turns and
+// breaking the cache — which directly inflates input cost and adds
+// per-turn latency. (Note: cache state itself does not change the
+// model's logical context length; what does grow is the volume of input
+// tokens billed.)
 type Usage struct {
-	InputTokens  int `json:"inputTokens"`
-	OutputTokens int `json:"outputTokens"`
+	InputTokens              int `json:"inputTokens"`
+	OutputTokens             int `json:"outputTokens"`
+	CacheReadInputTokens     int `json:"cacheReadInputTokens,omitempty"`
+	CacheCreationInputTokens int `json:"cacheCreationInputTokens,omitempty"`
 }
 
 // ChatEvent is streamed from backend to WebSocket during a chat.

@@ -901,6 +901,22 @@ func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 
 // --- Pre-Compact Handler ---
 
+// preCompactHookPayload mirrors the subset of Claude Code's PreCompact hook
+// JSON we care about. Claude pipes the full event object to the hook
+// command's stdin; with `--data-binary @-` it lands here verbatim.
+// Documented at:
+//
+//	https://docs.anthropic.com/en/docs/claude-code/hooks#precompact
+//
+// We only extract `transcript_path` so PreCompactSummarize can read the
+// exact session being compacted, instead of probing by mtime in the
+// project directory (which races with parallel sessions).
+type preCompactHookPayload struct {
+	TranscriptPath string `json:"transcript_path"`
+	Trigger        string `json:"trigger"`
+	SessionID      string `json:"session_id"`
+}
+
 func (s *Server) handlePreCompact(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	a, ok := s.agents.Get(id)
@@ -914,8 +930,18 @@ func (s *Server) handlePreCompact(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "conflict", "agent is archived")
 		return
 	}
+	// Best-effort decode. An empty / malformed body is fine: the
+	// summarizer falls back to project-dir discovery when transcript_path
+	// is empty, and we still want to honour the hook in either case.
+	// Cap the body so a misbehaving hook can't OOM the server with a
+	// gigabyte JSON object — Claude's PreCompact payload is a few hundred
+	// bytes in practice, 64 KiB is plenty of headroom.
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	var payload preCompactHookPayload
+	_ = json.NewDecoder(r.Body).Decode(&payload)
+
 	// Run synchronously — the PreCompact hook blocks until this returns
-	if err := agent.PreCompactSummarize(id, a.Tool, s.logger); err != nil {
+	if err := agent.PreCompactSummarize(id, a.Tool, payload.TranscriptPath, s.logger); err != nil {
 		s.logger.Warn("pre-compact summarize failed", "agent", id, "err", err)
 		// Return 200 anyway — don't block compaction on summary failure
 	}

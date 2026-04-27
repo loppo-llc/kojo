@@ -702,11 +702,18 @@ func (m *Manager) HasCredentials() bool {
 }
 
 // chatPrep holds the common setup result shared by Chat and ChatOneShot.
+//
+// volatileContext is the per-turn block prepended to the user message
+// (current time, active todos, recent diary, query-based memory hits).
+// It is intentionally NOT folded into sysPrompt: Claude's prompt cache
+// keys on the system prompt prefix, and any per-turn change there
+// invalidates the entire cache and inflates input cost.
 type chatPrep struct {
-	agentCopy  Agent
-	backend    ChatBackend
-	sysPrompt  string
-	mcpServers map[string]mcpServerEntry
+	agentCopy       Agent
+	backend         ChatBackend
+	sysPrompt       string
+	volatileContext string
+	mcpServers      map[string]mcpServerEntry
 }
 
 // prepareChat performs the common setup for Chat and ChatOneShot:
@@ -773,22 +780,31 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool, skip
 
 	sysPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
 
-	// Inject relevant memory context. IndexNewMessages is called for
-	// interactive chat (so the index is current) but skipped for one-shot
-	// chats which don't persist to the main transcript.
+	// Refresh the memory index, but emit query-based recall through the
+	// volatile context (per-turn user message), NOT the system prompt —
+	// otherwise every distinct user query would invalidate the prompt
+	// cache. IndexNewMessages is called for interactive chat (so the index
+	// is current) but skipped for one-shot chats which don't persist to
+	// the main transcript.
+	var queryContext string
 	if idx := m.getOrOpenIndex(agentID); idx != nil {
 		idx.IndexFilesIfStale(agentID)
 		if indexNewMessages {
 			idx.IndexNewMessages(agentID)
 		}
 		if !skipMemoryContext {
-			if memCtx := idx.BuildContextFromQuery(query); memCtx != "" {
-				sysPrompt += "\n\n" + memCtx
-			}
+			queryContext = idx.BuildContextFromQuery(query)
 		}
 	}
+	volatileContext := BuildVolatileContext(agentID, queryContext)
 
-	return &chatPrep{agentCopy: agentCopy, backend: backend, sysPrompt: sysPrompt, mcpServers: mcpServers}, nil
+	return &chatPrep{
+		agentCopy:       agentCopy,
+		backend:         backend,
+		sysPrompt:       sysPrompt,
+		volatileContext: volatileContext,
+		mcpServers:      mcpServers,
+	}, nil
 }
 
 // Chat sends a message to an agent and returns a channel of streaming events.
@@ -849,6 +865,12 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	effectiveMessage := userMessage
 	if len(attachments) > 0 {
 		effectiveMessage = formatMessageWithAttachments(userMessage, attachments)
+	}
+	// Prepend the per-turn volatile context (current time, active todos,
+	// recent-diary summary, query-based memory hits). Goes here — not in
+	// sysPrompt — to keep the prompt cache prefix stable.
+	if prep.volatileContext != "" {
+		effectiveMessage = prep.volatileContext + effectiveMessage
 	}
 
 	// Start chat. role=="system" marks automated triggers (cron, groupdm,
@@ -916,7 +938,14 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 
 	// NOTE: No appendMessage — one-shot chats are not saved to transcript.
 
-	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, userMessage, prep.sysPrompt, ChatOptions{OneShot: true, MCPServers: prep.mcpServers})
+	// Prepend volatile context for the same reason as the persistent
+	// chat path: keep dynamic data out of the system prompt to preserve
+	// the prompt cache.
+	effectiveMessage := userMessage
+	if prep.volatileContext != "" {
+		effectiveMessage = prep.volatileContext + userMessage
+	}
+	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{OneShot: true, MCPServers: prep.mcpServers})
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
@@ -1326,6 +1355,9 @@ func (m *Manager) Regenerate(agentID, msgID string) error {
 	effectiveMessage := target.Content
 	if len(target.Attachments) > 0 {
 		effectiveMessage = formatMessageWithAttachments(target.Content, target.Attachments)
+	}
+	if prep.volatileContext != "" {
+		effectiveMessage = prep.volatileContext + effectiveMessage
 	}
 
 	// Truncate synchronously so that any client reloading during the

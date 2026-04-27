@@ -170,6 +170,21 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		msg.ToolUses = result.toolUses
 		msg.Usage = result.usage
 
+		// Cache-hit telemetry. Logged on every turn so we can see whether
+		// the system-prompt / volatile-context split is actually keeping
+		// the prompt cache warm. A high cacheCreation:cacheRead ratio
+		// across consecutive turns means the cache prefix is being
+		// invalidated and we're paying full input cost each turn.
+		if u := result.usage; u != nil {
+			b.logger.Info("claude usage",
+				"agent", agent.ID,
+				"input", u.InputTokens,
+				"output", u.OutputTokens,
+				"cacheRead", u.CacheReadInputTokens,
+				"cacheCreation", u.CacheCreationInputTokens,
+			)
+		}
+
 		send(ChatEvent{Type: "done", Message: msg, Usage: result.usage, ErrorMessage: processError})
 	}()
 
@@ -327,10 +342,20 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 			}
 
 			if event.Message.StopReason != "" {
-				if event.Message.Usage.OutputTokens > 0 {
+				// Record usage whenever the assistant turn produced any
+				// metric, not just output_tokens. Cache fields are the
+				// signal we care about for diagnosing prompt-cache
+				// behaviour, and they can be non-zero even on stop
+				// reasons that yield no output text (e.g. tool-only
+				// turns or refusals truncated by max_tokens).
+				u := event.Message.Usage
+				if u.InputTokens > 0 || u.OutputTokens > 0 ||
+					u.CacheReadInputTokens > 0 || u.CacheCreationInputTokens > 0 {
 					res.usage = &Usage{
-						InputTokens:  event.Message.Usage.InputTokens,
-						OutputTokens: event.Message.Usage.OutputTokens,
+						InputTokens:              u.InputTokens,
+						OutputTokens:             u.OutputTokens,
+						CacheReadInputTokens:     u.CacheReadInputTokens,
+						CacheCreationInputTokens: u.CacheCreationInputTokens,
 					}
 				}
 			}
@@ -439,8 +464,10 @@ type claudeStreamEvent struct {
 		StopReason string               `json:"stop_reason,omitempty"`
 		Content    []claudeContentBlock `json:"content,omitempty"`
 		Usage      struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 		} `json:"usage,omitempty"`
 	} `json:"message,omitempty"`
 
@@ -614,7 +641,11 @@ const sessionTailReadBytes = 1 * 1024 * 1024
 // package variable so tests can substitute a deterministic fake instead of
 // spawning a real claude CLI process.
 var preResetSummarize = func(agentID, tool string, logger *slog.Logger) error {
-	return PreCompactSummarize(agentID, tool, logger)
+	// Reset path doesn't have the PreCompact-hook stdin payload (claude
+	// isn't telling us about a compaction here — kojo is initiating a
+	// session wipe), so transcriptPath is left empty and the function
+	// falls back to discovery.
+	return PreCompactSummarize(agentID, tool, "", logger)
 }
 
 // sessionResetMinIdleDuration is the package-default idle window used when
@@ -1038,6 +1069,14 @@ func PrepareClaudeSettings(agentID, apiBase string, allowProtectedPaths []string
 		if strings.HasPrefix(apiBase, "https://") {
 			curlFlags = "-sk"
 		}
+		// Hook payload: claude pipes a JSON object to stdin describing the
+		// triggering event. The fields kojo cares about are
+		// `transcript_path` (so we read the exact session being compacted
+		// instead of guessing) and `trigger` (manual vs auto, useful for
+		// telemetry but not yet used for branching). We pass that through
+		// verbatim with `--data-binary @-`. Older builds sent `-d '{}'`
+		// which dropped the payload, forcing the API to probe for the
+		// session file by mtime.
 		settings = fmt.Sprintf(`{
   "persona": "agent-managed",
   "permissions": {
@@ -1051,7 +1090,7 @@ func PrepareClaudeSettings(agentID, apiBase string, allowProtectedPaths []string
         "hooks": [
           {
             "type": "command",
-            "command": "curl %s -X POST '%s/api/v1/agents/%s/pre-compact' -H 'Content-Type: application/json' -d '{}' --max-time 120"
+            "command": "curl %s -X POST '%s/api/v1/agents/%s/pre-compact' -H 'Content-Type: application/json' --data-binary @- --max-time 120"
           }
         ]
       }
