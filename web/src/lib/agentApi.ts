@@ -54,6 +54,10 @@ export interface AgentInfo {
   activeStart?: string;
   activeEnd?: string;
   cronMessage?: string;
+  // RFC3339 timestamp of the next scheduled cron run, accounting for active
+  // hours. Empty/absent if cron is disabled, the agent is archived, or no
+  // schedule is registered. Server-derived; never sent on update.
+  nextCronAt?: string;
   createdAt: string;
   updatedAt: string;
   publicProfile: string;
@@ -270,6 +274,8 @@ export const agentApi = {
   resetData: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/reset`),
 
   resetSession: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/reset-session`),
+
+  checkin: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/checkin`),
 
   fork: (id: string, params: { name: string; includeTranscript: boolean }) =>
     post<AgentInfo>(`/api/v1/agents/${id}/fork`, params),

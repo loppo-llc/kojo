@@ -34,8 +34,13 @@ export function AgentSettings() {
   const [archiving, setArchiving] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [resettingSession, setResettingSession] = useState(false);
+  const [checkingIn, setCheckingIn] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState(false);
+  // Distinct from `success` because a manual check-in is fire-and-forget
+  // (server returns 202 immediately); reusing the green "Saved" banner
+  // would imply persistence rather than a job started in the background.
+  const [checkinNotice, setCheckinNotice] = useState("");
   const [avatarToken, setAvatarToken] = useState(() => Date.now());
   const [generatingAvatar, setGeneratingAvatar] = useState(false);
   const [personaPrompt, setPersonaPrompt] = useState("");
@@ -125,6 +130,65 @@ export function AgentSettings() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleCheckin = async () => {
+    // The server runs the check-in against the persisted agent record, not
+    // the in-flight edits in this form. Bail with a notice instead of
+    // silently using stale cronMessage/timeoutMinutes — fixing this with
+    // an auto-save would mean committing other unrelated dirty fields too.
+    // Match the same normalisations the load path applies so an agent that
+    // hasn't been touched doesn't read as dirty:
+    //   - timeoutMinutes: 0 (server default) is shown as 10 in the UI, so
+    //     compare against the same "|| 10" coercion done at load.
+    //   - cronMessage: the server trims on save, so a saved value of "x"
+    //     stays equal to "x" no matter how many spaces the textarea adds.
+    const savedTimeout = agent ? (agent.timeoutMinutes || 10) : timeoutMinutes;
+    const savedMessage = (agent?.cronMessage ?? "").trim();
+    if (
+      agent &&
+      (cronMessage.trim() !== savedMessage || savedTimeout !== timeoutMinutes)
+    ) {
+      setCheckinNotice(
+        "Save your changes first — manual check-in uses the saved Check-in Message and Timeout.",
+      );
+      setTimeout(() => setCheckinNotice(""), 5000);
+      return;
+    }
+    setCheckingIn(true);
+    setError("");
+    setCheckinNotice("");
+    try {
+      await agentApi.checkin(id!);
+      try {
+        const a = await agentApi.get(id!);
+        setAgent(a);
+      } catch {
+        // non-fatal — stick with the stale value
+      }
+      setCheckinNotice(
+        "Check-in started — the agent will reply in chat when it finishes.",
+      );
+      setTimeout(() => setCheckinNotice(""), 4000);
+    } catch (err) {
+      // Match against the server's typed error code rather than the HTTP
+      // status: 409 also covers `code:"archived"` (and any future
+      // conflict cases) which the user should NOT see as "already
+      // working". Only `code:"busy"` means a chat is in flight, which is
+      // the case we want to silently turn into a notice instead of a
+      // red error.
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/"code"\s*:\s*"busy"/.test(msg)) {
+        setCheckinNotice(
+          "Check-in skipped — the agent is already working on something.",
+        );
+        setTimeout(() => setCheckinNotice(""), 4000);
+      } else {
+        setError(msg);
+      }
+    } finally {
+      setCheckingIn(false);
     }
   };
 
@@ -606,6 +670,20 @@ export function AgentSettings() {
           onActiveEndChange={setActiveEnd}
           cronMessage={cronMessage}
           onCronMessageChange={setCronMessage}
+          nextCronAt={agent.nextCronAt}
+          scheduleDirty={
+            // Schedule-affecting fields differ from the persisted agent —
+            // nextCronAt is computed against the saved schedule so showing
+            // it during edits would mislead.
+            agent.intervalMinutes !== intervalMinutes ||
+            (agent.activeStart ?? "") !== activeStart ||
+            (agent.activeEnd ?? "") !== activeEnd
+          }
+          onCheckin={handleCheckin}
+          // Keep the button disabled while the notice banner is up so the
+          // user doesn't fire repeated 409s in quick succession before the
+          // server-side run actually gets going.
+          checkingIn={checkingIn || checkinNotice !== ""}
         />
 
         {error && (
@@ -616,6 +694,11 @@ export function AgentSettings() {
         {success && (
           <div className="p-3 bg-green-950 border border-green-800 rounded-lg text-sm text-green-300">
             Saved
+          </div>
+        )}
+        {checkinNotice && (
+          <div className="p-3 bg-amber-950/40 border border-amber-800/60 rounded-lg text-sm text-amber-200">
+            {checkinNotice}
           </div>
         )}
 

@@ -9,9 +9,30 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
 )
+
+// agentResponse embeds *agent.Agent and tacks on runtime-only fields the UI
+// consumes. These fields aren't persisted so they live outside the Agent
+// struct itself.
+type agentResponse struct {
+	*agent.Agent
+	NextCronAt string `json:"nextCronAt,omitempty"`
+}
+
+// buildAgentResponse decorates an *agent.Agent with derived runtime state
+// (next cron run, etc.) for API responses.
+func (s *Server) buildAgentResponse(a *agent.Agent) agentResponse {
+	resp := agentResponse{Agent: a}
+	if a != nil {
+		if t := s.agents.NextCronRun(a.ID); !t.IsZero() {
+			resp.NextCronAt = t.Format(time.RFC3339)
+		}
+	}
+	return resp
+}
 
 // --- Cron Pause ---
 
@@ -89,7 +110,7 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
 		return
 	}
-	writeJSONResponse(w, http.StatusOK, a)
+	writeJSONResponse(w, http.StatusOK, s.buildAgentResponse(a))
 }
 
 
@@ -109,7 +130,29 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeJSONResponse(w, http.StatusOK, a)
+	writeJSONResponse(w, http.StatusOK, s.buildAgentResponse(a))
+}
+
+// handleCheckin fires a manual check-in for the agent. The check-in runs
+// asynchronously on the server (events drained in a goroutine), so we
+// return immediately with 202 Accepted; the assistant reply will appear
+// in the transcript via the normal chat flow.
+func (s *Server) handleCheckin(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.agents.Checkin(id); err != nil {
+		switch {
+		case errors.Is(err, agent.ErrAgentNotFound):
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		case errors.Is(err, agent.ErrAgentArchived):
+			writeError(w, http.StatusConflict, "archived", err.Error())
+		case errors.Is(err, agent.ErrAgentBusy), errors.Is(err, agent.ErrAgentResetting):
+			writeError(w, http.StatusConflict, "busy", err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	writeJSONResponse(w, http.StatusAccepted, map[string]bool{"ok": true})
 }
 
 func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {

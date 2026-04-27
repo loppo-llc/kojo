@@ -54,6 +54,22 @@ func cronPromptAt(now, nextRun time.Time, timeoutMinutes int, customMessage stri
 	return msg
 }
 
+// checkinPrompt builds the manual check-in prompt. Unlike cronPromptAt this
+// is fired on demand from the UI and has no scheduled successor, so it omits
+// the "次回のチェックイン" footer and uses the wording "チェックイン" (not
+// "定期チェックイン") to make the source visible in the transcript.
+func checkinPrompt(now time.Time, timeoutMinutes int, customMessage string) string {
+	today := now.Format("2006-01-02")
+	msg := "[system message] " + now.Format("2006年1月2日 15:04") + "のチェックインです。"
+	msg += fmt.Sprintf("（今回のタイムアウトは%d分）", timeoutMinutes)
+	if trimmed := strings.TrimSpace(customMessage); trimmed != "" {
+		msg += "\n\n--- 指示 ---\n" + strings.ReplaceAll(trimmed, "{date}", today)
+	} else {
+		msg += "最近の出来事や気づきがあれば memory/" + today + ".md に記録し、必要なタスクを実行してください。"
+	}
+	return msg
+}
+
 // formatUntil returns a Japanese-formatted duration from now until t,
 // rounded to the nearest minute (minimum 1分).
 func formatUntil(t, now time.Time) string {

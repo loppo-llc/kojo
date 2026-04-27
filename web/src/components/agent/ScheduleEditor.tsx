@@ -18,6 +18,16 @@ interface Props {
   onActiveEndChange: (v: string) => void;
   cronMessage: string;
   onCronMessageChange: (v: string) => void;
+  // RFC3339 timestamp of the next scheduled run (active-hours-adjusted).
+  // Empty/undefined when scheduling is off or the agent has no schedule.
+  nextCronAt?: string;
+  // True when interval/active-hours have been edited but not yet saved —
+  // nextCronAt reflects the saved schedule, so we hide the value and
+  // prompt the user to save instead of showing a misleading time.
+  scheduleDirty?: boolean;
+  // Fires a manual check-in. When omitted the button is hidden.
+  onCheckin?: () => void;
+  checkingIn?: boolean;
 }
 
 const DEFAULT_CRON_MESSAGE_HINT =
@@ -51,6 +61,47 @@ function timelineGradient(start: string, end: string): string {
 
 const HOUR_MARKS = [0, 3, 6, 9, 12, 15, 18, 21];
 
+/**
+ * Format an ISO timestamp for the "Next check-in" row. The absolute side
+ * is rendered in the browser's local time with a `timeZoneName: "short"`
+ * suffix so the user can tell at a glance whether their machine and the
+ * server's TZ agree (Active Hours is configured against the server clock).
+ * The relative side is computed from `now` so a parent can re-render it
+ * every minute without remounting; rendering with `Date.now()` directly
+ * goes stale until the next prop change. Returns null for empty/invalid
+ * input so the caller can hide the row entirely.
+ */
+function formatNextCron(
+  iso: string | undefined,
+  now: number,
+): { abs: string; rel: string } | null {
+  if (!iso) return null;
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return null;
+  const abs = t.toLocaleString(undefined, {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZoneName: "short",
+  });
+  const diffMs = t.getTime() - now;
+  const past = diffMs < 0;
+  const mins = Math.max(1, Math.round(Math.abs(diffMs) / 60000));
+  let amount: string;
+  if (mins < 60) amount = `${mins}m`;
+  else if (mins < 60 * 24) {
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    amount = m === 0 ? `${h}h` : `${h}h${m}m`;
+  } else {
+    const d = Math.floor(mins / (60 * 24));
+    const h = Math.floor((mins % (60 * 24)) / 60);
+    amount = h === 0 ? `${d}d` : `${d}d${h}h`;
+  }
+  return { abs, rel: past ? `${amount} ago` : `in ${amount}` };
+}
+
 export function ScheduleEditor({
   intervalMinutes,
   onIntervalChange,
@@ -65,9 +116,25 @@ export function ScheduleEditor({
   onActiveEndChange,
   cronMessage,
   onCronMessageChange,
+  nextCronAt,
+  scheduleDirty,
+  onCheckin,
+  checkingIn,
 }: Props) {
   const showResumeIdle =
     onResumeIdleChange !== undefined && (tool === undefined || tool === "claude");
+
+  // Re-render every 30s so the "in 12m" / "2h ago" relative label next to
+  // the upcoming check-in stays accurate without the user reloading. We
+  // only run the timer when there's actually a value to display AND the
+  // schedule isn't dirty — a stale value gets hidden behind "save to
+  // update", so ticking would just burn renders for an invisible label.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!nextCronAt || scheduleDirty) return;
+    const id = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, [nextCronAt, scheduleDirty]);
   // Separate enabled state so toggling off doesn't hide inputs mid-edit
   const [enabled, setEnabled] = useState(activeStart !== "" && activeEnd !== "");
 
@@ -117,8 +184,11 @@ export function ScheduleEditor({
         </p>
       </div>
 
-      {/* Timeout */}
-      {intervalMinutes > 0 && (
+      {/* Timeout — also surfaced when manual check-in is available, since
+          that path uses the same TimeoutMinutes value. Hiding it when
+          interval=0 made sense before "Check in now" existed; now the
+          setting is meaningful in both modes. */}
+      {(intervalMinutes > 0 || onCheckin) && (
         <div>
           <label className="block text-sm text-neutral-400 mb-2">Timeout</label>
           <div className="flex gap-1.5 flex-wrap">
@@ -138,7 +208,7 @@ export function ScheduleEditor({
             ))}
           </div>
           <p className="mt-1.5 text-[11px] text-neutral-600">
-            Max duration for each scheduled run.
+            Max duration for each scheduled or manual check-in run.
           </p>
         </div>
       )}
@@ -255,15 +325,50 @@ export function ScheduleEditor({
         </div>
       )}
 
-      {/* Custom Check-in Message — always editable; only consumed when interval > 0 */}
+      {/* Next check-in / manual check-in trigger */}
+      {(intervalMinutes > 0 || onCheckin) && (
+        <div className="rounded-md border border-neutral-800 bg-neutral-900/50 p-3 space-y-2">
+          {intervalMinutes > 0 && (() => {
+            const next = scheduleDirty ? null : formatNextCron(nextCronAt, now);
+            return (
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-xs text-neutral-500">Next check-in</span>
+                <span className="text-xs text-neutral-300 tabular-nums">
+                  {scheduleDirty ? (
+                    <span className="text-neutral-600">save to update</span>
+                  ) : next ? (
+                    <>
+                      {next.abs}
+                      <span className="text-neutral-500 ml-1.5">({next.rel})</span>
+                    </>
+                  ) : (
+                    <span className="text-neutral-600">—</span>
+                  )}
+                </span>
+              </div>
+            );
+          })()}
+
+          {onCheckin && (
+            <button
+              type="button"
+              onClick={onCheckin}
+              disabled={checkingIn}
+              className="w-full px-3 py-1.5 rounded text-xs bg-amber-900/40 hover:bg-amber-900/60 border border-amber-800/60 text-amber-200 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              {checkingIn ? "Checking in…" : "Check in now"}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Custom Check-in Message — applied to BOTH periodic and manual
+          check-ins. The hint reflected that originally said "interval >
+          0 only", which was wrong: the manual "Check in now" button
+          calls the same prompt builder. */}
       <div>
         <label className="block text-sm text-neutral-400 mb-2">
           Check-in Message
-          {intervalMinutes === 0 && (
-            <span className="ml-2 text-[11px] text-neutral-600">
-              (applied when interval is enabled)
-            </span>
-          )}
         </label>
         <textarea
           value={cronMessage}
@@ -274,9 +379,10 @@ export function ScheduleEditor({
           className="w-full px-2.5 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 resize-none focus:outline-none focus:border-amber-700/60"
         />
         <p className="mt-1.5 text-[11px] text-neutral-600">
-          Replaces the trailing instruction in the periodic check-in prompt.
-          Use <code className="text-neutral-500">{"{date}"}</code> as a
-          placeholder for today (YYYY-MM-DD). Leave blank for the default.
+          Replaces the trailing instruction in periodic and manual check-in
+          prompts. Use <code className="text-neutral-500">{"{date}"}</code>{" "}
+          as a placeholder for today (YYYY-MM-DD). Leave blank for the
+          default.
         </p>
       </div>
     </div>

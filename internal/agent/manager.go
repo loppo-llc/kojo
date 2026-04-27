@@ -1011,7 +1011,7 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 	defer func() {
 		if receivedDone {
 			if ctx.Err() == context.DeadlineExceeded {
-				errMsg := newSystemMessage("⚠️ この定期チェックインは制限時間超過により中断されました。")
+				errMsg := newSystemMessage("⚠️ この応答は制限時間超過により中断されました。")
 				if err := appendMessage(agentID, errMsg); err != nil {
 					m.logger.Warn("failed to save timeout message", "err", err)
 				}
@@ -1026,7 +1026,7 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			m.persistDoneEvent(agentID, msg)
 		}
 		if ctx.Err() == context.DeadlineExceeded {
-			errMsg := newSystemMessage("⚠️ この定期チェックインは制限時間超過により中断されました。")
+			errMsg := newSystemMessage("⚠️ この応答は制限時間超過により中断されました。")
 			if err := appendMessage(agentID, errMsg); err != nil {
 				m.logger.Warn("failed to save timeout message", "err", err)
 			}
@@ -1162,6 +1162,77 @@ func (m *Manager) updatePostChatIndex(agentID string) {
 			idx.IndexFilesIfStale(agentID)
 		}
 	}
+}
+
+// NextCronRun returns the next scheduled run time for an agent, adjusted
+// for active hours. Returns the zero Time when there is no run to predict
+// because the agent has no schedule, is archived, doesn't exist, or all
+// cron is globally paused — anything that would make the displayed time
+// misleading.
+func (m *Manager) NextCronRun(agentID string) time.Time {
+	m.mu.Lock()
+	if m.cronPaused {
+		m.mu.Unlock()
+		return time.Time{}
+	}
+	a, ok := m.agents[agentID]
+	if !ok || a.Archived || a.IntervalMinutes <= 0 {
+		m.mu.Unlock()
+		return time.Time{}
+	}
+	activeStart, activeEnd := a.ActiveStart, a.ActiveEnd
+	m.mu.Unlock()
+	return m.cron.nextRun(agentID, activeStart, activeEnd)
+}
+
+// Checkin triggers a manual check-in for the agent. Unlike the periodic
+// cron job, this does not acquire the cron lock and does not check the
+// active-hours window — the user explicitly asked for it. The check-in
+// runs asynchronously: events are drained in a background goroutine and
+// the assistant reply is persisted to the transcript like any other chat.
+//
+// Returns ErrAgentNotFound, ErrAgentArchived, or ErrAgentBusy on rejection.
+func (m *Manager) Checkin(agentID string) error {
+	m.mu.Lock()
+	a, ok := m.agents[agentID]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
+	}
+	if a.Archived {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrAgentArchived, agentID)
+	}
+	timeoutMinutes := a.TimeoutMinutes
+	cronMessage := a.CronMessage
+	m.mu.Unlock()
+
+	timeout := cronTimeout
+	if timeoutMinutes > 0 {
+		timeout = time.Duration(timeoutMinutes) * time.Minute
+	}
+	effectiveTimeoutMin := int(timeout / time.Minute)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+
+	prompt := checkinPrompt(time.Now(), effectiveTimeoutMin, cronMessage)
+	events, err := m.Chat(ctx, agentID, prompt, "system", nil)
+	if err != nil {
+		cancel()
+		return err
+	}
+
+	go func() {
+		defer cancel()
+		for range events {
+		}
+		if ctx.Err() == context.DeadlineExceeded {
+			m.logger.Warn("manual checkin timed out", "agent", agentID, "timeout", timeout)
+		} else {
+			m.logger.Info("manual checkin completed", "agent", agentID)
+		}
+	}()
+	return nil
 }
 
 // CronPaused returns whether all cron jobs are globally paused.
