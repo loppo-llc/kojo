@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -114,7 +115,7 @@ func newMCPHandler(agents *agent.Manager, logger *slog.Logger) http.Handler {
 
 	// --- slack_list_users ---
 	listUsersTool := mcp.NewTool("slack_list_users",
-		mcp.WithDescription("List users in the Slack workspace. Returns user ID, display name, real name, and status. Useful for resolving @mentions or finding user IDs."),
+		mcp.WithDescription("List users in the Slack workspace. Returns user ID, name, display name, real name, and bot/admin flags. Useful for resolving @mentions or finding user IDs."),
 		mcp.WithString("name_contains", mcp.Description("Filter users whose name or display name contains this substring (case-insensitive)")),
 		mcp.WithNumber("limit", mcp.Description("Maximum number of users to return (default 200, max 500)")),
 		mcp.WithBoolean("include_bots", mcp.Description("If true, include bot users in the result (default false)")),
@@ -126,7 +127,7 @@ func newMCPHandler(agents *agent.Manager, logger *slog.Logger) http.Handler {
 		mcp.WithDescription("Upload a file to a Slack channel. Provide file_path (preferred for binary/large files) or content (for text snippets). Only one source allowed."),
 		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel ID or #channel-name to upload to")),
 		mcp.WithString("filename", mcp.Required(), mcp.Description("Name of the file (e.g. 'report.csv', 'image.png')")),
-		mcp.WithString("file_path", mcp.Description("Absolute path to a local file to upload. Preferred for binary and large files — avoids base64 overhead.")),
+		mcp.WithString("file_path", mcp.Description("Path to a local file to upload. Must be inside the kojo upload directory ({tmp}/kojo/upload). Preferred for binary and large files — avoids base64 overhead.")),
 		mcp.WithString("content", mcp.Description("Plain text content for the file (for text/code snippets). Use this OR file_path.")),
 		mcp.WithString("title", mcp.Description("Title of the file (defaults to filename)")),
 		mcp.WithString("initial_comment", mcp.Description("Message to post alongside the file")),
@@ -743,13 +744,7 @@ func slackListEmojiHandler(agents *agent.Manager, logger *slog.Logger) mcpserver
 			return mcp.NewToolResultError(fmt.Sprintf("Slack API error: %v", err)), nil
 		}
 
-		var emojis []emojiInfo
-		for name, value := range emojiMap {
-			if nameFilter != "" && !strings.Contains(strings.ToLower(name), nameFilter) {
-				continue
-			}
-			emojis = append(emojis, emojiInfo{Name: name, Value: value})
-		}
+		emojis := filterEmoji(emojiMap, nameFilter)
 
 		// Sort by name for deterministic output.
 		sort.Slice(emojis, func(i, j int) bool { return emojis[i].Name < emojis[j].Name })
@@ -790,13 +785,7 @@ func slackGetChannelHistoryHandler(agents *agent.Manager, logger *slog.Logger) m
 		oldest, _ := args["oldest"].(string)
 		latest, _ := args["latest"].(string)
 
-		limit := historyDefaultLimit
-		if v, ok := args["limit"].(float64); ok && v > 0 {
-			limit = int(v)
-			if limit > historyMaxLimit {
-				limit = historyMaxLimit
-			}
-		}
+		limit := clampLimit(args["limit"], historyDefaultLimit, historyMaxLimit)
 
 		logger.Info("mcp tool invoked",
 			"reqID", reqID, "agent", agentID, "tool", "slack_get_channel_history",
@@ -866,13 +855,7 @@ func slackGetThreadRepliesHandler(agents *agent.Manager, logger *slog.Logger) mc
 		channel, _ := args["channel"].(string)
 		threadTS, _ := args["thread_ts"].(string)
 
-		limit := threadRepliesDefaultLimit
-		if v, ok := args["limit"].(float64); ok && v > 0 {
-			limit = int(v)
-			if limit > threadRepliesMaxLimit {
-				limit = threadRepliesMaxLimit
-			}
-		}
+		limit := clampLimit(args["limit"], threadRepliesDefaultLimit, threadRepliesMaxLimit)
 
 		logger.Info("mcp tool invoked",
 			"reqID", reqID, "agent", agentID, "tool", "slack_get_thread_replies",
@@ -947,13 +930,7 @@ func slackListUsersHandler(agents *agent.Manager, logger *slog.Logger) mcpserver
 		nameFilter = strings.ToLower(nameFilter)
 		includeBots, _ := args["include_bots"].(bool)
 
-		limit := listUsersDefaultLimit
-		if v, ok := args["limit"].(float64); ok && v > 0 {
-			limit = int(v)
-			if limit > listUsersMaxLimit {
-				limit = listUsersMaxLimit
-			}
-		}
+		limit := clampLimit(args["limit"], listUsersDefaultLimit, listUsersMaxLimit)
 
 		logger.Info("mcp tool invoked",
 			"reqID", reqID, "agent", agentID, "tool", "slack_list_users",
@@ -973,33 +950,11 @@ func slackListUsersHandler(agents *agent.Manager, logger *slog.Logger) mcpserver
 
 		var users []userInfo
 		for _, u := range allUsers {
-			// Skip deleted users unless they match a name search
-			if u.Deleted {
+			info, ok := matchUser(u, nameFilter, includeBots)
+			if !ok {
 				continue
 			}
-			// Skip bots unless requested
-			if (u.IsBot || u.ID == "USLACKBOT") && !includeBots {
-				continue
-			}
-			// Apply name filter
-			if nameFilter != "" {
-				match := strings.Contains(strings.ToLower(u.Name), nameFilter) ||
-					strings.Contains(strings.ToLower(u.RealName), nameFilter) ||
-					strings.Contains(strings.ToLower(u.Profile.DisplayName), nameFilter)
-				if !match {
-					continue
-				}
-			}
-
-			users = append(users, userInfo{
-				ID:          u.ID,
-				Name:        u.Name,
-				RealName:    u.RealName,
-				DisplayName: u.Profile.DisplayName,
-				IsBot:       u.IsBot,
-				IsAdmin:     u.IsAdmin,
-			})
-
+			users = append(users, info)
 			if len(users) >= limit {
 				break
 			}
@@ -1031,8 +986,8 @@ func slackUploadFileHandler(agents *agent.Manager, logger *slog.Logger) mcpserve
 
 		logger.Info("mcp tool invoked",
 			"reqID", reqID, "agent", agentID, "tool", "slack_upload_file",
-			"channel", channel, "filename", filename, "filePath", filePath,
-			"contentLen", len(content),
+			"channel", channel, "filename", filename,
+			"hasFilePath", filePath != "", "contentLen", len(content),
 		)
 
 		api, errMsg := getSlackClient(ctx, agents)
@@ -1062,20 +1017,31 @@ func slackUploadFileHandler(agents *agent.Manager, logger *slog.Logger) mcpserve
 		}
 
 		params := slack.UploadFileParameters{
-			Filename:       filename,
-			Title:          title,
-			Channel:        resolvedChannel,
-			InitialComment: initialComment,
+			Filename:        filename,
+			Title:           title,
+			Channel:         resolvedChannel,
+			InitialComment:  initialComment,
 			ThreadTimestamp: threadTS,
 		}
 
+		// On the file_path branch we open the validated file ourselves and
+		// hand a *os.File to the Slack SDK. Passing the path would re-open
+		// it inside the SDK, leaving a TOCTOU window where a symlink swap
+		// (or rename) between validation and re-open could redirect the
+		// upload to a file outside the upload directory. Streaming through
+		// the fd we already pinned closes that window.
 		if filePath != "" {
-			info, err := os.Stat(filePath)
-			if err != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("cannot access file %q: %v", filePath, err)), nil
+			f, size, errKind := openUploadPath(filePath)
+			if errKind != "" {
+				logger.Warn("mcp tool aborted",
+					"reqID", reqID, "agent", agentID, "tool", "slack_upload_file",
+					"reason", errKind, "basename", filepath.Base(filePath),
+				)
+				return mcp.NewToolResultError(uploadPathUserMessage(errKind)), nil
 			}
-			params.File = filePath
-			params.FileSize = int(info.Size())
+			defer f.Close()
+			params.Reader = f
+			params.FileSize = int(size)
 		} else {
 			params.Content = content
 			params.FileSize = len(content)
@@ -1101,4 +1067,204 @@ func slackUploadFileHandler(agents *agent.Manager, logger *slog.Logger) mcpserve
 		data, _ := json.Marshal(result)
 		return mcp.NewToolResultText(string(data)), nil
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers (extracted for testability)
+// ---------------------------------------------------------------------------
+
+// clampLimit reads a JSON-decoded numeric "limit" argument and clamps it to
+// [1, max]. Inputs are floats because mcp-go decodes JSON numbers as float64.
+//
+// Returns def when the argument is missing, non-numeric, non-positive, or
+// rounds down to zero (e.g. 0.5).
+func clampLimit(raw any, def, max int) int {
+	v, ok := raw.(float64)
+	if !ok || v <= 0 {
+		return def
+	}
+	n := int(v)
+	if n < 1 {
+		return def
+	}
+	if n > max {
+		return max
+	}
+	return n
+}
+
+// filterEmoji returns emojiInfo entries from the Slack emoji map whose name
+// contains nameFilter (case-insensitive). An empty filter matches all.
+func filterEmoji(emojiMap map[string]string, nameFilter string) []emojiInfo {
+	filter := strings.ToLower(nameFilter)
+	var emojis []emojiInfo
+	for name, value := range emojiMap {
+		if filter != "" && !strings.Contains(strings.ToLower(name), filter) {
+			continue
+		}
+		emojis = append(emojis, emojiInfo{Name: name, Value: value})
+	}
+	return emojis
+}
+
+// matchUser applies the slack_list_users filter rules to a Slack user and
+// returns its userInfo projection on match. nameFilter is matched
+// case-insensitively against Name, RealName, and DisplayName; it does not
+// need to be pre-lowercased by the caller.
+//
+// Rules (in order):
+//  1. Skip users marked Deleted.
+//  2. Skip bot users (IsBot or USLACKBOT) unless includeBots is true.
+//  3. If nameFilter is non-empty, the user's Name, RealName, or DisplayName
+//     must contain it as a case-insensitive substring.
+func matchUser(u slack.User, nameFilter string, includeBots bool) (userInfo, bool) {
+	if u.Deleted {
+		return userInfo{}, false
+	}
+	if (u.IsBot || u.ID == "USLACKBOT") && !includeBots {
+		return userInfo{}, false
+	}
+	if nameFilter != "" {
+		needle := strings.ToLower(nameFilter)
+		match := strings.Contains(strings.ToLower(u.Name), needle) ||
+			strings.Contains(strings.ToLower(u.RealName), needle) ||
+			strings.Contains(strings.ToLower(u.Profile.DisplayName), needle)
+		if !match {
+			return userInfo{}, false
+		}
+	}
+	return userInfo{
+		ID:          u.ID,
+		Name:        u.Name,
+		RealName:    u.RealName,
+		DisplayName: u.Profile.DisplayName,
+		IsBot:       u.IsBot,
+		IsAdmin:     u.IsAdmin,
+	}, true
+}
+
+// upload path validation error kinds. These are constants (not formatted
+// errors) so they can be safely logged without leaking absolute paths or
+// other host details.
+const (
+	uploadErrEmpty     = "empty"
+	uploadErrInvalid   = "invalid_path"
+	uploadErrNotFound  = "not_found"
+	uploadErrOutside   = "outside_upload_dir"
+	uploadErrIsDir     = "is_directory"
+	uploadErrNotFile   = "not_regular_file"
+	uploadErrOpenFail  = "open_failed"
+	uploadErrStatFail  = "stat_failed"
+	uploadErrSwapped   = "swapped_during_validation"
+)
+
+// uploadPathUserMessage maps an internal error kind to a fixed,
+// path-free user-facing message.
+func uploadPathUserMessage(kind string) string {
+	switch kind {
+	case uploadErrEmpty:
+		return "'file_path' must not be empty"
+	case uploadErrOutside:
+		return "'file_path' must be inside the kojo upload directory"
+	case uploadErrIsDir:
+		return "'file_path' must be a regular file, not a directory"
+	case uploadErrNotFile:
+		return "'file_path' must be a regular file"
+	case uploadErrNotFound:
+		return "'file_path' does not exist or is not accessible"
+	case uploadErrSwapped:
+		return "'file_path' changed during validation; refusing to upload"
+	default:
+		return "'file_path' is invalid"
+	}
+}
+
+// openUploadPath validates that p points to a regular file inside the
+// kojo upload directory and returns an *os.File already opened on the
+// validated inode. Callers MUST Close the returned file.
+//
+// Opening up-front (rather than just resolving a path string) eliminates
+// the TOCTOU window between validation and Slack SDK re-open: even if a
+// symlink/rename races our check, the SDK reads from the fd we already
+// pinned to the verified inode.
+//
+// On error, returns (nil, 0, kind) where kind is one of the uploadErr*
+// constants — never a formatted error containing a host path.
+func openUploadPath(p string) (*os.File, int64, string) {
+	if p == "" {
+		return nil, 0, uploadErrEmpty
+	}
+
+	// Canonicalize the upload root once (handles /tmp → /private/tmp on macOS).
+	canonicalRoot, err := filepath.EvalSymlinks(uploadDir)
+	if err != nil {
+		canonicalRoot = uploadDir
+	}
+
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return nil, 0, uploadErrInvalid
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return nil, 0, uploadErrNotFound
+	}
+
+	// Must be inside the upload directory (canonical-prefix check).
+	if resolved != canonicalRoot &&
+		!strings.HasPrefix(resolved, canonicalRoot+string(filepath.Separator)) {
+		return nil, 0, uploadErrOutside
+	}
+
+	// Open the resolved (canonical) path.
+	f, err := os.Open(resolved)
+	if err != nil {
+		return nil, 0, uploadErrOpenFail
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, 0, uploadErrStatFail
+	}
+	if info.IsDir() {
+		f.Close()
+		return nil, 0, uploadErrIsDir
+	}
+	if !info.Mode().IsRegular() {
+		f.Close()
+		return nil, 0, uploadErrNotFile
+	}
+
+	// Close the residual TOCTOU window between EvalSymlinks and Open: if
+	// the path (or any of its parents) was swapped to a symlink or to a
+	// different inode in that gap, reject the upload.
+	//
+	// Three checks together cover the realistic attack vectors:
+	//  1. Re-resolve symlinks: if any component was made a symlink after
+	//     the first EvalSymlinks, the canonical form changes.
+	//  2. Lstat regular-file: reject if the final component is now a
+	//     symlink or non-regular type.
+	//  3. SameFile inode match: reject if the path now points to a
+	//     different inode than the open fd.
+	reResolved, err := filepath.EvalSymlinks(resolved)
+	if err != nil || reResolved != resolved {
+		f.Close()
+		return nil, 0, uploadErrSwapped
+	}
+	lstatInfo, err := os.Lstat(resolved)
+	if err != nil {
+		f.Close()
+		return nil, 0, uploadErrSwapped
+	}
+	if !lstatInfo.Mode().IsRegular() {
+		f.Close()
+		return nil, 0, uploadErrSwapped
+	}
+	if !os.SameFile(info, lstatInfo) {
+		f.Close()
+		return nil, 0, uploadErrSwapped
+	}
+
+	return f, info.Size(), ""
 }
