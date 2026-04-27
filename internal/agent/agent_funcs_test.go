@@ -203,10 +203,13 @@ func TestBuildSystemPrompt_MemoryWriteDirective(t *testing.T) {
 		// Lean-index rules — MEMORY.md hygiene guardrails
 		"LEAN index, not a dumping ground",
 		"~200 lines",
-		"archive/YYYY-MM.md",
+		dir + "/memory/archive/",
+		"{YYYY-MM}.md",
 		dir + "/memory/projects/",
 		dir + "/memory/topics/",
-		"Don't pile new on top of stale",
+		"Delete stale entries",
+		"Don't pile new on top of old",
+		"Do NOT write dates",
 	}
 	for _, s := range mustContain {
 		if !strings.Contains(prompt, s) {
