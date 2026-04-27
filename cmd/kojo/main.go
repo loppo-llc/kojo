@@ -9,17 +9,18 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
-	"net/netip"
-
 	"github.com/loppo-llc/kojo/internal/agent"
+	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/configdir"
 	"github.com/loppo-llc/kojo/internal/notify"
 	"github.com/loppo-llc/kojo/internal/server"
@@ -36,6 +37,7 @@ func main() {
 	local := flag.Bool("local", false, "listen on localhost only (no Tailscale)")
 	configDir := flag.String("config-dir", "", "override config directory (default: ~/.config/kojo)")
 	showVersion := flag.Bool("version", false, "show version")
+	noAuth := flag.Bool("no-auth", false, "disable agent-facing auth listener (--local/--dev only)")
 	flag.Parse()
 
 	if *showVersion {
@@ -116,6 +118,31 @@ func main() {
 	groupDMMgr := agent.NewGroupDMManager(agentMgr, logger)
 	agentMgr.SetGroupDMManager(groupDMMgr)
 
+	// --no-auth is dev-only — refuse to bypass auth on the public Tailscale
+	// listener where another user could reach the API directly.
+	if *noAuth && !*local && !*dev {
+		fmt.Fprintln(os.Stderr, "kojo: --no-auth requires --local or --dev")
+		os.Exit(1)
+	}
+
+	// Token store. Owner token is loaded/created at <configdir>/auth/owner.token
+	// unless KOJO_OWNER_TOKEN overrides it (handy for tests / scripted runs).
+	authBase := filepath.Join(resolvedDir, "auth")
+	tokens, err := auth.NewTokenStore(authBase, os.Getenv("KOJO_OWNER_TOKEN"))
+	if err != nil {
+		logger.Error("failed to initialize auth token store", "err", err)
+		os.Exit(1)
+	}
+	agentMgr.SetTokenStore(tokens)
+	agent.SetAgentTokenLookup(func(id string) (string, bool) {
+		t, err := tokens.AgentToken(id)
+		if err != nil {
+			return "", false
+		}
+		return t, true
+	})
+	resolver := auth.NewResolver(tokens, agentMgr.IsPrivileged)
+
 	srv := server.New(server.Config{
 		Addr:           fmt.Sprintf(":%d", *port),
 		DevMode:        *dev,
@@ -132,21 +159,57 @@ func main() {
 	defer stop()
 
 	if *local || *dev {
-		// local mode: listen on localhost with port fallback
+		// local mode: a single localhost listener serves both the UI
+		// (Owner via OwnerOnlyMiddleware) and any agent that can reach
+		// loopback. When --no-auth is set we keep the public-trusted
+		// behavior and skip the auth listener entirely; otherwise we
+		// add a second loopback port that gates non-Owner principals.
 		ln, err := listenWithFallback("127.0.0.1", *port, 10, logger)
 		if err != nil {
 			logger.Error("failed to listen", "err", err)
 			os.Exit(1)
 		}
 		actualAddr := ln.Addr().String()
-		groupDMMgr.SetAPIBase("http://" + actualAddr)
-		fmt.Fprintf(os.Stderr, "\n  kojo v%s running at:\n\n    http://%s\n\n", version, actualAddr)
+		// Public-listener URL is the user-facing one only. The agent-facing
+		// API base (used by system prompts, PreCompact hooks, group DM notify
+		// curl examples) is set further below to the auth listener so agents
+		// never reach the Owner-trusted listener with their own credentials.
+		fmt.Fprintf(os.Stderr, "\n  kojo v%s running at:\n\n    http://%s\n", version, actualAddr)
 		go func() {
 			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 				logger.Error("server error", "err", err)
-				os.Exit(1)
+				stop()
 			}
 		}()
+		if !*noAuth {
+			authLn, err := listenWithFallback("127.0.0.1", *port+1, 10, logger)
+			if err != nil {
+				logger.Error("failed to listen on auth port", "err", err)
+				os.Exit(1)
+			}
+			authAddr := authLn.Addr().String()
+			agentAPIBase := "http://" + authAddr
+			agent.SetKojoAPIBase(agentAPIBase)
+			groupDMMgr.SetAPIBase(agentAPIBase)
+			fmt.Fprintf(os.Stderr, "    agent API: %s  (Bearer required)\n", agentAPIBase)
+			go func() {
+				if err := srv.ServeAuth(authLn, resolver); err != nil && err != http.ErrServerClosed {
+					logger.Error("auth listener error", "err", err)
+					// Crash hard so agents do not keep targeting a dead
+					// $KOJO_API_BASE: the supervisor restarts kojo and the
+					// agents' next chat picks up the fresh URL.
+					stop()
+				}
+			}()
+		} else {
+			// --no-auth (--local/--dev only): agents talk to the public
+			// listener which is permanently Owner-trusted. Mirror that on
+			// the group DM curl examples so the docs do not point to a
+			// non-existent auth port.
+			groupDMMgr.SetAPIBase("http://" + actualAddr)
+			logger.Warn("agent auth listener disabled via --no-auth — agents can read full API as Owner")
+		}
+		fmt.Fprintln(os.Stderr)
 	} else {
 		// tailscale mode: listen via tsnet with HTTPS
 		tsServer := &tsnet.Server{
@@ -160,7 +223,9 @@ func main() {
 			os.Exit(1)
 		}
 
-		// get tailscale addresses for display
+		// get tailscale addresses for display. Display only — the agent
+		// API base is wired further below to the local auth listener so
+		// system prompts / PreCompact curl examples point Bearer-required.
 		fmt.Fprintf(os.Stderr, "\n  kojo v%s running at:\n\n", version)
 		lc, lcErr := tsServer.LocalClient()
 		if lcErr != nil {
@@ -174,10 +239,8 @@ func main() {
 					if dnsName != "" {
 						if *port == 443 {
 							fmt.Fprintf(os.Stderr, "    https://%s\n", dnsName)
-							groupDMMgr.SetAPIBase("https://" + dnsName)
 						} else {
 							fmt.Fprintf(os.Stderr, "    https://%s:%d\n", dnsName, *port)
-							groupDMMgr.SetAPIBase(fmt.Sprintf("https://%s:%d", dnsName, *port))
 						}
 					}
 				}
@@ -185,22 +248,11 @@ func main() {
 				for _, ip := range status.TailscaleIPs {
 					fmt.Fprintf(os.Stderr, "    https://%s\n", net.JoinHostPort(ip.String(), strconv.Itoa(*port)))
 				}
-				// Fallback: use first Tailscale IP if DNS name wasn't set
-				if groupDMMgr.APIBase() == "" && len(status.TailscaleIPs) > 0 {
-					groupDMMgr.SetAPIBase("https://" + tsAddrForURL(status.TailscaleIPs[0], *port))
-				}
 			} else {
 				logger.Warn("could not get tailscale status", "err", err)
 				fmt.Fprintf(os.Stderr, "    https://kojo:<tailnet>.ts.net:%d  (getting status...)\n", *port)
-				groupDMMgr.SetAPIBase(fmt.Sprintf("https://kojo:%d", *port))
 			}
 		}
-		// Final fallback if no address was resolved
-		if groupDMMgr.APIBase() == "" {
-			groupDMMgr.SetAPIBase(fmt.Sprintf("https://kojo:%d", *port))
-			logger.Warn("group DM API base set to fallback", "base", groupDMMgr.APIBase())
-		}
-		fmt.Fprintln(os.Stderr)
 
 		// tsnet.ListenTLS returns a tls.Listener, serve directly
 		go func() {
@@ -208,7 +260,31 @@ func main() {
 			srv.SetTLSConfig(&tls.Config{})
 			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 				logger.Error("server error", "err", err)
-				os.Exit(1)
+				stop()
+			}
+		}()
+
+		// Additional auth-required listener bound to loopback. Agents
+		// running in PTY sessions reach this via $KOJO_API_BASE; the
+		// Tailscale listener above stays open for the user UI without
+		// any token requirement, preserving the original UX.
+		authLn, err := listenWithFallback("127.0.0.1", *port+1, 10, logger)
+		if err != nil {
+			logger.Error("failed to listen on auth port", "err", err)
+			os.Exit(1)
+		}
+		authAddr := authLn.Addr().String()
+		agentAPIBase := "http://" + authAddr
+		agent.SetKojoAPIBase(agentAPIBase)
+		// Group DM / PreCompact / system-prompt curl examples must hit
+		// the auth listener so the agent's Bearer is honored. The
+		// Tailscale listener is for the user UI only.
+		groupDMMgr.SetAPIBase(agentAPIBase)
+		fmt.Fprintf(os.Stderr, "    agent API: %s  (Bearer required)\n\n", agentAPIBase)
+		go func() {
+			if err := srv.ServeAuth(authLn, resolver); err != nil && err != http.ErrServerClosed {
+				logger.Error("auth listener error", "err", err)
+				stop()
 			}
 		}()
 

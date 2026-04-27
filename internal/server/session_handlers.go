@@ -14,12 +14,21 @@ import (
 	"strings"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/session"
 )
 
 // --- Session Handlers ---
 
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
+	// Non-Owner principals (agents, guests) get only the version. The
+	// hostname / home dir / tool availability would otherwise leak the
+	// host's deploy details to a curl-happy agent.
+	p := auth.FromContext(r.Context())
+	if !p.IsOwner() {
+		writeJSONResponse(w, http.StatusOK, map[string]any{"version": s.version})
+		return
+	}
 	hostname, _ := os.Hostname()
 	homeDir, _ := os.UserHomeDir()
 	resp := map[string]any{

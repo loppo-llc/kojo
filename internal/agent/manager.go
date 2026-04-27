@@ -73,6 +73,76 @@ type Manager struct {
 	oneShotSeq       int64
 	oneShotCancels   map[string]map[int64]context.CancelFunc // agentID → id → cancel
 	oneShotCancelsMu sync.Mutex
+
+	// tokenStore, if set, is kept in sync with agent lifecycle: a per-agent
+	// token is created on Create/Fork and removed on Delete. The store is
+	// owned by the auth subsystem; agent.Manager only calls into the
+	// minimal AgentTokenStore interface.
+	tokenStore AgentTokenStore
+}
+
+// AgentTokenStore is the minimal contract the agent manager needs from
+// the auth token store, narrowed so the agent package does not import
+// internal/auth (avoids a layering cycle).
+type AgentTokenStore interface {
+	EnsureAgentToken(agentID string) error
+	RemoveAgentToken(agentID string)
+}
+
+// SetTokenStore wires the per-agent token store. Calling this after
+// agents have been loaded triggers token bootstrap for each existing
+// agent (so a kojo upgrade gets every agent a token without an explicit
+// migration step).
+func (m *Manager) SetTokenStore(ts AgentTokenStore) {
+	m.tokenStore = ts
+	if ts == nil {
+		return
+	}
+	m.mu.Lock()
+	ids := make([]string, 0, len(m.agents))
+	for id := range m.agents {
+		ids = append(ids, id)
+	}
+	m.mu.Unlock()
+	for _, id := range ids {
+		if err := ts.EnsureAgentToken(id); err != nil {
+			m.logger.Warn("failed to bootstrap agent token", "agent", id, "err", err)
+		}
+	}
+}
+
+// AgentTokenStore returns the wired-in token store (may be nil during
+// tests or before SetTokenStore is called).
+func (m *Manager) AgentTokenStore() AgentTokenStore { return m.tokenStore }
+
+// IsPrivileged returns whether the agent has the Privileged flag set.
+// Used by auth.Resolver to map a per-agent token to RoleAgent vs
+// RolePrivAgent.
+func (m *Manager) IsPrivileged(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.agents[id]
+	return ok && a.Privileged
+}
+
+// SetPrivileged toggles the Privileged flag on the named agent and
+// persists the change. Owner-only mutation enforced at the API layer.
+func (m *Manager) SetPrivileged(id string, privileged bool) error {
+	m.mu.Lock()
+	a, ok := m.agents[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
+	}
+	if a.Privileged == privileged {
+		m.mu.Unlock()
+		return nil
+	}
+	a.Privileged = privileged
+	a.UpdatedAt = time.Now().Format(time.RFC3339)
+	m.mu.Unlock()
+	m.save()
+	return nil
 }
 
 // NewManager creates a new agent manager.
@@ -183,6 +253,18 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 
 	has, hash := avatarMeta(a.ID)
 	applyAvatarMeta(a, has, hash)
+
+	// Provision the auth token first. A tokenless agent is silently
+	// broken (its $KOJO_AGENT_TOKEN env is unset, so any self-API
+	// curl from the PTY hits the auth listener as Guest and 403s).
+	// Better to fail Create loudly than hand back a half-wired agent.
+	if m.tokenStore != nil {
+		if err := m.tokenStore.EnsureAgentToken(a.ID); err != nil {
+			// Roll back the agent dir we created above.
+			_ = os.RemoveAll(agentDir(a.ID))
+			return nil, fmt.Errorf("provision agent token: %w", err)
+		}
+	}
 
 	m.mu.Lock()
 	m.agents[a.ID] = a

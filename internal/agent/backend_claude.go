@@ -1077,6 +1077,10 @@ func PrepareClaudeSettings(agentID, apiBase string, allowProtectedPaths []string
 		// verbatim with `--data-binary @-`. Older builds sent `-d '{}'`
 		// which dropped the payload, forcing the API to probe for the
 		// session file by mtime.
+		// $KOJO_AGENT_TOKEN is injected into the PTY by filterEnv. The
+		// auth listener requires it on every /api/v1/* call; without
+		// the X-Kojo-Token header the PreCompact hook would 403 from
+		// the agent perspective.
 		settings = fmt.Sprintf(`{
   "persona": "agent-managed",
   "permissions": {
@@ -1090,7 +1094,7 @@ func PrepareClaudeSettings(agentID, apiBase string, allowProtectedPaths []string
         "hooks": [
           {
             "type": "command",
-            "command": "curl %s -X POST '%s/api/v1/agents/%s/pre-compact' -H 'Content-Type: application/json' --data-binary @- --max-time 120"
+            "command": "curl %s -X POST '%s/api/v1/agents/%s/pre-compact' -H 'Content-Type: application/json' -H \"X-Kojo-Token: $KOJO_AGENT_TOKEN\" --data-binary @- --max-time 120"
           }
         ]
       }

@@ -85,6 +85,9 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 	// the source.
 	fork.Archived = false
 	fork.ArchivedAt = ""
+	// Privilege is NEVER inherited. Forks start as regular agents; the
+	// owner must explicitly grant privilege via the dedicated endpoint.
+	fork.Privileged = false
 	// Clear WorkDir so the fork does not share an external file storage
 	// directory with the source (would cross-contaminate generated files).
 	fork.WorkDir = ""
@@ -102,13 +105,16 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 		return nil, fmt.Errorf("create fork dir: %w", err)
 	}
 
-	// Remove the partially-populated fork directory if anything below fails
-	// before the agent is fully registered.
+	// Remove the partially-populated fork directory and its auth token
+	// if anything below fails before the agent is fully registered.
 	forkRegistered := false
 	defer func() {
 		if !forkRegistered {
 			if err := os.RemoveAll(dstDir); err != nil {
 				m.logger.Warn("failed to clean up partial fork dir", "dir", dstDir, "err", err)
+			}
+			if m.tokenStore != nil {
+				m.tokenStore.RemoveAgentToken(fork.ID)
 			}
 		}
 	}()
@@ -190,6 +196,17 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 				Role:      last.Role,
 				Timestamp: last.Timestamp,
 			}
+		}
+	}
+
+	// Provision the fork's auth token BEFORE registering it. A token
+	// failure here aborts the fork and triggers the dstDir cleanup
+	// defer above, leaving the source untouched. Once registered, the
+	// agent is reachable from cron / chat / Slack — a tokenless agent
+	// would silently lose self-API access at that point.
+	if m.tokenStore != nil {
+		if err := m.tokenStore.EnsureAgentToken(fork.ID); err != nil {
+			return nil, fmt.Errorf("provision fork token: %w", err)
 		}
 	}
 

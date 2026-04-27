@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,7 +13,35 @@ import (
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
+	"github.com/loppo-llc/kojo/internal/auth"
 )
+
+// directoryView returns a public, agent-safe view of an Agent. Used by
+// list/get handlers when the caller is not the Owner and not the agent
+// itself — exposes only ID/Name/PublicProfile and the avatar metadata
+// already shipped via /api/v1/agents/{id}/avatar.
+type directoryView struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	PublicProfile string `json:"publicProfile"`
+	HasAvatar     bool   `json:"hasAvatar"`
+	AvatarHash    string `json:"avatarHash,omitempty"`
+	Archived      bool   `json:"archived,omitempty"`
+}
+
+func toDirectoryView(a *agent.Agent) directoryView {
+	if a == nil {
+		return directoryView{}
+	}
+	return directoryView{
+		ID:            a.ID,
+		Name:          a.Name,
+		PublicProfile: a.PublicProfile,
+		HasAvatar:     a.HasAvatar,
+		AvatarHash:    a.AvatarHash,
+		Archived:      a.Archived,
+	}
+}
 
 // agentResponse embeds *agent.Agent and tacks on runtime-only fields the UI
 // consumes. These fields aren't persisted so they live outside the Agent
@@ -70,16 +99,39 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	p := auth.FromContext(r.Context())
 	all := s.agents.List()
-	out := make([]*agent.Agent, 0, len(all))
+	if p.IsOwner() {
+		out := make([]*agent.Agent, 0, len(all))
+		for _, a := range all {
+			switch {
+			case onlyArchived && !a.Archived:
+				continue
+			case !onlyArchived && !includeArchived && a.Archived:
+				continue
+			}
+			out = append(out, a)
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]any{"agents": out})
+		return
+	}
+
+	// Non-owner: full record for self, directory view for others.
+	// Force archived agents off the list — non-owners have no business
+	// enumerating tombstoned personas, so the includeArchived /
+	// onlyArchived flags are silently ignored at this layer (an
+	// agent's own archived self is also filtered out — they should be
+	// asking the owner to revive them, not poking the API).
+	out := make([]any, 0, len(all))
 	for _, a := range all {
-		switch {
-		case onlyArchived && !a.Archived:
-			continue
-		case !onlyArchived && !includeArchived && a.Archived:
+		if a.Archived {
 			continue
 		}
-		out = append(out, a)
+		if p.IsAgent() && p.AgentID == a.ID {
+			out = append(out, a)
+		} else {
+			out = append(out, toDirectoryView(a))
+		}
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]any{"agents": out})
 }
@@ -90,6 +142,10 @@ func (s *Server) handleAgentDirectory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
+	if p := auth.FromContext(r.Context()); !p.CanForkOrCreate() {
+		writeError(w, http.StatusForbidden, "forbidden", "agent creation is owner-only")
+		return
+	}
 	var cfg agent.AgentConfig
 	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
@@ -110,14 +166,44 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
 		return
 	}
-	writeJSONResponse(w, http.StatusOK, s.buildAgentResponse(a))
+	p := auth.FromContext(r.Context())
+	if p.CanReadFull(id) {
+		writeJSONResponse(w, http.StatusOK, s.buildAgentResponse(a))
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, toDirectoryView(a))
 }
 
 
 func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	p := auth.FromContext(r.Context())
+	if !p.CanMutateSelf(id) {
+		writeError(w, http.StatusForbidden, "forbidden", "agents may only PATCH themselves")
+		return
+	}
+	// Defensive: refuse a payload that smuggles a "privileged" field
+	// regardless of role. The Owner has a dedicated POST /privilege
+	// endpoint; anyone else trying to flip the bit through PATCH is
+	// almost certainly attempting self-elevation. Match keys
+	// case-insensitively so a casing trick can't sneak past either.
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err == nil {
+		for k := range raw {
+			if strings.EqualFold(k, "privileged") {
+				writeError(w, http.StatusForbidden, "forbidden",
+					"privileged is owner-only; use POST /api/v1/agents/{id}/privilege")
+				return
+			}
+		}
+	}
 	var cfg agent.AgentUpdateConfig
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+	if err := json.Unmarshal(body, &cfg); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
@@ -139,6 +225,11 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 // in the transcript via the normal chat flow.
 func (s *Server) handleCheckin(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	p := auth.FromContext(r.Context())
+	if !p.CanDeleteOrReset(id) {
+		writeError(w, http.StatusForbidden, "forbidden", "agent is not allowed to checkin others")
+		return
+	}
 	if err := s.agents.Checkin(id); err != nil {
 		switch {
 		case errors.Is(err, agent.ErrAgentNotFound):
@@ -157,6 +248,11 @@ func (s *Server) handleCheckin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	p := auth.FromContext(r.Context())
+	if !p.CanDeleteOrReset(id) {
+		writeError(w, http.StatusForbidden, "forbidden", "agent is not allowed to reset others")
+		return
+	}
 
 	// Stop Slack bot before resetting to avoid stale file references.
 	if s.slackHub != nil {
@@ -186,6 +282,10 @@ func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleForkAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if p := auth.FromContext(r.Context()); !p.CanForkOrCreate() {
+		writeError(w, http.StatusForbidden, "forbidden", "fork is owner-only")
+		return
+	}
 	var body struct {
 		Name              string `json:"name"`
 		IncludeTranscript bool   `json:"includeTranscript"`
@@ -215,6 +315,10 @@ func (s *Server) handleForkAgent(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if p := auth.FromContext(r.Context()); !p.CanDeleteOrReset(id) {
+		writeError(w, http.StatusForbidden, "forbidden", "agent is not allowed to delete others")
+		return
+	}
 	// ?archive=true keeps all on-disk data but stops runtime activity.
 	// Restored later via POST /api/v1/agents/{id}/unarchive.
 	archive := r.URL.Query().Get("archive") == "true"
@@ -255,6 +359,10 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 // poller, and (if previously enabled) the Slack bot.
 func (s *Server) handleUnarchiveAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if p := auth.FromContext(r.Context()); !p.CanDeleteOrReset(id) {
+		writeError(w, http.StatusForbidden, "forbidden", "agent is not allowed to unarchive others")
+		return
+	}
 	if err := s.agents.Unarchive(id); err != nil {
 		switch {
 		case errors.Is(err, agent.ErrAgentNotFound):
@@ -993,8 +1101,40 @@ func (s *Server) handlePreCompact(w http.ResponseWriter, r *http.Request) {
 
 // --- Session Reset Handler ---
 
+// handlePrivilegeAgent toggles the Privileged flag on an agent. Owner-only;
+// the auth middleware already denies non-Owner principals on this route, but
+// the handler reasserts the check defensively because the privilege flag is
+// the only authority an agent has to reach delete/reset on others.
+func (s *Server) handlePrivilegeAgent(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if p := auth.FromContext(r.Context()); !p.CanSetPrivileged() {
+		writeError(w, http.StatusForbidden, "forbidden", "privilege is owner-only")
+		return
+	}
+	var body struct {
+		Privileged bool `json:"privileged"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	if err := s.agents.SetPrivileged(id, body.Privileged); err != nil {
+		if errors.Is(err, agent.ErrAgentNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"id": id, "privileged": body.Privileged})
+}
+
 func (s *Server) handleResetSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if p := auth.FromContext(r.Context()); !p.CanDeleteOrReset(id) {
+		writeError(w, http.StatusForbidden, "forbidden", "agent is not allowed to reset others")
+		return
+	}
 	if err := s.agents.ResetSession(id); err != nil {
 		if errors.Is(err, agent.ErrAgentNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())

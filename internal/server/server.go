@@ -18,6 +18,7 @@ import (
 	"sync"
 
 	"github.com/loppo-llc/kojo/internal/agent"
+	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/filebrowser"
 	gitpkg "github.com/loppo-llc/kojo/internal/git"
 	"github.com/loppo-llc/kojo/internal/notify"
@@ -57,9 +58,12 @@ type Server struct {
 	git      *gitpkg.Manager
 	notify   *notify.Manager
 	logger   *slog.Logger
-	httpSrv  *http.Server
-	devMode   bool
-	version   string
+	mux      *http.ServeMux
+	httpSrv  *http.Server // public (Owner-trusted) listener
+	authSrv  *http.Server // agent-facing auth-required listener (lazy)
+	authMu   sync.Mutex
+	devMode    bool
+	version    string
 	oauth2Mgr  *gmailpkg.OAuth2Manager
 	oauth2Once sync.Once
 }
@@ -133,10 +137,14 @@ func New(cfg Config) *Server {
 
 	mux := http.NewServeMux()
 	s.registerRoutes(mux, cfg)
+	s.mux = mux
 
+	// The public listener (the kojo user's mobile UI) is unconditionally
+	// trusted as Owner — preserves the original UX with no token setup.
+	// The agent-facing auth listener is created lazily by ServeAuth.
 	s.httpSrv = &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           mux,
+		Handler:           auth.OwnerOnlyMiddleware(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20, // 1MB
@@ -213,6 +221,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /api/v1/agents/{id}", s.handleUpdateAgent)
 	mux.HandleFunc("POST /api/v1/agents/{id}/reset", s.handleResetAgentData)
 	mux.HandleFunc("POST /api/v1/agents/{id}/fork", s.handleForkAgent)
+	mux.HandleFunc("POST /api/v1/agents/{id}/privilege", s.handlePrivilegeAgent)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}", s.handleDeleteAgent)
 	mux.HandleFunc("POST /api/v1/agents/{id}/unarchive", s.handleUnarchiveAgent)
 	mux.HandleFunc("GET /api/v1/agents/{id}/avatar", s.handleGetAvatar)
@@ -341,6 +350,36 @@ func (s *Server) ServeTLS(ln net.Listener, certFile, keyFile string) error {
 	return s.httpSrv.ServeTLS(ln, certFile, keyFile)
 }
 
+// ServeAuth serves the agent-facing auth-required listener using the
+// supplied resolver. The handler chain is AuthMiddleware (sets
+// Principal from Authorization header) → EnforceMiddleware (denies
+// non-Owner principals on routes outside the allowlist) → mux.
+//
+// Intended use: bind to 127.0.0.1 only, expose to local PTY processes
+// via $KOJO_API_BASE. The public listener (Serve) bypasses auth and
+// keeps the user UX intact.
+func (s *Server) ServeAuth(ln net.Listener, resolver *auth.Resolver) error {
+	srv := s.ensureAuthServer(resolver)
+	s.logger.Info("auth listener started", "addr", ln.Addr().String())
+	return srv.Serve(ln)
+}
+
+func (s *Server) ensureAuthServer(resolver *auth.Resolver) *http.Server {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	if s.authSrv != nil {
+		return s.authSrv
+	}
+	handler := auth.AuthMiddleware(resolver)(auth.EnforceMiddleware(s.mux))
+	s.authSrv = &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	return s.authSrv
+}
+
 func (s *Server) Handler() http.Handler {
 	return s.httpSrv.Handler
 }
@@ -351,6 +390,23 @@ func (s *Server) SetTLSConfig(tlsCfg *tls.Config) {
 
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("shutting down...")
+
+	// Drain HTTP listeners first so no new requests can land while the
+	// rest of the system tears down. Otherwise an in-flight agent chat
+	// could be cancelled mid-stream by agents.Shutdown() and surface a
+	// confusing partial response to the user. Errors from each listener
+	// are logged independently so a timeout on the auth listener cannot
+	// hide a problem on the public listener.
+	if s.authSrv != nil {
+		if err := s.authSrv.Shutdown(ctx); err != nil {
+			s.logger.Warn("auth listener shutdown error", "err", err)
+		}
+	}
+	if err := s.httpSrv.Shutdown(ctx); err != nil {
+		s.logger.Warn("public listener shutdown error", "err", err)
+	}
+
+	// Now stop background producers / hubs.
 	if s.slackHub != nil {
 		s.slackHub.Stop()
 	}
@@ -360,7 +416,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.agents.Shutdown()
 	}
 	cleanupUploads()
-	return s.httpSrv.Shutdown(ctx)
+	return nil
 }
 
 // --- Helpers ---

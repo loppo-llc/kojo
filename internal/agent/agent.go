@@ -261,6 +261,12 @@ type Agent struct {
 	// ArchivedAt is the RFC3339 timestamp when Archived was last set.
 	// Cleared on unarchive.
 	ArchivedAt string `json:"archivedAt,omitempty"`
+
+	// Privileged grants the agent the ability to delete/reset other agents
+	// (but NOT to fork or read their full record). Owner-only mutation —
+	// the API strips this field from PATCH bodies and exposes a dedicated
+	// POST /api/v1/agents/{id}/privilege handler instead.
+	Privileged bool `json:"privileged,omitempty"`
 }
 
 // ResumeIdleDuration returns the configured idle window for keeping an

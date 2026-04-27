@@ -316,6 +316,12 @@ func (m *Manager) Delete(id string) error {
 		m.logger.Warn("failed to remove agent dir", "agent", id, "err", err)
 	}
 
+	// Drop auth token before removing from the in-memory map so a
+	// concurrent request can't temporarily resolve to a deleted agent.
+	if m.tokenStore != nil {
+		m.tokenStore.RemoveAgentToken(id)
+	}
+
 	// Remove from in-memory map
 	m.mu.Lock()
 	delete(m.agents, id)

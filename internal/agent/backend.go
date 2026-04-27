@@ -48,15 +48,44 @@ type ChatBackend interface {
 	Available() bool
 }
 
+// kojoAPIBase is the URL agents use to reach kojo's auth-required API
+// listener. Set by the server at startup via SetKojoAPIBase. Empty when
+// the auth listener is not configured (e.g. --no-auth dev mode), in
+// which case KOJO_API_BASE is omitted from the agent's environment.
+var kojoAPIBase string
+
+// SetKojoAPIBase records the URL agents should use for self-authenticated
+// API calls. Idempotent; safe to call repeatedly during boot.
+func SetKojoAPIBase(base string) { kojoAPIBase = base }
+
+// agentTokenLookup, when set, returns the per-agent auth token kojo
+// should expose via $KOJO_AGENT_TOKEN to the PTY. Wired up by the
+// server using the auth.TokenStore.
+var agentTokenLookup func(agentID string) (string, bool)
+
+// SetAgentTokenLookup wires the token lookup callback. May be nil
+// (disables token injection).
+func SetAgentTokenLookup(fn func(string) (string, bool)) { agentTokenLookup = fn }
+
 // filterEnv returns a copy of os.Environ() with entries matching any of the
 // given prefixes removed, and AGENT_BROWSER_SESSION / AGENT_BROWSER_COOKIE_DIR
-// vars set to agentID / dataDir.
+// vars set to agentID / dataDir. KOJO_AGENT_ID, KOJO_AGENT_TOKEN and
+// KOJO_API_BASE are also injected so the agent can identify itself when
+// curling kojo's API.
+//
+// Every KOJO_* var inherited from the parent process is stripped before the
+// per-agent values are appended. This prevents an Owner-only secret like
+// KOJO_OWNER_TOKEN — which a deployment may set on the kojo process to
+// bootstrap the owner role — from ever leaking into a PTY where the agent
+// could read it via $KOJO_OWNER_TOKEN.
 func filterEnv(removePrefixes []string, agentID, dataDir string) []string {
+	stripPrefixes := append([]string(nil), removePrefixes...)
+	stripPrefixes = append(stripPrefixes, "KOJO_")
 	env := os.Environ()
 	filtered := make([]string, 0, len(env))
 	for _, e := range env {
 		skip := false
-		for _, prefix := range removePrefixes {
+		for _, prefix := range stripPrefixes {
 			if strings.HasPrefix(e, prefix) {
 				skip = true
 				break
@@ -70,7 +99,16 @@ func filterEnv(removePrefixes []string, agentID, dataDir string) []string {
 		"AGENT_BROWSER_SESSION="+agentID,
 		"AGENT_BROWSER_SESSION_NAME="+agentID,
 		"AGENT_BROWSER_COOKIE_DIR="+dataDir,
+		"KOJO_AGENT_ID="+agentID,
 	)
+	if agentTokenLookup != nil {
+		if tok, ok := agentTokenLookup(agentID); ok && tok != "" {
+			filtered = append(filtered, "KOJO_AGENT_TOKEN="+tok)
+		}
+	}
+	if kojoAPIBase != "" {
+		filtered = append(filtered, "KOJO_API_BASE="+kojoAPIBase)
+	}
 	return filtered
 }
 
