@@ -32,33 +32,36 @@ func (c *SlackBotConfig) ReactMention() bool { return c.RespondMention == nil ||
 // ReactThread returns whether the bot should auto-reply in threads with history.
 func (c *SlackBotConfig) ReactThread() bool { return c.RespondThread == nil || *c.RespondThread }
 
-// ValidActiveHours validates the active hours range.
+// ValidSilentHours validates the silent hours range.
 // Both must be empty (no restriction) or both must be valid HH:MM format.
-func ValidActiveHours(start, end string) error {
+func ValidSilentHours(start, end string) error {
 	if start == "" && end == "" {
 		return nil
 	}
 	if (start == "") != (end == "") {
-		return fmt.Errorf("both activeStart and activeEnd must be set, or both empty")
+		return fmt.Errorf("both silentStart and silentEnd must be set, or both empty")
 	}
 	if _, err := time.Parse("15:04", start); err != nil {
-		return fmt.Errorf("invalid activeStart: %s", start)
+		return fmt.Errorf("invalid silentStart: %s", start)
 	}
 	if _, err := time.Parse("15:04", end); err != nil {
-		return fmt.Errorf("invalid activeEnd: %s", end)
+		return fmt.Errorf("invalid silentEnd: %s", end)
 	}
 	if start == end {
-		return fmt.Errorf("activeStart and activeEnd must differ")
+		return fmt.Errorf("silentStart and silentEnd must differ")
 	}
 	return nil
 }
 
-// IsWithinActiveHours checks if the current local time is within the active window.
-// Returns true if no restriction is set (both empty).
-// Supports overnight ranges (e.g., 22:00-06:00).
-func IsWithinActiveHours(start, end string) bool {
+// ValidActiveHours is a compatibility alias for ValidSilentHours.
+func ValidActiveHours(start, end string) error { return ValidSilentHours(start, end) }
+
+// IsInSilentHours checks if the current local time is within the silent window.
+// Returns false if no restriction is set (both empty = never silent).
+// Supports overnight ranges (e.g., 23:00-09:00).
+func IsInSilentHours(start, end string) bool {
 	if start == "" || end == "" {
-		return true
+		return false
 	}
 	now := time.Now()
 	nowMinutes := now.Hour()*60 + now.Minute()
@@ -69,10 +72,10 @@ func IsWithinActiveHours(start, end string) bool {
 	endMin := e.Hour()*60 + e.Minute()
 
 	if startMin <= endMin {
-		// Normal range: e.g., 09:00-23:00
+		// Normal range: e.g., 01:00-07:00
 		return nowMinutes >= startMin && nowMinutes < endMin
 	}
-	// Overnight range: e.g., 22:00-06:00
+	// Overnight range: e.g., 23:00-09:00
 	return nowMinutes >= startMin || nowMinutes < endMin
 }
 
@@ -198,8 +201,12 @@ type Agent struct {
 	// instead of resetting. 0 = use defaultResumeIdleDuration (5 min).
 	// claude-only; ignored by other backends.
 	ResumeIdleMinutes int    `json:"resumeIdleMinutes,omitempty"`
-	ActiveStart       string `json:"activeStart,omitempty"` // HH:MM — start of active window (empty = no restriction)
-	ActiveEnd         string `json:"activeEnd,omitempty"`   // HH:MM — end of active window (empty = no restriction)
+	SilentStart       string `json:"silentStart,omitempty"` // HH:MM — start of silent window (empty = no restriction)
+	SilentEnd         string `json:"silentEnd,omitempty"`   // HH:MM — end of silent window (empty = no restriction)
+	// NotifyDuringSilent controls whether the agent receives DM notifications
+	// during silent hours. Existing agents default to true (backward compat);
+	// new agents default to false.
+	NotifyDuringSilent *bool `json:"notifyDuringSilent,omitempty"`
 	// CronMessage overrides the trailing instruction in the periodic check-in
 	// prompt. Empty = use the default ("最近の出来事や気づきがあれば memory/...md に記録し、必要なタスクを実行してください。").
 	// The literal string "{date}" is replaced with today's date in YYYY-MM-DD form.
@@ -210,6 +217,12 @@ type Agent struct {
 	// Legacy field — only used during migration from cronExpr-based configs.
 	// Not included in JSON output; consumed by store.Load migration.
 	LegacyCronExpr string `json:"cronExpr,omitempty"`
+
+	// Legacy fields — consumed by store.Load for activeStart/activeEnd →
+	// silentStart/silentEnd migration. Active hours are inverted to silent
+	// hours: silentStart = old activeEnd, silentEnd = old activeStart.
+	LegacyActiveStart string `json:"activeStart,omitempty"`
+	LegacyActiveEnd   string `json:"activeEnd,omitempty"`
 
 	// HasAvatar indicates whether a custom avatar file exists.
 	HasAvatar bool `json:"hasAvatar"`
@@ -269,6 +282,16 @@ type Agent struct {
 	Privileged bool `json:"privileged,omitempty"`
 }
 
+// ShouldNotifyDuringSilent returns whether the agent should receive DM
+// notifications while in silent hours. Existing agents with a nil pointer
+// default to true for backward compatibility; new agents default to false.
+func (a *Agent) ShouldNotifyDuringSilent() bool {
+	if a.NotifyDuringSilent == nil {
+		return true // backward compat
+	}
+	return *a.NotifyDuringSilent
+}
+
 // ResumeIdleDuration returns the configured idle window for keeping an
 // over-token-threshold claude session via --resume. ResumeIdleMinutes==0
 // (the default for legacy agents) maps to defaultResumeIdleDuration so
@@ -312,9 +335,10 @@ type AgentConfig struct {
 	// ResumeIdleMinutes overrides the per-agent claude --resume idle window.
 	// nil/0 = use defaultResumeIdleDuration (5 min).
 	ResumeIdleMinutes *int    `json:"resumeIdleMinutes"`
-	ActiveStart       *string `json:"activeStart"` // HH:MM or empty
-	ActiveEnd         *string `json:"activeEnd"`   // HH:MM or empty
-	CronMessage       *string `json:"cronMessage"` // nil/empty = use default trailing instruction
+	SilentStart        *string `json:"silentStart"`        // HH:MM or empty
+	SilentEnd          *string `json:"silentEnd"`          // HH:MM or empty
+	NotifyDuringSilent *bool   `json:"notifyDuringSilent"` // nil = use default (false for new)
+	CronMessage        *string `json:"cronMessage"`        // nil/empty = use default trailing instruction
 }
 
 // AgentUpdateConfig is the request body for PATCH updates.
@@ -331,8 +355,9 @@ type AgentUpdateConfig struct {
 	IntervalMinutes       *int    `json:"intervalMinutes"`
 	TimeoutMinutes        *int    `json:"timeoutMinutes"`
 	ResumeIdleMinutes     *int    `json:"resumeIdleMinutes"`
-	ActiveStart           *string `json:"activeStart"`
-	ActiveEnd             *string `json:"activeEnd"`
+	SilentStart           *string `json:"silentStart"`
+	SilentEnd             *string `json:"silentEnd"`
+	NotifyDuringSilent    *bool   `json:"notifyDuringSilent"`
 	// CronMessage follows the standard *string PATCH convention used by every
 	// other field on this struct: nil/omitted = leave unchanged, "" = clear
 	// back to the built-in default trailing instruction.
@@ -370,12 +395,20 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	if !ValidResumeIdle(resumeIdleMin) {
 		return nil, fmt.Errorf("unsupported resumeIdle: %d minutes", resumeIdleMin)
 	}
-	var activeStart, activeEnd string
-	if cfg.ActiveStart != nil {
-		activeStart = *cfg.ActiveStart
+	var silentStart, silentEnd string
+	if cfg.SilentStart != nil {
+		silentStart = *cfg.SilentStart
 	}
-	if cfg.ActiveEnd != nil {
-		activeEnd = *cfg.ActiveEnd
+	if cfg.SilentEnd != nil {
+		silentEnd = *cfg.SilentEnd
+	}
+	// New agents default to false (don't receive DM during silent).
+	var notifyDuringSilent *bool
+	if cfg.NotifyDuringSilent != nil {
+		notifyDuringSilent = cfg.NotifyDuringSilent
+	} else {
+		f := false
+		notifyDuringSilent = &f
 	}
 	var cronMessage string
 	if cfg.CronMessage != nil {
@@ -385,7 +418,7 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		}
 		cronMessage = v
 	}
-	if err := ValidActiveHours(activeStart, activeEnd); err != nil {
+	if err := ValidSilentHours(silentStart, silentEnd); err != nil {
 		return nil, err
 	}
 	if !ValidModelEffort(cfg.Model, cfg.Effort) {
@@ -418,8 +451,9 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		IntervalMinutes:   interval,
 		TimeoutMinutes:    timeoutMin,
 		ResumeIdleMinutes: resumeIdleMin,
-		ActiveStart:       activeStart,
-		ActiveEnd:         activeEnd,
+		SilentStart:        silentStart,
+		SilentEnd:          silentEnd,
+		NotifyDuringSilent: notifyDuringSilent,
 		CronMessage:       cronMessage,
 		CreatedAt:         now,
 		UpdatedAt:         now,

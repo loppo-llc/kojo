@@ -52,10 +52,11 @@ export interface AgentInfo {
   intervalMinutes: number;
   timeoutMinutes: number;
   resumeIdleMinutes?: number;
-  activeStart?: string;
-  activeEnd?: string;
+  silentStart?: string;
+  silentEnd?: string;
+  notifyDuringSilent?: boolean;
   cronMessage?: string;
-  // RFC3339 timestamp of the next scheduled cron run, accounting for active
+  // RFC3339 timestamp of the next scheduled cron run, accounting for silent
   // hours. Empty/absent if cron is disabled, the agent is archived, or no
   // schedule is registered. Server-derived; never sent on update.
   nextCronAt?: string;
@@ -96,8 +97,9 @@ export interface AgentConfig {
   intervalMinutes?: number;
   timeoutMinutes?: number;
   resumeIdleMinutes?: number;
-  activeStart?: string;
-  activeEnd?: string;
+  silentStart?: string;
+  silentEnd?: string;
+  notifyDuringSilent?: boolean;
   cronMessage?: string;
 }
 

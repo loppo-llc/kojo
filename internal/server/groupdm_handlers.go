@@ -122,6 +122,17 @@ func (s *Server) handleCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, g)
 }
 
+// groupDMWithStatus wraps a GroupDM and overlays per-member online status.
+type groupDMWithStatus struct {
+	*agent.GroupDM
+	Members []groupMemberWithStatus `json:"members"`
+}
+
+type groupMemberWithStatus struct {
+	agent.GroupMember
+	Status string `json:"status"` // "online", "offline", or "unknown"
+}
+
 func (s *Server) handleGetGroupDM(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !s.requireMemberOrOwner(w, r, id) {
@@ -132,7 +143,27 @@ func (s *Server) handleGetGroupDM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "group not found: "+id)
 		return
 	}
-	writeJSONResponse(w, http.StatusOK, g)
+
+	isPhysical := g.Venue == agent.GroupDMVenueColocated
+	members := make([]groupMemberWithStatus, len(g.Members))
+	for i, m := range g.Members {
+		var status string
+		if isPhysical {
+			status = "unknown"
+		} else if avail, found := s.agents.IsAgentDMAvailable(m.AgentID); !found {
+			status = "unknown"
+		} else if avail && s.agents.IsBusy(m.AgentID) {
+			status = "busy"
+		} else if avail {
+			status = "online"
+		} else {
+			status = "offline"
+		}
+		members[i] = groupMemberWithStatus{GroupMember: m, Status: status}
+	}
+
+	resp := groupDMWithStatus{GroupDM: g, Members: members}
+	writeJSONResponse(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {

@@ -150,10 +150,10 @@ func (cs *cronScheduler) Schedule(agentID string, cronExpr string) error {
 }
 
 // nextRun returns the next scheduled run time for an agent, adjusted for
-// active hours. If the cron's Next falls outside the active window, it
-// iterates the cron schedule forward to find the first tick inside the window.
+// silent hours. If the cron's Next falls inside the silent window, it
+// iterates the cron schedule forward to find the first tick outside it.
 // Returns zero time if no schedule exists.
-func (cs *cronScheduler) nextRun(agentID string, activeStart, activeEnd string) time.Time {
+func (cs *cronScheduler) nextRun(agentID string, silentStart, silentEnd string) time.Time {
 	cs.mu.Lock()
 	var entry cron.Entry
 	if entryID, ok := cs.entries[agentID]; ok {
@@ -165,37 +165,39 @@ func (cs *cronScheduler) nextRun(agentID string, activeStart, activeEnd string) 
 		return time.Time{}
 	}
 
-	if activeStart == "" || activeEnd == "" {
+	if silentStart == "" || silentEnd == "" {
 		return entry.Next
 	}
 
-	return nextRunInActiveWindow(entry.Schedule, entry.Next, activeStart, activeEnd)
+	return nextRunOutsideSilentWindow(entry.Schedule, entry.Next, silentStart, silentEnd)
 }
 
-// nextRunInActiveWindow finds the first cron tick at or after t that falls
-// within the active hours window. Tries up to 48 iterations to avoid infinite loops.
-func nextRunInActiveWindow(sched cron.Schedule, t time.Time, start, end string) time.Time {
+// nextRunOutsideSilentWindow finds the first cron tick at or after t that falls
+// outside the silent hours window. Tries up to 300 iterations (covers 25h at
+// 5-minute intervals) to avoid returning a tick inside a long silent window.
+func nextRunOutsideSilentWindow(sched cron.Schedule, t time.Time, start, end string) time.Time {
 	s, _ := time.Parse("15:04", start)
 	e, _ := time.Parse("15:04", end)
 	startMin := s.Hour()*60 + s.Minute()
 	endMin := e.Hour()*60 + e.Minute()
 
 	candidate := t
-	for i := 0; i < 48; i++ {
+	for i := 0; i < 300; i++ {
 		cMin := candidate.Hour()*60 + candidate.Minute()
-		inWindow := false
+		inSilent := false
 		if startMin <= endMin {
-			inWindow = cMin >= startMin && cMin < endMin
+			inSilent = cMin >= startMin && cMin < endMin
 		} else {
-			inWindow = cMin >= startMin || cMin < endMin
+			inSilent = cMin >= startMin || cMin < endMin
 		}
-		if inWindow {
+		if !inSilent {
 			return candidate
 		}
 		candidate = sched.Next(candidate)
 	}
-	// Couldn't find one within 48 ticks; return raw next
-	return t
+	// Couldn't find a non-silent tick; return zero so the UI shows "—"
+	// instead of a misleading time that would be skipped.
+	return time.Time{}
 }
 
 // Remove removes the cron schedule for an agent.
@@ -258,8 +260,8 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 		return
 	}
 
-	// Check active hours and read agent config
-	var activeStart, activeEnd, cronMessage string
+	// Check silent hours and read agent config
+	var silentStart, silentEnd, cronMessage string
 	var timeoutMinutes int
 	if a, ok := cs.mgr.Get(agentID); ok {
 		// Archived guard: a tick may have queued just before Archive ran
@@ -269,12 +271,12 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 			cs.logger.Debug("cron job skipped (archived)", "agent", agentID)
 			return
 		}
-		activeStart, activeEnd = a.ActiveStart, a.ActiveEnd
+		silentStart, silentEnd = a.SilentStart, a.SilentEnd
 		timeoutMinutes = a.TimeoutMinutes
 		cronMessage = a.CronMessage
-		if !IsWithinActiveHours(activeStart, activeEnd) {
-			cs.logger.Debug("cron job skipped (outside active hours)", "agent", agentID,
-				"activeStart", activeStart, "activeEnd", activeEnd)
+		if IsInSilentHours(silentStart, silentEnd) {
+			cs.logger.Debug("cron job skipped (silent hours)", "agent", agentID,
+				"silentStart", silentStart, "silentEnd", silentEnd)
 			return
 		}
 	}
@@ -287,7 +289,7 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 
 	cs.logger.Info("cron job triggered", "agent", agentID)
 
-	nextRun := cs.nextRun(agentID, activeStart, activeEnd)
+	nextRun := cs.nextRun(agentID, silentStart, silentEnd)
 
 	// Per-agent timeout (0 = use default)
 	timeout := cronTimeout

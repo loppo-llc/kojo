@@ -1018,6 +1018,20 @@ func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName string, msg *Gr
 			"group", groupID, "agent", agentID, "messageID", msg.ID, "senderIsUser", senderIsUser)
 		return
 	}
+	// Silent-hour gate: skip notification when the recipient is in silent
+	// hours and has not opted in to DM during silent. The check consults
+	// the agent config directly — it uses IsInSilentHours (not
+	// IsAgentActive) because global-cron-pause is irrelevant for DM
+	// delivery: a message from a peer should still land if the agent
+	// opted in.
+	if a, ok := m.agentMgr.Get(agentID); ok {
+		if IsInSilentHours(a.SilentStart, a.SilentEnd) && !a.ShouldNotifyDuringSilent() {
+			m.logger.Debug("groupdm notification suppressed (silent hours)",
+				"group", groupID, "agent", agentID)
+			return
+		}
+	}
+
 	mode, digestWindow := m.memberNotifySettings(groupID, agentID)
 	if mode == NotifyMuted {
 		return
@@ -1325,6 +1339,20 @@ func (m *GroupDMManager) renderNotification(agentID, groupID, groupName, latestM
 // the buffer and a retry timer is armed. gen guards against state that was
 // cleaned up mid-delivery.
 func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, groupID, groupName string, pending []pendingMsg) {
+	// Re-check silent hours at delivery time — the batch may have been
+	// queued before the agent entered silent hours.
+	if a, ok := m.agentMgr.Get(agentID); ok {
+		if IsInSilentHours(a.SilentStart, a.SilentEnd) && !a.ShouldNotifyDuringSilent() {
+			m.notifyMu.Lock()
+			if ns := m.notify[key]; ns != nil && ns.gen == gen {
+				ns.inFlight = false
+			}
+			m.notifyMu.Unlock()
+			m.logger.Debug("groupdm delivery suppressed (silent hours)", "group", groupID, "agent", agentID)
+			return
+		}
+	}
+
 	mode, digestWindow := m.memberNotifySettings(groupID, agentID)
 	if mode == NotifyMuted {
 		// Member was muted between buffering and delivery — drop the batch.

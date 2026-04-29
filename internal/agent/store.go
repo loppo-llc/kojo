@@ -97,11 +97,33 @@ func (st *store) Load() ([]*Agent, error) {
 			a.ResumeIdleMinutes = 0
 			needsSave = true
 		}
-		// Validate loaded active hours — clear invalid values
-		if err := ValidActiveHours(a.ActiveStart, a.ActiveEnd); err != nil {
-			st.logger.Warn("invalid active hours in stored data, clearing", "agent", a.ID, "start", a.ActiveStart, "end", a.ActiveEnd, "err", err)
-			a.ActiveStart = ""
-			a.ActiveEnd = ""
+		// Migrate legacy activeStart/activeEnd → silentStart/silentEnd.
+		// Active hours (when the agent runs) invert to silent hours (when
+		// the agent sleeps): silentStart = old activeEnd, silentEnd = old
+		// activeStart. Existing agents get NotifyDuringSilent=true for
+		// backward compat.
+		if a.LegacyActiveStart != "" && a.LegacyActiveEnd != "" && a.SilentStart == "" && a.SilentEnd == "" {
+			a.SilentStart = a.LegacyActiveEnd
+			a.SilentEnd = a.LegacyActiveStart
+			// Backward compat: existing agents keep receiving DM during silent
+			if a.NotifyDuringSilent == nil {
+				t := true
+				a.NotifyDuringSilent = &t
+			}
+			st.logger.Info("migrated active hours → silent hours",
+				"agent", a.ID,
+				"activeStart", a.LegacyActiveStart, "activeEnd", a.LegacyActiveEnd,
+				"silentStart", a.SilentStart, "silentEnd", a.SilentEnd)
+			needsSave = true
+		}
+		a.LegacyActiveStart = ""
+		a.LegacyActiveEnd = ""
+
+		// Validate loaded silent hours — clear invalid values
+		if err := ValidSilentHours(a.SilentStart, a.SilentEnd); err != nil {
+			st.logger.Warn("invalid silent hours in stored data, clearing", "agent", a.ID, "start", a.SilentStart, "end", a.SilentEnd, "err", err)
+			a.SilentStart = ""
+			a.SilentEnd = ""
 			needsSave = true
 		}
 		// Validate loaded workDir — clear invalid values (not absolute or not a directory)

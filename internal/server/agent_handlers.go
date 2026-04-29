@@ -81,6 +81,18 @@ func (s *Server) handleSetCronPaused(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, map[string]any{"paused": body.Paused})
 }
 
+// --- Active Hour Check ---
+
+func (s *Server) handleGetAgentActive(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	active, ok := s.agents.IsAgentActive(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"active": active})
+}
+
 // --- Agent CRUD Handlers ---
 
 func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {

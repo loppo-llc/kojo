@@ -246,7 +246,7 @@ func (p *notifyPoller) tick() {
 		if !ok {
 			continue
 		}
-		if !IsWithinActiveHours(a.ActiveStart, a.ActiveEnd) {
+		if IsInSilentHours(a.SilentStart, a.SilentEnd) {
 			continue
 		}
 
@@ -379,6 +379,17 @@ func (p *notifyPoller) processRetries() {
 	p.mu.Unlock()
 
 	for _, pn := range ready {
+		// Re-check silent hours at retry time — the notification may
+		// have been queued before the agent entered silent hours.
+		// Requeue without consuming the retry budget so messages are
+		// not permanently lost during long silent windows.
+		if a, ok := p.mgr.Get(pn.agentID); ok && IsInSilentHours(a.SilentStart, a.SilentEnd) {
+			pn.nextAt = time.Now().Add(notifyRetryInterval)
+			p.mu.Lock()
+			p.pending = append(p.pending, pn)
+			p.mu.Unlock()
+			continue
+		}
 		if p.mgr.IsBusy(pn.agentID) {
 			pn.retries++
 			if pn.retries >= notifyMaxRetries {

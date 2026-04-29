@@ -594,14 +594,14 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 	// ResumeIdleMinutes is validated up-front (before any I/O / mutation).
 	{
-		s, e := a.ActiveStart, a.ActiveEnd
-		if cfg.ActiveStart != nil {
-			s = *cfg.ActiveStart
+		s, e := a.SilentStart, a.SilentEnd
+		if cfg.SilentStart != nil {
+			s = *cfg.SilentStart
 		}
-		if cfg.ActiveEnd != nil {
-			e = *cfg.ActiveEnd
+		if cfg.SilentEnd != nil {
+			e = *cfg.SilentEnd
 		}
-		if err := ValidActiveHours(s, e); err != nil {
+		if err := ValidSilentHours(s, e); err != nil {
 			m.mu.Unlock()
 			return nil, err
 		}
@@ -616,11 +616,14 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.ResumeIdleMinutes != nil {
 		a.ResumeIdleMinutes = *cfg.ResumeIdleMinutes
 	}
-	if cfg.ActiveStart != nil {
-		a.ActiveStart = *cfg.ActiveStart
+	if cfg.SilentStart != nil {
+		a.SilentStart = *cfg.SilentStart
 	}
-	if cfg.ActiveEnd != nil {
-		a.ActiveEnd = *cfg.ActiveEnd
+	if cfg.SilentEnd != nil {
+		a.SilentEnd = *cfg.SilentEnd
+	}
+	if cfg.NotifyDuringSilent != nil {
+		a.NotifyDuringSilent = cfg.NotifyDuringSilent
 	}
 	{
 		finalBaseURL := a.CustomBaseURL
@@ -1247,7 +1250,7 @@ func (m *Manager) updatePostChatIndex(agentID string) {
 }
 
 // NextCronRun returns the next scheduled run time for an agent, adjusted
-// for active hours. Returns the zero Time when there is no run to predict
+// for silent hours. Returns the zero Time when there is no run to predict
 // because the agent has no schedule, is archived, doesn't exist, or all
 // cron is globally paused — anything that would make the displayed time
 // misleading.
@@ -1262,9 +1265,9 @@ func (m *Manager) NextCronRun(agentID string) time.Time {
 		m.mu.Unlock()
 		return time.Time{}
 	}
-	activeStart, activeEnd := a.ActiveStart, a.ActiveEnd
+	silentStart, silentEnd := a.SilentStart, a.SilentEnd
 	m.mu.Unlock()
-	return m.cron.nextRun(agentID, activeStart, activeEnd)
+	return m.cron.nextRun(agentID, silentStart, silentEnd)
 }
 
 // Checkin triggers a manual check-in for the agent. Unlike the periodic
@@ -1331,6 +1334,57 @@ func (m *Manager) SetCronPaused(paused bool) {
 	m.mu.Unlock()
 	m.store.SaveCronPaused(paused)
 	m.logger.Info("cron pause toggled", "paused", paused)
+}
+
+// IsAgentActive reports whether an agent is currently "active":
+//   - Global cron is running (not paused)
+//   - Agent is not archived
+//   - Current time is NOT within the agent's silent hours
+//
+// Returns (active, found). found is false when the agent ID is unknown.
+func (m *Manager) IsAgentActive(agentID string) (bool, bool) {
+	m.mu.Lock()
+	paused := m.cronPaused
+	a, ok := m.agents[agentID]
+	if !ok {
+		m.mu.Unlock()
+		return false, false
+	}
+	if paused || a.Archived {
+		m.mu.Unlock()
+		return false, true
+	}
+	start, end := a.SilentStart, a.SilentEnd
+	m.mu.Unlock()
+
+	return !IsInSilentHours(start, end), true
+}
+
+// IsAgentDMAvailable reports whether an agent can receive DM notifications.
+// Unlike IsAgentActive, this ignores global cron pause (DM delivery is
+// independent of cron) and respects NotifyDuringSilent: an agent in silent
+// hours is still "available" for DMs if they opted in.
+//
+// Returns (available, found). found is false when the agent ID is unknown.
+func (m *Manager) IsAgentDMAvailable(agentID string) (bool, bool) {
+	m.mu.Lock()
+	a, ok := m.agents[agentID]
+	if !ok {
+		m.mu.Unlock()
+		return false, false
+	}
+	if a.Archived {
+		m.mu.Unlock()
+		return false, true
+	}
+	start, end := a.SilentStart, a.SilentEnd
+	notifyDuring := a.ShouldNotifyDuringSilent()
+	m.mu.Unlock()
+
+	if IsInSilentHours(start, end) && !notifyDuring {
+		return false, true
+	}
+	return true, true
 }
 
 // trackOneShot registers a one-shot chat's cancel func so it can be
@@ -1687,6 +1741,10 @@ func copyAgent(a *Agent) *Agent {
 	if a.LastMessage != nil {
 		lm := *a.LastMessage
 		cp.LastMessage = &lm
+	}
+	if a.NotifyDuringSilent != nil {
+		v := *a.NotifyDuringSilent
+		cp.NotifyDuringSilent = &v
 	}
 	if a.SlackBot != nil {
 		sb := *a.SlackBot

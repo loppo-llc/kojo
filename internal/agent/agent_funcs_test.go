@@ -103,7 +103,7 @@ func TestNormalizeTimestamp(t *testing.T) {
 	}
 }
 
-func TestValidActiveHours(t *testing.T) {
+func TestValidSilentHours(t *testing.T) {
 	tests := []struct {
 		name    string
 		start   string
@@ -111,19 +111,19 @@ func TestValidActiveHours(t *testing.T) {
 		wantErr bool
 	}{
 		{"both empty is valid", "", "", false},
-		{"valid range", "09:00", "17:00", false},
-		{"overnight range", "22:00", "06:00", false},
-		{"start only", "09:00", "", true},
-		{"end only", "", "17:00", true},
-		{"same values", "09:00", "09:00", true},
-		{"invalid start format", "25:00", "17:00", true},
-		{"invalid end format", "09:00", "99:99", true},
+		{"valid range", "01:00", "07:00", false},
+		{"overnight range", "23:00", "09:00", false},
+		{"start only", "01:00", "", true},
+		{"end only", "", "07:00", true},
+		{"same values", "01:00", "01:00", true},
+		{"invalid start format", "25:00", "07:00", true},
+		{"invalid end format", "01:00", "99:99", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidActiveHours(tt.start, tt.end)
+			err := ValidSilentHours(tt.start, tt.end)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("ValidActiveHours(%q, %q) error = %v, wantErr %v", tt.start, tt.end, err, tt.wantErr)
+				t.Errorf("ValidSilentHours(%q, %q) error = %v, wantErr %v", tt.start, tt.end, err, tt.wantErr)
 			}
 		})
 	}

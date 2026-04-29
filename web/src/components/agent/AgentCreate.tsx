@@ -22,8 +22,8 @@ export function AgentCreate() {
   const [intervalMinutes, setIntervalMinutes] = useState(30);
   const [timeoutMinutes, setTimeoutMinutes] = useState(10);
   const [resumeIdleMinutes, setResumeIdleMinutes] = useState(0);
-  const [activeStart, setActiveStart] = useState("");
-  const [activeEnd, setActiveEnd] = useState("");
+  const [silentStart, setSilentStart] = useState("");
+  const [silentEnd, setSilentEnd] = useState("");
   const [cronMessage, setCronMessage] = useState("");
   const [genPrompt, setGenPrompt] = useState("");
   const [personaPrompt, setPersonaPrompt] = useState("");
@@ -241,8 +241,8 @@ export function AgentCreate() {
         intervalMinutes,
         timeoutMinutes,
         resumeIdleMinutes: resumeIdleMinutes || undefined,
-        activeStart: activeStart || undefined,
-        activeEnd: activeEnd || undefined,
+        silentStart: silentStart || undefined,
+        silentEnd: silentEnd || undefined,
         cronMessage: cronMessage.trim() || undefined,
       });
 
@@ -593,10 +593,10 @@ export function AgentCreate() {
           resumeIdleMinutes={resumeIdleMinutes}
           onResumeIdleChange={setResumeIdleMinutes}
           tool={tool}
-          activeStart={activeStart}
-          activeEnd={activeEnd}
-          onActiveStartChange={setActiveStart}
-          onActiveEndChange={setActiveEnd}
+          silentStart={silentStart}
+          silentEnd={silentEnd}
+          onSilentStartChange={setSilentStart}
+          onSilentEndChange={setSilentEnd}
           cronMessage={cronMessage}
           onCronMessageChange={setCronMessage}
         />

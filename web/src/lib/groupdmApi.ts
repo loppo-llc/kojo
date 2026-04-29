@@ -31,6 +31,7 @@ export interface GroupDMInfo {
 export interface GroupMember {
   agentId: string;
   agentName: string;
+  status?: "online" | "offline" | "busy" | "unknown";
 }
 
 export interface GroupMessage {

@@ -26,8 +26,9 @@ export function AgentSettings() {
   const [intervalMinutes, setIntervalMinutes] = useState(30);
   const [timeoutMinutes, setTimeoutMinutes] = useState(10);
   const [resumeIdleMinutes, setResumeIdleMinutes] = useState(0);
-  const [activeStart, setActiveStart] = useState("");
-  const [activeEnd, setActiveEnd] = useState("");
+  const [silentStart, setSilentStart] = useState("");
+  const [silentEnd, setSilentEnd] = useState("");
+  const [notifyDuringSilent, setNotifyDuringSilent] = useState(false);
   const [cronMessage, setCronMessage] = useState("");
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -73,8 +74,9 @@ export function AgentSettings() {
       setIntervalMinutes(a.intervalMinutes);
       setTimeoutMinutes(a.timeoutMinutes || 10);
       setResumeIdleMinutes(a.resumeIdleMinutes ?? 0);
-      setActiveStart(a.activeStart ?? "");
-      setActiveEnd(a.activeEnd ?? "");
+      setSilentStart(a.silentStart ?? "");
+      setSilentEnd(a.silentEnd ?? "");
+      setNotifyDuringSilent(a.notifyDuringSilent ?? true);
       setCronMessage(a.cronMessage ?? "");
       setAllowedTools(a.allowedTools ?? []);
       setAllowProtectedPaths(a.allowProtectedPaths ?? []);
@@ -118,8 +120,9 @@ export function AgentSettings() {
         intervalMinutes,
         timeoutMinutes,
         resumeIdleMinutes,
-        activeStart,
-        activeEnd,
+        silentStart,
+        silentEnd,
+        notifyDuringSilent,
         cronMessage,
         allowedTools: (tool === "custom") ? allowedTools : undefined,
         allowProtectedPaths: (tool === "claude" || tool === "custom") ? allowProtectedPaths : undefined,
@@ -683,10 +686,10 @@ export function AgentSettings() {
           resumeIdleMinutes={resumeIdleMinutes}
           onResumeIdleChange={setResumeIdleMinutes}
           tool={tool}
-          activeStart={activeStart}
-          activeEnd={activeEnd}
-          onActiveStartChange={setActiveStart}
-          onActiveEndChange={setActiveEnd}
+          silentStart={silentStart}
+          silentEnd={silentEnd}
+          onSilentStartChange={setSilentStart}
+          onSilentEndChange={setSilentEnd}
           cronMessage={cronMessage}
           onCronMessageChange={setCronMessage}
           nextCronAt={agent.nextCronAt}
@@ -695,8 +698,8 @@ export function AgentSettings() {
             // nextCronAt is computed against the saved schedule so showing
             // it during edits would mislead.
             agent.intervalMinutes !== intervalMinutes ||
-            (agent.activeStart ?? "") !== activeStart ||
-            (agent.activeEnd ?? "") !== activeEnd
+            (agent.silentStart ?? "") !== silentStart ||
+            (agent.silentEnd ?? "") !== silentEnd
           }
           onCheckin={handleCheckin}
           // Keep the button disabled while the notice banner is up so the
@@ -704,6 +707,26 @@ export function AgentSettings() {
           // server-side run actually gets going.
           checkingIn={checkingIn || checkinNotice !== ""}
         />
+
+        {/* Notify During Silent Hours */}
+        <div>
+          <label className="flex items-start gap-3 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={notifyDuringSilent}
+              onChange={(e) => setNotifyDuringSilent(e.target.checked)}
+              className="mt-1 accent-amber-500"
+            />
+            <div className="flex-1">
+              <div className="text-sm text-neutral-300">Receive DM During Silent Hours</div>
+              <p className="text-xs text-neutral-600 mt-0.5">
+                When enabled, group DM notifications are delivered even
+                during silent hours. When disabled, notifications are
+                suppressed (messages remain in the transcript).
+              </p>
+            </div>
+          </label>
+        </div>
 
         {/* Privilege.
 

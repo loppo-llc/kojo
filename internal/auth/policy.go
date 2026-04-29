@@ -67,8 +67,8 @@ func AllowNonOwner(p Principal, method, path string) bool {
 
 	// Per-agent {id} routes.
 	if id, sub, ok := splitAgentIDPath(path); ok {
-		// Avatar is public-readable.
-		if method == http.MethodGet && sub == "/avatar" {
+		// Avatar and agent-active status are public-readable.
+		if method == http.MethodGet && (sub == "/avatar" || sub == "/active") {
 			return true
 		}
 		// WebSocket endpoint binds the calling agent to a chat session;

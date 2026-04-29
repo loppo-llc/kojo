@@ -243,6 +243,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents/{id}/credentials/{credId}/totp", s.handleGetTOTPCode)
 	mux.HandleFunc("POST /api/v1/agents/{id}/credentials/parse-qr", s.handleParseQR)
 	mux.HandleFunc("POST /api/v1/agents/{id}/credentials/parse-uri", s.handleParseOTPURI)
+	mux.HandleFunc("GET /api/v1/agents/{id}/active", s.handleGetAgentActive)
 	mux.HandleFunc("GET /api/v1/agents/{id}/ws", s.handleAgentWebSocket)
 
 	// Tasks
