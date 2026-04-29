@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -1045,9 +1046,164 @@ func buildProtectedPathAllowRules(paths []string) string {
 	return strings.Join(rules, ",")
 }
 
+// bashCaptureHookScript is the PreToolUse hook installed for every claude
+// agent session. It rewrites Bash tool_input.command so that the original
+// command runs to completion in a sub-script, full stdout+stderr are
+// persisted to a capture log, and only head + tail (≤8KB) are returned to
+// the agent when the output is large. Token consumption is bounded without
+// losing the full output for later inspection.
+//
+// __CAP_DIR__ is replaced at write time with the absolute path of the
+// per-agent captures directory. The script is intentionally tolerant of
+// missing jq / write failures: any error path emits `{}` so claude proceeds
+// with the original command (degrading to BASH_MAX_OUTPUT_LENGTH default).
+//
+// Trust boundary: the agent runs Bash with bypassPermissions, so it could
+// in principle modify the hook script or read capture files. This hook
+// targets token-cost suppression, not a security boundary; with the marker
+// emitting only a capture_id (not a path), an agent cannot incidentally
+// inflate context by reading the capture back. A determined agent can still
+// re-run a command without truncation, but that's no worse than the
+// pre-existing baseline.
+const bashCaptureHookScript = `#!/bin/bash
+# kojo bash output capture hook (PreToolUse).
+# Generated per-agent by kojo. Do not edit manually.
+set -uo pipefail
+
+JQ=$(command -v jq) || { echo '{}'; exit 0; }
+
+input=$(cat)
+tool=$(printf '%s' "$input" | "$JQ" -r '.tool_name // empty' 2>/dev/null) || { echo '{}'; exit 0; }
+if [ "$tool" != "Bash" ]; then echo '{}'; exit 0; fi
+orig=$(printf '%s' "$input" | "$JQ" -r '.tool_input.command // empty' 2>/dev/null) || { echo '{}'; exit 0; }
+if [ -z "$orig" ]; then echo '{}'; exit 0; fi
+
+cap_dir='__CAP_DIR__'
+mkdir -p "$cap_dir" || { echo '{}'; exit 0; }
+
+# Best-effort TTL prune (silent failures OK). Removes capture pairs older
+# than 24h. find with -mmin skips files currently being written by parallel
+# hook invocations because their mtime is fresh.
+find "$cap_dir" -type f -mmin +1440 -delete 2>/dev/null || true
+
+# mktemp avoids id collisions under concurrent Bash invocations. macOS BSD
+# mktemp requires X's at end of template (no trailing extension allowed).
+script=$(mktemp "$cap_dir/cmd-XXXXXX") || { echo '{}'; exit 0; }
+id=${script##*/cmd-}
+log="$cap_dir/out-$id.log"
+printf '%s\n' "$orig" > "$script" || { echo '{}'; exit 0; }
+
+# Capture the original tool_input into a variable with graceful fallback —
+# if jq fails for any reason the merge falls back to a bare {command} object,
+# matching the pre-fix behavior rather than crashing the hook.
+orig_json=$(printf '%s' "$input" | "$JQ" -c '.tool_input // {}' 2>/dev/null) || orig_json='{}'
+[ -z "$orig_json" ] && orig_json='{}'
+
+# Shell-escape paths before embedding in the wrapper. cap_dir is controlled
+# by kojo (no spaces / quotes by construction today), but printf %q is
+# defensive against future config changes that might place agentDir on a
+# path with whitespace.
+script_q=$(printf '%q' "$script")
+log_q=$(printf '%q' "$log")
+
+# Wrapper command returned to claude as updatedInput.command.
+# \$ escapes apply to the OUTER bash (this hook); the INNER bash (executed
+# by claude) sees plain $ec / $sz.
+wrapper="LC_ALL=C bash $script_q >$log_q 2>&1
+ec=\$?
+sz=\$(LC_ALL=C wc -c <$log_q | tr -d ' ')
+if [ \"\$sz\" -le 8192 ]; then
+  cat $log_q
+else
+  LC_ALL=C head -c 4096 $log_q
+  printf '\\n...[KOJO_TRUNCATED %d bytes; capture_id=%s]...\\n' \"\$sz\" \"$id\"
+  LC_ALL=C tail -c 4096 $log_q
+fi
+exit \$ec"
+
+# updatedInput must preserve the rest of tool_input (description, timeout,
+# run_in_background, …); only command is replaced. Without the merge, those
+# fields would be silently dropped and claude would default them.
+"$JQ" -nc --argjson orig "$orig_json" --arg cmd "$wrapper" '{
+  hookSpecificOutput: {
+    hookEventName: "PreToolUse",
+    permissionDecision: "allow",
+    permissionDecisionReason: "kojo bash capture",
+    updatedInput: ($orig + { command: $cmd })
+  }
+}'
+`
+
+// hostOS is overridable for tests. Initialized to runtime.GOOS at startup.
+var hostOS = runtime.GOOS
+
+// writeBashCaptureHook materializes the per-agent PreToolUse hook script
+// and creates the captures directory. Returns the absolute path of the
+// hook script, suitable for embedding in settings.local.json.
+func writeBashCaptureHook(claudeDir, captureDir string) (string, error) {
+	if err := os.MkdirAll(captureDir, 0o755); err != nil {
+		return "", fmt.Errorf("create capture dir: %w", err)
+	}
+	hooksDir := filepath.Join(claudeDir, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		return "", fmt.Errorf("create hooks dir: %w", err)
+	}
+	// captureDir is embedded inside single quotes in the hook script
+	// (cap_dir='__CAP_DIR__'), so any literal single quote in the path would
+	// terminate the bash string and break the script. Escape using the
+	// canonical '\'' close-open-close pattern. agentDir today never contains
+	// quotes, but defensive escaping prevents future surprises.
+	capDirSafe := strings.ReplaceAll(captureDir, `'`, `'\''`)
+	script := strings.ReplaceAll(bashCaptureHookScript, "__CAP_DIR__", capDirSafe)
+	hookPath := filepath.Join(hooksDir, "bash-capture.sh")
+	// Atomic write: an in-flight bash hook invocation could be mid-read on
+	// the existing file. os.WriteFile would truncate it and corrupt that
+	// reader. Write to a sibling temp file then rename — rename is atomic
+	// within a directory, so concurrent readers see either the old or new
+	// version, never a half-written file.
+	if err := atomicWriteFile(hookPath, []byte(script), 0o755); err != nil {
+		return "", fmt.Errorf("write hook script: %w", err)
+	}
+	return hookPath, nil
+}
+
+// atomicWriteFile writes data to path via a temp+rename, ensuring concurrent
+// readers never observe a partial write.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
 // PrepareClaudeSettings writes .claude/settings.local.json with persona
-// override and (when apiBase is available) a PreCompact hook that calls
-// kojo's API to save a conversation summary before Claude compacts context.
+// override, the bash-capture PreToolUse hook (always installed), and
+// (when apiBase is available) a PreCompact hook that calls kojo's API to
+// save a conversation summary before Claude compacts context.
 // Called from Manager.Chat before backend.Chat to ensure settings are in
 // place before the Claude process reads them.
 func PrepareClaudeSettings(agentID, apiBase string, allowProtectedPaths []string, logger *slog.Logger) {
@@ -1058,13 +1214,52 @@ func PrepareClaudeSettings(agentID, apiBase string, allowProtectedPaths []string
 		return
 	}
 
-	allowRules := buildProtectedPathAllowRules(allowProtectedPaths)
-
-	var settings string
-	if apiBase == "" {
-		// No API base — just disable persona hook
-		settings = `{"persona":"agent-managed","permissions":{"defaultMode":"bypassPermissions","allow":[` + allowRules + `]}}` + "\n"
+	captureDir := filepath.Join(claudeDir, "captures")
+	// Captures are NOT pruned here. PrepareClaudeSettings is called from
+	// prepareChat *before* the busy lock is acquired and can also fire
+	// concurrently from multiple ChatOneShot invocations for the same agent
+	// — a RemoveAll here would race against an in-flight claude process and
+	// nuke its live capture files. Instead, captures are bounded by:
+	//   1) per-call cleanup of stale entries (TTL) inside the hook itself,
+	//   2) full wipe of .claude/ on agent reset (manager_lifecycle.go).
+	//
+	// Skip on Windows: the hook script is POSIX bash and depends on
+	// mktemp / find / jq / wc / tr / head -c / tail -c / printf %q. Whether
+	// Claude Code on Windows can even execute a `.sh` hook command is also
+	// unverified. Falling back to BASH_MAX_OUTPUT_LENGTH default keeps the
+	// agent functional; we just lose the capture-to-file behavior.
+	var hookPath string
+	if hostOS == "windows" {
+		logger.Debug("bash capture hook skipped on windows", "agent", agentID)
 	} else {
+		var err error
+		hookPath, err = writeBashCaptureHook(claudeDir, captureDir)
+		if err != nil {
+			// Non-fatal: claude can still run, just without capture.
+			logger.Warn("failed to install bash capture hook", "agent", agentID, "err", err)
+			hookPath = ""
+		}
+	}
+
+	allowRules := buildProtectedPathAllowRules(allowProtectedPaths)
+	bashHookBlock := ""
+	if hookPath != "" {
+		// hookPath is an absolute path under agentDir, no embedded quotes.
+		bashHookBlock = fmt.Sprintf(`    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": %q
+          }
+        ]
+      }
+    ]`, hookPath)
+	}
+
+	var preCompactBlock string
+	if apiBase != "" {
 		curlFlags := "-s"
 		if strings.HasPrefix(apiBase, "https://") {
 			curlFlags = "-sk"
@@ -1081,14 +1276,7 @@ func PrepareClaudeSettings(agentID, apiBase string, allowProtectedPaths []string
 		// auth listener requires it on every /api/v1/* call; without
 		// the X-Kojo-Token header the PreCompact hook would 403 from
 		// the agent perspective.
-		settings = fmt.Sprintf(`{
-  "persona": "agent-managed",
-  "permissions": {
-    "defaultMode": "bypassPermissions",
-    "allow": [%s]
-  },
-  "hooks": {
-    "PreCompact": [
+		preCompactBlock = fmt.Sprintf(`    "PreCompact": [
       {
         "matcher": "",
         "hooks": [
@@ -1098,14 +1286,39 @@ func PrepareClaudeSettings(agentID, apiBase string, allowProtectedPaths []string
           }
         ]
       }
-    ]
+    ]`, curlFlags, apiBase, agentID)
+	}
+
+	hookBlocks := []string{}
+	if bashHookBlock != "" {
+		hookBlocks = append(hookBlocks, bashHookBlock)
+	}
+	if preCompactBlock != "" {
+		hookBlocks = append(hookBlocks, preCompactBlock)
+	}
+
+	var settings string
+	if len(hookBlocks) == 0 {
+		settings = fmt.Sprintf(`{"persona":"agent-managed","permissions":{"defaultMode":"bypassPermissions","allow":[%s]}}`, allowRules) + "\n"
+	} else {
+		settings = fmt.Sprintf(`{
+  "persona": "agent-managed",
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "allow": [%s]
+  },
+  "hooks": {
+%s
   }
 }
-`, allowRules, curlFlags, apiBase, agentID)
+`, allowRules, strings.Join(hookBlocks, ",\n"))
 	}
 
 	settingsPath := filepath.Join(claudeDir, "settings.local.json")
-	if err := os.WriteFile(settingsPath, []byte(settings), 0o644); err != nil {
+	// Atomic write — claude reads settings.local.json on startup, and a
+	// concurrent Chat overwriting it could surface a partial JSON to a
+	// claude process that's also booting.
+	if err := atomicWriteFile(settingsPath, []byte(settings), 0o644); err != nil {
 		logger.Warn("failed to write claude settings", "agent", agentID, "err", err)
 	}
 }

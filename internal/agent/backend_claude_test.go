@@ -782,3 +782,124 @@ func TestAgent_ResumeIdleDuration_Default(t *testing.T) {
 		})
 	}
 }
+
+func TestPrepareClaudeSettings_BashCaptureHook(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	agentID := "ag_bash_capture_test"
+	if err := os.MkdirAll(agentDir(agentID), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	t.Run("apiBase empty installs PreToolUse only", func(t *testing.T) {
+		PrepareClaudeSettings(agentID, "", nil, logger)
+
+		claudeDir := filepath.Join(agentDir(agentID), ".claude")
+		settingsPath := filepath.Join(claudeDir, "settings.local.json")
+		hookPath := filepath.Join(claudeDir, "hooks", "bash-capture.sh")
+		captureDir := filepath.Join(claudeDir, "captures")
+
+		// Hook script must exist and be executable.
+		st, err := os.Stat(hookPath)
+		if err != nil {
+			t.Fatalf("hook script not written: %v", err)
+		}
+		if st.Mode().Perm()&0o111 == 0 {
+			t.Errorf("hook script not executable: mode=%v", st.Mode())
+		}
+		// Captures dir must exist.
+		if st, err := os.Stat(captureDir); err != nil || !st.IsDir() {
+			t.Errorf("captures dir missing: %v", err)
+		}
+
+		// Settings JSON must contain PreToolUse pointing at hook script,
+		// and must NOT contain PreCompact (apiBase empty).
+		raw, err := os.ReadFile(settingsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			t.Fatalf("settings is not valid JSON: %v\n%s", err, raw)
+		}
+		hooks, _ := parsed["hooks"].(map[string]any)
+		if _, ok := hooks["PreToolUse"]; !ok {
+			t.Errorf("PreToolUse missing from settings: %s", raw)
+		}
+		if _, ok := hooks["PreCompact"]; ok {
+			t.Errorf("PreCompact must not appear when apiBase empty: %s", raw)
+		}
+		if !strings.Contains(string(raw), hookPath) {
+			t.Errorf("hook path %q not embedded in settings: %s", hookPath, raw)
+		}
+
+		// Hook script must contain capture dir path.
+		hookSrc, _ := os.ReadFile(hookPath)
+		if !strings.Contains(string(hookSrc), captureDir) {
+			t.Errorf("capture dir not baked into hook script")
+		}
+		if strings.Contains(string(hookSrc), "__CAP_DIR__") {
+			t.Errorf("template placeholder __CAP_DIR__ left unreplaced")
+		}
+	})
+
+	t.Run("apiBase set installs both PreToolUse and PreCompact", func(t *testing.T) {
+		PrepareClaudeSettings(agentID, "https://kojo.example/api", nil, logger)
+
+		settingsPath := filepath.Join(agentDir(agentID), ".claude", "settings.local.json")
+		raw, err := os.ReadFile(settingsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			t.Fatalf("settings is not valid JSON: %v\n%s", err, raw)
+		}
+		hooks, _ := parsed["hooks"].(map[string]any)
+		if _, ok := hooks["PreToolUse"]; !ok {
+			t.Errorf("PreToolUse missing: %s", raw)
+		}
+		if _, ok := hooks["PreCompact"]; !ok {
+			t.Errorf("PreCompact missing: %s", raw)
+		}
+	})
+
+	t.Run("windows skips PreToolUse hook", func(t *testing.T) {
+		// Fresh agent dir to avoid carryover from previous subtests.
+		winAgentID := "ag_bash_capture_test_win"
+		if err := os.MkdirAll(agentDir(winAgentID), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		orig := hostOS
+		hostOS = "windows"
+		t.Cleanup(func() { hostOS = orig })
+
+		PrepareClaudeSettings(winAgentID, "https://kojo.example/api", nil, logger)
+
+		claudeDir := filepath.Join(agentDir(winAgentID), ".claude")
+		hookPath := filepath.Join(claudeDir, "hooks", "bash-capture.sh")
+		if _, err := os.Stat(hookPath); !os.IsNotExist(err) {
+			t.Errorf("hook script must not exist on windows: stat err=%v", err)
+		}
+
+		raw, err := os.ReadFile(filepath.Join(claudeDir, "settings.local.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			t.Fatalf("settings is not valid JSON: %v\n%s", err, raw)
+		}
+		hooks, _ := parsed["hooks"].(map[string]any)
+		if _, ok := hooks["PreToolUse"]; ok {
+			t.Errorf("PreToolUse must not appear on windows: %s", raw)
+		}
+		// PreCompact still installs (curl-based, also POSIX-shell but
+		// matches existing kojo Windows assumption).
+		if _, ok := hooks["PreCompact"]; !ok {
+			t.Errorf("PreCompact missing: %s", raw)
+		}
+	})
+}
