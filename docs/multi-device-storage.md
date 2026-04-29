@@ -931,6 +931,14 @@ v1 binary 起動時:
 | `credentials.db`, `credentials.key` | v1 dir に **そのままコピー** (machine-bound 据え置き) |
 
 7. blob (avatar, books, outbox, temp, index/memory.db) を v1 blob store にコピー、`blob_refs` 登録
+   - **agent dir 直下の hidden dotfile も含める**:
+     - `.claude/settings.local.json`, `.claude/hooks/`, `.claude/captures/` (claude project-local hooks / capture history)
+     - `.codex/...`, `.gemini/...` (もし存在すれば)
+     - `.cron_last` (cron 実行 marker)
+   - これらは agent CLI が CWD = agent dir 上で参照する project-local file。layout は変えず agent dir 配下にそのまま再配置
+   - **コピー時の制約**:
+     - symlink を follow しない (`os.Lstat` で判定、`os.Symlink` で再現せず skip + warning)。v0 dir の中に予想外の symlink が混入していてもそれを辿って外部参照しない
+     - v0 dir 外への遷移を禁止 (filepath.EvalSymlinks の結果が v0 root prefix で始まることを assert)
 8. owner / agent token は **新規生成** して既存クライアントに再配布要求
    - **decision**: import せず再生成する。理由は (a) v0 では平文ファイル保存だったが v1 は hash のみ保存に変更する **breaking security upgrade**、(b) breaking release のタイミングで token rotation を兼ねる、の 2 点。技術的には旧 token を hash 化して持ち込むことも可能だが採用しない
    - **Web UI の owner Bearer**: 再ログイン要求 (UI で新 token を入力)
@@ -954,6 +962,102 @@ v1 binary 起動時:
     起動時に **manifest と v1 schema_version の整合性を verify**。改竄 / 不整合検出時は起動拒否
 12. 起動メッセージに「migration 完了。v0 data は <path> に残っています。kojo clean で削除可能」を表示
 
+### 5.5.1 外部 CLI transcript dir の継続性
+
+各 agent backend (`internal/agent/backend_{claude,codex,gemini}.go`) は CWD を agent dir に設定する:
+
+```go
+cmd.Dir = agentDir(agent.ID)   // = configdir.Path() + "/agents/<id>/"
+```
+
+claude / codex は **CWD の絶対 path から hash を導出** して transcript / session を `<claude_config_dir>/projects/<hash>/`、`~/.codex/sessions/<hash>/` などに保存する。
+
+- claude config dir は `$CLAUDE_CONFIG_DIR` 環境変数があればそれを優先、なければ `~/.claude` (`internal/agent/backend_claude.go` の `claudeConfigDir`)。migration コードも同じ resolver を使うこと。`~/.claude` 固定の hard-code は禁止
+- codex は実装時に確認
+
+gemini は **path hash ではなく** `~/.gemini/projects.json` の `absDir → projectName` mapping を保持する設計 (`internal/agent/backend_gemini.go` の `hasGeminiSession`)。session は `~/.gemini/tmp/<projectName>/chats/*.json` に格納される。**hash 方式とは別設計** が必要 (5.5.1.2 で別途扱う)。
+
+v0 → v1 で agent dir path が変わるため hash も変わり、**既存 transcript dir が orphan 化** する (claude --continue が効かなくなる、in-CLI 文脈喪失)。kojo 側 `messages.jsonl` と MEMORY.md は import されるので UI 履歴と persona は維持されるが、CLI 内部の細かい context は失われる。
+
+#### 5.5.1.1 claude / codex (path-hash 方式) の対応: symlink
+
+`--migrate` 時、`--migrate-external-cli` フラグ (**default on**) で:
+
+```
+For each agent in v0:
+  v0_cwd = <v0 dir>/agents/<id>
+  v1_cwd = <v1 dir>/agents/<id>
+  for each cli in {claude, codex}:
+    v0_hash = cli.hashPath(v0_cwd)
+    v1_hash = cli.hashPath(v1_cwd)
+    base    = cli.transcriptBase()    # claudeConfigDir() 等
+    target  = base/<v0_hash>/         # 実体 (directory)
+    link    = base/<v1_hash>/         # 新 hash のエントリ
+    if target exists (= directory) and link does not exist:
+      Unix:    os.Symlink(target, link)
+      Windows: junction (`mklink /J link target` または equiv API)
+```
+
+#### 5.5.1.2 gemini (mapping 方式) の対応: projects.json への entry 追加
+
+gemini は `~/.gemini/projects.json` の `Projects: {absDir: projectName}` map を持つ。migration では mapping を **追加**:
+
+```
+projects.json:
+  既存:  { "/Users/loppo/.config/kojo/agents/ag_xxx": "kojo-ag_xxx" }
+  追加:  { "/Users/loppo/.config/kojo-v1/agents/ag_xxx": "kojo-ag_xxx" }
+```
+
+同じ `projectName` に v0 と v1 の両 absDir を写像することで、`~/.gemini/tmp/<projectName>/chats/` の実体を共有する。symlink は不要。
+
+注意:
+- projects.json は gemini 側のファイルなので、**読んで → 追記して → atomic rename** で書き戻す。format 不明な場合は skip + warning
+- mapping 方式は将来 gemini 側仕様変更で壊れるリスクあり。失敗時は fresh session fallback
+- gemini が新規 projectName を勝手に発番するなら、その規則を `internal/agent/backend_gemini.go` から再利用
+
+#### 5.5.1.3 共通
+
+- 失敗時 (権限エラー、disk full、target 不在、format 不明等): warning ログを出すだけ。**fresh session に自然 fallback** するので機能継続には影響しない
+- `--migrate-external-cli=false` 指定時は何もしない (= 強制 fresh session)
+- **Windows junction の制約**:
+  - 作成対象は **directory のみ** (junction は file には不可)。target が file なら skip
+  - 削除時は junction の target を辿らない (`os.Remove` は junction 自体を消すべき。`os.RemoveAll` は target 配下まで消すので使わない)
+
+#### 5.5.1.4 hash 関数 / config dir resolver の出所
+
+| CLI | hash / mapping | 出所 |
+|-----|----------------|------|
+| claude | `claudeEncodePath(absDir)` | `internal/agent/backend_claude.go` |
+| claude config root | `claudeConfigDir()` (`$CLAUDE_CONFIG_DIR` 優先、fallback `~/.claude`) | 同上 |
+| codex | TODO: 実装時に確認 | `~/.codex/` 配下を実機検証 |
+| gemini | `~/.gemini/projects.json` map | `internal/agent/backend_gemini.go` |
+
+実装フェーズで codex の hash 関数 (or mapping) を実機確認すること。判明しない CLI については migration で skip → fresh session で許容。
+
+#### 5.5.1.5 制約と非ゴール
+
+- 旧 v0 transcript store (claude/codex の v0 hash dir、gemini の v0 absDir entry に紐付く chats dir) 自体は **kojo は touch しない** (外部 CLI 管轄)。ユーザーが各 CLI の clean 機能で削除する
+- 「外部 CLI transcript の取り込みは非ゴール」(8 節) は変えない。symlink / projects.json mapping は**継続性のためだけ**の薄い互換 layer
+- v1 から v1.x で agent dir path 変更が起きる際 (例えば configdir のさらなる変更) は同様の問題が再発する。その時もこの仕組みを再利用する
+
+#### 5.5.1.6 v0 rollback 時の transcript 混在リスク
+
+v1 で symlink / projects.json mapping を作ったあと v0 binary に rollback すると:
+
+- v1 で claude / codex / gemini が更新した transcript は **v0 と共通の transcript store 実体** に書かれている (claude / codex は symlink target、gemini は同一 projectName 経由で同じ chats dir)
+- → v0 binary を起動すると、その「v1 で増えた turn」も同じ transcript store から見える
+- v0 binary は v1 と互換性のない transcript format を踏むかもしれず (claude のスキーマ変更等)、最悪 corrupt 扱いで失敗する
+- claude / codex / gemini どの方式でも実体共有 = rollback 時の混在リスクは同等
+
+**rollback の前提として**:
+
+- ユーザーが v0 binary を起動する場合、**`--migrate-external-cli` の効果も巻き戻す手順** を想定する:
+  - claude: v1 hash dir の symlink を `os.Remove` で削除 (target 実体は触らない)
+  - gemini: projects.json から v1 absDir entry を削除 (mapping 追加分のみ revert)
+- これは `kojo --rollback-external-cli` のような **migration の逆操作 subcommand** として v1 binary が提供する。v0 dir に戻る前に v1 で実行
+- 実行しない場合の動作は **未定義**。混在状態として UI で警告
+- 設計書として「v0 rollback 時は kojo --rollback-external-cli を先に実行すること」を運用ドキュメントで義務化
+
 **v0 read-only 保証の実装規約**:
 
 - migration コードは v0 file を **必ず `O_RDONLY`** で open する。`O_RDWR` / `O_WRONLY` を使ったら panic する assertion を `internal/migrate/` に組み込む
@@ -973,12 +1077,17 @@ v1 binary 起動時:
 ### 5.7 Rollback
 
 1. v1 binary を停止
-2. v0 binary (v0.x release) を再起動
-3. v0 dir は無傷なのでそのまま動作
-4. v1 dir はそのまま残るが v0 binary は読まないので無害
-5. 必要に応じてユーザーが手動削除 (`rm -rf ~/.config/kojo-v1`)
+2. **`kojo --rollback-external-cli` を v1 binary で実行** (5.5.1.6 参照):
+   - claude / codex の v1 hash dir symlink を削除 (`os.Remove`、target 実体は触らない)
+   - gemini の `~/.gemini/projects.json` から v1 absDir entry を削除
+   - skip 時は v0 / v1 transcript 混在状態で「v0 binary 起動時の動作未定義」警告を表示
+3. v0 binary (v0.x release) を再起動
+4. v0 dir は無傷なのでそのまま動作
+5. v1 dir はそのまま残るが v0 binary は読まないので無害
+6. 必要に応じてユーザーが手動削除 (`rm -rf ~/.config/kojo-v1`)
 
-v1 で行った編集は失われる (片方向 migration の前提)。
+v1 で行った編集 (kojo 側 DB) は失われる (片方向 migration の前提)。
+外部 CLI transcript の v1 で増えた turn は **v0 / v1 共通の transcript store** (claude/codex は symlink target、gemini は同一 projectName 配下) に物理的に残るが、v0 binary が読めるかは v0 / v1 の format 互換性次第。
 
 ### 5.8 `kojo clean` コマンド
 
@@ -1028,9 +1137,10 @@ v1 起動時:
 |-----------|------|
 | `internal/configdir/` | major version suffix で path 解決 (`Path()` = v1, `V0Path()` = 旧) |
 | `internal/migrate/` | 新設 (v0 → v1 import 専用) |
-| `cmd/kojo/main.go` | `--migrate`, `--migrate-restart`, `--fresh` フラグ |
+| `cmd/kojo/main.go` | `--migrate`, `--migrate-restart`, `--fresh`, `--migrate-external-cli` (default on), `--migrate-backup`, `--rollback-external-cli` フラグ |
 | `cmd/kojo/clean.go` | `kojo clean` サブコマンド |
 | `internal/store/` | schema 適用 + `migration_status` テーブル管理 |
+| `internal/agent/backend_*.go` | claude / codex は path-hash 関数 (claude は既存の `claudeEncodePath`、codex は実装時に確認・追加) を、gemini は projects.json mapping 操作 (既存の `hasGeminiSession` から read 部分を再利用) を、それぞれ migration が呼び出せる形で expose |
 
 ### 5.12 互換性検証 (DoD)
 
@@ -1039,6 +1149,11 @@ v1 起動時:
 - migration 中の中断 (kill -9) → 再実行で完走
 - v0 dir の sha256 manifest が import 前後で **変化しない** (read-only 保証)
 - `kojo clean --dry-run` で v0 dir のみ列挙され、v1 dir は含まれない
+- `--migrate-external-cli` 有効時、claude / codex の v1 hash dir から v0 hash dir のファイルが read 可能 (symlink 経由)
+- claude `--continue` が v1 起動後も正常動作する (symlink で過去 transcript に到達)
+- gemini は `~/.gemini/projects.json` に v1 absDir entry が追記され、`hasGeminiSession(v1_cwd)` が true を返す
+- `kojo --rollback-external-cli` 実行で claude / codex の v1 symlink が削除され、gemini projects.json から v1 absDir entry が消える (target / v0 entry は残存)
+- rollback-external-cli を実行せずに v0 binary に戻した場合の動作 (混在状態) を別途記録 (= 動作未定義のまま CI で確認しないが、UI 警告が出ることは検証)
 
 ## 6. オープンクエスチョン (v2 以降)
 
