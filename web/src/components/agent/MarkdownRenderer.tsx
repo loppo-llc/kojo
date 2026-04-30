@@ -14,6 +14,7 @@ interface MarkdownRendererProps {
 
 /** Skip text processing inside these intrinsic element types. */
 const SKIP_TAGS = new Set(["code", "pre", "a"]);
+const INLINE_CODE_PATH_WRAPPER_RE = /^[\s`"'()[\]{}<>.,;:!?]*$/;
 
 /**
  * Recursively apply processText to string children.
@@ -37,6 +38,23 @@ function mapTextChildren(
     }
     return child;
   });
+}
+
+function canReplaceInlineCodeWithProcessedText(result: React.ReactNode): boolean {
+  if (!Array.isArray(result)) return false;
+  let hasProcessedNode = false;
+  for (const item of result) {
+    if (typeof item === "string") {
+      if (!INLINE_CODE_PATH_WRAPPER_RE.test(item)) return false;
+      continue;
+    }
+    if (isValidElement(item)) {
+      hasProcessedNode = true;
+      continue;
+    }
+    return false;
+  }
+  return hasProcessedNode;
 }
 
 export function MarkdownRenderer({ content, processText }: MarkdownRendererProps) {
@@ -108,13 +126,14 @@ export function MarkdownRenderer({ content, processText }: MarkdownRendererProps
             const insideLink = useContext(InsideLinkCtx);
             const insidePre = useContext(InsidePreCtx);
             // Only process inline code (skip code blocks and code inside links).
-            // Replace only when the entire content is a single file path.
+            // Replace when the inline code is just one file path, optionally
+            // surrounded by lightweight punctuation such as quotes or brackets.
             const text = typeof children === "string" ? children
               : Array.isArray(children) && children.length === 1 && typeof children[0] === "string" ? children[0]
               : null;
             if (!insidePre && !insideLink && text) {
               const result = processText(text);
-              if (Array.isArray(result) && result.length === 1 && typeof result[0] !== "string") {
+              if (canReplaceInlineCodeWithProcessedText(result)) {
                 return <>{result}</>;
               }
             }

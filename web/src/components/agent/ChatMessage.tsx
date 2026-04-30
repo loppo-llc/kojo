@@ -1,4 +1,4 @@
-import { memo, useState, useCallback, useMemo, useEffect, useRef } from "react";
+import { memo, useState, useCallback, useEffect, useRef } from "react";
 import type { AgentMessage, AgentMessageAttachment } from "../../lib/agentApi";
 import { ToolUseCard } from "./ToolUseCard";
 import { AgentAvatar } from "./AgentAvatar";
@@ -11,12 +11,24 @@ import { formatSize } from "../../lib/utils";
 const IMAGE_EXTS = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
 const VIDEO_EXTS = /\.(mp4|webm|mov|avi|mkv|ogv|m4v|flv|wmv)$/i;
 
-// Match absolute file paths (Unix, ~/-relative, or Windows-style) with any file extension (1-10 chars).
-// Unix: starts with / or ~/, Windows: starts with drive letter like C:\
-// Path segments: exclude only delimiters that indicate end-of-path (comma, semicolon, quotes, newline, slash).
-// This allows Unicode, spaces, parens, apostrophes, etc. in filenames.
+// Match absolute file paths (Unix, ~/-relative, or Windows-style) with any file
+// extension (1-10 chars). Bare chat autolinks intentionally reject whitespace:
+// it avoids turning fragments like "/ hoge/foo.txt" into broken file links.
 const FILE_PATH_RE =
-  /(?:~?(?:\/[^,;:"<>\n/][^,;:"<>\n/]*)+|[A-Z]:\\(?:[^,;:"<>\n\\]+\\)*[^,;:"<>\n\\]+)\.[a-zA-Z0-9]{1,10}\b/gi;
+  /(?:~?(?:\/[^\s,;:"'`<>\[\]{}()\\|/]+)+|[A-Z]:\\(?:[^\s,;:"'`<>\[\]{}()\\|]+\\)*[^\s,;:"'`<>\[\]{}()\\|]+)\.[a-zA-Z0-9]{1,10}\b/gi;
+
+const FILE_PATH_PREFIX_CHARS = new Set([
+  " ", "\t", "\n", "\r",
+  "`", "\"", "'",
+  "(", "[", "{", "<",
+]);
+
+const FILE_PATH_SUFFIX_CHARS = new Set([
+  " ", "\t", "\n", "\r",
+  "`", "\"", "'",
+  ".", ",", ";", ":", "!", "?",
+  ")", "]", "}", ">",
+]);
 
 function getFileType(path: string): "image" | "video" | "other" {
   if (IMAGE_EXTS.test(path)) return "image";
@@ -180,6 +192,7 @@ function FilePathChip({
   const [fileSize, setFileSize] = useState<string | null>(null);
   const fetchedRef = useRef(false);
   const rawUrl = api.files.rawUrl(path);
+  const linkUrl = api.files.rawUrl(path, fileType === "other");
   const fileName = path.split(/[/\\]/).pop() || path;
 
   // Reset fetch state when path changes (e.g. streaming token extends path)
@@ -201,15 +214,19 @@ function FilePathChip({
       .catch(() => setFileSize("—"));
   }, [hover, fileType, rawUrl]);
 
-  const handleClick = () => {
-    if (fileType === "other") {
-      const a = document.createElement("a");
-      a.href = `${rawUrl}&download=1`;
-      a.download = fileName;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-    } else {
+  const handleClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
+    const selection = window.getSelection();
+    if (selection && !selection.isCollapsed && selection.toString() && selection.rangeCount > 0) {
+      for (let i = 0; i < selection.rangeCount; i += 1) {
+        if (selection.getRangeAt(i).intersectsNode(e.currentTarget)) {
+          e.preventDefault();
+          return;
+        }
+      }
+    }
+
+    if (fileType !== "other") {
+      e.preventDefault();
       onPreview({ path, type: fileType });
     }
   };
@@ -220,9 +237,11 @@ function FilePathChip({
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
     >
-      <button
+      <a
+        href={linkUrl}
+        download={fileType === "other" ? fileName : undefined}
         onClick={handleClick}
-        className="inline px-1.5 py-0.5 mx-0.5 bg-neutral-700/50 hover:bg-neutral-600/50 rounded text-xs font-mono text-blue-300 hover:text-blue-200 transition-colors text-left wrap-anywhere box-decoration-clone"
+        className="inline px-1.5 py-0.5 mx-0.5 bg-neutral-700/50 hover:bg-neutral-600/50 rounded text-xs font-mono text-blue-300 hover:text-blue-200 transition-colors text-left wrap-anywhere box-decoration-clone cursor-pointer select-text"
         title={fileType === "other" ? `Download ${fileName}` : `Preview ${fileName}`}
       >
         {fileType === "image" ? (
@@ -239,7 +258,7 @@ function FilePathChip({
           </svg>
         )}
         {fileName}
-      </button>
+      </a>
       {hover && (
         <div className="absolute bottom-full left-0 mb-1.5 z-40 pointer-events-none">
           {fileType === "image" ? (
@@ -452,9 +471,6 @@ function MessageContent({
     el.setSelectionRange(len, len);
   }, [editing]);
 
-  const parts = useMemo(() => splitFilePaths(content), [content]);
-  const hasFiles = parts.length > 1 || (parts.length === 1 && parts[0].type === "file");
-
   const processText = useCallback(
     (text: string): React.ReactNode => {
       const segs = splitFilePaths(text);
@@ -650,21 +666,10 @@ function MessageContent({
   if (viewMode === "plain") {
     return (
       <>
-        {hasFiles ? (
-          <FileTextContent parts={parts} onPreview={setPreview} />
-        ) : (
-          <div className="text-sm whitespace-pre-wrap wrap-anywhere leading-relaxed">
-            {content}
-          </div>
-        )}
+        <div className="text-sm whitespace-pre-wrap wrap-anywhere leading-relaxed">
+          {content}
+        </div>
         {actionButtons}
-        {preview && (
-          <MediaOverlay
-            path={preview.path}
-            type={preview.type}
-            onClose={() => setPreview(null)}
-          />
-        )}
       </>
     );
   }
@@ -790,16 +795,19 @@ export function splitFilePaths(text: string): Array<{ type: "text" | "file"; val
   FILE_PATH_RE.lastIndex = 0;
   let match;
   while ((match = FILE_PATH_RE.exec(text)) !== null) {
-    // Only match paths preceded by whitespace, start of text, or safe delimiters
+    // Only match paths preceded/followed by whitespace, text boundaries, or
+    // delimiters that commonly wrap paths in chat text.
     if (match.index > 0) {
       const prev = text[match.index - 1];
-      if (" \t\n\r`\"'".indexOf(prev) === -1) continue;
+      if (!FILE_PATH_PREFIX_CHARS.has(prev)) continue;
     }
+    const endIndex = match.index + match[0].length;
+    if (endIndex < text.length && !FILE_PATH_SUFFIX_CHARS.has(text[endIndex])) continue;
     if (match.index > lastIndex) {
       parts.push({ type: "text", value: text.slice(lastIndex, match.index) });
     }
     parts.push({ type: "file", value: match[0] });
-    lastIndex = match.index + match[0].length;
+    lastIndex = endIndex;
   }
 
   if (lastIndex < text.length) {
@@ -936,11 +944,6 @@ export function StreamingMessage({
     [],
   );
 
-  const textParts = useMemo(
-    () => (viewMode === "plain" && text ? splitFilePaths(text) : []),
-    [viewMode, text],
-  );
-
   let activeTool: string | null = null;
   for (let i = toolUses.length - 1; i >= 0; i--) {
     if (toolUses[i].output === null) {
@@ -969,7 +972,9 @@ export function StreamingMessage({
             {viewMode === "markdown" ? (
               <MarkdownRenderer content={text} processText={processText} />
             ) : (
-              <FileTextContent parts={textParts} onPreview={setPreview} />
+              <div className="text-sm whitespace-pre-wrap wrap-anywhere leading-relaxed">
+                {text}
+              </div>
             )}
             <span className="inline-block w-0.5 h-4 bg-neutral-400 animate-pulse ml-0.5 align-text-bottom" />
           </div>
