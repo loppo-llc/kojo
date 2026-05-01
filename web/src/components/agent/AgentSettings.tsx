@@ -135,11 +135,17 @@ export function AgentSettings() {
   const [forkIncludeTranscript, setForkIncludeTranscript] = useState(false);
   const [forking, setForking] = useState(false);
   const [forkError, setForkError] = useState("");
+  const [userContext, setUserContext] = useState("");
+  const [userContextDirty, setUserContextDirty] = useState(false);
+  const [savingUserContext, setSavingUserContext] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!id) return;
-    agentApi.get(id).then((a) => {
+    Promise.all([
+      agentApi.get(id),
+      agentApi.userContext.get(id),
+    ]).then(([a, uc]) => {
       setAgent(a);
       setName(a.name);
       setPersona(a.persona);
@@ -165,6 +171,7 @@ export function AgentSettings() {
       setTTSModel(a.tts?.model ?? "");
       setTTSVoice(a.tts?.voice ?? "");
       setTTSStylePrompt(a.tts?.stylePrompt ?? "");
+      setUserContext(uc);
     }).catch(() => navigate("/"));
   }, [id, navigate]);
 
@@ -190,36 +197,40 @@ export function AgentSettings() {
     setError("");
     setSuccess(false);
     try {
-      const updated = await agentApi.update(id!, {
-        name: name.trim(),
-        persona: persona.trim(),
-        ...(publicProfileOverride ? { publicProfile: publicProfile.trim() } : {}),
-        publicProfileOverride,
-        model: model.trim(),
-        effort: supportsEffort(tool) ? effort : undefined,
-        tool: tool.trim(),
-        customBaseURL: needsCustomURL ? customBaseURL.trim() : undefined,
-        thinkingMode: tool === "llama.cpp" ? thinkingMode : undefined,
-        workDir: workDir.trim(),
-        intervalMinutes,
-        timeoutMinutes,
-        resumeIdleMinutes,
-        silentStart,
-        silentEnd,
-        notifyDuringSilent,
-        cronMessage,
-        allowedTools: (tool === "custom") ? allowedTools : undefined,
-        allowProtectedPaths: (tool === "claude" || tool === "custom") ? allowProtectedPaths : undefined,
-        tts: {
-          enabled: ttsEnabled,
-          model: ttsModel || undefined,
-          voice: ttsVoice || undefined,
-          stylePrompt: ttsStylePrompt.trim() || undefined,
-        },
-      });
+      const [updated] = await Promise.all([
+        agentApi.update(id!, {
+          name: name.trim(),
+          persona: persona.trim(),
+          ...(publicProfileOverride ? { publicProfile: publicProfile.trim() } : {}),
+          publicProfileOverride,
+          model: model.trim(),
+          effort: supportsEffort(tool) ? effort : undefined,
+          tool: tool.trim(),
+          customBaseURL: needsCustomURL ? customBaseURL.trim() : undefined,
+          thinkingMode: tool === "llama.cpp" ? thinkingMode : undefined,
+          workDir: workDir.trim(),
+          intervalMinutes,
+          timeoutMinutes,
+          resumeIdleMinutes,
+          silentStart,
+          silentEnd,
+          notifyDuringSilent,
+          cronMessage,
+          allowedTools: (tool === "custom") ? allowedTools : undefined,
+          allowProtectedPaths: (tool === "claude" || tool === "custom") ? allowProtectedPaths : undefined,
+          tts: {
+            enabled: ttsEnabled,
+            model: ttsModel || undefined,
+            voice: ttsVoice || undefined,
+            stylePrompt: ttsStylePrompt.trim() || undefined,
+          },
+        }),
+        agentApi.userContext.set(id!, userContext),
+      ]);
       setAgent(updated);
       setPublicProfile(updated.publicProfile ?? "");
       setPublicProfileOverride(updated.publicProfileOverride ?? false);
+      setUserContextDirty(false);
       setSuccess(true);
       setTimeout(() => setSuccess(false), 2000);
     } catch (err) {
@@ -577,6 +588,23 @@ export function AgentSettings() {
               )}
             </button>
           </div>
+        </div>
+
+        {/* User Context */}
+        <div>
+          <label className="block text-sm text-neutral-400 mb-2">
+            User Context
+          </label>
+          <textarea
+            value={userContext}
+            onChange={(e) => { setUserContext(e.target.value); setUserContextDirty(true); }}
+            rows={6}
+            placeholder="ユーザーや関係者の情報を記録（エージェントも対話を通じて更新します）"
+            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm resize-none focus:outline-none focus:border-neutral-500"
+          />
+          <p className="mt-1 text-xs text-neutral-600">
+            Injected into system prompt. Agents can also update this via their tools.
+          </p>
         </div>
 
         {/* Public Profile */}

@@ -339,16 +339,10 @@ func (m *Manager) syncPersona(agentID string) {
 		return
 	}
 	a.Persona = content
-	tool := a.Tool
 	override := a.PublicProfileOverride
 	a.UpdatedAt = time.Now().Format(time.RFC3339)
 	m.mu.Unlock()
 	m.save()
-
-	// Pre-generate persona summary in background so it's cached for next chat
-	if len([]rune(content)) > maxPersonaSummaryRunes {
-		go getPersonaSummary(agentID, content, tool, m.logger)
-	}
 
 	// Regenerate or clear public profile when persona changes via file edit (unless overridden)
 	if !override {

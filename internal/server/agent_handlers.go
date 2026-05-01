@@ -1134,6 +1134,42 @@ func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// --- User Context Handlers ---
+
+func (s *Server) handleGetUserContext(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	content, ok := agent.ReadUserFile(id)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to read user.md")
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]string{"content": content})
+}
+
+func (s *Server) handleSetUserContext(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	var body struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	if err := agent.WriteUserFile(id, body.Content); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]string{"content": body.Content})
+}
+
 // --- Pre-Compact Handler ---
 
 // preCompactHookPayload mirrors the subset of Claude Code's PreCompact hook
