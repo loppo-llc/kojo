@@ -599,7 +599,7 @@ export function AgentSettings() {
             value={userContext}
             onChange={(e) => { setUserContext(e.target.value); setUserContextDirty(true); }}
             rows={6}
-            placeholder="ユーザーや関係者の情報を記録（エージェントも対話を通じて更新します）"
+            placeholder="Record information about users and collaborators (agents also update this through conversation)"
             className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm resize-none focus:outline-none focus:border-neutral-500"
           />
           <p className="mt-1 text-xs text-neutral-600">

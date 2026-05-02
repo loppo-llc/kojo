@@ -122,7 +122,7 @@ func truncateBootstrapFile(content string, filePath string) string {
 	if len(runes) <= maxBootstrapRunes {
 		return content
 	}
-	marker := fmt.Sprintf("\n\n[...省略 — 全文: %s ...]\n\n", filePath)
+	marker := fmt.Sprintf("\n\n[...truncated — full file: %s ...]\n\n", filePath)
 	markerRunes := []rune(marker)
 	budget := maxBootstrapRunes - len(markerRunes)
 	if budget < 100 {
@@ -153,18 +153,18 @@ func WriteUserFile(agentID string, content string) error {
 	return os.WriteFile(filepath.Join(agentDir(agentID), "user.md"), []byte(content), 0o644)
 }
 
-const defaultUserContent = `# ユーザーについて
+const defaultUserContent = `# About the User
 
-（まだユーザーのことをよく知りません。会話を通じて学んだことをここに記録していきます。）
+(Not much is known yet. This file is updated as the agent learns through conversation.)
 
-## メインユーザー
-- 名前:
-- タイムゾーン:
-- 関心・専門領域:
-- コミュニケーションの好み:
+## Primary User
+- Name:
+- Timezone:
+- Interests / Expertise:
+- Communication preferences:
 
-## 関係者
-（Slack等で関わる人たちについて、わかったことを記録）
+## Other People
+(Notes about collaborators encountered via Slack, etc.)
 `
 
 // buildSystemPrompt constructs the system prompt for an agent chat.
