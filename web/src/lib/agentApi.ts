@@ -477,6 +477,15 @@ export const agentApi = {
       del<unknown>(`/api/v1/api-keys/${provider}`),
   },
 
+  userContext: {
+    get: (agentId: string) =>
+      get<{ content: string }>(`/api/v1/agents/${agentId}/user-context`).then(
+        (r) => r.content ?? "",
+      ),
+    set: (agentId: string, content: string) =>
+      put<{ content: string }>(`/api/v1/agents/${agentId}/user-context`, { content }),
+  },
+
   embeddingModel: {
     set: (model: string) =>
       put<{ ok: boolean; model: string; embeddingsCleared: boolean }>(`/api/v1/embedding-model`, { model }),

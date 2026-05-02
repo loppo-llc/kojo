@@ -4,15 +4,15 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 )
 
-// maxPersonaSummaryRunes is the threshold above which we use an LLM-generated
-// summary instead of the full persona text in the system prompt.
-const maxPersonaSummaryRunes = 500
+// maxBootstrapRunes is the per-file character limit for workspace files
+// (persona.md, user.md) injected into the system prompt.
+// Files under this limit are injected in full; files over it are head/tail truncated.
+const maxBootstrapRunes = 1500
 
 // curlFlagsForAPI builds the curl flag string used in every
 // system-prompt example targeting the kojo agent API. Examples must
@@ -114,74 +114,58 @@ func writePersonaFile(agentID string, content string) error {
 	return os.WriteFile(p, []byte(content), 0o644)
 }
 
-// truncatePersona returns the first maxPersonaSummaryRunes of persona text.
-func truncatePersona(persona string) string {
-	runes := []rune(persona)
-	if len(runes) > maxPersonaSummaryRunes {
-		return string(runes[:maxPersonaSummaryRunes]) + "…"
+// truncateBootstrapFile performs head/tail truncation on a workspace file.
+// When the content exceeds maxBootstrapRunes, it keeps the first 75% and last 25%
+// with a marker in between pointing to the full file path.
+func truncateBootstrapFile(content string, filePath string) string {
+	runes := []rune(content)
+	if len(runes) <= maxBootstrapRunes {
+		return content
 	}
-	return persona
+	marker := fmt.Sprintf("\n\n[...truncated — full file: %s ...]\n\n", filePath)
+	markerRunes := []rune(marker)
+	budget := maxBootstrapRunes - len(markerRunes)
+	if budget < 100 {
+		return string(runes[:maxBootstrapRunes]) + "…"
+	}
+	headSize := int(float64(budget) * 0.75)
+	tailSize := budget - headSize
+	return string(runes[:headSize]) + marker + string(runes[len(runes)-tailSize:])
 }
 
-// getPersonaSummary returns a concise summary of the persona for system prompt injection.
-// It caches the summary in persona_summary.md and regenerates when persona.md is newer.
-// Fallback chain: agent's own CLI tool → other available CLI tools → truncation.
-func getPersonaSummary(agentID string, persona string, tool string, logger *slog.Logger) string {
-	dir := agentDir(agentID)
-	personaPath := filepath.Join(dir, "persona.md")
-	summaryPath := filepath.Join(dir, "persona_summary.md")
-
-	// Use cached summary if persona.md hasn't changed since last generation
-	pInfo, pErr := os.Stat(personaPath)
-	sInfo, sErr := os.Stat(summaryPath)
-	if sErr == nil && pErr == nil && !pInfo.ModTime().After(sInfo.ModTime()) {
-		if data, err := os.ReadFile(summaryPath); err == nil && len(data) > 0 {
-			return string(data)
+// readUserFile reads the content of user.md for an agent.
+func readUserFile(agentID string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(agentDir(agentID), "user.md"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", true
 		}
+		return "", false
 	}
-
-	// 1. Try agent's own CLI tool (claude / codex / gemini)
-	var summary string
-	if result, err := SummarizeWithCLI(tool, persona); err != nil {
-		logger.Warn("CLI persona summary failed", "agent", agentID, "tool", tool, "err", err)
-	} else {
-		summary = result
-	}
-
-	// 2. Fallback: try other available CLI tools
-	if summary == "" {
-		for _, fallback := range []string{"claude", "codex", "gemini"} {
-			if fallback == tool {
-				continue
-			}
-			if _, err := exec.LookPath(fallback); err != nil {
-				continue
-			}
-			if result, err := SummarizeWithCLI(fallback, persona); err != nil {
-				logger.Warn("CLI persona summary fallback failed", "agent", agentID, "tool", fallback, "err", err)
-			} else {
-				summary = result
-				break
-			}
-		}
-	}
-
-	// 3. Final fallback: truncation
-	if summary == "" {
-		summary = truncatePersona(persona)
-	}
-
-	// Cache — but only if persona.md hasn't been updated since we started.
-	// This prevents a slow background goroutine from overwriting a newer summary.
-	if pErr != nil {
-		// persona.md didn't exist at start — cache unconditionally
-		_ = os.WriteFile(summaryPath, []byte(summary), 0o644)
-	} else if pNow, err := os.Stat(personaPath); err == nil &&
-		pNow.ModTime().Equal(pInfo.ModTime()) {
-		_ = os.WriteFile(summaryPath, []byte(summary), 0o644)
-	}
-	return summary
+	return string(data), true
 }
+
+// ReadUserFile is the exported wrapper for readUserFile.
+func ReadUserFile(agentID string) (string, bool) { return readUserFile(agentID) }
+
+// WriteUserFile writes user context content to user.md.
+func WriteUserFile(agentID string, content string) error {
+	return os.WriteFile(filepath.Join(agentDir(agentID), "user.md"), []byte(content), 0o644)
+}
+
+const defaultUserContent = `# About the User
+
+(Not much is known yet. This file is updated as the agent learns through conversation.)
+
+## Primary User
+- Name:
+- Timezone:
+- Interests / Expertise:
+- Communication preferences:
+
+## Other People
+(Notes about collaborators encountered via Slack, etc.)
+`
 
 // buildSystemPrompt constructs the system prompt for an agent chat.
 //
@@ -228,6 +212,8 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	sb.WriteString(fmt.Sprintf("    - DO NOT drop newly generated artifacts directly at %s. For new outputs, always pick either temp/ or a purpose-named subdirectory.\n", fileDir))
 	sb.WriteString("    - When unsure whether something is keep-worthy, default to temp/. Promoting a file out of temp/ later is cheap; cleaning up a polluted root is not.\n")
 	sb.WriteString(fmt.Sprintf("- %s contains notes about who you are. You can edit it as you grow and change.\n", personaPath))
+	userPath := filepath.Join(dir, "user.md")
+	sb.WriteString(fmt.Sprintf("- %s contains information about the people you work with. Update it as you learn about them.\n", userPath))
 	sb.WriteString("- Speak naturally, as yourself.\n")
 	sb.WriteString("- The current date and time is supplied at the top of each user message in a `<context>` block. Read it from there when you need it — it intentionally is NOT in this system prompt so the prompt cache stays warm across turns.\n")
 
@@ -328,6 +314,13 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	} else if memoryOversized {
 		sb.WriteString(fmt.Sprintf("\n### MEMORY.md is over the injection budget\n\n"))
 		sb.WriteString(fmt.Sprintf("%s exceeds %d bytes so it was NOT prepended to this prompt. Read it manually and then trim it to the lean-index rules above — extract long sections to %s/archive/ or %s/projects/ and replace them with one-line pointers.\n", memoryIndexPath, memoryInjectMaxBytes, memoryRoot, memoryRoot))
+	}
+
+	// User Context — injected from user.md
+	if userContent, ok := readUserFile(a.ID); ok && userContent != "" {
+		sb.WriteString("\n# User Context\n\n")
+		sb.WriteString(truncateBootstrapFile(userContent, userPath))
+		sb.WriteString("\n\n")
 	}
 
 	// Credentials — only shown when the credential store is available
@@ -437,18 +430,9 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 
 	// Identity
 	if a.Persona != "" {
-		runes := []rune(a.Persona)
-		if len(runes) > maxPersonaSummaryRunes {
-			summary := getPersonaSummary(a.ID, a.Persona, a.Tool, logger)
-			sb.WriteString("\n# Who You Are\n\n")
-			sb.WriteString(summary)
-			sb.WriteString("\n\n")
-			sb.WriteString(fmt.Sprintf("Full details about yourself: %s\n\n", personaPath))
-		} else {
-			sb.WriteString("\n# Who You Are\n\n")
-			sb.WriteString(a.Persona)
-			sb.WriteString("\n\n")
-		}
+		sb.WriteString("\n# Who You Are\n\n")
+		sb.WriteString(truncateBootstrapFile(a.Persona, personaPath))
+		sb.WriteString("\n\n")
 	}
 
 	return sb.String()
@@ -530,6 +514,14 @@ func ensureAgentDir(a *Agent) error {
 	// Write persona.md
 	if err := writePersonaFile(a.ID, a.Persona); err != nil {
 		return err
+	}
+
+	// Create user.md with default template if it doesn't exist
+	userPath := filepath.Join(dir, "user.md")
+	if _, err := os.Stat(userPath); os.IsNotExist(err) {
+		if err := os.WriteFile(userPath, []byte(defaultUserContent), 0o644); err != nil {
+			return err
+		}
 	}
 
 	return nil
