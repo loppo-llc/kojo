@@ -1142,7 +1142,7 @@ func (s *Server) handleGetUserContext(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
 		return
 	}
-	content, ok := agent.ReadUserFile(id)
+	content, ok := agent.ReadUserFileOrDefault(id)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "internal_error", "failed to read user.md")
 		return

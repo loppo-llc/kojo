@@ -148,12 +148,31 @@ func readUserFile(agentID string) (string, bool) {
 // ReadUserFile is the exported wrapper for readUserFile.
 func ReadUserFile(agentID string) (string, bool) { return readUserFile(agentID) }
 
+// ReadUserFileOrDefault returns user.md content, falling back to
+// DefaultUserContent when the file does not exist. Used by the API layer
+// so the UI shows the fill-in template for agents that haven't configured
+// user context yet, without persisting the template to disk.
+func ReadUserFileOrDefault(agentID string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(agentDir(agentID), "user.md"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return DefaultUserContent, true
+		}
+		return "", false
+	}
+	return string(data), true
+}
+
 // WriteUserFile writes user context content to user.md.
 func WriteUserFile(agentID string, content string) error {
 	return os.WriteFile(filepath.Join(agentDir(agentID), "user.md"), []byte(content), 0o644)
 }
 
-const defaultUserContent = `# About the User
+// DefaultUserContent is the template pre-populated when a user opens the
+// User Context settings for an agent that has no user.md yet. It is NOT
+// written to disk until the user explicitly saves — this keeps unfilled
+// templates out of the system prompt.
+const DefaultUserContent = `# About the User
 
 (Not much is known yet. This file is updated as the agent learns through conversation.)
 
@@ -514,14 +533,6 @@ func ensureAgentDir(a *Agent) error {
 	// Write persona.md
 	if err := writePersonaFile(a.ID, a.Persona); err != nil {
 		return err
-	}
-
-	// Create user.md with default template if it doesn't exist
-	userPath := filepath.Join(dir, "user.md")
-	if _, err := os.Stat(userPath); os.IsNotExist(err) {
-		if err := os.WriteFile(userPath, []byte(defaultUserContent), 0o644); err != nil {
-			return err
-		}
 	}
 
 	return nil
