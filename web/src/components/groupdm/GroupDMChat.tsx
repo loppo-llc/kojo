@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useNavigate } from "react-router";
 import {
   groupdmApi,
@@ -11,31 +11,9 @@ import {
 } from "../../lib/groupdmApi";
 import { useEnterSends } from "../../lib/preferences";
 import { AgentAvatar } from "../agent/AgentAvatar";
-import { splitFilePaths, FileTextContent, MediaOverlay } from "../agent/ChatMessage";
+import { MessageContent } from "../agent/ChatMessage";
 
 const PAGE_SIZE = 50;
-
-function formatTime(timestamp: string): string {
-  try {
-    const d = new Date(timestamp);
-    const now = new Date();
-    const isToday =
-      d.getDate() === now.getDate() &&
-      d.getMonth() === now.getMonth() &&
-      d.getFullYear() === now.getFullYear();
-    if (isToday) {
-      return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    }
-    return d.toLocaleDateString([], {
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  } catch {
-    return "";
-  }
-}
 
 export function GroupDMChat() {
   const { id } = useParams<{ id: string }>();
@@ -441,15 +419,8 @@ export function GroupDMChat() {
         {messages.map((msg) => {
           const isUser = msg.agentId === USER_SENDER_ID;
           return (
-            <div key={msg.id} className="flex gap-3">
-              {isUser ? (
-                <div
-                  className="w-12 h-12 rounded-full bg-green-600/80 text-white text-sm font-semibold flex items-center justify-center shrink-0 mt-1"
-                  title="You (human operator)"
-                >
-                  You
-                </div>
-              ) : (
+            <div key={msg.id} className={`flex gap-3 ${isUser ? "flex-row-reverse" : "flex-row"}`}>
+              {!isUser && (
                 <AgentAvatar
                   agentId={msg.agentId}
                   name={msg.agentName}
@@ -457,20 +428,28 @@ export function GroupDMChat() {
                   className="mt-1 shrink-0"
                 />
               )}
-              <div className="min-w-0 flex-1">
-                <div className="flex items-baseline gap-2">
-                  <span
-                    className={`text-sm font-medium ${
-                      isUser
-                        ? "text-green-400"
-                        : agentColors.get(msg.agentId) ?? "text-neutral-300"
+              <div
+                className={`max-w-[80%] min-w-0 px-3.5 py-2.5 ${
+                  isUser
+                    ? "bg-blue-600/90 text-white rounded-2xl rounded-tr-sm"
+                    : "bg-neutral-800/80 text-neutral-200 rounded-2xl rounded-tl-sm"
+                }`}
+              >
+                {!isUser && (
+                  <div
+                    className={`mb-1 text-[11px] font-medium ${
+                      agentColors.get(msg.agentId) ?? "text-neutral-300"
                     }`}
                   >
-                    {isUser ? "You" : msg.agentName}
-                  </span>
-                  <span className="text-[10px] text-neutral-600">{formatTime(msg.timestamp)}</span>
-                </div>
-                <GroupMessageContent content={msg.content} />
+                    {msg.agentName}
+                  </div>
+                )}
+                <MessageContent
+                  messageId={msg.id}
+                  content={msg.content}
+                  isUser={isUser}
+                  timestamp={msg.timestamp}
+                />
               </div>
             </div>
           );
@@ -575,34 +554,6 @@ export function GroupDMChat() {
             </div>
           </div>
         </div>
-      )}
-    </div>
-  );
-}
-
-/** Message content with file path detection, hover preview, and download */
-function GroupMessageContent({ content }: { content: string }) {
-  const [preview, setPreview] = useState<{ path: string; type: "image" | "video" } | null>(null);
-  const parts = useMemo(() => splitFilePaths(content), [content]);
-  const hasFiles = parts.length > 1 || (parts.length === 1 && parts[0].type === "file");
-
-  if (!hasFiles) {
-    return (
-      <div className="text-sm text-neutral-300 whitespace-pre-wrap wrap-anywhere leading-relaxed mt-0.5">
-        {content}
-      </div>
-    );
-  }
-
-  return (
-    <div className="mt-0.5 text-neutral-300">
-      <FileTextContent parts={parts} onPreview={setPreview} />
-      {preview && (
-        <MediaOverlay
-          path={preview.path}
-          type={preview.type}
-          onClose={() => setPreview(null)}
-        />
       )}
     </div>
   );

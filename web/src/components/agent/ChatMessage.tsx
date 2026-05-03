@@ -435,7 +435,7 @@ function actionBtnClass(isUser: boolean): string {
 }
 
 /** Renders text with markdown or plain text, plus copy/toggle buttons */
-function MessageContent({
+export function MessageContent({
   messageId,
   content,
   isUser,
