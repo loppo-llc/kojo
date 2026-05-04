@@ -595,6 +595,8 @@ export function AgentCreate() {
           silentEnd={silentEnd}
           onSilentStartChange={setSilentStart}
           onSilentEndChange={setSilentEnd}
+          cronMessage=""
+          onCronMessageChange={() => {}}
         />
 
         {error && (

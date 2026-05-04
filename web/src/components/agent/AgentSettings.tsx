@@ -137,6 +137,7 @@ export function AgentSettings() {
   const [userContext, setUserContext] = useState("");
   const [userContextDirty, setUserContextDirty] = useState(false);
   const [savingUserContext, setSavingUserContext] = useState(false);
+  const [cronMessage, setCronMessage] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -144,7 +145,8 @@ export function AgentSettings() {
     Promise.all([
       agentApi.get(id),
       agentApi.userContext.get(id),
-    ]).then(([a, uc]) => {
+      agentApi.getCheckinFile(id),
+    ]).then(([a, uc, checkin]) => {
       setAgent(a);
       setName(a.name);
       setPersona(a.persona);
@@ -170,6 +172,7 @@ export function AgentSettings() {
       setTTSVoice(a.tts?.voice ?? "");
       setTTSStylePrompt(a.tts?.stylePrompt ?? "");
       setUserContext(uc);
+      setCronMessage(checkin.content);
     }).catch(() => navigate("/"));
   }, [id, navigate]);
 
@@ -223,6 +226,7 @@ export function AgentSettings() {
           },
         }),
         agentApi.userContext.set(id!, userContext),
+        agentApi.putCheckinFile(id!, cronMessage),
       ]);
       setAgent(updated);
       setPublicProfile(updated.publicProfile ?? "");
@@ -831,7 +835,6 @@ export function AgentSettings() {
 
         {/* Schedule */}
         <ScheduleEditor
-          agentId={id!}
           intervalMinutes={intervalMinutes}
           onIntervalChange={setIntervalMinutes}
           timeoutMinutes={timeoutMinutes}
@@ -857,6 +860,8 @@ export function AgentSettings() {
           // user doesn't fire repeated 409s in quick succession before the
           // server-side run actually gets going.
           checkingIn={checkingIn || checkinNotice !== ""}
+          cronMessage={cronMessage}
+          onCronMessageChange={setCronMessage}
         />
 
         {/* Notify During Silent Hours */}
