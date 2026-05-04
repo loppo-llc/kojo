@@ -175,23 +175,6 @@ func ValidModelEffort(model, effort string) bool {
 	return true
 }
 
-// MaxCronMessageRunes caps the per-agent cron check-in custom message at
-// 4096 Unicode code points. The limit is in runes (not bytes) so Japanese
-// users can write the same number of characters as ASCII users; the resulting
-// byte size can be up to ~16 KiB worst case for 4-byte runes. The message is
-// re-injected on every cron run so an unbounded value would inflate every
-// prompt and the on-disk agent record.
-const MaxCronMessageRunes = 4096
-
-// validateCronMessage trims surrounding whitespace and rejects values that
-// exceed MaxCronMessageRunes.
-func validateCronMessage(s string) (string, error) {
-	trimmed := strings.TrimSpace(s)
-	if n := len([]rune(trimmed)); n > MaxCronMessageRunes {
-		return "", fmt.Errorf("cronMessage too long: %d runes (max %d)", n, MaxCronMessageRunes)
-	}
-	return trimmed, nil
-}
 
 // allowedTimeouts defines the valid timeoutMinutes values.
 // 0 means "use default" (10 minutes at runtime) for backward compatibility.
@@ -383,8 +366,7 @@ type AgentConfig struct {
 	ResumeIdleMinutes *int    `json:"resumeIdleMinutes"`
 	SilentStart        *string `json:"silentStart"`        // HH:MM or empty
 	SilentEnd          *string `json:"silentEnd"`          // HH:MM or empty
-	NotifyDuringSilent *bool   `json:"notifyDuringSilent"` // nil = use default (false for new)
-	CronMessage        *string `json:"cronMessage"`        // nil/empty = use default trailing instruction
+	NotifyDuringSilent *bool `json:"notifyDuringSilent"` // nil = use default (false for new)
 }
 
 // AgentUpdateConfig is the request body for PATCH updates.
@@ -401,14 +383,10 @@ type AgentUpdateConfig struct {
 	IntervalMinutes       *int    `json:"intervalMinutes"`
 	TimeoutMinutes        *int    `json:"timeoutMinutes"`
 	ResumeIdleMinutes     *int    `json:"resumeIdleMinutes"`
-	SilentStart           *string `json:"silentStart"`
-	SilentEnd             *string `json:"silentEnd"`
-	NotifyDuringSilent    *bool   `json:"notifyDuringSilent"`
-	// CronMessage follows the standard *string PATCH convention used by every
-	// other field on this struct: nil/omitted = leave unchanged, "" = clear
-	// back to the built-in default trailing instruction.
-	CronMessage         *string   `json:"cronMessage"`
-	CustomBaseURL       *string   `json:"customBaseURL"`
+	SilentStart        *string `json:"silentStart"`
+	SilentEnd          *string `json:"silentEnd"`
+	NotifyDuringSilent *bool   `json:"notifyDuringSilent"`
+	CustomBaseURL      *string `json:"customBaseURL"`
 	ThinkingMode        *string   `json:"thinkingMode"`
 	AllowedTools        []string  `json:"allowedTools"`
 	AllowProtectedPaths *[]string `json:"allowProtectedPaths"`
@@ -460,14 +438,6 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		f := false
 		notifyDuringSilent = &f
 	}
-	var cronMessage string
-	if cfg.CronMessage != nil {
-		v, err := validateCronMessage(*cfg.CronMessage)
-		if err != nil {
-			return nil, err
-		}
-		cronMessage = v
-	}
 	if err := ValidSilentHours(silentStart, silentEnd); err != nil {
 		return nil, err
 	}
@@ -504,7 +474,6 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		SilentStart:        silentStart,
 		SilentEnd:          silentEnd,
 		NotifyDuringSilent: notifyDuringSilent,
-		CronMessage:       cronMessage,
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}

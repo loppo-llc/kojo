@@ -85,6 +85,58 @@ func longestBacktickRun(data []byte) int {
 	return max
 }
 
+// MaxCheckinRunes caps checkin.md at 4096 runes.
+const MaxCheckinRunes = 4096
+
+// DefaultCheckinContent is the template shown in the UI for new/unedited agents.
+const DefaultCheckinContent = `# Check-in Instructions
+
+Tasks to perform on each scheduled check-in.
+The token ` + "`{date}`" + ` is replaced with today's date (YYYY-MM-DD) at runtime.
+
+- Record recent events or observations in memory/{date}.md
+- Check and respond to pending notifications
+- Review and update active todos
+`
+
+// readCheckinFile reads checkin.md for an agent.
+// Returns "" if the file doesn't exist (caller uses default behavior).
+func readCheckinFile(agentID string) string {
+	data, err := os.ReadFile(filepath.Join(agentDir(agentID), "checkin.md"))
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// WriteCheckinFile writes checkin content to checkin.md.
+// Validates size (MaxCheckinRunes). Empty content removes the file.
+func WriteCheckinFile(agentID string, content string) error {
+	trimmed := strings.TrimSpace(content)
+	if n := len([]rune(trimmed)); n > MaxCheckinRunes {
+		return fmt.Errorf("checkin content too long: %d runes (max %d)", n, MaxCheckinRunes)
+	}
+	p := filepath.Join(agentDir(agentID), "checkin.md")
+	if trimmed == "" {
+		err := os.Remove(p)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	return os.WriteFile(p, []byte(trimmed), 0o644)
+}
+
+// ReadCheckinFileOrDefault reads checkin.md, returning DefaultCheckinContent
+// if the file doesn't exist. Used by the API to show a template in the UI.
+func ReadCheckinFileOrDefault(agentID string) string {
+	data, err := os.ReadFile(filepath.Join(agentDir(agentID), "checkin.md"))
+	if err != nil {
+		return DefaultCheckinContent
+	}
+	return string(data)
+}
+
 // readPersonaFile reads the full content of persona.md for an agent.
 // Returns (content, true) on success (including empty file and missing file).
 // Missing file returns ("", true) — treated as "persona cleared".

@@ -278,6 +278,10 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	// Manual check-in (fires the periodic check-in prompt on demand)
 	mux.HandleFunc("POST /api/v1/agents/{id}/checkin", s.handleCheckin)
 
+	// Checkin file (file-based check-in instructions)
+	mux.HandleFunc("GET /api/v1/agents/{id}/checkin-file", s.handleGetCheckinFile)
+	mux.HandleFunc("PUT /api/v1/agents/{id}/checkin-file", s.handlePutCheckinFile)
+
 	// Slack bot
 	mux.HandleFunc("GET /api/v1/agents/{id}/slackbot", s.handleGetSlackBot)
 	mux.HandleFunc("PUT /api/v1/agents/{id}/slackbot", s.handleSetSlackBot)

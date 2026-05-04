@@ -258,6 +258,31 @@ func (s *Server) handleCheckin(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusAccepted, map[string]bool{"ok": true})
 }
 
+// handleGetCheckinFile returns the checkin.md content for an agent.
+// Returns DefaultCheckinContent if the file doesn't exist.
+func (s *Server) handleGetCheckinFile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	content := agent.ReadCheckinFileOrDefault(id)
+	writeJSONResponse(w, http.StatusOK, map[string]string{"content": content})
+}
+
+// handlePutCheckinFile writes checkin.md content for an agent.
+func (s *Server) handlePutCheckinFile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var body struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+		return
+	}
+	if err := agent.WriteCheckinFile(id, body.Content); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]string{"content": agent.ReadCheckinFileOrDefault(id)})
+}
+
 func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	p := auth.FromContext(r.Context())

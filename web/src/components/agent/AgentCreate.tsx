@@ -24,7 +24,6 @@ export function AgentCreate() {
   const [resumeIdleMinutes, setResumeIdleMinutes] = useState(0);
   const [silentStart, setSilentStart] = useState("");
   const [silentEnd, setSilentEnd] = useState("");
-  const [cronMessage, setCronMessage] = useState("");
   const [genPrompt, setGenPrompt] = useState("");
   const [personaPrompt, setPersonaPrompt] = useState("");
   const [loading, setLoading] = useState(false);
@@ -243,7 +242,6 @@ export function AgentCreate() {
         resumeIdleMinutes: resumeIdleMinutes || undefined,
         silentStart: silentStart || undefined,
         silentEnd: silentEnd || undefined,
-        cronMessage: cronMessage.trim() || undefined,
       });
 
       // Upload avatar (best-effort — agent is already created)
@@ -597,8 +595,6 @@ export function AgentCreate() {
           silentEnd={silentEnd}
           onSilentStartChange={setSilentStart}
           onSilentEndChange={setSilentEnd}
-          cronMessage={cronMessage}
-          onCronMessageChange={setCronMessage}
         />
 
         {error && (

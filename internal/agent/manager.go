@@ -500,19 +500,6 @@ func (m *Manager) regeneratePublicProfile(agentID, persona string) {
 
 // Update updates an agent's configuration. Only non-nil fields are applied.
 func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
-	// Pure-input validations that don't depend on existing state run first so
-	// a malformed payload can't trigger any I/O (persona.md write, avatar
-	// fetch) or partial in-memory mutations below.
-	var nextCronMessage string
-	cronMessageDirty := false
-	if cfg.CronMessage != nil {
-		v, err := validateCronMessage(*cfg.CronMessage)
-		if err != nil {
-			return nil, err
-		}
-		nextCronMessage = v
-		cronMessageDirty = true
-	}
 	// Reject invalid resume-idle presets up front so a malformed PATCH cannot
 	// land partial mutations (Persona / Name / Model are applied before the
 	// later validation block, so deferring this check would let a bad value
@@ -664,9 +651,6 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 			return nil, fmt.Errorf("unsupported thinkingMode: %q", *cfg.ThinkingMode)
 		}
 		a.ThinkingMode = NormalizeThinkingMode(*cfg.ThinkingMode)
-	}
-	if cronMessageDirty {
-		a.CronMessage = nextCronMessage
 	}
 	if cfg.TTS != nil {
 		// Already validated up-front before any I/O / mutation.
@@ -1317,8 +1301,9 @@ func (m *Manager) Checkin(agentID string) error {
 		return fmt.Errorf("%w: %s", ErrAgentArchived, agentID)
 	}
 	timeoutMinutes := a.TimeoutMinutes
-	cronMessage := a.CronMessage
 	m.mu.Unlock()
+
+	cronMessage := readCheckinFile(agentID)
 
 	timeout := cronTimeout
 	if timeoutMinutes > 0 {

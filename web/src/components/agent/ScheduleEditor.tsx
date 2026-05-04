@@ -1,7 +1,8 @@
 import { useState, useEffect } from "react";
-import { INTERVAL_PRESETS, TIMEOUT_PRESETS, RESUME_IDLE_PRESETS } from "../../lib/agentApi";
+import { INTERVAL_PRESETS, TIMEOUT_PRESETS, RESUME_IDLE_PRESETS, agentApi } from "../../lib/agentApi";
 
 interface Props {
+  agentId?: string;
   intervalMinutes: number;
   onIntervalChange: (v: number) => void;
   timeoutMinutes: number;
@@ -16,8 +17,6 @@ interface Props {
   silentEnd: string;
   onSilentStartChange: (v: string) => void;
   onSilentEndChange: (v: string) => void;
-  cronMessage: string;
-  onCronMessageChange: (v: string) => void;
   // RFC3339 timestamp of the next scheduled run (silent-hours-adjusted).
   // Empty/undefined when scheduling is off or the agent has no schedule.
   nextCronAt?: string;
@@ -103,6 +102,7 @@ function formatNextCron(
 }
 
 export function ScheduleEditor({
+  agentId,
   intervalMinutes,
   onIntervalChange,
   timeoutMinutes,
@@ -114,8 +114,6 @@ export function ScheduleEditor({
   silentEnd,
   onSilentStartChange,
   onSilentEndChange,
-  cronMessage,
-  onCronMessageChange,
   nextCronAt,
   scheduleDirty,
   onCheckin,
@@ -123,6 +121,38 @@ export function ScheduleEditor({
 }: Props) {
   const showResumeIdle =
     onResumeIdleChange !== undefined && (tool === undefined || tool === "claude");
+
+  // Checkin file state — managed independently via file-based API
+  const [cronMessage, setCronMessage] = useState("");
+  const [checkinDirty, setCheckinDirty] = useState(false);
+  const [checkinSaving, setCheckinSaving] = useState(false);
+
+  useEffect(() => {
+    if (!agentId) return;
+    agentApi.getCheckinFile(agentId).then((content) => {
+      setCronMessage(content);
+      setCheckinDirty(false);
+    }).catch(() => {});
+  }, [agentId]);
+
+  const handleCheckinMessageChange = (v: string) => {
+    setCronMessage(v);
+    setCheckinDirty(true);
+  };
+
+  const handleSaveCheckinFile = async () => {
+    if (!agentId) return;
+    setCheckinSaving(true);
+    try {
+      const saved = await agentApi.putCheckinFile(agentId, cronMessage);
+      setCronMessage(saved);
+      setCheckinDirty(false);
+    } catch {
+      // keep dirty state so user can retry
+    } finally {
+      setCheckinSaving(false);
+    }
+  };
 
   // Re-render every 30s so the "in 12m" / "2h ago" relative label next to
   // the upcoming check-in stays accurate without the user reloading. We
@@ -363,27 +393,37 @@ export function ScheduleEditor({
       )}
 
       {/* Custom Check-in Message — applied to BOTH periodic and manual
-          check-ins. The hint reflected that originally said "interval >
-          0 only", which was wrong: the manual "Check in now" button
-          calls the same prompt builder. */}
+          check-ins. Saved independently via file-based API. */}
       <div>
         <label className="block text-sm text-neutral-400 mb-2">
           Check-in Message
         </label>
         <textarea
           value={cronMessage}
-          onChange={(e) => onCronMessageChange(e.target.value)}
-          rows={3}
+          onChange={(e) => handleCheckinMessageChange(e.target.value)}
+          rows={5}
           maxLength={4096}
           placeholder={DEFAULT_CRON_MESSAGE_HINT}
           className="w-full px-2.5 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 resize-none focus:outline-none focus:border-amber-700/60"
         />
-        <p className="mt-1.5 text-[11px] text-neutral-600">
-          Replaces the trailing instruction in periodic and manual check-in
-          prompts. Use <code className="text-neutral-500">{"{date}"}</code>{" "}
-          as a placeholder for today (YYYY-MM-DD). Leave blank for the
-          default.
-        </p>
+        <div className="flex items-center justify-between mt-1.5">
+          <p className="text-[11px] text-neutral-600">
+            Replaces the trailing instruction in periodic and manual check-in
+            prompts. Use <code className="text-neutral-500">{"{date}"}</code>{" "}
+            as a placeholder for today (YYYY-MM-DD). Leave blank for the
+            default.
+          </p>
+          {checkinDirty && (
+            <button
+              type="button"
+              onClick={handleSaveCheckinFile}
+              disabled={checkinSaving}
+              className="ml-3 px-3 py-1 rounded text-xs bg-amber-900/40 hover:bg-amber-900/60 border border-amber-800/60 text-amber-200 disabled:opacity-50 disabled:cursor-not-allowed transition-colors whitespace-nowrap"
+            >
+              {checkinSaving ? "Saving…" : "Save"}
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

@@ -63,29 +63,21 @@ func TestCronPromptAt_NoNextRun(t *testing.T) {
 	}
 }
 
-func TestValidateCronMessage(t *testing.T) {
-	t.Run("trims surrounding whitespace", func(t *testing.T) {
-		got, err := validateCronMessage("  hello  ")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if got != "hello" {
-			t.Errorf("got %q, want %q", got, "hello")
-		}
-	})
-
+func TestWriteCheckinFile(t *testing.T) {
 	t.Run("rejects oversized input", func(t *testing.T) {
-		too := strings.Repeat("a", MaxCronMessageRunes+1)
-		if _, err := validateCronMessage(too); err == nil {
-			t.Errorf("expected error for %d-rune input, got nil", len(too))
+		too := strings.Repeat("a", MaxCheckinRunes+1)
+		if err := WriteCheckinFile("nonexistent-test-agent", too); err == nil {
+			t.Errorf("expected error for %d-rune input, got nil", len([]rune(too)))
 		}
 	})
 
 	t.Run("counts runes not bytes", func(t *testing.T) {
-		// 日本語は3バイトだが1ルーン。MaxCronMessageRunes ルーンまで許容される。
-		ok := strings.Repeat("あ", MaxCronMessageRunes)
-		if got, err := validateCronMessage(ok); err != nil {
-			t.Errorf("unexpected error for %d-rune input: %v (got=%d)", MaxCronMessageRunes, err, len([]rune(got)))
+		// 日本語は3バイトだが1ルーン。MaxCheckinRunes ルーンまで許容される。
+		ok := strings.Repeat("あ", MaxCheckinRunes)
+		// This will fail on the write (no dir exists) but validation should pass
+		err := WriteCheckinFile("nonexistent-test-agent", ok)
+		if err != nil && strings.Contains(err.Error(), "too long") {
+			t.Errorf("unexpected size error for %d-rune input: %v", MaxCheckinRunes, err)
 		}
 	})
 }

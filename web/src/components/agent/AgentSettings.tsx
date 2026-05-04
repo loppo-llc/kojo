@@ -31,7 +31,6 @@ export function AgentSettings() {
   const [silentStart, setSilentStart] = useState("");
   const [silentEnd, setSilentEnd] = useState("");
   const [notifyDuringSilent, setNotifyDuringSilent] = useState(false);
-  const [cronMessage, setCronMessage] = useState("");
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [archiving, setArchiving] = useState(false);
@@ -163,7 +162,6 @@ export function AgentSettings() {
       setSilentStart(a.silentStart ?? "");
       setSilentEnd(a.silentEnd ?? "");
       setNotifyDuringSilent(a.notifyDuringSilent ?? true);
-      setCronMessage(a.cronMessage ?? "");
       setAllowedTools(a.allowedTools ?? []);
       setAllowProtectedPaths(a.allowProtectedPaths ?? []);
       setPrivileged(a.privileged ?? false);
@@ -215,7 +213,6 @@ export function AgentSettings() {
           silentStart,
           silentEnd,
           notifyDuringSilent,
-          cronMessage,
           allowedTools: (tool === "custom") ? allowedTools : undefined,
           allowProtectedPaths: (tool === "claude" || tool === "custom") ? allowProtectedPaths : undefined,
           tts: {
@@ -242,23 +239,13 @@ export function AgentSettings() {
 
   const handleCheckin = async () => {
     // The server runs the check-in against the persisted agent record, not
-    // the in-flight edits in this form. Bail with a notice instead of
-    // silently using stale cronMessage/timeoutMinutes — fixing this with
-    // an auto-save would mean committing other unrelated dirty fields too.
-    // Match the same normalisations the load path applies so an agent that
-    // hasn't been touched doesn't read as dirty:
-    //   - timeoutMinutes: 0 (server default) is shown as 10 in the UI, so
-    //     compare against the same "|| 10" coercion done at load.
-    //   - cronMessage: the server trims on save, so a saved value of "x"
-    //     stays equal to "x" no matter how many spaces the textarea adds.
+    // the in-flight edits in this form. Bail with a notice if timeout has
+    // unsaved changes — fixing this with an auto-save would mean committing
+    // other unrelated dirty fields too.
     const savedTimeout = agent ? (agent.timeoutMinutes || 10) : timeoutMinutes;
-    const savedMessage = (agent?.cronMessage ?? "").trim();
-    if (
-      agent &&
-      (cronMessage.trim() !== savedMessage || savedTimeout !== timeoutMinutes)
-    ) {
+    if (agent && savedTimeout !== timeoutMinutes) {
       setCheckinNotice(
-        "Save your changes first — manual check-in uses the saved Check-in Message and Timeout.",
+        "Save your changes first — manual check-in uses the saved Timeout.",
       );
       setTimeout(() => setCheckinNotice(""), 5000);
       return;
@@ -844,6 +831,7 @@ export function AgentSettings() {
 
         {/* Schedule */}
         <ScheduleEditor
+          agentId={id!}
           intervalMinutes={intervalMinutes}
           onIntervalChange={setIntervalMinutes}
           timeoutMinutes={timeoutMinutes}
@@ -855,8 +843,6 @@ export function AgentSettings() {
           silentEnd={silentEnd}
           onSilentStartChange={setSilentStart}
           onSilentEndChange={setSilentEnd}
-          cronMessage={cronMessage}
-          onCronMessageChange={setCronMessage}
           nextCronAt={agent.nextCronAt}
           scheduleDirty={
             // Schedule-affecting fields differ from the persisted agent —
