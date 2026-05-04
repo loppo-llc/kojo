@@ -320,10 +320,10 @@ export const agentApi = {
   checkin: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/checkin`),
 
   getCheckinFile: (id: string) =>
-    get<{ content: string }>(`/api/v1/agents/${id}/checkin-file`).then((r) => r.content),
+    get<{ content: string; isDefault: boolean }>(`/api/v1/agents/${id}/checkin-file`),
 
   putCheckinFile: (id: string, content: string) =>
-    put<{ content: string }>(`/api/v1/agents/${id}/checkin-file`, { content }).then((r) => r.content),
+    put<{ content: string; isDefault: boolean }>(`/api/v1/agents/${id}/checkin-file`, { content }).then((r) => r.content),
 
   fork: (id: string, params: { name: string; includeTranscript: boolean }) =>
     post<AgentInfo>(`/api/v1/agents/${id}/fork`, params),

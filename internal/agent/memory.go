@@ -129,12 +129,13 @@ func WriteCheckinFile(agentID string, content string) error {
 
 // ReadCheckinFileOrDefault reads checkin.md, returning DefaultCheckinContent
 // if the file doesn't exist. Used by the API to show a template in the UI.
-func ReadCheckinFileOrDefault(agentID string) string {
+// The second return value indicates whether the default template was used.
+func ReadCheckinFileOrDefault(agentID string) (string, bool) {
 	data, err := os.ReadFile(filepath.Join(agentDir(agentID), "checkin.md"))
 	if err != nil {
-		return DefaultCheckinContent
+		return DefaultCheckinContent, true
 	}
-	return string(data)
+	return string(data), false
 }
 
 // readPersonaFile reads the full content of persona.md for an agent.

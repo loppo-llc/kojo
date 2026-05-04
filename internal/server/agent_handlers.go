@@ -262,8 +262,8 @@ func (s *Server) handleCheckin(w http.ResponseWriter, r *http.Request) {
 // Returns DefaultCheckinContent if the file doesn't exist.
 func (s *Server) handleGetCheckinFile(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	content := agent.ReadCheckinFileOrDefault(id)
-	writeJSONResponse(w, http.StatusOK, map[string]string{"content": content})
+	content, isDefault := agent.ReadCheckinFileOrDefault(id)
+	writeJSONResponse(w, http.StatusOK, map[string]any{"content": content, "isDefault": isDefault})
 }
 
 // handlePutCheckinFile writes checkin.md content for an agent.
@@ -280,7 +280,8 @@ func (s *Server) handlePutCheckinFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	writeJSONResponse(w, http.StatusOK, map[string]string{"content": agent.ReadCheckinFileOrDefault(id)})
+	content, isDefault := agent.ReadCheckinFileOrDefault(id)
+	writeJSONResponse(w, http.StatusOK, map[string]any{"content": content, "isDefault": isDefault})
 }
 
 func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {

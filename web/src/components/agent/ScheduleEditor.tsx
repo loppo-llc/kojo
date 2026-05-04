@@ -129,9 +129,9 @@ export function ScheduleEditor({
 
   useEffect(() => {
     if (!agentId) return;
-    agentApi.getCheckinFile(agentId).then((content) => {
+    agentApi.getCheckinFile(agentId).then(({ content, isDefault }) => {
       setCronMessage(content);
-      setCheckinDirty(false);
+      setCheckinDirty(isDefault);
     }).catch(() => {});
   }, [agentId]);
 
