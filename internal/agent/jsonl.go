@@ -3,6 +3,8 @@ package agent
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 )
 
@@ -38,17 +40,25 @@ func jsonlLoadPaginated[T any](path string, limit int, before string, idFunc fun
 	defer f.Close()
 
 	var all []*T
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // up to 1MB per line
-	for scanner.Scan() {
-		var v T
-		if err := json.Unmarshal(scanner.Bytes(), &v); err != nil {
-			continue // skip malformed lines
+	r := bufio.NewReader(f)
+	for {
+		// ReadBytes has no fixed cap, so a single record can be arbitrarily
+		// large. The returned slice includes the trailing '\n' when present;
+		// json.Unmarshal tolerates trailing whitespace, so we pass it as-is.
+		line, readErr := r.ReadBytes('\n')
+		if len(line) > 0 {
+			var v T
+			if jerr := json.Unmarshal(line, &v); jerr == nil {
+				all = append(all, &v)
+			}
+			// malformed/empty lines are skipped
 		}
-		all = append(all, &v)
-	}
-	if err := scanner.Err(); err != nil {
-		return all, false, err
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return all, false, readErr
+		}
 	}
 
 	if before != "" {
@@ -71,3 +81,4 @@ func jsonlLoadPaginated[T any](path string, limit int, before string, idFunc fun
 	}
 	return all, hasMore, nil
 }
+

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -100,44 +101,67 @@ func rewriteMessages(agentID string, transform func(*Message) (*Message, bool)) 
 
 	var matched *Message
 	w := bufio.NewWriter(tmp)
-	scanner := bufio.NewScanner(src)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		var m Message
-		if err := json.Unmarshal(line, &m); err != nil {
-			// Preserve malformed lines verbatim.
-			if _, err := w.Write(append(append([]byte{}, line...), '\n')); err != nil {
-				cleanup()
-				return nil, err
+	r := bufio.NewReader(src)
+	for {
+		// raw includes the trailing '\n' (or '\r\n') when present, so we can
+		// write malformed/empty lines back byte-for-byte. ReadBytes has no
+		// size cap, so single records can be arbitrarily large.
+		raw, readErr := r.ReadBytes('\n')
+		if len(raw) > 0 {
+			// Strip trailing '\n' / '\r\n' for the unmarshal attempt.
+			line := raw
+			if line[len(line)-1] == '\n' {
+				line = line[:len(line)-1]
+				if len(line) > 0 && line[len(line)-1] == '\r' {
+					line = line[:len(line)-1]
+				}
 			}
-			continue
+			if len(line) == 0 {
+				// Empty line: preserve verbatim (raw still carries the
+				// terminator, if any).
+				if _, werr := w.Write(raw); werr != nil {
+					cleanup()
+					return nil, werr
+				}
+			} else {
+				var m Message
+				if uerr := json.Unmarshal(line, &m); uerr != nil {
+					// Malformed JSON: preserve raw bytes (incl. terminator).
+					if _, werr := w.Write(raw); werr != nil {
+						cleanup()
+						return nil, werr
+					}
+				} else {
+					out, drop := transform(&m)
+					if out != nil {
+						matched = out
+					}
+					if !drop {
+						target := &m
+						if out != nil {
+							target = out
+						}
+						data, jerr := json.Marshal(target)
+						if jerr != nil {
+							cleanup()
+							return nil, jerr
+						}
+						data = append(data, '\n')
+						if _, werr := w.Write(data); werr != nil {
+							cleanup()
+							return nil, werr
+						}
+					}
+				}
+			}
 		}
-		out, drop := transform(&m)
-		if out != nil {
-			matched = out
-		}
-		if drop {
-			continue
-		}
-		target := &m
-		if out != nil {
-			target = out
-		}
-		data, err := json.Marshal(target)
-		if err != nil {
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
 			cleanup()
-			return nil, err
+			return nil, readErr
 		}
-		data = append(data, '\n')
-		if _, err := w.Write(data); err != nil {
-			cleanup()
-			return nil, err
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		cleanup()
-		return nil, err
 	}
 	if matched == nil {
 		cleanup()
