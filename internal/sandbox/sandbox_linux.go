@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
 	"syscall"
 	"unsafe"
 
@@ -103,31 +102,6 @@ func ExecSandboxed(args []string) {
 		fmt.Fprintf(os.Stderr, "kojo sandbox: exec %s: %v\n", cmdPath, err)
 		os.Exit(1)
 	}
-}
-
-// parseSandboxArgs extracts --rw paths and the trailing command from the
-// argument list.  The "--" separator is required between flags and the command.
-func parseSandboxArgs(args []string) (rwPaths []string, cmdArgs []string, err error) {
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--" {
-			cmdArgs = args[i+1:]
-			return rwPaths, cmdArgs, nil
-		}
-		if args[i] == "--rw" {
-			i++
-			if i >= len(args) {
-				return nil, nil, fmt.Errorf("--rw requires a path argument")
-			}
-			rwPaths = append(rwPaths, args[i])
-			continue
-		}
-		if strings.HasPrefix(args[i], "--rw=") {
-			rwPaths = append(rwPaths, strings.TrimPrefix(args[i], "--rw="))
-			continue
-		}
-		return nil, nil, fmt.Errorf("unknown flag: %s", args[i])
-	}
-	return nil, nil, fmt.Errorf("missing -- separator")
 }
 
 // landlockABI queries the kernel for the best supported Landlock ABI version.
