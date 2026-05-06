@@ -62,9 +62,10 @@ var kojoAPIBase string
 // API calls. Idempotent; safe to call repeatedly during boot.
 func SetKojoAPIBase(base string) { kojoAPIBase = base }
 
-// agentTokenLookup, when set, returns the per-agent auth token kojo
-// should expose via $KOJO_AGENT_TOKEN to the PTY. Wired up by the
-// server using the auth.TokenStore.
+// agentTokenLookup, when set, returns the per-agent auth token for
+// direct injection into the system prompt and MCP config. The token is
+// NOT exposed as an environment variable — see filterEnv doc. Wired up
+// by the server using the auth.TokenStore.
 var agentTokenLookup func(agentID string) (string, bool)
 
 // SetAgentTokenLookup wires the token lookup callback. May be nil
@@ -73,9 +74,13 @@ func SetAgentTokenLookup(fn func(string) (string, bool)) { agentTokenLookup = fn
 
 // filterEnv returns a copy of os.Environ() with entries matching any of the
 // given prefixes removed, and AGENT_BROWSER_SESSION / AGENT_BROWSER_COOKIE_DIR
-// vars set to agentID / dataDir. KOJO_AGENT_ID, KOJO_AGENT_TOKEN and
-// KOJO_API_BASE are also injected so the agent can identify itself when
-// curling kojo's API.
+// vars set to agentID / dataDir. KOJO_AGENT_ID and KOJO_API_BASE are injected
+// so the agent can identify itself.
+//
+// KOJO_AGENT_TOKEN is intentionally NOT set as an environment variable.
+// Agent tokens are injected directly into the system prompt to avoid
+// exposure via /proc/{pid}/environ, which any process running as the same
+// UID can read.
 //
 // Every KOJO_* var inherited from the parent process is stripped before the
 // per-agent values are appended. This prevents an Owner-only secret like
@@ -105,11 +110,6 @@ func filterEnv(removePrefixes []string, agentID, dataDir string) []string {
 		"AGENT_BROWSER_COOKIE_DIR="+dataDir,
 		"KOJO_AGENT_ID="+agentID,
 	)
-	if agentTokenLookup != nil {
-		if tok, ok := agentTokenLookup(agentID); ok && tok != "" {
-			filtered = append(filtered, "KOJO_AGENT_TOKEN="+tok)
-		}
-	}
 	if kojoAPIBase != "" {
 		filtered = append(filtered, "KOJO_API_BASE="+kojoAPIBase)
 	}

@@ -34,7 +34,7 @@ func TestBuildSystemPrompt_NoVolatileContent(t *testing.T) {
 		t.Fatalf("write recent.md: %v", err)
 	}
 
-	prompt := buildSystemPrompt(a, testLogger(), "http://127.0.0.1:8080", nil, false)
+	prompt := buildSystemPrompt(a, testLogger(), "http://127.0.0.1:8080", "test-token", nil, false)
 
 	// Wall-clock fragments must not be in the prompt. We don't assert on
 	// minute precision (fragile) but on the directive text the prior
