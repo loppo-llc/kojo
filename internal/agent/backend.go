@@ -2,8 +2,12 @@ package agent
 
 import (
 	"context"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
+
+	"github.com/loppo-llc/kojo/internal/sandbox"
 )
 
 // ErrMsgTimeout is the error message attached to a "done" event when
@@ -131,6 +135,47 @@ func emitCancelDone(ctx context.Context, ch chan<- ChatEvent, content, thinking 
 		Message:      msg,
 		Usage:        usage,
 		ErrorMessage: errMsg,
+	}
+}
+
+// sandboxConfig builds a sandbox.Config for the given agent.  The config
+// allows writes to the agent's own data directory plus common paths that
+// CLI tools need (temp dirs, caches, tool-specific config dirs).
+func sandboxConfig(agent *Agent, logger *slog.Logger) sandbox.Config {
+	if !sandbox.Available() {
+		return sandbox.Config{Enabled: false}
+	}
+
+	dir := agentDir(agent.ID)
+	home, _ := os.UserHomeDir()
+
+	rw := []string{
+		dir,               // agent's own data
+		os.TempDir(),      // /tmp
+		"/var/tmp",        // persistent temp
+	}
+
+	if home != "" {
+		rw = append(rw,
+			filepath.Join(home, ".cache"),  // npm/pip/go caches
+			filepath.Join(home, ".claude"), // Claude Code sessions & config
+			filepath.Join(home, ".gemini"), // Gemini CLI config
+			filepath.Join(home, ".codex"),  // Codex CLI config
+		)
+	}
+
+	// Custom work directory (e.g. a project checkout).
+	if agent.WorkDir != "" && agent.WorkDir != dir {
+		rw = append(rw, agent.WorkDir)
+	}
+
+	logger.Info("sandbox enabled",
+		"agent", agent.ID,
+		"rw_paths", rw,
+	)
+	return sandbox.Config{
+		RWPaths: rw,
+		Enabled: true,
 	}
 }
 

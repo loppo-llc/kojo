@@ -13,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/sandbox"
 )
 
 // GeminiBackend implements ChatBackend for the Gemini CLI.
@@ -64,7 +66,7 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		args = append(args, "-m", agent.Model)
 	}
 
-	cmd := exec.CommandContext(ctx, geminiPath, args...)
+	cmd := sandbox.WrapCommand(ctx, geminiPath, args, sandboxConfig(agent, b.logger))
 	cmd.Dir = dir
 	cmd.Cancel = func() error {
 		return cmd.Process.Signal(syscall.SIGTERM)

@@ -24,6 +24,7 @@ import (
 	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/configdir"
 	"github.com/loppo-llc/kojo/internal/notify"
+	"github.com/loppo-llc/kojo/internal/sandbox"
 	"github.com/loppo-llc/kojo/internal/server"
 	"github.com/loppo-llc/kojo/internal/session"
 	"github.com/loppo-llc/kojo/web"
@@ -33,6 +34,14 @@ import (
 var version = "0.18.1"
 
 func main() {
+	// "kojo sandbox ..." subcommand: apply Landlock restrictions then exec
+	// the real command.  Must be handled before flag.Parse() because the
+	// sandbox args use their own format (--rw <path> -- <cmd>).
+	if len(os.Args) > 1 && os.Args[1] == "sandbox" {
+		sandbox.ExecSandboxed(os.Args[2:])
+		return // unreachable on success (ExecSandboxed replaces the process)
+	}
+
 	port := flag.Int("port", 8080, "port number (auto-increments if busy)")
 	dev := flag.Bool("dev", false, "enable dev mode (proxy to Vite)")
 	local := flag.Bool("local", false, "listen on localhost only (no Tailscale)")
