@@ -83,6 +83,17 @@ export interface AgentInfo {
   // agents (NOT to fork or read their full record). Owner-only mutation
   // via POST /api/v1/agents/{id}/privilege.
   privileged?: boolean;
+  tts?: TTSConfig;
+}
+
+// TTSConfig mirrors internal/agent.TTSConfig in the Go backend.
+// Empty model/voice/stylePrompt are interpreted as "use default" at
+// synthesize time.
+export interface TTSConfig {
+  enabled: boolean;
+  model?: string;
+  voice?: string;
+  stylePrompt?: string;
 }
 
 export interface AgentConfig {
@@ -109,6 +120,7 @@ export interface AgentUpdateParams extends Partial<AgentConfig> {
   allowedTools?: string[];
   allowProtectedPaths?: string[];
   thinkingMode?: string;
+  tts?: TTSConfig | null;
 }
 
 export interface AgentMessageAttachment {

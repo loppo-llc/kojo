@@ -526,6 +526,13 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.ResumeIdleMinutes != nil && !ValidResumeIdle(*cfg.ResumeIdleMinutes) {
 		return nil, fmt.Errorf("unsupported resumeIdle: %d minutes", *cfg.ResumeIdleMinutes)
 	}
+	// Same reasoning for TTS — checked here so a bad model/voice can't
+	// trigger persona.md write or partial sibling-field mutations below.
+	if cfg.TTS != nil {
+		if err := ValidateTTS(cfg.TTS); err != nil {
+			return nil, err
+		}
+	}
 
 	// Check agent exists before any file I/O
 	m.mu.Lock()
@@ -555,6 +562,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 
 	oldPersona := a.Persona
+	oldOverride := a.PublicProfileOverride
 	if cfg.Persona != nil {
 		a.Persona = *cfg.Persona
 	}
@@ -666,11 +674,17 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cronMessageDirty {
 		a.CronMessage = nextCronMessage
 	}
+	if cfg.TTS != nil {
+		// Already validated up-front before any I/O / mutation.
+		// Defensive copy so callers can't mutate the stored config out-of-band.
+		t := *cfg.TTS
+		a.TTS = &t
+	}
 	newInterval := a.IntervalMinutes
 	a.UpdatedAt = time.Now().Format(time.RFC3339)
 	applyAvatarMeta(a, avHas, avHash)
 
-	needsRegen := resolvePublicProfile(a, cfg, oldPersona)
+	needsRegen := resolvePublicProfile(a, cfg, oldPersona, oldOverride)
 
 	// Take a copy for return and post-lock operations
 	cp := copyAgent(a)
@@ -1770,6 +1784,10 @@ func copyAgent(a *Agent) *Agent {
 		sb := *a.SlackBot
 		cp.SlackBot = &sb
 	}
+	if a.TTS != nil {
+		t := *a.TTS
+		cp.TTS = &t
+	}
 	if len(a.NotifySources) > 0 {
 		cp.NotifySources = make([]notifysource.Config, len(a.NotifySources))
 		for i, ns := range a.NotifySources {
@@ -1788,8 +1806,15 @@ func copyAgent(a *Agent) *Agent {
 // resolvePublicProfile determines whether the agent's public profile needs
 // regeneration based on persona/override changes, clearing the profile as needed.
 // Returns true if background regeneration should be triggered.
-func resolvePublicProfile(a *Agent, cfg AgentUpdateConfig, oldPersona string) bool {
+//
+// oldOverride is the agent's PublicProfileOverride value *before* the
+// PATCH was applied. We need it to distinguish "the user just turned
+// override OFF" (regenerate) from "override is still OFF and the form
+// re-sent the same value" (don't regenerate every save).
+func resolvePublicProfile(a *Agent, cfg AgentUpdateConfig, oldPersona string, oldOverride bool) bool {
 	personaChanged := cfg.Persona != nil && *cfg.Persona != oldPersona
+	overrideTurnedOff := cfg.PublicProfileOverride != nil &&
+		!*cfg.PublicProfileOverride && oldOverride
 	needsRegen := false
 	if !a.PublicProfileOverride {
 		if personaChanged && *cfg.Persona == "" {
@@ -1800,8 +1825,8 @@ func resolvePublicProfile(a *Agent, cfg AgentUpdateConfig, oldPersona string) bo
 			a.PublicProfile = ""
 			needsRegen = true
 		}
-		if cfg.PublicProfileOverride != nil && !*cfg.PublicProfileOverride && a.Persona != "" {
-			// Override turned OFF → will regenerate
+		if overrideTurnedOff && a.Persona != "" {
+			// Override flipped from ON to OFF → will regenerate
 			a.PublicProfile = ""
 			needsRegen = true
 		}

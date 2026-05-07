@@ -289,6 +289,14 @@ func SummarizeWithCLI(tool string, persona string) (string, error) {
 	}
 }
 
+// LoadGeminiAPIKey is the exported wrapper around loadGeminiAPIKey for
+// callers outside the agent package (e.g. internal/server's TTS handler).
+// It applies the same priority order: encrypted credential store first,
+// then the legacy nanobanana credentials file as a fallback.
+func LoadGeminiAPIKey(creds *CredentialStore) (string, error) {
+	return loadGeminiAPIKey(creds)
+}
+
 // loadGeminiAPIKey loads the Gemini API key.
 // Priority: 1) encrypted credential store, 2) nanobanana credentials file (fallback).
 func loadGeminiAPIKey(creds *CredentialStore) (string, error) {

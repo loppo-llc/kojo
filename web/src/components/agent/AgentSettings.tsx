@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router";
 import { agentApi, type AgentInfo } from "../../lib/agentApi";
 import { api } from "../../lib/api";
+import { useTTSCapability } from "../../hooks/useTTS";
+import { ttsApi, pickBestFormat } from "../../lib/ttsApi";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
 import { NotifySourcesEditor } from "./NotifySourcesEditor";
@@ -48,6 +50,69 @@ export function AgentSettings() {
   const [generatingPersona, setGeneratingPersona] = useState(false);
   const [allowedTools, setAllowedTools] = useState<string[]>([]);
   const [allowProtectedPaths, setAllowProtectedPaths] = useState<string[]>([]);
+  // TTS settings
+  const [ttsEnabled, setTTSEnabled] = useState(false);
+  const [ttsModel, setTTSModel] = useState("");
+  const [ttsVoice, setTTSVoice] = useState("");
+  const [ttsStylePrompt, setTTSStylePrompt] = useState("");
+  const [ttsPreviewVoice, setTTSPreviewVoice] = useState<string | null>(null);
+  const [ttsPreviewError, setTTSPreviewError] = useState("");
+  const ttsCapability = useTTSCapability();
+  const ttsPreviewAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  // playPreview synthesizes a fixed sample line for the chosen voice
+  // and plays it. Concurrent preview clicks supersede the previous one.
+  const playPreview = async (voiceName: string) => {
+    if (!ttsCapability) return;
+    setTTSPreviewError("");
+    setTTSPreviewVoice(voiceName);
+    // Stop whatever's currently playing before kicking off a new fetch
+    // so two clicks don't overlap audibly.
+    if (ttsPreviewAudioRef.current) {
+      ttsPreviewAudioRef.current.pause();
+      ttsPreviewAudioRef.current.src = "";
+      ttsPreviewAudioRef.current = null;
+    }
+    try {
+      const fmt = pickBestFormat(ttsCapability.formats);
+      const res = await ttsApi.preview(voiceName, {
+        model: ttsModel || undefined,
+        stylePrompt: ttsStylePrompt.trim() || undefined,
+        format: fmt,
+      });
+      const audio = new Audio(ttsApi.audioUrl(res.url));
+      audio.onended = () => {
+        if (ttsPreviewAudioRef.current === audio) {
+          ttsPreviewAudioRef.current = null;
+          setTTSPreviewVoice((cur) => (cur === voiceName ? null : cur));
+        }
+      };
+      audio.onerror = () => {
+        if (ttsPreviewAudioRef.current === audio) {
+          setTTSPreviewError("Playback error");
+          ttsPreviewAudioRef.current = null;
+          setTTSPreviewVoice(null);
+        }
+      };
+      ttsPreviewAudioRef.current = audio;
+      await audio.play();
+    } catch (e) {
+      setTTSPreviewError(e instanceof Error ? e.message : String(e));
+      setTTSPreviewVoice(null);
+    }
+  };
+
+  // Stop preview audio when the settings page unmounts.
+  useEffect(
+    () => () => {
+      if (ttsPreviewAudioRef.current) {
+        ttsPreviewAudioRef.current.pause();
+        ttsPreviewAudioRef.current.src = "";
+        ttsPreviewAudioRef.current = null;
+      }
+    },
+    [],
+  );
   const [privileged, setPrivileged] = useState(false);
   const [privilegeSaving, setPrivilegeSaving] = useState(false);
   const [showForkDialog, setShowForkDialog] = useState(false);
@@ -81,6 +146,10 @@ export function AgentSettings() {
       setAllowedTools(a.allowedTools ?? []);
       setAllowProtectedPaths(a.allowProtectedPaths ?? []);
       setPrivileged(a.privileged ?? false);
+      setTTSEnabled(a.tts?.enabled ?? false);
+      setTTSModel(a.tts?.model ?? "");
+      setTTSVoice(a.tts?.voice ?? "");
+      setTTSStylePrompt(a.tts?.stylePrompt ?? "");
     }).catch(() => navigate("/"));
   }, [id, navigate]);
 
@@ -126,6 +195,12 @@ export function AgentSettings() {
         cronMessage,
         allowedTools: (tool === "custom") ? allowedTools : undefined,
         allowProtectedPaths: (tool === "claude" || tool === "custom") ? allowProtectedPaths : undefined,
+        tts: {
+          enabled: ttsEnabled,
+          model: ttsModel || undefined,
+          voice: ttsVoice || undefined,
+          stylePrompt: ttsStylePrompt.trim() || undefined,
+        },
       });
       setAgent(updated);
       setPublicProfile(updated.publicProfile ?? "");
@@ -780,6 +855,175 @@ export function AgentSettings() {
         >
           {saving ? "Saving..." : "Save Changes"}
         </button>
+        </section>
+
+        {/* ── Text-to-Speech ── */}
+        <section className="rounded-xl border border-neutral-800 p-5 space-y-4">
+          <div>
+            <h2 className="text-sm font-semibold text-neutral-200">Text-to-Speech</h2>
+            <p className="text-xs text-neutral-500 mt-1">
+              Read assistant replies out loud via Gemini TTS. Manual playback per message; auto playback toggled in the chat header.
+            </p>
+          </div>
+
+          <label className="flex items-center gap-3 text-sm">
+            <input
+              type="checkbox"
+              checked={ttsEnabled}
+              onChange={(e) => setTTSEnabled(e.target.checked)}
+              className="w-4 h-4"
+            />
+            Enable TTS for this agent
+          </label>
+
+          {ttsEnabled && (
+            <div className="space-y-4 pl-7">
+              <div>
+                <label className="block text-xs font-medium text-neutral-400 mb-1">Model</label>
+                <select
+                  value={ttsModel}
+                  onChange={(e) => setTTSModel(e.target.value)}
+                  className="w-full bg-neutral-900 border border-neutral-700 rounded px-3 py-2 text-sm"
+                >
+                  <option value="">Default ({ttsCapability?.defaults.model ?? "gemini-3.1-flash-tts-preview"})</option>
+                  {(ttsCapability?.models ?? []).map((m) => (
+                    <option key={m} value={m}>{m}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-medium text-neutral-400">Voice</label>
+                  {ttsVoice && (
+                    <button
+                      type="button"
+                      onClick={() => playPreview(ttsVoice)}
+                      className="text-[11px] text-blue-400 hover:text-blue-300"
+                    >
+                      {ttsPreviewVoice === ttsVoice ? "▶ Playing..." : "▶ Preview"}
+                    </button>
+                  )}
+                </div>
+                <select
+                  value={ttsVoice}
+                  onChange={(e) => setTTSVoice(e.target.value)}
+                  className="w-full bg-neutral-900 border border-neutral-700 rounded px-3 py-2 text-sm"
+                >
+                  <option value="">
+                    Default ({ttsCapability?.defaults.voice ?? "Kore"})
+                  </option>
+                  {(ttsCapability?.voiceCatalog ?? []).map((v) => (
+                    <option key={v.name} value={v.name}>
+                      {v.name} ({v.gender || "?"}) — {v.trait}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-[11px] text-neutral-600 mt-1">
+                  Gender from Cloud TTS Chirp3-HD mapping. Use{" "}
+                  <span className="text-neutral-400">Preview</span> to listen.
+                </p>
+                {ttsPreviewError && (
+                  <p className="text-[11px] text-red-400 mt-1">{ttsPreviewError}</p>
+                )}
+              </div>
+
+              {/* All-voices preview grid — lets the user audition every voice
+                  without leaving the settings page. Each row stays compact
+                  so 30 voices fit without dominating the form. */}
+              <details className="bg-neutral-900/50 border border-neutral-800 rounded">
+                <summary className="px-3 py-2 text-xs text-neutral-400 cursor-pointer select-none">
+                  Browse all 30 voices
+                </summary>
+                <div className="grid grid-cols-2 gap-1 p-2 max-h-64 overflow-y-auto">
+                  {(ttsCapability?.voiceCatalog ?? []).map((v) => (
+                    <button
+                      type="button"
+                      key={v.name}
+                      onClick={() => {
+                        setTTSVoice(v.name);
+                        playPreview(v.name);
+                      }}
+                      className={`flex items-center justify-between px-2 py-1.5 rounded text-left text-xs hover:bg-neutral-800 ${
+                        ttsVoice === v.name ? "bg-neutral-800 ring-1 ring-blue-500/40" : ""
+                      }`}
+                    >
+                      <span className="truncate flex items-center gap-1.5">
+                        {v.gender && (
+                          <span
+                            className={`inline-block w-3 text-center text-[10px] font-mono rounded-sm ${
+                              v.gender === "F"
+                                ? "bg-pink-500/20 text-pink-300"
+                                : "bg-sky-500/20 text-sky-300"
+                            }`}
+                          >
+                            {v.gender}
+                          </span>
+                        )}
+                        <span className="text-neutral-200">{v.name}</span>
+                        <span className="text-neutral-500"> — {v.trait}</span>
+                      </span>
+                      <span
+                        className={`ml-2 text-[10px] ${
+                          ttsPreviewVoice === v.name ? "text-blue-400" : "text-neutral-600"
+                        }`}
+                      >
+                        {ttsPreviewVoice === v.name ? "▶" : "▷"}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </details>
+
+              <div>
+                <label className="block text-xs font-medium text-neutral-400 mb-1">Style Prompt</label>
+                <textarea
+                  value={ttsStylePrompt}
+                  onChange={(e) => setTTSStylePrompt(e.target.value)}
+                  placeholder={ttsCapability?.defaults.stylePrompt ?? "落ち着いた日本語で、淡々と短く読み上げて。"}
+                  rows={3}
+                  maxLength={500}
+                  className="w-full bg-neutral-900 border border-neutral-700 rounded px-3 py-2 text-sm font-mono resize-y"
+                />
+                <div className="text-[11px] text-neutral-600 mt-1 space-y-1">
+                  <p>
+                    Free-form prompt prepended to the text. Audio tags such as{" "}
+                    <code className="text-neutral-400">[whispers]</code>,{" "}
+                    <code className="text-neutral-400">[excited]</code>,{" "}
+                    <code className="text-neutral-400">[laughs]</code> can be embedded inline.
+                  </p>
+                  <p>
+                    Reference:{" "}
+                    <a
+                      href="https://ai.google.dev/gemini-api/docs/speech-generation"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-blue-400 hover:text-blue-300"
+                    >
+                      Gemini TTS prompt guide
+                    </a>
+                  </p>
+                </div>
+              </div>
+
+              {ttsCapability && !ttsCapability.ffmpeg && (
+                <div className="text-xs text-amber-400/80 bg-amber-950/20 border border-amber-900/40 rounded px-3 py-2">
+                  ffmpeg not detected — only WAV output is available. Install ffmpeg to enable Opus/MP3 (much smaller).
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Local Save button so users editing TTS settings don't have
+              to scroll up to the main Save Changes button. handleSave
+              already includes the TTS payload, so this just re-uses it. */}
+          <button
+            onClick={handleSave}
+            disabled={saving}
+            className="w-full py-2.5 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm font-medium disabled:opacity-40"
+          >
+            {saving ? "Saving..." : "Save TTS Settings"}
+          </button>
         </section>
 
         {/* ── Notifications ── */}

@@ -5,6 +5,7 @@ import { api } from "../../lib/api";
 import { localRFC3339 } from "../../lib/utils";
 import { useEnterSends } from "../../lib/preferences";
 import { useAgentWebSocket } from "../../hooks/useAgentWebSocket";
+import { useTTSAutoToggle, useTTSPlayer } from "../../hooks/useTTS";
 import { ChatMessage, StreamingMessage } from "./ChatMessage";
 import { AgentAvatar } from "./AgentAvatar";
 
@@ -43,6 +44,33 @@ export function AgentChat() {
   const liveStreamTextRef = useRef("");
   const liveStreamThinkingRef = useRef("");
   const liveStreamToolsRef = useRef<Array<{ id: string; name: string; input: string; output: string | null }>>([]);
+
+  // TTS — auto-play toggle (per agent, persisted in localStorage) and
+  // shared player. The player is only "enabled" when both the agent has
+  // a TTS config with enabled=true AND the user has the auto toggle on
+  // for *manual* play; manual play also requires agent enable but does
+  // not require the auto toggle. Manual is the default UX.
+  const [ttsAuto, setTTSAuto] = useTTSAutoToggle(id);
+  const ttsAgentEnabled = !!agent?.tts?.enabled;
+  const tts = useTTSPlayer(id, ttsAgentEnabled);
+  // Track which message IDs we've already auto-played in this session
+  // so re-renders / message edits don't replay the same audio.
+  const autoPlayedRef = useRef<Set<string>>(new Set());
+  // onEvent is memoized with a narrow dep set so the WebSocket doesn't
+  // tear down on every TTS state flip; the callback reads live values
+  // through these refs instead.
+  const ttsAutoRef = useRef(ttsAuto);
+  const ttsAgentEnabledRef = useRef(ttsAgentEnabled);
+  const ttsPlayRef = useRef(tts.play);
+  useEffect(() => {
+    ttsAutoRef.current = ttsAuto;
+  }, [ttsAuto]);
+  useEffect(() => {
+    ttsAgentEnabledRef.current = ttsAgentEnabled;
+  }, [ttsAgentEnabled]);
+  useEffect(() => {
+    ttsPlayRef.current = tts.play;
+  }, [tts.play]);
 
   // Restore draft and textarea height on mount / id change
   useEffect(() => {
@@ -209,6 +237,21 @@ export function AgentChat() {
                 ? prev
                 : [...prev, event.message!],
             );
+            // Auto-play if both agent has TTS enabled AND the user has
+            // the header toggle on. abortedId == null already guarantees
+            // this is a real completion, not a synthesized abort marker.
+            // Read live values through refs so the memoized onEvent
+            // callback (narrow dep list) sees current TTS state.
+            if (
+              ttsAutoRef.current &&
+              ttsAgentEnabledRef.current &&
+              event.message.role === "assistant" &&
+              event.message.content &&
+              !autoPlayedRef.current.has(event.message.id)
+            ) {
+              autoPlayedRef.current.add(event.message.id);
+              ttsPlayRef.current(event.message.id, event.message.content);
+            }
           } else if (id) {
             // Background chat finished — reload recent and merge with older loaded messages
             agentApi.messages(id, PAGE_SIZE).then((r) => {
@@ -413,6 +456,31 @@ export function AgentChat() {
             {connected ? (streaming ? "typing..." : "online") : "connecting..."}
           </div>
         </div>
+        {ttsAgentEnabled && (
+          <button
+            onClick={() => setTTSAuto((v) => !v)}
+            className={`p-2 rounded ${
+              ttsAuto
+                ? "text-blue-400 hover:text-blue-300"
+                : "text-neutral-500 hover:text-neutral-300"
+            }`}
+            title={ttsAuto ? "Auto TTS: ON" : "Auto TTS: OFF"}
+            aria-pressed={ttsAuto}
+          >
+            {ttsAuto ? (
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
+                <path d="M9.383 3.076A1 1 0 0 1 11 4v12a1 1 0 0 1-1.617.781L5.586 13H3a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1h2.586l3.797-3.924z" />
+                <path d="M14.657 5.343a1 1 0 0 1 1.414 0 6 6 0 0 1 0 9.314 1 1 0 1 1-1.414-1.414 4 4 0 0 0 0-6.486 1 1 0 0 1 0-1.414z" />
+                <path d="M16.95 2.464a1 1 0 0 1 1.414 0A11 11 0 0 1 18.364 17.95a1 1 0 0 1-1.414-1.414 9 9 0 0 0 0-12.728 1 1 0 0 1 0-1.344z" />
+              </svg>
+            ) : (
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
+                <path d="M9.383 3.076A1 1 0 0 1 11 4v12a1 1 0 0 1-1.617.781L5.586 13H3a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1h2.586l3.797-3.924z" />
+                <path d="M13.293 7.293a1 1 0 0 1 1.414 0L16 8.586l1.293-1.293a1 1 0 1 1 1.414 1.414L17.414 10l1.293 1.293a1 1 0 0 1-1.414 1.414L16 11.414l-1.293 1.293a1 1 0 0 1-1.414-1.414L14.586 10l-1.293-1.293a1 1 0 0 1 0-1.414z" />
+              </svg>
+            )}
+          </button>
+        )}
         {agent.tool === "llama.cpp" && (
           <button
             onClick={async () => {
@@ -501,6 +569,9 @@ export function AgentChat() {
               agentName={agent.name}
               agentId={agent.id}
               avatarHash={agent.avatarHash}
+              ttsEnabled={ttsAgentEnabled}
+              ttsPlayState={tts.state[msg.id]}
+              onTTSPlay={ttsAgentEnabled ? tts.play : undefined}
               onEdit={
                 editable
                   ? async (msgId, content) => {

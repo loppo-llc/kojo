@@ -25,6 +25,7 @@ import (
 	gmailpkg "github.com/loppo-llc/kojo/internal/notifysource/gmail"
 	"github.com/loppo-llc/kojo/internal/session"
 	"github.com/loppo-llc/kojo/internal/slackbot"
+	"github.com/loppo-llc/kojo/internal/tts"
 )
 
 func init() {
@@ -139,6 +140,10 @@ func New(cfg Config) *Server {
 	s.registerRoutes(mux, cfg)
 	s.mux = mux
 
+	// Start the TTS cache sweep at process startup so a stale cache
+	// from a previous run is trimmed before the first synthesize call.
+	tts.StartCacheSweep()
+
 	// The public listener (the kojo user's mobile UI) is unconditionally
 	// trusted as Owner — preserves the original UX with no token setup.
 	// The agent-facing auth listener is created lazily by ServeAuth.
@@ -245,6 +250,13 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/agents/{id}/credentials/parse-uri", s.handleParseOTPURI)
 	mux.HandleFunc("GET /api/v1/agents/{id}/active", s.handleGetAgentActive)
 	mux.HandleFunc("GET /api/v1/agents/{id}/ws", s.handleAgentWebSocket)
+
+	// Text-to-speech
+	mux.HandleFunc("GET /api/v1/tts/capability", s.handleTTSCapability)
+	mux.HandleFunc("POST /api/v1/tts/preview", s.handleTTSPreview)
+	mux.HandleFunc("POST /api/v1/agents/{id}/tts/synthesize", s.handleTTSSynthesize)
+	mux.HandleFunc("GET /api/v1/tts/audio/{file}", s.handleTTSAudio)
+	mux.HandleFunc("HEAD /api/v1/tts/audio/{file}", s.handleTTSAudio)
 
 	// Tasks
 	mux.HandleFunc("GET /api/v1/agents/{id}/tasks", s.handleListTasks)

@@ -9,7 +9,27 @@ import (
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/notifysource"
+	"github.com/loppo-llc/kojo/internal/tts"
 )
+
+// ValidateTTS checks a TTSConfig against the canonical model/voice
+// allow-lists. Empty Model/Voice are accepted (treated as "use default"
+// at synthesize time). StylePrompt is length-clipped, not validated.
+func ValidateTTS(c *TTSConfig) error {
+	if c == nil {
+		return nil
+	}
+	if c.Model != "" && !tts.IsValidModel(c.Model) {
+		return fmt.Errorf("invalid tts model: %q", c.Model)
+	}
+	if c.Voice != "" && !tts.IsValidVoice(c.Voice) {
+		return fmt.Errorf("invalid tts voice: %q", c.Voice)
+	}
+	if l := len([]rune(c.StylePrompt)); l > 500 {
+		return fmt.Errorf("tts stylePrompt too long: %d runes (max 500)", l)
+	}
+	return nil
+}
 
 // SlackBotConfig holds Slack bot configuration for an agent.
 type SlackBotConfig struct {
@@ -31,6 +51,26 @@ func (c *SlackBotConfig) ReactMention() bool { return c.RespondMention == nil ||
 
 // ReactThread returns whether the bot should auto-reply in threads with history.
 func (c *SlackBotConfig) ReactThread() bool { return c.RespondThread == nil || *c.RespondThread }
+
+// TTSConfig holds per-agent text-to-speech configuration.
+//
+// Validation lives in (*Manager).Update — the model and voice are checked
+// against fixed allow-lists from internal/tts before being stored, so a
+// hand-edited agents.json with garbage values can't reach the synthesize
+// path.
+type TTSConfig struct {
+	// Enabled gates the TTS feature for this agent. Even when the per-
+	// browser auto-play toggle is on, a disabled agent never synthesizes.
+	Enabled bool `json:"enabled"`
+	// Model is the Gemini TTS model id (e.g. "gemini-3.1-flash-tts-preview").
+	// Empty = use the kojo default.
+	Model string `json:"model,omitempty"`
+	// Voice picks one of the 30 prebuilt voices. Empty = default.
+	Voice string `json:"voice,omitempty"`
+	// StylePrompt is a free-form natural-language instruction prepended to
+	// the input ("落ち着いた日本語で淡々と…"). Empty = kojo default.
+	StylePrompt string `json:"stylePrompt,omitempty"`
+}
 
 // ValidSilentHours validates the silent hours range.
 // Both must be empty (no restriction) or both must be valid HH:MM format.
@@ -259,6 +299,12 @@ type Agent struct {
 	// SlackBot holds the Slack Socket Mode bot configuration for this agent.
 	SlackBot *SlackBotConfig `json:"slackBot,omitempty"`
 
+	// TTS holds per-agent text-to-speech configuration. Nil = TTS disabled
+	// (no synthesize/playback). The header toggle in the chat view is a
+	// session-level UI preference and lives in localStorage; this struct
+	// only governs voice/style/model when a synthesize call actually runs.
+	TTS *TTSConfig `json:"tts,omitempty"`
+
 	// LastMessage is a preview of the most recent message (for list display).
 	LastMessage *MessagePreview `json:"lastMessage,omitempty"`
 
@@ -366,6 +412,10 @@ type AgentUpdateConfig struct {
 	ThinkingMode        *string   `json:"thinkingMode"`
 	AllowedTools        []string  `json:"allowedTools"`
 	AllowProtectedPaths *[]string `json:"allowProtectedPaths"`
+	// TTS replaces the entire TTSConfig when non-nil. Pass an explicit
+	// {enabled:false} to keep the field but disable synthesis; pass a
+	// fully-populated struct to enable.
+	TTS *TTSConfig `json:"tts,omitempty"`
 }
 
 func generateID() string {

@@ -10,7 +10,7 @@ func TestResolvePublicProfile(t *testing.T) {
 	t.Run("persona emptied clears profile", func(t *testing.T) {
 		a := &Agent{Persona: "", PublicProfile: "old profile"}
 		empty := ""
-		regen := resolvePublicProfile(a, AgentUpdateConfig{Persona: &empty}, "had persona")
+		regen := resolvePublicProfile(a, AgentUpdateConfig{Persona: &empty}, "had persona", false)
 		if regen {
 			t.Error("expected no regen when persona emptied")
 		}
@@ -22,7 +22,7 @@ func TestResolvePublicProfile(t *testing.T) {
 	t.Run("persona changed triggers regen", func(t *testing.T) {
 		a := &Agent{Persona: "new persona", PublicProfile: "old"}
 		newP := "new persona"
-		regen := resolvePublicProfile(a, AgentUpdateConfig{Persona: &newP}, "old persona")
+		regen := resolvePublicProfile(a, AgentUpdateConfig{Persona: &newP}, "old persona", false)
 		if !regen {
 			t.Error("expected regen when persona changed")
 		}
@@ -34,7 +34,7 @@ func TestResolvePublicProfile(t *testing.T) {
 	t.Run("override on prevents regen", func(t *testing.T) {
 		a := &Agent{Persona: "new", PublicProfile: "manual", PublicProfileOverride: true}
 		newP := "new"
-		regen := resolvePublicProfile(a, AgentUpdateConfig{Persona: &newP}, "old")
+		regen := resolvePublicProfile(a, AgentUpdateConfig{Persona: &newP}, "old", true)
 		if regen {
 			t.Error("expected no regen with override on")
 		}
@@ -44,17 +44,31 @@ func TestResolvePublicProfile(t *testing.T) {
 	})
 
 	t.Run("override turned off triggers regen", func(t *testing.T) {
+		// override flips from true → false
 		a := &Agent{Persona: "has persona", PublicProfile: "manual", PublicProfileOverride: false}
 		off := false
-		regen := resolvePublicProfile(a, AgentUpdateConfig{PublicProfileOverride: &off}, "has persona")
+		regen := resolvePublicProfile(a, AgentUpdateConfig{PublicProfileOverride: &off}, "has persona", true)
 		if !regen {
 			t.Error("expected regen when override turned off")
 		}
 	})
 
+	t.Run("override stays off does not regen", func(t *testing.T) {
+		// override stays false → false (form re-sent same value); must not regen
+		a := &Agent{Persona: "has persona", PublicProfile: "kept", PublicProfileOverride: false}
+		off := false
+		regen := resolvePublicProfile(a, AgentUpdateConfig{PublicProfileOverride: &off}, "has persona", false)
+		if regen {
+			t.Error("expected no regen when override stays off")
+		}
+		if a.PublicProfile != "kept" {
+			t.Errorf("expected profile preserved, got %q", a.PublicProfile)
+		}
+	})
+
 	t.Run("no persona no override clears profile", func(t *testing.T) {
 		a := &Agent{Persona: "", PublicProfile: "leftover"}
-		regen := resolvePublicProfile(a, AgentUpdateConfig{}, "")
+		regen := resolvePublicProfile(a, AgentUpdateConfig{}, "", false)
 		if regen {
 			t.Error("expected no regen")
 		}

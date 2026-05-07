@@ -44,6 +44,12 @@ interface ChatMessageProps {
   onEdit?: (msgId: string, content: string) => Promise<void>;
   onDelete?: (msgId: string) => Promise<void>;
   onRegenerate?: (msgId: string) => Promise<void>;
+  // TTS controls — when ttsEnabled is true a small play/stop button is
+  // rendered next to assistant messages. The parent owns the audio
+  // element so navigating between messages cancels the previous one.
+  ttsEnabled?: boolean;
+  ttsPlayState?: "idle" | "loading" | "playing" | "error";
+  onTTSPlay?: (msgId: string, text: string) => void;
 }
 
 export const ChatMessage = memo(function ChatMessage({
@@ -54,6 +60,9 @@ export const ChatMessage = memo(function ChatMessage({
   onEdit,
   onDelete,
   onRegenerate,
+  ttsEnabled,
+  ttsPlayState,
+  onTTSPlay,
 }: ChatMessageProps) {
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
@@ -107,10 +116,74 @@ export const ChatMessage = memo(function ChatMessage({
           </div>
         )}
 
+        {/* TTS playback button — assistant messages only */}
+        {!isUser && ttsEnabled && message.content && onTTSPlay && (
+          <TTSPlayButton
+            state={ttsPlayState ?? "idle"}
+            onClick={() => onTTSPlay(message.id, message.content)}
+          />
+        )}
+
       </div>
     </div>
   );
 });
+
+// TTSPlayButton renders a tiny speaker / spinner / stop icon based on
+// the current play state. Kept inline because it has no other consumers
+// and depends on the parent's onClick + state shape.
+function TTSPlayButton({
+  state,
+  onClick,
+}: {
+  state: "idle" | "loading" | "playing" | "error";
+  onClick: () => void;
+}) {
+  const label =
+    state === "loading"
+      ? "Loading..."
+      : state === "playing"
+        ? "Stop"
+        : state === "error"
+          ? "TTS error — retry"
+          : "Play";
+  const colorClass =
+    state === "error"
+      ? "text-red-400 hover:text-red-300"
+      : state === "playing"
+        ? "text-blue-400 hover:text-blue-300"
+        : "text-neutral-500 hover:text-neutral-300";
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={state === "loading"}
+      className={`mt-1 inline-flex items-center gap-1 text-[11px] ${colorClass} disabled:opacity-50`}
+      title={label}
+    >
+      {state === "loading" ? (
+        <svg className="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none">
+          <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" />
+          <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+        </svg>
+      ) : state === "playing" ? (
+        <svg className="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor">
+          <rect x="5" y="4" width="3" height="12" rx="1" />
+          <rect x="12" y="4" width="3" height="12" rx="1" />
+        </svg>
+      ) : (
+        <svg className="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor">
+          <path d="M9.383 3.076A1 1 0 0 1 11 4v12a1 1 0 0 1-1.617.781L5.586 13H3a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1h2.586l3.797-3.924z" />
+          <path
+            d="M14.657 5.343a1 1 0 0 1 1.414 0 6 6 0 0 1 0 9.314 1 1 0 1 1-1.414-1.414 4 4 0 0 0 0-6.486 1 1 0 0 1 0-1.414z"
+            opacity={state === "error" ? 0.5 : 1}
+          />
+        </svg>
+      )}
+      <span>{label}</span>
+    </button>
+  );
+}
 
 /** Display file attachments on a message */
 function AttachmentList({ attachments, isUser }: { attachments: AgentMessageAttachment[]; isUser: boolean }) {
