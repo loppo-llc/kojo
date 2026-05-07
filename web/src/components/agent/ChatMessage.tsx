@@ -351,6 +351,10 @@ function FilePathChip({
   );
 }
 
+// Match check-in messages: "[system message] ...チェックインです。"
+// Captures the timestamp prefix and the type (定期チェックイン or チェックイン).
+const CHECKIN_RE = /^\[system message\] (.+?)の(定期チェックイン|チェックイン)です。/;
+
 // Match the legacy "[Group DM: <name>] New message from <sender> at <timestamp>."
 // header. Older sessions still have these rendered in their transcripts.
 const GROUP_DM_LEGACY_RE = /^\[Group DM: (.+)\] New message from (.+?)(?:\s+at\s+\S+)?\.?\n/;
@@ -421,11 +425,64 @@ function GroupDMNotificationPill({
   );
 }
 
+/**
+ * Compact pill for check-in messages. Check-in prompts can be very long
+ * (custom instructions, metadata), so we show a single-line summary and
+ * let the user expand to see the full content.
+ */
+function CheckinPill({ message, timestamp, type }: { message: AgentMessage; timestamp: string; type: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const label = type === "定期チェックイン" ? "Scheduled check-in" : "Check-in";
+  return (
+    <div className="flex justify-center my-1.5">
+      <div className="flex flex-col items-center max-w-[90%] w-full">
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-neutral-900/60 border border-neutral-800 hover:border-neutral-700 text-[11px] text-neutral-500 transition-colors cursor-pointer"
+          title={expanded ? "Hide check-in content" : "Show check-in content"}
+        >
+          <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+          <span>
+            <span className="text-neutral-400">{label}</span>
+          </span>
+          <span className="text-neutral-600">{timestamp}</span>
+          <svg
+            className={`w-3 h-3 transition-transform ${expanded ? "rotate-90" : ""}`}
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth={2}
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+          </svg>
+        </button>
+        {expanded && (
+          <pre className="mt-1.5 w-full min-w-0 px-3 py-2 rounded bg-neutral-900/80 border border-neutral-800 text-[10px] leading-relaxed text-neutral-400 whitespace-pre-wrap wrap-anywhere overflow-x-auto">
+            {message.content}
+          </pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /** System / error messages -- centered, distinct styling */
 function SystemMessage({ message }: { message: AgentMessage }) {
   const isError = message.content.startsWith("\u26a0\ufe0f Error:");
 
-  // New batch-format group DM notification \u2014 collapse by default.
+  // Check-in messages — collapse by default (prompts can be very long).
+  if (!isError) {
+    const checkin = CHECKIN_RE.exec(message.content);
+    if (checkin) {
+      const [, ts, type] = checkin;
+      return <CheckinPill message={message} timestamp={ts} type={type} />;
+    }
+  }
+
+  // New batch-format group DM notification — collapse by default.
   if (!isError) {
     const batch = GROUP_DM_BATCH_RE.exec(message.content);
     if (batch) {
