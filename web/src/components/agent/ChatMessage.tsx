@@ -351,114 +351,50 @@ function FilePathChip({
   );
 }
 
-// Match check-in messages: "[system message] ...チェックインです。"
-// Captures the timestamp prefix and the type (定期チェックイン or チェックイン).
-const CHECKIN_RE = /^\[system message\] (.+?)の(定期チェックイン|チェックイン)です。/;
-
-// Match the legacy "[Group DM: <name>] New message from <sender> at <timestamp>."
-// header. Older sessions still have these rendered in their transcripts.
-const GROUP_DM_LEGACY_RE = /^\[Group DM: (.+)\] New message from (.+?)(?:\s+at\s+\S+)?\.?\n/;
-
-// Match the current "[Group DM: <name>] N new message(s) from <sender>."
-// header. The "from <sender>" suffix is server-emitted into the trusted
-// header so we never have to parse the untrusted message block to find
-// the latest sender. The suffix is optional to stay compatible with any
-// transcripts captured before the suffix landed.
-const GROUP_DM_BATCH_RE = /^\[Group DM: (.+?)\] (\d+) new message\(s\)(?: from (.+?))?\./;
-
 /**
- * Compact pill for group-DM notifications. The full notification body now
- * runs ~10KB (inline message bodies + reply curl + truncation footer), so
- * we render a collapsed pill by default and let the user click to inspect
- * the raw payload. New batch format and legacy single-message format share
- * this widget.
+ * Collapsible pill for non-error system messages. Shows just the first line
+ * with a timestamp; clicking expands to reveal the full content. This
+ * replaces the old per-type pills (CheckinPill, GroupDMNotificationPill)
+ * and removes the need for regex-based message classification entirely.
  */
-function GroupDMNotificationPill({
-  message,
-  groupName,
-  sender,
-  count,
-}: {
-  message: AgentMessage;
-  groupName: string;
-  sender?: string;
-  count?: number;
-}) {
+function CollapsibleSystemPill({ message }: { message: AgentMessage }) {
   const [expanded, setExpanded] = useState(false);
-  const senderLabel = sender ?? "?";
+  const firstLine = message.content.split("\n", 1)[0];
+  const hasMore = message.content.length > firstLine.length;
   return (
     <div className="flex justify-center my-1.5">
       <div className="flex flex-col items-center max-w-[90%] w-full">
-        <button
-          type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-neutral-900/60 border border-neutral-800 hover:border-neutral-700 text-[11px] text-neutral-500 transition-colors cursor-pointer"
-          title={expanded ? "Hide notification body" : "Show notification body"}
-        >
-          <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M20.25 8.511c.884.284 1.5 1.128 1.5 2.097v4.286c0 1.136-.847 2.1-1.98 2.193-.34.027-.68.052-1.02.072v3.091l-3-3c-1.354 0-2.694-.055-4.02-.163a2.115 2.115 0 01-.825-.242m9.345-8.334a2.126 2.126 0 00-.476-.095 48.64 48.64 0 00-8.048 0c-1.131.094-1.976 1.057-1.976 2.192v4.286c0 .837.46 1.58 1.155 1.951m9.345-8.334V6.637c0-1.621-1.152-3.026-2.76-3.235A48.455 48.455 0 0011.25 3c-2.115 0-4.198.137-6.24.402-1.608.209-2.76 1.614-2.76 3.235v6.226c0 1.621 1.152 3.026 2.76 3.235.577.075 1.157.14 1.74.194V21l4.155-4.155" />
-          </svg>
-          <span>
-            <span className="text-neutral-400">{senderLabel}</span> &rarr; {groupName}
-          </span>
-          {count != null && count > 1 && (
-            <span className="text-neutral-600">{count} msgs</span>
-          )}
-          <span className="text-neutral-600">{formatTime(message.timestamp)}</span>
-          <svg
-            className={`w-3 h-3 transition-transform ${expanded ? "rotate-90" : ""}`}
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            strokeWidth={2}
+        {hasMore ? (
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-neutral-900/60 border border-neutral-800 hover:border-neutral-700 text-[11px] text-neutral-500 transition-colors cursor-pointer max-w-full"
+            title={expanded ? "Hide details" : "Show details"}
           >
-            <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-          </svg>
-        </button>
-        {expanded && (
-          <pre className="mt-1.5 w-full min-w-0 px-3 py-2 rounded bg-neutral-900/80 border border-neutral-800 text-[10px] leading-relaxed text-neutral-400 whitespace-pre-wrap wrap-anywhere overflow-x-auto">
-            {message.content}
-          </pre>
+            <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M11.25 11.25l.041-.02a.75.75 0 011.063.852l-.708 2.836a.75.75 0 001.063.853l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z" />
+            </svg>
+            <span className="truncate">{firstLine}</span>
+            <span className="text-neutral-600 shrink-0">{formatTime(message.timestamp)}</span>
+            <svg
+              className={`w-3 h-3 shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`}
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              strokeWidth={2}
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+            </svg>
+          </button>
+        ) : (
+          <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-neutral-900/60 border border-neutral-800 text-[11px] text-neutral-500 max-w-full">
+            <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M11.25 11.25l.041-.02a.75.75 0 011.063.852l-.708 2.836a.75.75 0 001.063.853l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z" />
+            </svg>
+            <span className="truncate">{firstLine}</span>
+            <span className="text-neutral-600 shrink-0">{formatTime(message.timestamp)}</span>
+          </div>
         )}
-      </div>
-    </div>
-  );
-}
-
-/**
- * Compact pill for check-in messages. Check-in prompts can be very long
- * (custom instructions, metadata), so we show a single-line summary and
- * let the user expand to see the full content.
- */
-function CheckinPill({ message, timestamp, type }: { message: AgentMessage; timestamp: string; type: string }) {
-  const [expanded, setExpanded] = useState(false);
-  const label = type === "定期チェックイン" ? "Scheduled check-in" : "Check-in";
-  return (
-    <div className="flex justify-center my-1.5">
-      <div className="flex flex-col items-center max-w-[90%] w-full">
-        <button
-          type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-neutral-900/60 border border-neutral-800 hover:border-neutral-700 text-[11px] text-neutral-500 transition-colors cursor-pointer"
-          title={expanded ? "Hide check-in content" : "Show check-in content"}
-        >
-          <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
-          <span>
-            <span className="text-neutral-400">{label}</span>
-          </span>
-          <span className="text-neutral-600">{timestamp}</span>
-          <svg
-            className={`w-3 h-3 transition-transform ${expanded ? "rotate-90" : ""}`}
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            strokeWidth={2}
-          >
-            <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-          </svg>
-        </button>
         {expanded && (
           <pre className="mt-1.5 w-full min-w-0 px-3 py-2 rounded bg-neutral-900/80 border border-neutral-800 text-[10px] leading-relaxed text-neutral-400 whitespace-pre-wrap wrap-anywhere overflow-x-auto">
             {message.content}
@@ -473,51 +409,13 @@ function CheckinPill({ message, timestamp, type }: { message: AgentMessage; time
 function SystemMessage({ message }: { message: AgentMessage }) {
   const isError = message.content.startsWith("\u26a0\ufe0f Error:");
 
-  // Check-in messages — collapse by default (prompts can be very long).
-  if (!isError) {
-    const checkin = CHECKIN_RE.exec(message.content);
-    if (checkin) {
-      const [, ts, type] = checkin;
-      return <CheckinPill message={message} timestamp={ts} type={type} />;
-    }
-  }
-
-  // New batch-format group DM notification — collapse by default.
-  if (!isError) {
-    const batch = GROUP_DM_BATCH_RE.exec(message.content);
-    if (batch) {
-      const [, groupName, countStr, sender] = batch;
-      return (
-        <GroupDMNotificationPill
-          message={message}
-          groupName={groupName}
-          sender={sender}
-          count={parseInt(countStr, 10)}
-        />
-      );
-    }
-    const legacy = GROUP_DM_LEGACY_RE.exec(message.content);
-    if (legacy) {
-      const [, groupName, sender] = legacy;
-      return <GroupDMNotificationPill message={message} groupName={groupName} sender={sender} />;
-    }
-  }
-
-  const content = isError
-    ? message.content.replace(/^\u26a0\ufe0f Error:\s*/, "")
-    : message.content;
-
-  return (
-    <div className="flex justify-center my-2">
-      <div
-        className={`max-w-[90%] px-4 py-2.5 rounded-lg text-xs leading-relaxed ${
-          isError
-            ? "bg-red-950/50 border border-red-900/50 text-red-300"
-            : "bg-neutral-900/60 border border-neutral-800 text-neutral-400"
-        }`}
-      >
-        <div className="flex items-start gap-2">
-          {isError ? (
+  // Errors get prominent red styling — always fully visible.
+  if (isError) {
+    const content = message.content.replace(/^\u26a0\ufe0f Error:\s*/, "");
+    return (
+      <div className="flex justify-center my-2">
+        <div className="max-w-[90%] px-4 py-2.5 rounded-lg text-xs leading-relaxed bg-red-950/50 border border-red-900/50 text-red-300">
+          <div className="flex items-start gap-2">
             <svg
               className="w-4 h-4 text-red-400 shrink-0 mt-0.5"
               fill="none"
@@ -531,29 +429,18 @@ function SystemMessage({ message }: { message: AgentMessage }) {
                 d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"
               />
             </svg>
-          ) : (
-            <svg
-              className="w-4 h-4 text-neutral-500 shrink-0 mt-0.5"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              strokeWidth={2}
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M11.25 11.25l.041-.02a.75.75 0 011.063.852l-.708 2.836a.75.75 0 001.063.853l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z"
-              />
-            </svg>
-          )}
-          <span className="whitespace-pre-wrap wrap-anywhere">{content}</span>
-        </div>
-        <div className="text-[10px] text-neutral-600 mt-1.5 text-right">
-          {formatTime(message.timestamp)}
+            <span className="whitespace-pre-wrap wrap-anywhere">{content}</span>
+          </div>
+          <div className="text-[10px] text-neutral-600 mt-1.5 text-right">
+            {formatTime(message.timestamp)}
+          </div>
         </div>
       </div>
-    </div>
-  );
+    );
+  }
+
+  // All other system messages: collapsible pill showing first line only.
+  return <CollapsibleSystemPill message={message} />;
 }
 
 function actionBtnClass(isUser: boolean): string {
