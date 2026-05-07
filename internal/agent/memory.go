@@ -85,9 +85,6 @@ func longestBacktickRun(data []byte) int {
 	return max
 }
 
-// MaxCheckinRunes caps checkin.md at 4096 runes.
-const MaxCheckinRunes = 4096
-
 // DefaultCheckinContent is the template shown in the UI for new/unedited agents.
 const DefaultCheckinContent = `# Check-in Instructions
 
@@ -110,12 +107,10 @@ func readCheckinFile(agentID string) string {
 }
 
 // WriteCheckinFile writes checkin content to checkin.md.
-// Validates size (MaxCheckinRunes). Empty content removes the file.
+// Empty content removes the file. No size limit — checkin prompts must not be
+// truncated as that could break the check-in workflow.
 func WriteCheckinFile(agentID string, content string) error {
 	trimmed := strings.TrimSpace(content)
-	if n := len([]rune(trimmed)); n > MaxCheckinRunes {
-		return fmt.Errorf("checkin content too long: %d runes (max %d)", n, MaxCheckinRunes)
-	}
 	p := filepath.Join(agentDir(agentID), "checkin.md")
 	if trimmed == "" {
 		err := os.Remove(p)

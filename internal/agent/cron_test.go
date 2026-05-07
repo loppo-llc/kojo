@@ -64,20 +64,13 @@ func TestCronPromptAt_NoNextRun(t *testing.T) {
 }
 
 func TestWriteCheckinFile(t *testing.T) {
-	t.Run("rejects oversized input", func(t *testing.T) {
-		too := strings.Repeat("a", MaxCheckinRunes+1)
-		if err := WriteCheckinFile("nonexistent-test-agent", too); err == nil {
-			t.Errorf("expected error for %d-rune input, got nil", len([]rune(too)))
-		}
-	})
-
-	t.Run("counts runes not bytes", func(t *testing.T) {
-		// 日本語は3バイトだが1ルーン。MaxCheckinRunes ルーンまで許容される。
-		ok := strings.Repeat("あ", MaxCheckinRunes)
-		// This will fail on the write (no dir exists) but validation should pass
-		err := WriteCheckinFile("nonexistent-test-agent", ok)
+	t.Run("no size limit", func(t *testing.T) {
+		// checkin.md has no size limit — large content should not be rejected.
+		big := strings.Repeat("a", 10000)
+		err := WriteCheckinFile("nonexistent-test-agent", big)
+		// Write itself will fail (no dir), but there must be no "too long" error.
 		if err != nil && strings.Contains(err.Error(), "too long") {
-			t.Errorf("unexpected size error for %d-rune input: %v", MaxCheckinRunes, err)
+			t.Errorf("unexpected size error for large input: %v", err)
 		}
 	})
 }

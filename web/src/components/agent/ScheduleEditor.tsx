@@ -374,7 +374,7 @@ export function ScheduleEditor({
           value={cronMessage}
           onChange={(e) => onCronMessageChange(e.target.value)}
           rows={5}
-          maxLength={4096}
+
           placeholder={DEFAULT_CRON_MESSAGE_HINT}
           className="w-full px-2.5 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 resize-none focus:outline-none focus:border-amber-700/60"
         />
