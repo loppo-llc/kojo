@@ -393,18 +393,11 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	var lastAppend time.Time
 	hasError := false
 	streamFailed := false // true if StartStream failed, use fallback
-	filter := &agent.ReplyTagFilter{}
-
 	for evt := range events {
 		switch evt.Type {
 		case "text":
-			// Only forward text inside <reply>...</reply> tags.
-			delta := filter.Feed(evt.Delta)
-			if delta == "" {
-				continue
-			}
-			response.WriteString(delta)
-			pendingDelta.WriteString(delta)
+			response.WriteString(evt.Delta)
+			pendingDelta.WriteString(evt.Delta)
 
 			// Start stream on first text event
 			if streamTS == "" && !streamFailed {
@@ -433,12 +426,6 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			hasError = true
 			b.logger.Warn("agent returned error during slack chat", "err", evt.ErrorMessage)
 		}
-	}
-
-	// Flush any remaining buffered reply content.
-	if remaining := filter.Flush(); remaining != "" {
-		response.WriteString(remaining)
-		pendingDelta.WriteString(remaining)
 	}
 
 	// Use a separate context for finalization so that cleanup API calls
