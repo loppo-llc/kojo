@@ -1003,10 +1003,19 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 }
 
 // ChatOneShot runs a one-shot chat that does not save to transcript
-// (messages.jsonl) and does not resume the CLI session. Used for external
-// platform conversations (Slack, Discord) that carry their own context.
+// (messages.jsonl). Used for external platform conversations (Slack, Discord)
+// that carry their own context.
 // Memory (MEMORY.md, diary) access is still available via system prompt.
-func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string) (<-chan ChatEvent, error) {
+//
+// When sessionKey is provided and non-empty, the chat uses session resumption
+// with a deterministic session ID derived from the key (e.g. per Slack thread).
+// This gives the agent persistent Claude context across messages in the same
+// conversation, while still keeping each conversation isolated from the
+// WebUI session and from other threads.
+//
+// When sessionKey is empty or omitted, the chat runs as a fresh ephemeral
+// session with no resumption (original one-shot behavior).
+func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string, sessionKey ...string) (<-chan ChatEvent, error) {
 	prep, err := m.prepareChat(agentID, userMessage, false, false)
 	if err != nil {
 		return nil, err
@@ -1042,7 +1051,30 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	if prep.volatileContext != "" {
 		effectiveMessage = prep.volatileContext + userMessage
 	}
-	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{OneShot: true, MCPServers: prep.mcpServers})
+
+	// Build chat options. When a session key is provided, enable session
+	// resumption so the agent maintains Claude context across messages in
+	// the same conversation (e.g. Slack thread). Otherwise, run a fresh
+	// ephemeral session.
+	key := ""
+	if len(sessionKey) > 0 {
+		key = sessionKey[0]
+	}
+	var chatOpts ChatOptions
+	if key != "" {
+		chatOpts = ChatOptions{
+			MCPServers:       prep.mcpServers,
+			AutomatedTrigger: true,
+			SessionKey:       key,
+		}
+	} else {
+		chatOpts = ChatOptions{
+			OneShot:    true,
+			MCPServers: prep.mcpServers,
+		}
+	}
+
+	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, chatOpts)
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)

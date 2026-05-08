@@ -20,7 +20,7 @@ import (
 // agent.Manager satisfies this interface directly — no adapter needed.
 type ChatManager interface {
 	Chat(ctx context.Context, agentID, message, role string, attachments []agent.MessageAttachment, source ...agent.BusySource) (<-chan agent.ChatEvent, error)
-	ChatOneShot(ctx context.Context, agentID, message string) (<-chan agent.ChatEvent, error)
+	ChatOneShot(ctx context.Context, agentID, message string, sessionKey ...string) (<-chan agent.ChatEvent, error)
 }
 
 // Bot manages a single Slack Socket Mode connection for one agent.
@@ -374,7 +374,12 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		Status:    typingStatus,
 	})
 
-	events, err := b.mgr.ChatOneShot(ctx, b.agentID, message)
+	// Build a session key that maps 1:1 to the chat_history file unit
+	// (per-thread or per-channel). This gives each Slack conversation its
+	// own Claude session with full context resumption across messages.
+	slackSessionKey := b.agentID + ":slack:" + channel + ":" + threadTS
+
+	events, err := b.mgr.ChatOneShot(ctx, b.agentID, message, slackSessionKey)
 	if err != nil {
 		b.clearAssistantStatus(ctx, channel, threadTS)
 		b.logger.Warn("failed to start agent chat from slack", "err", err)

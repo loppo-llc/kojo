@@ -33,6 +33,14 @@ type ChatOptions struct {
 	// guard on session resets: there is no interactive conversation to
 	// preserve, so token conservation wins over continuity.
 	AutomatedTrigger bool
+
+	// SessionKey, when non-empty, overrides the default agent-ID-based
+	// session identifier. The key is hashed to a deterministic UUID, so
+	// callers can pass any unique string (e.g. "slack:<channel>:<thread>")
+	// to get an independent Claude session. Used for Slack thread-level
+	// session resumption where each conversation thread maintains its own
+	// Claude context.
+	SessionKey string
 }
 
 // ChatBackend abstracts a CLI tool for agent chat.
