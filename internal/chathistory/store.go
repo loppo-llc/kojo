@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,20 +41,23 @@ func LoadHistory(path string) ([]HistoryMessage, error) {
 	defer f.Close()
 
 	var msgs []HistoryMessage
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024) // up to 1MB per line
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
+	br := bufio.NewReader(f)
+	for {
+		line, err := br.ReadBytes('\n')
+		if len(line) > 0 {
+			var m HistoryMessage
+			if json.Unmarshal(line, &m) == nil {
+				msgs = append(msgs, m)
+			}
 		}
-		var m HistoryMessage
-		if err := json.Unmarshal(line, &m); err != nil {
-			continue // skip corrupt lines
+		if err != nil {
+			if err != io.EOF {
+				return nil, fmt.Errorf("read history: %w", err)
+			}
+			break
 		}
-		msgs = append(msgs, m)
 	}
-	return msgs, sc.Err()
+	return msgs, nil
 }
 
 // AppendMessages appends messages to a JSONL history file, creating
@@ -125,22 +129,21 @@ func LastMessage(path string) *HistoryMessage {
 	}
 	defer f.Close()
 
-	var lastLine string
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		if line := sc.Text(); line != "" {
-			lastLine = line
+	var last *HistoryMessage
+	br := bufio.NewReader(f)
+	for {
+		line, err := br.ReadBytes('\n')
+		if len(line) > 0 {
+			var m HistoryMessage
+			if json.Unmarshal(line, &m) == nil {
+				last = &m
+			}
+		}
+		if err != nil {
+			break
 		}
 	}
-	if lastLine == "" {
-		return nil
-	}
-	var m HistoryMessage
-	if err := json.Unmarshal([]byte(lastLine), &m); err != nil {
-		return nil
-	}
-	return &m
+	return last
 }
 
 // HasHistory returns true if a history file exists and is non-empty.
@@ -161,19 +164,17 @@ func LastPlatformTS(path string) string {
 	defer f.Close()
 
 	var lastReal string
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
+	br := bufio.NewReader(f)
+	for {
+		line, err := br.ReadBytes('\n')
+		if len(line) > 0 {
+			var m HistoryMessage
+			if json.Unmarshal(line, &m) == nil && isNumericTS(m.MessageID) {
+				lastReal = m.MessageID
+			}
 		}
-		var m HistoryMessage
-		if err := json.Unmarshal(line, &m); err != nil {
-			continue
-		}
-		if isNumericTS(m.MessageID) {
-			lastReal = m.MessageID
+		if err != nil {
+			break
 		}
 	}
 	return lastReal
