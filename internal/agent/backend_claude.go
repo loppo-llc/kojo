@@ -205,10 +205,15 @@ func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir s
 		// Setting permission-mode explicitly forces bypass regardless of the
 		// default mode the CLI resolves to.
 		"--permission-mode", "bypassPermissions",
-		// Scheduling tools don't make sense in kojo's non-interactive agent
-		// context — the scheduled job would fire against the user's claude,
-		// not this agent's session.
-		"--disallowedTools", "CronCreate,CronDelete,CronList,ScheduleWakeup",
+		// Disable tools that don't apply in kojo's non-interactive agent
+		// context:
+		//   - AskUserQuestion / EnterPlanMode / ExitPlanMode: prompt the
+		//     human via the host CLI's UI; the agent chat backend has no
+		//     way to surface or respond to those prompts.
+		//   - CronCreate / CronDelete / CronList / ScheduleWakeup: the
+		//     scheduled job would fire against the user's claude, not
+		//     this agent's session.
+		"--disallowedTools", "AskUserQuestion,EnterPlanMode,ExitPlanMode,CronCreate,CronDelete,CronList,ScheduleWakeup",
 	}
 
 	if systemPrompt != "" {
