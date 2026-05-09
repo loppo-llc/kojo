@@ -449,11 +449,14 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		// Replace stream content with the full response via chat.update.
 		// This ensures complete text even if AppendStream calls were lost
 		// due to rate limiting, stream timeout, or transient errors.
+		// Use MsgOptionMarkdownText (markdown_text param) so Slack uses the
+		// same full-Markdown renderer as chat.appendStream; the legacy mrkdwn
+		// renderer (text param) does not support tables, headings, etc.
 		if response.Len() > 0 {
-			text := PlainToSlack(response.String())
+			text := response.String()
 			chunks := SplitMessage(text, slackMaxMsgLen)
 			// First chunk: update the streaming message in-place
-			updateOpts := []slack.MsgOption{slack.MsgOptionText(chunks[0], false)}
+			updateOpts := []slack.MsgOption{slack.MsgOptionMarkdownText(chunks[0])}
 			if threadTS != "" {
 				updateOpts = append(updateOpts, slack.MsgOptionTS(threadTS))
 			}
@@ -467,7 +470,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		}
 	} else if response.Len() > 0 {
 		// Fallback: traditional batch post (StartStream failed or no streaming support)
-		text := PlainToSlack(response.String())
+		text := response.String()
 		chunks := SplitMessage(text, slackMaxMsgLen)
 		for _, chunk := range chunks {
 			b.postMessage(finCtx, channel, threadTS, chunk)
@@ -537,7 +540,7 @@ func (b *Bot) clearAssistantStatus(ctx context.Context, channel, threadTS string
 
 func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) {
 	opts := []slack.MsgOption{
-		slack.MsgOptionText(text, false),
+		slack.MsgOptionMarkdownText(text),
 	}
 	if threadTS != "" {
 		opts = append(opts, slack.MsgOptionTS(threadTS))
