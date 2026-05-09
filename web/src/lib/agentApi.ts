@@ -225,6 +225,19 @@ export interface SlackBotStatus {
   connected: boolean;
 }
 
+// TruncateMemoryResult mirrors the Go TruncateMemoryResult struct returned by
+// POST /api/v1/agents/:id/memory/truncate. Counts are best-effort (records the
+// server couldn't parse are kept verbatim and not counted, matching the
+// agent transcript's forgiving rewrite stance).
+export interface TruncateMemoryResult {
+  since: string;
+  messagesRemoved: number;
+  claudeSessionEntriesRemoved: number;
+  claudeSessionFilesRemoved: number;
+  diaryFilesRemoved: number;
+  diaryEntriesRemoved: number;
+}
+
 export interface SlackBotSetRequest {
   enabled: boolean;
   appToken?: string;
@@ -293,6 +306,18 @@ export const agentApi = {
   resetData: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/reset`),
 
   resetSession: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/reset-session`),
+
+  // Truncate the agent's memory at a point in time. Either `since` (RFC3339)
+  // or `fromMessageId` must be provided. Removes kojo transcript records,
+  // Claude session JSONL records (with trailing-turn trim), and daily diary
+  // bullets in memory/YYYY-MM-DD.md whose timestamp is at-or-after the
+  // threshold. Persona, MEMORY.md, project / people / topic notes, archive,
+  // credentials, and tasks are kept.
+  truncateMemory: (
+    id: string,
+    body: { since: string } | { fromMessageId: string },
+  ) =>
+    post<TruncateMemoryResult>(`/api/v1/agents/${id}/memory/truncate`, body),
 
   checkin: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/checkin`),
 

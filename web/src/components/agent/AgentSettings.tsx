@@ -37,6 +37,21 @@ export function AgentSettings() {
   const [archiving, setArchiving] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [resettingSession, setResettingSession] = useState(false);
+  // Memory truncation. The datetime-local input emits a naive
+  // "YYYY-MM-DDTHH:mm" string; we attach the browser's current UTC offset
+  // when calling the API so the server interprets it in local time. The
+  // result preview stays visible until the next truncation kicks off so
+  // operators can see what got removed.
+  const [truncating, setTruncating] = useState(false);
+  const [truncateSince, setTruncateSince] = useState("");
+  const [truncateResult, setTruncateResult] = useState<{
+    since: string;
+    messagesRemoved: number;
+    claudeSessionEntriesRemoved: number;
+    claudeSessionFilesRemoved: number;
+    diaryFilesRemoved: number;
+    diaryEntriesRemoved: number;
+  } | null>(null);
   const [checkingIn, setCheckingIn] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState(false);
@@ -301,6 +316,53 @@ export function AgentSettings() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setResettingSession(false);
+    }
+  };
+
+  // Convert a datetime-local value ("YYYY-MM-DDTHH:mm") into RFC3339 with
+  // the browser's local UTC offset. Returns null if the input is empty or
+  // doesn't parse — caller surfaces that as a validation error.
+  const datetimeLocalToRFC3339 = (value: string): string | null => {
+    if (!value) return null;
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return null;
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const offMin = -d.getTimezoneOffset();
+    const sign = offMin >= 0 ? "+" : "-";
+    const offH = pad(Math.floor(Math.abs(offMin) / 60));
+    const offM = pad(Math.abs(offMin) % 60);
+    return (
+      `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+      `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}` +
+      `${sign}${offH}:${offM}`
+    );
+  };
+
+  const handleTruncateMemory = async () => {
+    const iso = datetimeLocalToRFC3339(truncateSince);
+    if (!iso) {
+      setError("Pick a date/time to truncate from.");
+      return;
+    }
+    if (
+      !confirm(
+        `Delete every memory recorded at or after ${iso}? This drops kojo transcript records, Claude --resume session entries (with trailing-turn cleanup), and matching daily diary bullets. Persona, MEMORY.md, project / people / topic notes, and credentials are kept.`,
+      )
+    ) {
+      return;
+    }
+    setTruncating(true);
+    setError("");
+    setTruncateResult(null);
+    try {
+      const res = await agentApi.truncateMemory(id!, { since: iso });
+      setTruncateResult(res);
+      setSuccess(true);
+      setTimeout(() => setSuccess(false), 2000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTruncating(false);
     }
   };
 
@@ -1073,6 +1135,37 @@ export function AgentSettings() {
             <p className="text-xs text-neutral-600 mt-1">
               Force a fresh context window. History and memory are kept, but the AI re-reads everything from scratch.
             </p>
+          </div>
+          <div>
+            <label className="block text-xs text-neutral-400 mb-1">
+              Truncate memory since
+            </label>
+            <input
+              type="datetime-local"
+              value={truncateSince}
+              onChange={(e) => setTruncateSince(e.target.value)}
+              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded-lg text-sm text-neutral-200 mb-2"
+            />
+            <button
+              onClick={handleTruncateMemory}
+              disabled={truncating || !truncateSince}
+              className="w-full py-3 bg-amber-950 hover:bg-amber-900 border border-amber-800 rounded-lg text-sm font-medium text-amber-300 disabled:opacity-40"
+            >
+              {truncating ? "Truncating..." : "Truncate Memory From This Time"}
+            </button>
+            <p className="text-xs text-neutral-600 mt-1">
+              Drop transcript records, Claude --resume session entries, and daily diary bullets recorded at or after this instant. Persona, MEMORY.md, project / people / topic notes, archive, and credentials are kept.
+            </p>
+            {truncateResult && (
+              <div className="mt-2 text-xs text-neutral-400 bg-neutral-900/60 border border-neutral-800 rounded-lg p-2 space-y-0.5">
+                <div>Threshold: <span className="text-neutral-300">{truncateResult.since}</span></div>
+                <div>
+                  Transcript: {truncateResult.messagesRemoved} ·
+                  {" "}Claude session: {truncateResult.claudeSessionEntriesRemoved} entries / {truncateResult.claudeSessionFilesRemoved} files ·
+                  {" "}Diary: {truncateResult.diaryEntriesRemoved} entries / {truncateResult.diaryFilesRemoved} files
+                </div>
+              </div>
+            )}
           </div>
           <div>
             <button

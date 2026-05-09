@@ -292,6 +292,78 @@ func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// handleTruncateAgentMemory removes everything in the agent's memory
+// recorded at-or-after the given instant: kojo transcript records, Claude
+// session JSONL records (with trailing-turn trim), and daily diary bullets
+// in memory/YYYY-MM-DD.md. Settings, persona, MEMORY.md, project / people /
+// topic notes, archive, credentials and tasks are untouched.
+//
+// Two ways to specify the threshold (request body):
+//   - {"since": "2026-05-09T12:00:00+09:00"}     — absolute RFC3339
+//   - {"fromMessageId": "m_abc..."}              — use that message's
+//     timestamp; the message itself is included in the removed set.
+//
+// Same auth gate as reset/delete (CanDeleteOrReset), same busy / reset
+// guard semantics. Returns 404 when the agent or fromMessageId can't be
+// found, 409 if a chat is in flight or another reset is racing.
+func (s *Server) handleTruncateAgentMemory(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	p := auth.FromContext(r.Context())
+	if !p.CanDeleteOrReset(id) {
+		writeError(w, http.StatusForbidden, "forbidden", "agent is not allowed to truncate others' memory")
+		return
+	}
+
+	var body struct {
+		Since         string `json:"since"`
+		FromMessageID string `json:"fromMessageId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+
+	hasSince := strings.TrimSpace(body.Since) != ""
+	hasMsg := strings.TrimSpace(body.FromMessageID) != ""
+	if hasSince == hasMsg {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"exactly one of 'since' (RFC3339) or 'fromMessageId' is required")
+		return
+	}
+
+	var (
+		res *agent.TruncateMemoryResult
+		err error
+	)
+	if hasSince {
+		t, perr := time.Parse(time.RFC3339, body.Since)
+		if perr != nil {
+			writeError(w, http.StatusBadRequest, "bad_request",
+				fmt.Sprintf("'since' must be RFC3339 (e.g. 2026-05-09T12:00:00+09:00): %v", perr))
+			return
+		}
+		res, err = s.agents.TruncateMemoryAt(id, t)
+	} else {
+		res, err = s.agents.TruncateMemoryFromMessage(id, body.FromMessageID)
+	}
+
+	if err != nil {
+		switch {
+		case errors.Is(err, agent.ErrAgentNotFound):
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		case errors.Is(err, agent.ErrMessageNotFound):
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		case errors.Is(err, agent.ErrAgentBusy), errors.Is(err, agent.ErrAgentResetting):
+			writeError(w, http.StatusConflict, "conflict", err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+
+	writeJSONResponse(w, http.StatusOK, res)
+}
+
 func (s *Server) handleForkAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if p := auth.FromContext(r.Context()); !p.CanForkOrCreate() {

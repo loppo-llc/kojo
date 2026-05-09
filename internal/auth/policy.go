@@ -86,7 +86,7 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			}
 		case http.MethodPost:
 			switch sub {
-			case "/reset", "/unarchive", "/checkin", "/reset-session":
+			case "/reset", "/unarchive", "/checkin", "/reset-session", "/memory/truncate":
 				return p.CanDeleteOrReset(id)
 			case "/fork", "/privilege":
 				// Owner-only — already filtered out above.
