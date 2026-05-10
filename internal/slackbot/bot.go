@@ -361,7 +361,11 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		sb.WriteString(chathistory.FormatForInjection(history, b.botUserID, chathistory.DefaultMaxMessages, chathistory.DefaultMaxChars))
 		sb.WriteString("\n---\n\n")
 	}
-	sb.WriteString(fmt.Sprintf("[Slack @%s] %s", displayName, text))
+	if replyTS != "" {
+		sb.WriteString(fmt.Sprintf("[Slack @%s | channel:%s thread:%s] %s", displayName, channel, replyTS, text))
+	} else {
+		sb.WriteString(fmt.Sprintf("[Slack @%s | channel:%s] %s", displayName, channel, text))
+	}
 	message := sb.String()
 
 	// From here on, the thread handle used for posting/streaming.
