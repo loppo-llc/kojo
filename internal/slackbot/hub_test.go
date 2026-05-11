@@ -36,7 +36,7 @@ func (m *mockMgr) Chat(_ context.Context, _, _, _ string, _ []agent.MessageAttac
 	return ch, nil
 }
 
-func (m *mockMgr) ChatOneShot(_ context.Context, _, _ string, _ ...string) (<-chan agent.ChatEvent, error) {
+func (m *mockMgr) ChatOneShot(_ context.Context, _, _ string, _ ...agent.OneShotOpts) (<-chan agent.ChatEvent, error) {
 	ch := make(chan agent.ChatEvent, 1)
 	ch <- agent.ChatEvent{Type: "done"}
 	close(ch)

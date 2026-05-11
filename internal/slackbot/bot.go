@@ -20,7 +20,7 @@ import (
 // agent.Manager satisfies this interface directly — no adapter needed.
 type ChatManager interface {
 	Chat(ctx context.Context, agentID, message, role string, attachments []agent.MessageAttachment, source ...agent.BusySource) (<-chan agent.ChatEvent, error)
-	ChatOneShot(ctx context.Context, agentID, message string, sessionKey ...string) (<-chan agent.ChatEvent, error)
+	ChatOneShot(ctx context.Context, agentID, message string, opts ...agent.OneShotOpts) (<-chan agent.ChatEvent, error)
 }
 
 // Bot manages a single Slack Socket Mode connection for one agent.
@@ -68,6 +68,15 @@ const (
 
 	// typingStatus is the assistant status text shown while processing a message.
 	typingStatus = "Thinking…"
+
+	// slackSystemPrompt is appended to the system prompt when the message
+	// originates from Slack. It tells the agent how Slack replies work so it
+	// responds naturally instead of trying to use MCP tools to reply.
+	slackSystemPrompt = `## Slack Conversation
+
+This message was received via Slack. Your text response will be automatically posted to the Slack thread — just respond normally. Do NOT use Slack MCP tools (slack_post_message, slack_reply_to_thread, etc.) to reply to this conversation.
+
+Slack MCP tools are still available for other actions: posting to a different channel, adding reactions, uploading files, listing channels/users, etc.`
 )
 
 // NewBot creates a new Bot instance. Call Run() to start it.
@@ -383,7 +392,10 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	// own Claude session with full context resumption across messages.
 	slackSessionKey := b.agentID + ":slack:" + channel + ":" + threadTS
 
-	events, err := b.mgr.ChatOneShot(ctx, b.agentID, message, slackSessionKey)
+	events, err := b.mgr.ChatOneShot(ctx, b.agentID, message, agent.OneShotOpts{
+		SessionKey:        slackSessionKey,
+		SystemPromptExtra: slackSystemPrompt,
+	})
 	if err != nil {
 		b.clearAssistantStatus(ctx, channel, threadTS)
 		b.logger.Warn("failed to start agent chat from slack", "err", err)

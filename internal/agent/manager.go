@@ -1007,15 +1007,30 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 // that carry their own context.
 // Memory (MEMORY.md, diary) access is still available via system prompt.
 //
-// When sessionKey is provided and non-empty, the chat uses session resumption
-// with a deterministic session ID derived from the key (e.g. per Slack thread).
-// This gives the agent persistent Claude context across messages in the same
-// conversation, while still keeping each conversation isolated from the
-// WebUI session and from other threads.
+// OneShotOpts configures a one-shot chat session.
+type OneShotOpts struct {
+	// SessionKey enables session resumption with a deterministic session ID
+	// derived from this key (e.g. per Slack thread). When empty, the chat
+	// runs as a fresh ephemeral session with no resumption.
+	SessionKey string
+
+	// SystemPromptExtra is appended to the system prompt for this session.
+	// Use it to inject platform-specific context (e.g. Slack reply behavior)
+	// without modifying the shared system prompt builder.
+	SystemPromptExtra string
+}
+
+// ChatOneShot runs a non-persistent chat that doesn't save to the transcript.
 //
-// When sessionKey is empty or omitted, the chat runs as a fresh ephemeral
-// session with no resumption (original one-shot behavior).
-func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string, sessionKey ...string) (<-chan ChatEvent, error) {
+// When opts.SessionKey is non-empty, the chat uses session resumption so the
+// agent maintains Claude context across messages in the same conversation
+// (e.g. Slack thread), isolated from the WebUI session and other threads.
+func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string, opts ...OneShotOpts) (<-chan ChatEvent, error) {
+	var cfg OneShotOpts
+	if len(opts) > 0 {
+		cfg = opts[0]
+	}
+
 	prep, err := m.prepareChat(agentID, userMessage, false, false)
 	if err != nil {
 		return nil, err
@@ -1042,20 +1057,21 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		effectiveMessage = prep.volatileContext + userMessage
 	}
 
-	// Build chat options. When a session key is provided, enable session
-	// resumption so the agent maintains Claude context across messages in
-	// the same conversation (e.g. Slack thread). Otherwise, run a fresh
-	// ephemeral session.
-	key := ""
-	if len(sessionKey) > 0 {
-		key = sessionKey[0]
+	// Append platform-specific system prompt extra (e.g. Slack context).
+	// This goes at the end of the system prompt so it doesn't break
+	// the prompt cache prefix shared across turns within the same session.
+	sysPrompt := prep.sysPrompt
+	if cfg.SystemPromptExtra != "" {
+		sysPrompt += "\n\n" + cfg.SystemPromptExtra
 	}
+
+	// Build chat options.
 	var chatOpts ChatOptions
-	if key != "" {
+	if cfg.SessionKey != "" {
 		chatOpts = ChatOptions{
 			MCPServers:       prep.mcpServers,
 			AutomatedTrigger: true,
-			SessionKey:       key,
+			SessionKey:       cfg.SessionKey,
 		}
 	} else {
 		chatOpts = ChatOptions{
@@ -1064,7 +1080,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		}
 	}
 
-	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, chatOpts)
+	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, sysPrompt, chatOpts)
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
