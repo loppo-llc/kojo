@@ -397,6 +397,31 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	var lastAppend time.Time
 	hasError := false
 	streamFailed := false // true if StartStream failed, use fallback
+
+	// startStream initializes the Slack stream if not already started.
+	// Returns true if the stream is active (either already started or just created).
+	startStream := func() bool {
+		if streamTS != "" {
+			return true
+		}
+		if streamFailed {
+			return false
+		}
+		opts := []slack.MsgOption{}
+		if threadTS != "" {
+			opts = append(opts, slack.MsgOptionTS(threadTS))
+		}
+		_, ts, err := b.api.StartStreamContext(ctx, channel, opts...)
+		if err != nil {
+			b.logger.Warn("failed to start slack stream, falling back to batch post", "err", err)
+			streamFailed = true
+			return false
+		}
+		streamTS = ts
+		lastAppend = time.Now()
+		return true
+	}
+
 	for evt := range events {
 		switch evt.Type {
 		case "text":
@@ -404,27 +429,48 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			pendingDelta.WriteString(evt.Delta)
 
 			// Start stream on first text event
-			if streamTS == "" && !streamFailed {
-				opts := []slack.MsgOption{}
-				if threadTS != "" {
-					opts = append(opts, slack.MsgOptionTS(threadTS))
-				}
-				_, ts, err := b.api.StartStreamContext(ctx, channel, opts...)
-				if err != nil {
-					b.logger.Warn("failed to start slack stream, falling back to batch post", "err", err)
-					streamFailed = true
-					continue
-				}
-				streamTS = ts
-				lastAppend = time.Now()
+			if !startStream() {
+				continue
 			}
 
 			// Throttled append
-			if streamTS != "" && pendingDelta.Len() > 0 && time.Since(lastAppend) >= streamAppendInterval {
+			if pendingDelta.Len() > 0 && time.Since(lastAppend) >= streamAppendInterval {
 				b.appendStream(ctx, channel, streamTS, pendingDelta.String())
 				pendingDelta.Reset()
 				lastAppend = time.Now()
 			}
+
+		case "tool_use":
+			// Update assistant status to show which tool is running
+			status := toolStatusText(evt.ToolName)
+			_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
+				ChannelID: channel,
+				ThreadTS:  threadTS,
+				Status:    status,
+			})
+
+			// Append tool status indicator to the stream so the user can
+			// see progress even during long tool executions. The final
+			// UpdateMessage replaces the stream with clean response text,
+			// so these ephemeral indicators are automatically removed.
+			if startStream() && time.Since(lastAppend) >= streamAppendInterval {
+				// Flush any pending text delta first
+				if pendingDelta.Len() > 0 {
+					b.appendStream(ctx, channel, streamTS, pendingDelta.String())
+					pendingDelta.Reset()
+				}
+				b.appendStream(ctx, channel, streamTS, "\n\n_⏳ "+status+"_")
+				lastAppend = time.Now()
+			}
+
+		case "tool_result":
+			// Revert assistant status to "Thinking…" while the agent
+			// processes the tool result and decides the next action.
+			_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
+				ChannelID: channel,
+				ThreadTS:  threadTS,
+				Status:    typingStatus,
+			})
 
 		case "error":
 			hasError = true
@@ -506,6 +552,37 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		}
 	}
 
+}
+
+// toolStatusText returns a human-readable status string for the given tool name.
+func toolStatusText(toolName string) string {
+	switch toolName {
+	case "Bash":
+		return "Running command…"
+	case "Read":
+		return "Reading file…"
+	case "Write":
+		return "Writing file…"
+	case "Edit":
+		return "Editing file…"
+	case "Grep":
+		return "Searching code…"
+	case "Glob":
+		return "Finding files…"
+	case "Agent":
+		return "Running sub-agent…"
+	case "WebFetch":
+		return "Fetching web page…"
+	case "WebSearch":
+		return "Searching the web…"
+	case "NotebookEdit":
+		return "Editing notebook…"
+	default:
+		if toolName == "" {
+			return "Working…"
+		}
+		return "Using " + toolName + "…"
+	}
 }
 
 // appendStream appends text to a streaming Slack message with rate limit retry.
