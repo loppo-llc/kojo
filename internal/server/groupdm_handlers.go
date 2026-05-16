@@ -518,17 +518,27 @@ func (s *Server) handlePostGroupMessage(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handlePostGroupUserMessage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req struct {
-		Content string `json:"content"`
+		Content     string                    `json:"content"`
+		Attachments []agent.MessageAttachment `json:"attachments,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
-	if req.Content == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "content is required")
+	// Validate attachment paths against uploadDir before persisting or
+	// notifying — an unvalidated path would let any caller stash an
+	// arbitrary filesystem reference in the transcript that the group's
+	// agents would then dutifully open via their Read tool. validateAttachments
+	// also rebuilds metadata from disk so client-supplied size/mime/name
+	// can't be spoofed.
+	cleanAtts := validateAttachments(req.Attachments)
+	// Empty content is allowed when at least one valid attachment is
+	// present (image-only / file-only posts mirror AgentChat).
+	if req.Content == "" && len(cleanAtts) == 0 {
+		writeError(w, http.StatusBadRequest, "bad_request", "content or attachments required")
 		return
 	}
-	msg, err := s.groupdms.PostUserMessage(r.Context(), id, req.Content, true)
+	msg, err := s.groupdms.PostUserMessage(r.Context(), id, req.Content, cleanAtts, true)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return

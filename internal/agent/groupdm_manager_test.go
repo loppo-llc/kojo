@@ -608,7 +608,7 @@ func TestGroupDMManager_MutedMemberDropsNotification(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	msg := newGroupMessage("ag_bob", "Bob", "ping")
+	msg := newGroupMessage("ag_bob", "Bob", "ping", nil)
 	// notifyAgent must return without touching notify state for a muted member.
 	gdm.notifyAgent("ag_alice", g.ID, g.Name, msg, false)
 
@@ -626,7 +626,7 @@ func TestGroupDMManager_SelfNotificationDropped(t *testing.T) {
 
 	// Sender == recipient: must be dropped without ever creating a notify
 	// state entry, even if some future caller mis-routes the fan-out.
-	msg := newGroupMessage("ag_alice", "Alice", "self")
+	msg := newGroupMessage("ag_alice", "Alice", "self", nil)
 	gdm.notifyAgent("ag_alice", g.ID, g.Name, msg, false)
 
 	gdm.notifyMu.Lock()
@@ -640,7 +640,7 @@ func TestGroupDMManager_SelfNotificationDropped(t *testing.T) {
 	// member is notified (msg.AgentID is the reserved "user" sender,
 	// which can never match a real member's ID). The guard must not
 	// block this real-world path.
-	userMsg := newGroupMessage(UserSenderID, UserSenderName, "ping")
+	userMsg := newGroupMessage(UserSenderID, UserSenderName, "ping", nil)
 	gdm.notifyAgent("ag_alice", g.ID, g.Name, userMsg, true)
 	gdm.notifyMu.Lock()
 	_, userExists := gdm.notify[g.ID+":ag_alice"]
@@ -922,7 +922,7 @@ func TestGroupDMManager_PendingBufferCap(t *testing.T) {
 
 	// Push twice the cap; expect the oldest half to be dropped.
 	for i := 0; i < notifyMaxPending*2; i++ {
-		msg := newGroupMessage("ag_bob", "Bob", fmt.Sprintf("msg-%d", i))
+		msg := newGroupMessage("ag_bob", "Bob", fmt.Sprintf("msg-%d", i), nil)
 		gdm.notifyAgent("ag_alice", g.ID, g.Name, msg, false)
 	}
 
@@ -1242,7 +1242,7 @@ func TestGroupDMManager_PostUserMessage_AdvancesLatestForCAS(t *testing.T) {
 	bobMsg, _ := gdm.PostMessage(context.Background(), g.ID, "ag_bob", "first", "", false)
 	expected := bobMsg.ID
 
-	userMsg, err := gdm.PostUserMessage(context.Background(), g.ID, "user-cuts-in", false)
+	userMsg, err := gdm.PostUserMessage(context.Background(), g.ID, "user-cuts-in", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}

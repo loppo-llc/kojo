@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,6 +11,16 @@ import (
 
 	"github.com/loppo-llc/kojo/internal/store"
 )
+
+// jsonMarshalAttachments encodes attachments as a json.RawMessage suitable
+// for store.GroupDMMessageRecord.Attachments. Returns nil RawMessage when
+// the input slice is empty so the store wraps it as SQL NULL via nullJSON.
+func jsonMarshalAttachments(atts []MessageAttachment) (json.RawMessage, error) {
+	if len(atts) == 0 {
+		return nil, nil
+	}
+	return json.Marshal(atts)
+}
 
 // GroupDM represents a group conversation between agents.
 // GroupDMStyle controls the communication style for a group conversation.
@@ -118,11 +129,12 @@ type GroupMember struct {
 
 // GroupMessage is a single message in a group DM transcript.
 type GroupMessage struct {
-	ID        string `json:"id"`
-	AgentID   string `json:"agentId"`
-	AgentName string `json:"agentName"`
-	Content   string `json:"content"`
-	Timestamp string `json:"timestamp"`
+	ID          string              `json:"id"`
+	AgentID     string              `json:"agentId"`
+	AgentName   string              `json:"agentName"`
+	Content     string              `json:"content"`
+	Attachments []MessageAttachment `json:"attachments,omitempty"`
+	Timestamp   string              `json:"timestamp"`
 }
 
 func generateGroupID() string {
@@ -150,6 +162,13 @@ func appendGroupMessage(groupID string, msg *GroupMessage) error {
 		GroupDMID: groupID,
 		AgentID:   msg.AgentID,
 		Content:   msg.Content,
+	}
+	if len(msg.Attachments) > 0 {
+		buf, err := jsonMarshalAttachments(msg.Attachments)
+		if err != nil {
+			return fmt.Errorf("appendGroupMessage: marshal attachments: %w", err)
+		}
+		rec.Attachments = buf
 	}
 	ts := parseAgentRFC3339Millis(msg.Timestamp)
 	if ts == 0 {
@@ -367,12 +386,19 @@ func reverseToOldestFirst(recs []*store.GroupDMMessageRecord) []*GroupMessage {
 // the v0-shaped GroupMessage. AgentName is left blank — populateAgentNames
 // fills it in a single batched read.
 func groupRecordToMessage(rec *store.GroupDMMessageRecord) *GroupMessage {
-	return &GroupMessage{
+	out := &GroupMessage{
 		ID:        rec.ID,
 		AgentID:   rec.AgentID,
 		Content:   rec.Content,
 		Timestamp: normalizeTimestamp(millisToRFC3339(rec.CreatedAt)),
 	}
+	if len(rec.Attachments) > 0 && string(rec.Attachments) != "null" {
+		var atts []MessageAttachment
+		if err := json.Unmarshal(rec.Attachments, &atts); err == nil {
+			out.Attachments = atts
+		}
+	}
+	return out
 }
 
 // groupMessageSeq looks up a group message's seq by ID. ok=false means
@@ -466,12 +492,13 @@ func populateAgentNames(ctx context.Context, db *store.Store, msgs []*GroupMessa
 	return nil
 }
 
-func newGroupMessage(agentID, agentName, content string) *GroupMessage {
+func newGroupMessage(agentID, agentName, content string, attachments []MessageAttachment) *GroupMessage {
 	return &GroupMessage{
-		ID:        generateGroupMessageID(),
-		AgentID:   agentID,
-		AgentName: agentName,
-		Content:   content,
-		Timestamp: time.Now().Format(time.RFC3339),
+		ID:          generateGroupMessageID(),
+		AgentID:     agentID,
+		AgentName:   agentName,
+		Content:     content,
+		Attachments: attachments,
+		Timestamp:   time.Now().Format(time.RFC3339),
 	}
 }

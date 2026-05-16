@@ -70,6 +70,7 @@ type pendingMsg struct {
 	content      string
 	timestamp    string // RFC3339
 	senderIsUser bool
+	attachments  []MessageAttachment
 }
 
 // notifyState tracks cooldown, pending message buffer, and deferred-timer state
@@ -642,7 +643,7 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 
 	// Store message under the lock. Failure here aborts the post without
 	// touching the cache, so the next CAS still uses the previous head.
-	msg := newGroupMessage(agentID, senderName, content)
+	msg := newGroupMessage(agentID, senderName, content, nil)
 	if err := appendGroupMessage(groupID, msg); err != nil {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("store message: %w", err)
@@ -670,7 +671,7 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 // from the notification fan-out. CAS is intentionally not enforced for user
 // posts: humans typing in the Web UI should not get 409s from the racing
 // chatter of agents replying around them.
-func (m *GroupDMManager) PostUserMessage(ctx context.Context, groupID, content string, notify bool) (*GroupMessage, error) {
+func (m *GroupDMManager) PostUserMessage(ctx context.Context, groupID, content string, attachments []MessageAttachment, notify bool) (*GroupMessage, error) {
 	m.mu.Lock()
 	g, err := m.liveGroupLocked(groupID)
 	if err != nil {
@@ -681,7 +682,7 @@ func (m *GroupDMManager) PostUserMessage(ctx context.Context, groupID, content s
 	copy(recipients, g.Members)
 	groupName := g.Name
 
-	msg := newGroupMessage(UserSenderID, UserSenderName, content)
+	msg := newGroupMessage(UserSenderID, UserSenderName, content, attachments)
 	if err := appendGroupMessage(groupID, msg); err != nil {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("store message: %w", err)
@@ -1195,6 +1196,7 @@ func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName string, msg *Gr
 		content:      msg.Content,
 		timestamp:    msg.Timestamp,
 		senderIsUser: senderIsUser,
+		attachments:  msg.Attachments,
 	})
 	// Bound the pending buffer: if a recipient stays busy while posts pile
 	// up we drop the oldest entries rather than growing without limit. The
@@ -1288,7 +1290,14 @@ func pendingLineCost(p pendingMsg) int {
 	//    1      1      1            17                 2          14            1   = 37
 	// Use 40 to keep the bound conservative if the format string ever grows.
 	const overhead = 40
-	return len(p.timestamp) + len(p.sender) + len(p.content) + overhead
+	n := len(p.timestamp) + len(p.sender) + len(p.content) + overhead
+	// Each attachment renders as "  📎 <path> (<name>, <mime>)\n" — emoji
+	// "📎" is 4 bytes in UTF-8; framing is 11 chars of separators/newline.
+	const attOverhead = 4 + 11
+	for _, a := range p.attachments {
+		n += len(a.Path) + len(a.Name) + len(a.Mime) + attOverhead
+	}
+	return n
 }
 
 // notifyHeaderFooterReserve is the byte budget set aside for everything in
@@ -1466,6 +1475,15 @@ func (m *GroupDMManager) renderNotification(agentID, groupID, groupName, latestM
 			b.WriteString(" …[truncated]")
 		}
 		b.WriteString("\n")
+		// Attachment references — emitted as plain text inside the
+		// untrusted block so the rendering treats them as data. Agents
+		// can read the files via their Read tool using the path.
+		for _, a := range p.attachments {
+			fmt.Fprintf(&b, "  📎 %s (%s, %s)\n",
+				sanitizeHeaderField(a.Path),
+				sanitizeHeaderField(a.Name),
+				sanitizeHeaderField(a.Mime))
+		}
 	}
 	b.WriteString("--- END UNTRUSTED GROUP MESSAGES ---\n")
 	// Reply curl. expectedLatestMessageId is the CAS guard: the server

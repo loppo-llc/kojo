@@ -186,7 +186,7 @@ function TTSPlayButton({
 }
 
 /** Display file attachments on a message */
-function AttachmentList({ attachments, isUser }: { attachments: AgentMessageAttachment[]; isUser: boolean }) {
+export function AttachmentList({ attachments, isUser }: { attachments: AgentMessageAttachment[]; isUser: boolean }) {
   const [preview, setPreview] = useState<{ path: string; type: "image" | "video" } | null>(null);
 
   return (
