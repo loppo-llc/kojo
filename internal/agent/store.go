@@ -308,15 +308,43 @@ func (st *agentStore) upsertAgentSkipPersona(ctx context.Context, a *Agent) erro
 }
 
 func (st *agentStore) upsertAgentInner(ctx context.Context, a *Agent, skipPersona bool) error {
-	created := parseAgentRFC3339Millis(a.CreatedAt)
-	updated := parseAgentRFC3339Millis(a.UpdatedAt)
+	created, updated := resolveAgentTimestamps(a)
+	if err := st.upsertAgentRow(ctx, a, created, updated); err != nil {
+		return err
+	}
+	// CRITICAL: syncPersona / PutAgentPersona MUST NOT call this path
+	// while holding personaSyncMu — that would self-deadlock.
+	// They handle their own persona-row update inline under the
+	// lock, then call upsertAgentSkipPersona which routes here
+	// with skipPersona=true.
+	if skipPersona {
+		return nil
+	}
+	return st.syncAgentPersonaRow(ctx, a, updated)
+}
+
+// resolveAgentTimestamps picks created_at / updated_at from a.CreatedAt
+// / a.UpdatedAt, falling back to NowMillis() and to updated for a
+// missing created. Pure helper extracted from upsertAgentInner so the
+// DB-row and persona-sync halves can be split without duplicating the
+// timestamp logic.
+func resolveAgentTimestamps(a *Agent) (created, updated int64) {
+	created = parseAgentRFC3339Millis(a.CreatedAt)
+	updated = parseAgentRFC3339Millis(a.UpdatedAt)
 	if updated == 0 {
 		updated = store.NowMillis()
 	}
 	if created == 0 {
 		created = updated
 	}
+	return created, updated
+}
 
+// upsertAgentRow performs the agents-row half of upsertAgentInner:
+// insert when missing, update with forward-compat settings merge when
+// present, no-op when name+settings are byte-identical. Does NOT touch
+// the persona row.
+func (st *agentStore) upsertAgentRow(ctx context.Context, a *Agent, created, updated int64) error {
 	cur, err := st.db.GetAgent(ctx, a.ID)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
@@ -335,61 +363,60 @@ func (st *agentStore) upsertAgentInner(ctx context.Context, a *Agent, skipPerson
 		}); err != nil {
 			return fmt.Errorf("insert: %w", err)
 		}
+		return nil
 	case err != nil:
 		return fmt.Errorf("get: %w", err)
-	default:
-		// Forward-compat: keys present in cur.Settings that this binary
-		// doesn't know about are preserved by merging into the new
-		// settings map. Without this a v1.x daemon downgraded to v1
-		// would silently drop fields its successor wrote — a regression
-		// the design doc (§3.3) calls out explicitly.
-		nextSettings, err := agentToSettings(a, cur.Settings)
-		if err != nil {
-			return fmt.Errorf("encode settings: %w", err)
-		}
-		// No-op skip: m.save() runs on every state transition (interval
-		// changes, message-preview updates, busy clears) and many of those
-		// don't change settings at all. Without this short-circuit each
-		// bench-clear or shutdown bumps version/etag for every agent and
-		// floods the change feed. reflect.DeepEqual works on the JSON-
-		// roundtripped maps because every leaf is a JSON-native type.
-		if cur.Name == a.Name && reflect.DeepEqual(cur.Settings, nextSettings) {
-			break
-		}
-		if _, err := st.db.UpdateAgent(ctx, a.ID, "", func(r *store.AgentRecord) error {
-			r.Name = a.Name
-			r.Settings = nextSettings
-			return nil
-		}); err != nil {
-			return fmt.Errorf("update: %w", err)
-		}
 	}
-
-	// Persona row mirrors persona.md. Post-cutover (Phase 2c-2) the DB
-	// is canonical and disk is a hydrated mirror — see docs §2.3 /
-	// §5.5 — but the CLI process still edits persona.md directly, so
-	// this sync path remains. Skip the upsert when (a) body is
-	// unchanged — a fresh BodySHA256 equality is the same check the
-	// store would do internally — or (b) body is empty AND no prior
-	// row exists (creating an empty row would etag-churn it on the
-	// next real persona write). Missing-disk + live-DB takes the
-	// hydrate branch below before reaching this comparison.
-	//
-	// Take personaSyncMu around the read-then-upsert pair so a
-	// concurrent PutAgentPersona (which holds the same mutex)
-	// can't race us: without this, a Web client's PUT could land
-	// between our GetAgentPersona and UpsertAgentPersona, and our
-	// blind AllowOverwrite would clobber it. The lock is per-agent
-	// so saves for unrelated agents don't queue.
-	//
-	// CRITICAL: syncPersona / PutAgentPersona MUST NOT call this
-	// path while holding personaSyncMu — that would self-deadlock.
-	// They handle their own persona-row update inline under the
-	// lock, then call upsertAgentSkipPersona which routes here
-	// with skipPersona=true.
-	if skipPersona {
+	// Forward-compat: keys present in cur.Settings that this binary
+	// doesn't know about are preserved by merging into the new
+	// settings map. Without this a v1.x daemon downgraded to v1
+	// would silently drop fields its successor wrote — a regression
+	// the design doc (§3.3) calls out explicitly.
+	nextSettings, err := agentToSettings(a, cur.Settings)
+	if err != nil {
+		return fmt.Errorf("encode settings: %w", err)
+	}
+	// No-op skip: m.save() runs on every state transition (interval
+	// changes, message-preview updates, busy clears) and many of those
+	// don't change settings at all. Without this short-circuit each
+	// bench-clear or shutdown bumps version/etag for every agent and
+	// floods the change feed. reflect.DeepEqual works on the JSON-
+	// roundtripped maps because every leaf is a JSON-native type.
+	if cur.Name == a.Name && reflect.DeepEqual(cur.Settings, nextSettings) {
 		return nil
 	}
+	if _, err := st.db.UpdateAgent(ctx, a.ID, "", func(r *store.AgentRecord) error {
+		r.Name = a.Name
+		r.Settings = nextSettings
+		return nil
+	}); err != nil {
+		return fmt.Errorf("update: %w", err)
+	}
+	return nil
+}
+
+// syncAgentPersonaRow performs the persona-row half of upsertAgentInner:
+// take personaSyncMu (per-agent), re-read the live persona.md, then
+// either hydrate disk from DB (file missing + DB has body), no-op
+// (already in sync / no prior row + empty body), or upsert the DB row
+// from disk content.
+//
+// Persona row mirrors persona.md. Post-cutover (Phase 2c-2) the DB is
+// canonical and disk is a hydrated mirror (docs §2.3 / §5.5) — but the
+// CLI process still edits persona.md directly, so this sync path
+// remains. Skip the upsert when (a) body is unchanged — a fresh
+// BodySHA256 equality is the same check the store would do internally
+// — or (b) body is empty AND no prior row exists (creating an empty
+// row would etag-churn it on the next real persona write).
+//
+// Lock ordering: callers reach this method without holding
+// personaSyncMu; the per-agent mutex is acquired here. The outer
+// store.mu in Manager.save and friends is therefore released BEFORE
+// this lock is taken, matching the project-wide store.mu →
+// personaSyncMu ordering. PutAgentPersona / syncPersona take the
+// same mutex themselves so the read-then-upsert pair below cannot
+// race a concurrent Web-client PUT.
+func (st *agentStore) syncAgentPersonaRow(ctx context.Context, a *Agent, updated int64) error {
 	releaseSync := lockPersonaSync(a.ID)
 	defer releaseSync()
 
