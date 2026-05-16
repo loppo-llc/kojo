@@ -193,48 +193,10 @@ ON CONFLICT(endpoint) DO NOTHING`
 }
 
 // preloadExistingPushSubscriptionEndpoints returns the set of endpoints
-// already in push_subscriptions for the given batch. Chunked to stay
-// under SQLite's default 999-variable limit.
+// already in push_subscriptions for the given batch. Delegates to
+// preloadExistingKeys.
 func preloadExistingPushSubscriptionEndpoints(ctx context.Context, tx *sql.Tx, recs []*PushSubscriptionRecord) (map[string]bool, error) {
-	if len(recs) == 0 {
-		return nil, nil
-	}
-	const chunkSize = 500
-	out := make(map[string]bool, len(recs))
-	for start := 0; start < len(recs); start += chunkSize {
-		end := start + chunkSize
-		if end > len(recs) {
-			end = len(recs)
-		}
-		eps := make([]any, 0, end-start)
-		placeholders := make([]byte, 0, (end-start)*2)
-		for i := start; i < end; i++ {
-			if i > start {
-				placeholders = append(placeholders, ',')
-			}
-			placeholders = append(placeholders, '?')
-			eps = append(eps, recs[i].Endpoint)
-		}
-		q := `SELECT endpoint FROM push_subscriptions WHERE endpoint IN (` + string(placeholders) + `)`
-		rows, err := tx.QueryContext(ctx, q, eps...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var ep string
-			if err := rows.Scan(&ep); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			out[ep] = true
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		rows.Close()
-	}
-	return out, nil
+	return preloadExistingKeys(ctx, tx, "push_subscriptions", "endpoint", recs, func(r *PushSubscriptionRecord) string { return r.Endpoint })
 }
 
 // GetPushSubscription returns the row by endpoint. ErrNotFound on miss.

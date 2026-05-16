@@ -225,48 +225,10 @@ ON CONFLICT(id) DO NOTHING`
 }
 
 // preloadExistingExternalChatCursorIDs returns the set of cursor ids
-// already in external_chat_cursors for the given batch. Chunked to stay
-// under SQLite's default 999-variable limit.
+// already in external_chat_cursors for the given batch. Delegates to
+// preloadExistingKeys.
 func preloadExistingExternalChatCursorIDs(ctx context.Context, tx *sql.Tx, recs []*ExternalChatCursorRecord) (map[string]bool, error) {
-	if len(recs) == 0 {
-		return nil, nil
-	}
-	const chunkSize = 500
-	out := make(map[string]bool, len(recs))
-	for start := 0; start < len(recs); start += chunkSize {
-		end := start + chunkSize
-		if end > len(recs) {
-			end = len(recs)
-		}
-		ids := make([]any, 0, end-start)
-		placeholders := make([]byte, 0, (end-start)*2)
-		for i := start; i < end; i++ {
-			if i > start {
-				placeholders = append(placeholders, ',')
-			}
-			placeholders = append(placeholders, '?')
-			ids = append(ids, recs[i].ID)
-		}
-		q := `SELECT id FROM external_chat_cursors WHERE id IN (` + string(placeholders) + `)`
-		rows, err := tx.QueryContext(ctx, q, ids...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			out[id] = true
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		rows.Close()
-	}
-	return out, nil
+	return preloadExistingKeys(ctx, tx, "external_chat_cursors", "id", recs, func(r *ExternalChatCursorRecord) string { return r.ID })
 }
 
 // GetExternalChatCursor returns the row by id. ErrNotFound on miss.

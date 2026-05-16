@@ -250,48 +250,10 @@ ON CONFLICT(id) DO NOTHING`
 }
 
 // preloadExistingSessionIDs returns the set of session ids already in
-// the sessions table for the given batch. Chunked to stay under
-// SQLite's default 999-variable limit.
+// the sessions table for the given batch. Delegates to
+// preloadExistingKeys.
 func preloadExistingSessionIDs(ctx context.Context, tx *sql.Tx, recs []*SessionRecord) (map[string]bool, error) {
-	if len(recs) == 0 {
-		return nil, nil
-	}
-	const chunkSize = 500
-	out := make(map[string]bool, len(recs))
-	for start := 0; start < len(recs); start += chunkSize {
-		end := start + chunkSize
-		if end > len(recs) {
-			end = len(recs)
-		}
-		ids := make([]any, 0, end-start)
-		placeholders := make([]byte, 0, (end-start)*2)
-		for i := start; i < end; i++ {
-			if i > start {
-				placeholders = append(placeholders, ',')
-			}
-			placeholders = append(placeholders, '?')
-			ids = append(ids, recs[i].ID)
-		}
-		q := `SELECT id FROM sessions WHERE id IN (` + string(placeholders) + `)`
-		rows, err := tx.QueryContext(ctx, q, ids...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			out[id] = true
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		rows.Close()
-	}
-	return out, nil
+	return preloadExistingKeys(ctx, tx, "sessions", "id", recs, func(r *SessionRecord) string { return r.ID })
 }
 
 // GetSession returns the row by id. ErrNotFound on miss. Used by tests
