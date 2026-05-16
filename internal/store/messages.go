@@ -8,6 +8,26 @@ import (
 	"fmt"
 )
 
+// messageSelectColumns is the canonical SELECT column list for
+// `agent_messages m` reads. Every read path uses this exact projection
+// so scanMessageRow stays the single source of truth for column
+// ordering. FROM / JOIN / WHERE clauses are intentionally NOT factored
+// out — readers differ on join-vs-no-join (cascade-on-tombstone via
+// JOIN agents vs. tx-scoped reads that already validated the parent)
+// and soft-delete predicates, and merging those would obscure intent.
+const messageSelectColumns = `m.id, m.agent_id, m.seq, m.role,
+       COALESCE(m.content,''), COALESCE(m.thinking,''),
+       m.tool_uses, m.attachments, m.usage,
+       m.version, m.etag, m.created_at, m.updated_at, m.deleted_at, COALESCE(m.peer_id,'')`
+
+// messageTombstoneUpdate is the canonical UPDATE statement used by
+// every tombstone-with-recomputed-etag path. The `deleted_at IS NULL`
+// guard makes the update idempotent under concurrent deletes.
+const messageTombstoneUpdate = `
+UPDATE agent_messages
+   SET deleted_at = ?, updated_at = ?, version = ?, etag = ?
+ WHERE id = ? AND deleted_at IS NULL`
+
 // MessageRecord mirrors the `agent_messages` table. Tool/attachment/usage
 // payloads are kept as opaque JSON so message-shape upgrades don't require a
 // schema migration; downstream consumers are expected to validate their own
@@ -438,11 +458,7 @@ INSERT INTO agent_messages (
 // the JOIN rather than by mass UPDATE on SoftDeleteAgent — a 100k-message
 // agent would otherwise pay a heavy delete cost.
 func (s *Store) GetMessage(ctx context.Context, id string) (*MessageRecord, error) {
-	const q = `
-SELECT m.id, m.agent_id, m.seq, m.role,
-       COALESCE(m.content,''), COALESCE(m.thinking,''),
-       m.tool_uses, m.attachments, m.usage,
-       m.version, m.etag, m.created_at, m.updated_at, m.deleted_at, COALESCE(m.peer_id,'')
+	const q = `SELECT ` + messageSelectColumns + `
   FROM agent_messages m
   JOIN agents        a ON a.id = m.agent_id
  WHERE m.id = ? AND m.deleted_at IS NULL AND a.deleted_at IS NULL`
@@ -459,11 +475,7 @@ SELECT m.id, m.agent_id, m.seq, m.role,
 // transaction's snapshot (including any preceding INSERT that the
 // op-log dispatch path wired up).
 func (s *Store) getMessageTx(ctx context.Context, tx *sql.Tx, id string) (*MessageRecord, error) {
-	const q = `
-SELECT m.id, m.agent_id, m.seq, m.role,
-       COALESCE(m.content,''), COALESCE(m.thinking,''),
-       m.tool_uses, m.attachments, m.usage,
-       m.version, m.etag, m.created_at, m.updated_at, m.deleted_at, COALESCE(m.peer_id,'')
+	const q = `SELECT ` + messageSelectColumns + `
   FROM agent_messages m
  WHERE m.id = ? AND m.deleted_at IS NULL`
 	rec, err := scanMessageRow(tx.QueryRowContext(ctx, q, id))
@@ -500,11 +512,7 @@ func (s *Store) ListMessages(ctx context.Context, agentID string, opts MessageLi
 	}
 
 	args := []any{agentID}
-	q := `
-SELECT m.id, m.agent_id, m.seq, m.role,
-       COALESCE(m.content,''), COALESCE(m.thinking,''),
-       m.tool_uses, m.attachments, m.usage,
-       m.version, m.etag, m.created_at, m.updated_at, m.deleted_at, COALESCE(m.peer_id,'')
+	q := `SELECT ` + messageSelectColumns + `
   FROM agent_messages m
   JOIN agents        a ON a.id = m.agent_id
  WHERE m.agent_id = ? AND a.deleted_at IS NULL`
@@ -614,11 +622,7 @@ SELECT COUNT(*), COALESCE(MAX(m.updated_at), 0)
 // LatestMessage returns the highest-seq live message for agentID, or
 // ErrNotFound if the transcript is empty / the agent is tombstoned.
 func (s *Store) LatestMessage(ctx context.Context, agentID string) (*MessageRecord, error) {
-	const q = `
-SELECT m.id, m.agent_id, m.seq, m.role,
-       COALESCE(m.content,''), COALESCE(m.thinking,''),
-       m.tool_uses, m.attachments, m.usage,
-       m.version, m.etag, m.created_at, m.updated_at, m.deleted_at, COALESCE(m.peer_id,'')
+	const q = `SELECT ` + messageSelectColumns + `
   FROM agent_messages m
   JOIN agents        a ON a.id = m.agent_id
  WHERE m.agent_id = ? AND m.deleted_at IS NULL AND a.deleted_at IS NULL
@@ -654,11 +658,7 @@ func (s *Store) UpdateMessage(ctx context.Context, id, ifMatchETag string, patch
 	// JOIN agents WHERE alive enforces cascade-on-tombstone for mutations
 	// the same way the read helpers do. Without it a write could land on a
 	// tombstoned-parent row and resurrect content via the change feed.
-	const sel = `
-SELECT m.id, m.agent_id, m.seq, m.role,
-       COALESCE(m.content,''), COALESCE(m.thinking,''),
-       m.tool_uses, m.attachments, m.usage,
-       m.version, m.etag, m.created_at, m.updated_at, m.deleted_at, COALESCE(m.peer_id,'')
+	const sel = `SELECT ` + messageSelectColumns + `
   FROM agent_messages m
   JOIN agents        a ON a.id = m.agent_id
  WHERE m.id = ? AND m.deleted_at IS NULL AND a.deleted_at IS NULL`
@@ -760,11 +760,7 @@ func (s *Store) SoftDeleteMessage(ctx context.Context, id, ifMatchETag string) e
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	const sel = `
-SELECT m.id, m.agent_id, m.seq, m.role,
-       COALESCE(m.content,''), COALESCE(m.thinking,''),
-       m.tool_uses, m.attachments, m.usage,
-       m.version, m.etag, m.created_at, m.updated_at, m.deleted_at, COALESCE(m.peer_id,'')
+	const sel = `SELECT ` + messageSelectColumns + `
   FROM agent_messages m
   JOIN agents        a ON a.id = m.agent_id
  WHERE m.id = ? AND m.deleted_at IS NULL AND a.deleted_at IS NULL`
@@ -794,11 +790,7 @@ SELECT m.id, m.agent_id, m.seq, m.role,
 		return err
 	}
 
-	const upd = `
-UPDATE agent_messages
-   SET deleted_at = ?, updated_at = ?, version = ?, etag = ?
- WHERE id = ? AND deleted_at IS NULL`
-	if _, err := tx.ExecContext(ctx, upd, now, now, cur.Version, newETag, id); err != nil {
+	if _, err := tx.ExecContext(ctx, messageTombstoneUpdate, now, now, cur.Version, newETag, id); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -852,11 +844,7 @@ func (s *Store) TruncateMessagesAfterSeq(ctx context.Context, agentID string, af
 		}
 	}
 
-	const sel = `
-SELECT m.id, m.agent_id, m.seq, m.role,
-       COALESCE(m.content,''), COALESCE(m.thinking,''),
-       m.tool_uses, m.attachments, m.usage,
-       m.version, m.etag, m.created_at, m.updated_at, m.deleted_at, COALESCE(m.peer_id,'')
+	const sel = `SELECT ` + messageSelectColumns + `
   FROM agent_messages m
   JOIN agents        a ON a.id = m.agent_id
  WHERE m.agent_id = ? AND m.seq > ? AND m.deleted_at IS NULL AND a.deleted_at IS NULL
@@ -881,10 +869,6 @@ SELECT m.id, m.agent_id, m.seq, m.role,
 	rows.Close()
 
 	now := NowMillis()
-	const upd = `
-UPDATE agent_messages
-   SET deleted_at = ?, updated_at = ?, version = ?, etag = ?
- WHERE id = ? AND deleted_at IS NULL`
 	var n int64
 	for _, rec := range targets {
 		rec.Version++
@@ -894,7 +878,7 @@ UPDATE agent_messages
 		if err != nil {
 			return n, err
 		}
-		res, err := tx.ExecContext(ctx, upd, now, now, rec.Version, newETag, rec.ID)
+		res, err := tx.ExecContext(ctx, messageTombstoneUpdate, now, now, rec.Version, newETag, rec.ID)
 		if err != nil {
 			return n, err
 		}
@@ -926,11 +910,7 @@ func (s *Store) TruncateMessagesFromCreatedAt(ctx context.Context, agentID strin
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	const sel = `
-SELECT m.id, m.agent_id, m.seq, m.role,
-       COALESCE(m.content,''), COALESCE(m.thinking,''),
-       m.tool_uses, m.attachments, m.usage,
-       m.version, m.etag, m.created_at, m.updated_at, m.deleted_at, COALESCE(m.peer_id,'')
+	const sel = `SELECT ` + messageSelectColumns + `
   FROM agent_messages m
   JOIN agents        a ON a.id = m.agent_id
  WHERE m.agent_id = ? AND m.created_at >= ? AND m.deleted_at IS NULL AND a.deleted_at IS NULL
@@ -955,10 +935,6 @@ SELECT m.id, m.agent_id, m.seq, m.role,
 	rows.Close()
 
 	now := NowMillis()
-	const upd = `
-UPDATE agent_messages
-   SET deleted_at = ?, updated_at = ?, version = ?, etag = ?
- WHERE id = ? AND deleted_at IS NULL`
 	var n int64
 	for _, rec := range targets {
 		rec.Version++
@@ -968,7 +944,7 @@ UPDATE agent_messages
 		if err != nil {
 			return n, err
 		}
-		res, err := tx.ExecContext(ctx, upd, now, now, rec.Version, newETag, rec.ID)
+		res, err := tx.ExecContext(ctx, messageTombstoneUpdate, now, now, rec.Version, newETag, rec.ID)
 		if err != nil {
 			return n, err
 		}
@@ -1126,11 +1102,7 @@ func (s *Store) TruncateForRegenerate(ctx context.Context, agentID, pivotID, piv
 		afterSeq = pivotSeq - 1
 	}
 
-	const sel = `
-SELECT m.id, m.agent_id, m.seq, m.role,
-       COALESCE(m.content,''), COALESCE(m.thinking,''),
-       m.tool_uses, m.attachments, m.usage,
-       m.version, m.etag, m.created_at, m.updated_at, m.deleted_at, COALESCE(m.peer_id,'')
+	const sel = `SELECT ` + messageSelectColumns + `
   FROM agent_messages m
  WHERE m.agent_id = ? AND m.seq > ? AND m.deleted_at IS NULL
  ORDER BY m.seq ASC`
@@ -1154,10 +1126,6 @@ SELECT m.id, m.agent_id, m.seq, m.role,
 	rows.Close()
 
 	now := NowMillis()
-	const upd = `
-UPDATE agent_messages
-   SET deleted_at = ?, updated_at = ?, version = ?, etag = ?
- WHERE id = ? AND deleted_at IS NULL`
 	for _, rec := range targets {
 		rec.Version++
 		rec.UpdatedAt = now
@@ -1166,7 +1134,7 @@ UPDATE agent_messages
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, upd, now, now, rec.Version, newETag, rec.ID); err != nil {
+		if _, err := tx.ExecContext(ctx, messageTombstoneUpdate, now, now, rec.Version, newETag, rec.ID); err != nil {
 			return err
 		}
 	}
