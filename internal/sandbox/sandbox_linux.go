@@ -7,11 +7,22 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
+
+// minLandlockABI is the minimum Landlock ABI version we require for the
+// sandbox to be considered active. ABI v3 (Linux 6.2+) added the
+// LANDLOCK_ACCESS_FS_TRUNCATE right; without it, an agent inside the
+// sandbox could still truncate any file the kernel exposes for write —
+// including files in other agents' data directories. Falling back to
+// v1/v2 with TRUNCATE dropped from the handled mask would silently
+// degrade write isolation while Available() still reported "sandboxed",
+// so we fail closed instead.
+const minLandlockABI = 3
 
 // handledAccessFS is the set of filesystem access rights that Landlock will
 // govern.  Phase 1 restricts writes only — reads and execution are
@@ -29,10 +40,16 @@ const handledAccessFS = unix.LANDLOCK_ACCESS_FS_WRITE_FILE |
 	unix.LANDLOCK_ACCESS_FS_TRUNCATE |
 	unix.LANDLOCK_ACCESS_FS_REFER
 
-// Available reports whether the running kernel supports Landlock.
+// Available reports whether the running kernel supports a Landlock ABI
+// strong enough for kojo's write-isolation guarantees.
+//
+// We require ABI >= minLandlockABI (currently 3) so that
+// LANDLOCK_ACCESS_FS_TRUNCATE is honoured. Older ABIs would let an agent
+// truncate files outside the allowlist, which defeats the per-agent
+// write-isolation this package exists to provide.
 func Available() bool {
 	abi, err := landlockABI()
-	return err == nil && abi >= 1
+	return err == nil && abi >= minLandlockABI
 }
 
 // wrapCommand builds an exec.Cmd that re-execs kojo with the "sandbox"
@@ -121,25 +138,36 @@ func landlockABI() (int, error) {
 
 // applyLandlock creates a Landlock ruleset that restricts filesystem writes
 // to the given paths, then applies it to the current process.
+//
+// Important: this function locks the calling goroutine to its OS thread and
+// never unlocks it. prctl(PR_SET_NO_NEW_PRIVS) and landlock_restrict_self
+// are both thread-scoped on Linux. If the Go runtime rescheduled the
+// goroutine between those two syscalls, restrict_self could fail with EPERM
+// because the new thread does not have no_new_privs set. The kojo sandbox
+// process is single-purpose (it calls applyLandlock then syscall.Exec to
+// replace itself with the agent binary), so leaving the thread locked has
+// no downside.
 func applyLandlock(rwPaths []string) error {
+	runtime.LockOSThread()
+
 	abi, err := landlockABI()
 	if err != nil {
 		return fmt.Errorf("query ABI: %w", err)
 	}
-	if abi < 1 {
-		return fmt.Errorf("unsupported ABI version %d", abi)
+	if abi < minLandlockABI {
+		// Fail closed. Older ABIs (v1, v2) lack LANDLOCK_ACCESS_FS_TRUNCATE,
+		// so an agent inside the sandbox could still truncate files outside
+		// the allowlist. We refuse to provide a weaker-than-advertised
+		// guarantee — Available() should have gated this call already.
+		return fmt.Errorf("Landlock ABI %d is below required minimum %d "+
+			"(missing LANDLOCK_ACCESS_FS_TRUNCATE); refusing to enforce a "+
+			"sandbox that cannot block write isolation bypasses", abi, minLandlockABI)
 	}
 
-	// Build the handled-access mask, downgrading for older ABIs.
+	// Full handled-access mask. ABI v3+ supports every right we care
+	// about (WRITE_FILE, REMOVE_*, MAKE_*, TRUNCATE, REFER), so no
+	// downgrading is needed.
 	handled := uint64(handledAccessFS)
-	if abi < 2 {
-		// REFER added in ABI v2
-		handled &^= unix.LANDLOCK_ACCESS_FS_REFER
-	}
-	if abi < 3 {
-		// TRUNCATE added in ABI v3
-		handled &^= unix.LANDLOCK_ACCESS_FS_TRUNCATE
-	}
 
 	// Prevent privilege escalation via setuid/setgid binaries.
 	if err := prctlNoNewPrivs(); err != nil {
@@ -186,9 +214,24 @@ func applyLandlock(rwPaths []string) error {
 func addPathRule(rulesetFD int, path string, accessMask uint64) error {
 	pathFD, err := syscall.Open(path, unix.O_PATH|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		// Path doesn't exist yet — skip silently.  The agent might
-		// create it at runtime under an already-allowed parent.
+		// Path doesn't exist. Once Landlock is enforced, the agent can
+		// only create a directory if one of its ancestors is already on
+		// the allowlist. Most kojo-owned paths (agent data dir, the tool
+		// config dirs we deliberately allow) do not have such an ancestor
+		// — silently skipping here means the CLI would then fail to
+		// create them at runtime with EACCES.
+		//
+		// Surface the issue on stderr (the kojo sandbox subprocess
+		// streams stderr to the parent) so operators can diagnose
+		// "claude can't write to ~/.claude on a fresh machine". The
+		// caller (sandboxConfig in internal/agent) is expected to
+		// pre-create kojo-owned paths before invoking us; this log
+		// catches any path we missed.
 		if os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr,
+				"kojo sandbox: skipping missing RW path %q — the sandboxed "+
+					"process will not be able to create it unless an ancestor "+
+					"is also on the allowlist\n", path)
 			return nil
 		}
 		return fmt.Errorf("open %q: %w", path, err)

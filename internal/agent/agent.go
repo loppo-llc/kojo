@@ -431,11 +431,8 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		return nil, fmt.Errorf("unsupported thinkingMode: %q", cfg.ThinkingMode)
 	}
 	if cfg.WorkDir != "" {
-		if !filepath.IsAbs(cfg.WorkDir) {
-			return nil, fmt.Errorf("workDir must be an absolute path: %s", cfg.WorkDir)
-		}
-		if info, err := os.Stat(cfg.WorkDir); err != nil || !info.IsDir() {
-			return nil, fmt.Errorf("workDir does not exist or is not a directory: %s", cfg.WorkDir)
+		if err := validateWorkDir(cfg.WorkDir); err != nil {
+			return nil, err
 		}
 	}
 	a := &Agent{
@@ -465,6 +462,32 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		a.Model = "sonnet"
 	}
 	return a, nil
+}
+
+// validateWorkDir checks that a user-supplied WorkDir is acceptable for
+// use as an agent's file storage directory.
+//
+// Beyond the obvious "absolute, exists, is a directory" checks, this
+// also refuses any path that resolves inside (or equal to / above) the
+// kojo agents-root directory. Without that guard, an agent could
+// elevate its own sandbox to cover another agent's data dir by simply
+// PATCHing its WorkDir to /…/agents/{other-id} — the next backend launch
+// would add the path to the Landlock allowlist and the agent would gain
+// write access to the other agent's MEMORY.md, persona, transcripts,
+// etc. Symlinks are resolved before comparison so an indirect path
+// cannot bypass the check.
+func validateWorkDir(workDir string) error {
+	if !filepath.IsAbs(workDir) {
+		return fmt.Errorf("workDir must be an absolute path: %s", workDir)
+	}
+	info, err := os.Stat(workDir)
+	if err != nil || !info.IsDir() {
+		return fmt.Errorf("workDir does not exist or is not a directory: %s", workDir)
+	}
+	if isWithinAgentsRoot(workDir) {
+		return fmt.Errorf("workDir must not be inside, equal to, or above the kojo agents root (%s): %s", agentsDir(), workDir)
+	}
+	return nil
 }
 
 // intervalToCron converts an interval in minutes and an agent ID to a cron

@@ -13,9 +13,25 @@ func TestLandlockABI(t *testing.T) {
 	if err != nil {
 		t.Skipf("Landlock not available on this kernel: %v", err)
 	}
-	t.Logf("Landlock ABI version: %d", abi)
+	t.Logf("Landlock ABI version: %d (kojo requires >= %d)", abi, minLandlockABI)
 	if abi < 1 {
 		t.Errorf("expected ABI >= 1, got %d", abi)
+	}
+}
+
+// TestAvailableRequiresMinABI documents that Available() now gates on
+// minLandlockABI rather than ABI >= 1. Older kernels (5.13-6.1) report a
+// non-zero ABI but lack LANDLOCK_ACCESS_FS_TRUNCATE, so the package treats
+// them as unsupported to avoid silently degrading write isolation.
+func TestAvailableRequiresMinABI(t *testing.T) {
+	abi, err := landlockABI()
+	if err != nil {
+		t.Skipf("Landlock not available on this kernel: %v", err)
+	}
+	got := Available()
+	want := abi >= minLandlockABI
+	if got != want {
+		t.Errorf("Available() = %v, want %v (abi=%d, min=%d)", got, want, abi, minLandlockABI)
 	}
 }
 

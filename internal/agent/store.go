@@ -126,14 +126,15 @@ func (st *store) Load() ([]*Agent, error) {
 			a.SilentEnd = ""
 			needsSave = true
 		}
-		// Validate loaded workDir — clear invalid values (not absolute or not a directory)
+		// Validate loaded workDir — clear invalid values. Reuses
+		// validateWorkDir so the load path enforces the same rules as
+		// CreateAgent / UpdateAgentConfig, including the agents-root
+		// containment guard that prevents sandbox bypass via WorkDir.
+		// A stale on-disk config saved before the guard existed (or
+		// hand-edited later) is cleared rather than honoured.
 		if a.WorkDir != "" {
-			if !filepath.IsAbs(a.WorkDir) {
-				st.logger.Warn("invalid workDir in stored data (not absolute), clearing", "agent", a.ID, "workDir", a.WorkDir)
-				a.WorkDir = ""
-				needsSave = true
-			} else if info, err := os.Stat(a.WorkDir); err != nil || !info.IsDir() {
-				st.logger.Warn("workDir does not exist or is not a directory, clearing", "agent", a.ID, "workDir", a.WorkDir)
+			if err := validateWorkDir(a.WorkDir); err != nil {
+				st.logger.Warn("invalid workDir in stored data, clearing", "agent", a.ID, "workDir", a.WorkDir, "err", err)
 				a.WorkDir = ""
 				needsSave = true
 			}

@@ -138,11 +138,45 @@ func emitCancelDone(ctx context.Context, ch chan<- ChatEvent, content, thinking 
 	}
 }
 
+// sharedHomeToolDirs lists per-user CLI config dirs that every agent on
+// the host shares because all agents run as the same OS user. They are
+// included in the sandbox allowlist so the underlying CLI (claude / codex
+// / gemini) can read auth tokens and write session state — without them
+// the tools refuse to start.
+//
+// Known limitation: any agent can modify these dirs and influence every
+// other agent that uses the same tool (e.g. by writing a hook into
+// ~/.claude/settings.json). True per-agent isolation requires redirecting
+// each tool to a per-agent config dir via env vars, which depends on the
+// per-agent CLI auth work tracked separately. Until that lands,
+// sandboxConfig emits a warning the first time it allows these paths so
+// the limitation is visible in operator logs rather than buried in the
+// PR description.
+var sharedHomeToolDirs = []string{
+	".cache",  // npm/pip/go caches — typically benign but still shared
+	".claude", // Claude Code sessions & config
+	".gemini", // Gemini CLI config
+	".codex",  // Codex CLI config
+}
+
 // sandboxConfig builds a sandbox.Config for the given agent.  The config
 // allows writes to the agent's own data directory plus common paths that
 // CLI tools need (temp dirs, caches, tool-specific config dirs).
+//
+// When Landlock is unavailable on the host (or the kernel is below the
+// required ABI), sandboxConfig logs a warning so operators know agent
+// processes are running unrestricted — silently degrading would hide a
+// material security posture change.
 func sandboxConfig(agent *Agent, logger *slog.Logger) sandbox.Config {
 	if !sandbox.Available() {
+		// Surface degraded state. The original PR description promised a
+		// "warning, no restriction" path here; without this log, agents
+		// would silently run unsandboxed on macOS, in CI, or on Linux
+		// kernels below the required Landlock ABI.
+		logger.Warn("filesystem sandbox unavailable — agent processes will run UNRESTRICTED. "+
+			"Cross-agent FS isolation requires Linux 6.2+ with Landlock ABI v3 enabled.",
+			"agent", agent.ID,
+		)
 		return sandbox.Config{Enabled: false}
 	}
 
@@ -150,23 +184,61 @@ func sandboxConfig(agent *Agent, logger *slog.Logger) sandbox.Config {
 	home, _ := os.UserHomeDir()
 
 	rw := []string{
-		dir,               // agent's own data
-		os.TempDir(),      // /tmp
-		"/var/tmp",        // persistent temp
+		dir,          // agent's own data
+		os.TempDir(), // /tmp
+		"/var/tmp",   // persistent temp
 	}
 
 	if home != "" {
-		rw = append(rw,
-			filepath.Join(home, ".cache"),  // npm/pip/go caches
-			filepath.Join(home, ".claude"), // Claude Code sessions & config
-			filepath.Join(home, ".gemini"), // Gemini CLI config
-			filepath.Join(home, ".codex"),  // Codex CLI config
+		for _, sub := range sharedHomeToolDirs {
+			rw = append(rw, filepath.Join(home, sub))
+		}
+		logger.Warn("sandbox allows shared per-user CLI dirs — "+
+			"these are NOT isolated between agents on the same host. "+
+			"An agent writing to ~/.claude (etc.) can influence every other "+
+			"agent that uses the same tool. Per-agent isolation depends on "+
+			"future per-agent CLI auth work.",
+			"agent", agent.ID,
+			"shared_dirs", sharedHomeToolDirs,
 		)
 	}
 
-	// Custom work directory (e.g. a project checkout).
+	// Custom work directory (e.g. a project checkout). The WorkDir must
+	// not point inside the agents-root, because that would let an agent
+	// elevate its sandbox to cover another agent's data dir simply by
+	// PATCHing its own WorkDir. agent.go and manager.go validate this on
+	// the write path; the check here is defense-in-depth in case a stale
+	// or hand-edited on-disk config slipped past validation.
 	if agent.WorkDir != "" && agent.WorkDir != dir {
-		rw = append(rw, agent.WorkDir)
+		if isWithinAgentsRoot(agent.WorkDir) {
+			logger.Error("refusing to add WorkDir to sandbox: path is inside agents root — "+
+				"this would let the agent write into other agents' data dirs",
+				"agent", agent.ID,
+				"workDir", agent.WorkDir,
+				"agentsRoot", agentsDir(),
+			)
+		} else {
+			rw = append(rw, agent.WorkDir)
+		}
+	}
+
+	// Pre-create kojo-owned RW paths so Landlock's path-beneath rules can
+	// open them. Once Landlock enforces, the sandboxed CLI can only create
+	// a dir if an ancestor is already on the allowlist — and home-relative
+	// tool dirs like ~/.claude have no such ancestor. mkdir is idempotent
+	// and uses 0o700 (caller-only access) to match the privacy expectations
+	// of tool config dirs.
+	for _, p := range rw {
+		if p == "" {
+			continue
+		}
+		if err := os.MkdirAll(p, 0o700); err != nil {
+			logger.Warn("failed to pre-create sandbox RW path; sandbox will skip it and the agent may fail to write there",
+				"agent", agent.ID,
+				"path", p,
+				"err", err,
+			)
+		}
 	}
 
 	logger.Info("sandbox enabled",
@@ -177,6 +249,63 @@ func sandboxConfig(agent *Agent, logger *slog.Logger) sandbox.Config {
 		RWPaths: rw,
 		Enabled: true,
 	}
+}
+
+// isWithinAgentsRoot reports whether path is the agents-root directory
+// itself, a parent of it, or a path located under it. Symlinks are
+// resolved before comparison so an agent cannot use a symlink as a
+// WorkDir to bypass the check.
+//
+// We treat all three forms ("equal", "ancestor", "descendant") as inside
+// the agents root, because each grants the agent write access to another
+// agent's data directory in different ways. Equal and ancestor cover the
+// whole root in one path-beneath rule; descendant points directly into
+// another agent's dir.
+func isWithinAgentsRoot(path string) bool {
+	if path == "" {
+		return false
+	}
+	root := agentsDir()
+	rootResolved := resolvePath(root)
+	pathResolved := resolvePath(path)
+	// Path is the root itself or an ancestor that contains the root.
+	if pathResolved == rootResolved {
+		return true
+	}
+	rel, err := filepath.Rel(rootResolved, pathResolved)
+	if err != nil {
+		return false
+	}
+	// If Rel produces a result that does not start with "..", path is
+	// inside root. ".." prefix means path is a sibling / ancestor /
+	// elsewhere — and an ancestor would let the agent encompass root, so
+	// we additionally check for the inverse: root inside path.
+	if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return true
+	}
+	if relInv, err := filepath.Rel(pathResolved, rootResolved); err == nil {
+		if relInv == "." || (relInv != ".." && !strings.HasPrefix(relInv, ".."+string(filepath.Separator))) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolvePath returns the absolute, symlink-resolved form of path. When
+// the path doesn't exist yet (Stat would fail before EvalSymlinks
+// resolves), we fall back to filepath.Clean(Abs(path)) so the check still
+// gives a deterministic comparison. Used by isWithinAgentsRoot to defeat
+// symlink-based attempts to escape WorkDir validation.
+func resolvePath(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return filepath.Clean(p)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return filepath.Clean(abs)
+	}
+	return resolved
 }
 
 // matchToolOutput pairs a tool result with the most recent matching ToolUse
