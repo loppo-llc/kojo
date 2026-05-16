@@ -20,10 +20,18 @@ const maxPersonaSummaryRunes = 500
 // every /api/v1/* request — without the header an agent's curl lands
 // as a Guest principal and is rejected with 403.
 //
-// The token is injected as a literal value directly in the system prompt
-// rather than via environment variable. This eliminates the
-// /proc/{pid}/environ attack surface where one agent could read another
-// agent's token from the process environment.
+// The token is embedded literally in the prompt so the examples are
+// copy-pasteable without requiring the agent to know it must reference
+// $KOJO_AGENT_TOKEN. The same token is also exported as KOJO_AGENT_TOKEN
+// in the agent's environment (see filterEnv) for the Claude PreCompact
+// hook and any agent-issued shell command that prefers env-var transport.
+//
+// Note on cross-agent secrecy: literal embedding does NOT provide
+// isolation between agents on the same host. Phase 1 Landlock restricts
+// writes only, so any same-UID process can read another agent's
+// /proc/{pid}/environ, /proc/{pid}/cmdline, and on-disk session files.
+// Cross-agent token isolation requires per-agent UIDs and is tracked as
+// future work — see filterEnv in backend.go for the full discussion.
 //
 // `-sk` is used for HTTPS endpoints to skip TLS verification because
 // the Tailscale listener uses a self-signed cert. The auth listener is
@@ -203,9 +211,10 @@ func getPersonaSummary(agentID string, persona string, tool string, logger *slog
 // edits it (low frequency) — one cache_creation per edit is acceptable.
 //
 // apiBase is the server URL for group DM API access (e.g. "http://127.0.0.1:8080").
-// agentToken is the literal auth token injected into curl examples so the
-// agent can authenticate with the kojo API. Passed directly in the prompt
-// instead of via environment variable to avoid /proc/{pid}/environ exposure.
+// agentToken is the literal auth token embedded in curl examples so the
+// agent can authenticate with the kojo API without needing to know about
+// $KOJO_AGENT_TOKEN. The same value is also exported as that env var by
+// filterEnv — see curlFlagsForAPI for the cross-agent-secrecy caveat.
 func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase, agentToken string, groups []*GroupDM, hasCreds bool) string {
 	dir := agentDir(a.ID)
 	personaPath := filepath.Join(dir, "persona.md")

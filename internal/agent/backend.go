@@ -62,10 +62,12 @@ var kojoAPIBase string
 // API calls. Idempotent; safe to call repeatedly during boot.
 func SetKojoAPIBase(base string) { kojoAPIBase = base }
 
-// agentTokenLookup, when set, returns the per-agent auth token for
-// direct injection into the system prompt and MCP config. The token is
-// NOT exposed as an environment variable — see filterEnv doc. Wired up
-// by the server using the auth.TokenStore.
+// agentTokenLookup, when set, returns the per-agent auth token. It feeds
+// both the system-prompt injection (so curl examples are self-contained)
+// and the KOJO_AGENT_TOKEN env var (so the Claude PreCompact hook can
+// authenticate to /api/v1/agents/{id}/pre-compact). Wired up by the
+// server using the auth.TokenStore. See filterEnv for the env-transport
+// trade-offs.
 var agentTokenLookup func(agentID string) (string, bool)
 
 // SetAgentTokenLookup wires the token lookup callback. May be nil
@@ -73,20 +75,31 @@ var agentTokenLookup func(agentID string) (string, bool)
 func SetAgentTokenLookup(fn func(string) (string, bool)) { agentTokenLookup = fn }
 
 // filterEnv returns a copy of os.Environ() with entries matching any of the
-// given prefixes removed, and AGENT_BROWSER_SESSION / AGENT_BROWSER_COOKIE_DIR
-// vars set to agentID / dataDir. KOJO_AGENT_ID and KOJO_API_BASE are injected
-// so the agent can identify itself.
-//
-// KOJO_AGENT_TOKEN is intentionally NOT set as an environment variable.
-// Agent tokens are injected directly into the system prompt to avoid
-// exposure via /proc/{pid}/environ, which any process running as the same
-// UID can read.
+// given prefixes removed, plus per-agent KOJO_* / AGENT_BROWSER_* vars.
 //
 // Every KOJO_* var inherited from the parent process is stripped before the
 // per-agent values are appended. This prevents an Owner-only secret like
 // KOJO_OWNER_TOKEN — which a deployment may set on the kojo process to
 // bootstrap the owner role — from ever leaking into a PTY where the agent
-// could read it via $KOJO_OWNER_TOKEN.
+// could read it via $KOJO_OWNER_TOKEN. Only the explicit allowlist below is
+// reinjected after the strip.
+//
+// Token exposure note: KOJO_AGENT_TOKEN is reinjected so the Claude
+// PreCompact hook (and any other agent-issued curl) can attach the
+// X-Kojo-Token header. An earlier revision tried to omit the env var and
+// only inject the token via --system-prompt, hoping to "remove the
+// /proc/{pid}/environ attack surface". That goal is unreachable in Phase 1:
+//
+//   - argv is exposed via /proc/{pid}/cmdline for every same-UID process,
+//     so --system-prompt leaks the token identically to environ.
+//   - Phase 1 Landlock restricts WRITES only; /proc reads and same-UID
+//     file reads are unrestricted, so any agent on the host can read any
+//     other agent's environ, cmdline, or token file.
+//
+// Cross-agent token isolation therefore requires per-agent UIDs (or
+// equivalent OS-level separation) and is tracked as future work. Until
+// then, env transport is the simplest path that keeps the PreCompact hook
+// working and surfaces the token exposure honestly in this comment.
 func filterEnv(removePrefixes []string, agentID, dataDir string) []string {
 	stripPrefixes := append([]string(nil), removePrefixes...)
 	stripPrefixes = append(stripPrefixes, "KOJO_")
@@ -112,6 +125,11 @@ func filterEnv(removePrefixes []string, agentID, dataDir string) []string {
 	)
 	if kojoAPIBase != "" {
 		filtered = append(filtered, "KOJO_API_BASE="+kojoAPIBase)
+	}
+	if agentTokenLookup != nil {
+		if tok, ok := agentTokenLookup(agentID); ok && tok != "" {
+			filtered = append(filtered, "KOJO_AGENT_TOKEN="+tok)
+		}
 	}
 	return filtered
 }

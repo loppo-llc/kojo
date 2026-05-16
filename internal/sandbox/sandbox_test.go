@@ -8,15 +8,15 @@ import (
 func TestWrapCommandDisabled(t *testing.T) {
 	cfg := Config{Enabled: false}
 	cmd := WrapCommand(context.Background(), "/bin/echo", []string{"hello"}, cfg)
-	// When disabled, the command should invoke the original binary directly
-	// (no sandbox wrapper).
+	// When Enabled=false, WrapCommand MUST passthrough to the original
+	// binary on every platform. A regression that still re-execs through
+	// "kojo sandbox" while disabled would silently change agent semantics
+	// (extra fork, different argv exposure, etc.), so this is a hard
+	// invariant — not a log statement.
 	if cmd.Path != "/bin/echo" {
-		// On non-Linux, WrapCommand always returns the original.
-		// On Linux with Landlock unavailable, same.
-		// We check that it doesn't crash and returns a valid Cmd.
-		t.Logf("cmd.Path = %s (may differ on Linux if Available() is true, but Enabled=false should still passthrough)", cmd.Path)
+		t.Errorf("Enabled=false must passthrough: cmd.Path = %q, want %q", cmd.Path, "/bin/echo")
 	}
-	if cmd.Args[0] != "/bin/echo" || cmd.Args[1] != "hello" {
+	if len(cmd.Args) != 2 || cmd.Args[0] != "/bin/echo" || cmd.Args[1] != "hello" {
 		t.Errorf("unexpected args: %v", cmd.Args)
 	}
 }

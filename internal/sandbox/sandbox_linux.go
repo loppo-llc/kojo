@@ -55,17 +55,38 @@ func Available() bool {
 // wrapCommand builds an exec.Cmd that re-execs kojo with the "sandbox"
 // subcommand, passing the allowed RW paths and the real command to execute.
 //
-// If sandboxing is disabled or unavailable, it falls back to a plain
-// exec.CommandContext.
+// Fail-closed contract:
+//   - cfg.Enabled == false  → passthrough (caller deliberately opted out).
+//   - cfg.Enabled == true   → either return a real sandbox-wrapped Cmd,
+//     OR return a Cmd whose Start() fails. We never silently fall back to
+//     an unsandboxed exec, because the caller asked for sandboxing and a
+//     transparent downgrade would hide a material security posture change
+//     behind a successful-looking process launch.
+//
+// Failures handled this way:
+//   - Available() flipped to false between sandboxConfig and now (TOCTOU
+//     against module-level state or kernel module unload).
+//   - os.Executable() can't resolve the kojo binary (deleted, exec on a
+//     stripped layer, etc.) — without a kojo binary we can't re-exec
+//     ourselves as the sandbox helper.
+//
+// Both are returned through *exec.Cmd's Err field; exec.Cmd.Start propagates
+// it directly so the caller sees a clear "sandbox setup failed" instead of
+// an unsandboxed agent silently coming up.
 func wrapCommand(ctx context.Context, name string, args []string, cfg Config) *exec.Cmd {
-	if !cfg.Enabled || !Available() {
+	if !cfg.Enabled {
 		return exec.CommandContext(ctx, name, args...)
+	}
+
+	if !Available() {
+		return errorCmd(ctx, name, args, fmt.Errorf(
+			"sandbox: Enabled=true but Landlock is no longer available — refusing to launch unsandboxed"))
 	}
 
 	kojoPath, err := os.Executable()
 	if err != nil {
-		// Can't find our own binary — fall back to unsandboxed.
-		return exec.CommandContext(ctx, name, args...)
+		return errorCmd(ctx, name, args, fmt.Errorf(
+			"sandbox: cannot resolve kojo executable for re-exec (%w) — refusing to launch unsandboxed", err))
 	}
 
 	// Build: kojo sandbox --rw path1 --rw path2 -- cmd args...
@@ -78,6 +99,17 @@ func wrapCommand(ctx context.Context, name string, args []string, cfg Config) *e
 	sandboxArgs = append(sandboxArgs, args...)
 
 	return exec.CommandContext(ctx, kojoPath, sandboxArgs...)
+}
+
+// errorCmd returns an *exec.Cmd whose Start() will fail with err. The Cmd
+// still carries the original name/args so callers that log cmd.Path/Args on
+// failure produce intelligible diagnostics. exec.Cmd.Err was added precisely
+// for this "constructor failure" use case — Start() returns it without
+// attempting fork/exec.
+func errorCmd(ctx context.Context, name string, args []string, err error) *exec.Cmd {
+	c := exec.CommandContext(ctx, name, args...)
+	c.Err = err
+	return c
 }
 
 // ExecSandboxed is the entry point for the "kojo sandbox" subcommand.
