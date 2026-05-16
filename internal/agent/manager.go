@@ -1066,8 +1066,16 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	}
 
 	// Build chat options.
+	//
+	// SessionKey-scoped resumption is only honored by backends that read
+	// opts.SessionKey when building their CLI args (currently: claude).
+	// Other backends like gemini interpret !OneShot as "resume the agent's
+	// latest session", which would incorrectly mix Slack thread context
+	// with the agent's normal WebUI context — or with a different Slack
+	// thread's session. For those backends we force OneShot=true so the
+	// chat stays ephemeral, mirroring the no-SessionKey path.
 	var chatOpts ChatOptions
-	if cfg.SessionKey != "" {
+	if cfg.SessionKey != "" && backendSupportsSessionKey(prep.backend) {
 		chatOpts = ChatOptions{
 			MCPServers:       prep.mcpServers,
 			AutomatedTrigger: true,

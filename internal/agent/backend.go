@@ -56,6 +56,24 @@ type ChatBackend interface {
 	Available() bool
 }
 
+// backendSupportsSessionKey reports whether the backend honors
+// ChatOptions.SessionKey when building its CLI invocation. Backends that
+// ignore SessionKey will interpret !OneShot as "resume the agent's latest
+// session" — which is the wrong behavior for callers that pass SessionKey
+// to isolate a Slack thread (or similar) from the agent's main session.
+// Keep this list in sync with the backends that actually read opts.SessionKey.
+func backendSupportsSessionKey(b ChatBackend) bool {
+	if b == nil {
+		return false
+	}
+	switch b.Name() {
+	case "claude":
+		return true
+	default:
+		return false
+	}
+}
+
 // kojoAPIBase is the URL agents use to reach kojo's auth-required API
 // listener. Set by the server at startup via SetKojoAPIBase. Empty when
 // the auth listener is not configured (e.g. --no-auth dev mode), in

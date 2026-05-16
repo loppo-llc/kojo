@@ -465,8 +465,17 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			// see progress even during long tool executions. The final
 			// UpdateMessage replaces the stream with clean response text,
 			// so these ephemeral indicators are automatically removed.
-			if startStream() && time.Since(lastAppend) >= streamAppendInterval {
-				// Flush any pending text delta first
+			//
+			// Note: status indicators bypass the streamAppendInterval throttle
+			// because tool_use events fire at most once per tool invocation
+			// (not in a tight loop like text deltas) and a user who sees no
+			// updates during a long-running tool has no way to tell the agent
+			// is still working. If the very first event is tool_use,
+			// throttling would suppress the indicator until any subsequent
+			// text — which may never come if the tool takes minutes.
+			if startStream() {
+				// Flush any pending text delta first so the status appears after
+				// whatever the assistant has said so far.
 				if pendingDelta.Len() > 0 {
 					b.appendStream(ctx, channel, streamTS, pendingDelta.String())
 					pendingDelta.Reset()

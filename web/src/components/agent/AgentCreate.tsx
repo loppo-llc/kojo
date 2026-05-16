@@ -595,8 +595,10 @@ export function AgentCreate() {
           silentEnd={silentEnd}
           onSilentStartChange={setSilentStart}
           onSilentEndChange={setSilentEnd}
-          cronMessage=""
-          onCronMessageChange={() => {}}
+          // Hide the Check-in Message field on create — checkin.md doesn't
+          // exist until the agent is created, and there's no API surface to
+          // PUT it before creation. Users can edit it from AgentSettings
+          // immediately after creating.
         />
 
         {error && (

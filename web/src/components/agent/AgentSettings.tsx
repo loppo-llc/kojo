@@ -138,6 +138,12 @@ export function AgentSettings() {
   const [userContextDirty, setUserContextDirty] = useState(false);
   const [savingUserContext, setSavingUserContext] = useState(false);
   const [cronMessage, setCronMessage] = useState("");
+  // Track whether cronMessage diverges from what's persisted in checkin.md.
+  // Manual check-in runs against the persisted file, so editing the textarea
+  // without saving would silently fire with stale instructions. We block the
+  // button when this is true (see handleCheckin).
+  const [savedCronMessage, setSavedCronMessage] = useState("");
+  const cronMessageDirty = cronMessage !== savedCronMessage;
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -173,6 +179,7 @@ export function AgentSettings() {
       setTTSStylePrompt(a.tts?.stylePrompt ?? "");
       setUserContext(uc);
       setCronMessage(checkin.content);
+      setSavedCronMessage(checkin.content);
     }).catch(() => navigate("/"));
   }, [id, navigate]);
 
@@ -198,7 +205,7 @@ export function AgentSettings() {
     setError("");
     setSuccess(false);
     try {
-      const [updated] = await Promise.all([
+      const [updated, , savedCheckin] = await Promise.all([
         agentApi.update(id!, {
           name: name.trim(),
           persona: persona.trim(),
@@ -232,6 +239,11 @@ export function AgentSettings() {
       setPublicProfile(updated.publicProfile ?? "");
       setPublicProfileOverride(updated.publicProfileOverride ?? false);
       setUserContextDirty(false);
+      // Sync the textarea to the server-normalized value (WriteCheckinFile
+      // trims whitespace) so the UI matches what was actually persisted, and
+      // reset the dirty flag so manual check-in unblocks.
+      setCronMessage(savedCheckin);
+      setSavedCronMessage(savedCheckin);
       setSuccess(true);
       setTimeout(() => setSuccess(false), 2000);
     } catch (err) {
@@ -242,14 +254,22 @@ export function AgentSettings() {
   };
 
   const handleCheckin = async () => {
-    // The server runs the check-in against the persisted agent record, not
-    // the in-flight edits in this form. Bail with a notice if timeout has
-    // unsaved changes — fixing this with an auto-save would mean committing
-    // other unrelated dirty fields too.
+    // The server runs the check-in against the persisted agent record and
+    // the persisted checkin.md, not the in-flight edits in this form. Bail
+    // with a notice if either Timeout or Check-in Message has unsaved
+    // changes — fixing this with an auto-save would mean committing other
+    // unrelated dirty fields too.
     const savedTimeout = agent ? (agent.timeoutMinutes || 10) : timeoutMinutes;
     if (agent && savedTimeout !== timeoutMinutes) {
       setCheckinNotice(
         "Save your changes first — manual check-in uses the saved Timeout.",
+      );
+      setTimeout(() => setCheckinNotice(""), 5000);
+      return;
+    }
+    if (cronMessageDirty) {
+      setCheckinNotice(
+        "Save your changes first — manual check-in uses the saved Check-in Message.",
       );
       setTimeout(() => setCheckinNotice(""), 5000);
       return;
