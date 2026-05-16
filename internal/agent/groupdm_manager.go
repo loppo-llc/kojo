@@ -305,6 +305,21 @@ func (m *GroupDMManager) persistOne(snapshot *GroupDM) error {
 	return upsertGroupDM(ctx, db, snapshot)
 }
 
+// liveGroupLocked returns the live (non-tombstoned, not-being-deleted)
+// group for id without taking m.mu — callers MUST already hold the
+// lock. Returns ErrGroupNotFound (wrapped, with id) for either failure
+// mode, matching the inline guards every caller used to write.
+func (m *GroupDMManager) liveGroupLocked(id string) (*GroupDM, error) {
+	if m.deleting[id] {
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+	}
+	g, ok := m.groups[id]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+	}
+	return g, nil
+}
+
 // CheckMembership verifies that the group exists and the agent is a member.
 func (m *GroupDMManager) CheckMembership(groupID, agentID string) error {
 	m.mu.Lock()
@@ -353,14 +368,10 @@ func (m *GroupDMManager) Rename(id, name, callerAgentID string) (*GroupDM, error
 	}
 
 	m.mu.Lock()
-	if m.deleting[id] {
+	g, err := m.liveGroupLocked(id)
+	if err != nil {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
-	}
-	g, ok := m.groups[id]
-	if !ok {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+		return nil, err
 	}
 
 	// Verify caller is a member
@@ -424,6 +435,12 @@ func (m *GroupDMManager) Rename(id, name, callerAgentID string) (*GroupDM, error
 // If notify is true, members are notified about the deletion before the group is removed.
 func (m *GroupDMManager) Delete(id string, notify bool) error {
 	m.mu.Lock()
+	// liveGroupLocked is intentionally NOT used here: a Delete that
+	// races a previous Delete still in flight should report
+	// ErrGroupNotFound, and the deleting[id] entry from the in-flight
+	// caller is exactly that signal. Using liveGroupLocked would do
+	// the same thing, but spelling out the second branch keeps the
+	// "first caller wins, second sees not-found" race explicit.
 	g, ok := m.groups[id]
 	if !ok {
 		m.mu.Unlock()
@@ -534,18 +551,14 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 	// a single DB INSERT (groupdm_messages) so the held-lock window is
 	// bounded; for chat workloads this serialization cost is invisible.
 	m.mu.Lock()
-	if m.deleting[groupID] {
-		// Tombstone is in flight. Bail with the same not-found shape
-		// the API surfaces for a hard-deleted group; the store-level
-		// AppendGroupDMMessage would also fail past this point but
-		// with a less recognizable error.
+	// Bail with the same not-found shape the API surfaces for a
+	// hard-deleted group (deleting[id] case) and a never-existed group
+	// (groups[id] miss). The store-level AppendGroupDMMessage would
+	// also fail past either point but with a less recognizable error.
+	g, err := m.liveGroupLocked(groupID)
+	if err != nil {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
-	}
-	g, ok := m.groups[groupID]
-	if !ok {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
+		return nil, err
 	}
 
 	// Verify sender is a member. Membership is decided by AgentID only —
@@ -659,14 +672,10 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 // chatter of agents replying around them.
 func (m *GroupDMManager) PostUserMessage(ctx context.Context, groupID, content string, notify bool) (*GroupMessage, error) {
 	m.mu.Lock()
-	if m.deleting[groupID] {
+	g, err := m.liveGroupLocked(groupID)
+	if err != nil {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
-	}
-	g, ok := m.groups[groupID]
-	if !ok {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
+		return nil, err
 	}
 	recipients := make([]GroupMember, len(g.Members))
 	copy(recipients, g.Members)
@@ -855,14 +864,10 @@ func (m *GroupDMManager) SetMemberNotifyMode(groupID, agentID string, mode Notif
 	}
 
 	m.mu.Lock()
-	if m.deleting[groupID] {
+	g, err := m.liveGroupLocked(groupID)
+	if err != nil {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
-	}
-	g, ok := m.groups[groupID]
-	if !ok {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
+		return nil, err
 	}
 	// Verify caller membership inside the lock.
 	if callerAgentID != "" {
@@ -931,14 +936,10 @@ func clampCooldown(seconds int) int {
 func (m *GroupDMManager) SetCooldown(id string, seconds int) (*GroupDM, error) {
 	seconds = clampCooldown(seconds)
 	m.mu.Lock()
-	if m.deleting[id] {
+	g, err := m.liveGroupLocked(id)
+	if err != nil {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
-	}
-	g, ok := m.groups[id]
-	if !ok {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+		return nil, err
 	}
 	g.Cooldown = seconds
 	g.UpdatedAt = time.Now().Format(time.RFC3339)
@@ -962,14 +963,10 @@ func (m *GroupDMManager) SetStyle(id string, style GroupDMStyle, callerAgentID s
 		return nil, err
 	}
 	m.mu.Lock()
-	if m.deleting[id] {
+	g, err := m.liveGroupLocked(id)
+	if err != nil {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
-	}
-	g, ok := m.groups[id]
-	if !ok {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+		return nil, err
 	}
 	if callerAgentID != "" {
 		found := false
@@ -1015,14 +1012,10 @@ func (m *GroupDMManager) SetVenue(id string, venue GroupDMVenue, callerAgentID s
 		return nil, err
 	}
 	m.mu.Lock()
-	if m.deleting[id] {
+	g, err := m.liveGroupLocked(id)
+	if err != nil {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
-	}
-	g, ok := m.groups[id]
-	if !ok {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+		return nil, err
 	}
 	if callerAgentID != "" {
 		found := false
@@ -1690,14 +1683,10 @@ func (m *GroupDMManager) AddMember(id, newAgentID, callerAgentID string) (*Group
 	newMember := GroupMember{AgentID: a.ID, AgentName: a.Name}
 
 	m.mu.Lock()
-	if m.deleting[id] {
+	g, err := m.liveGroupLocked(id)
+	if err != nil {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
-	}
-	g, ok := m.groups[id]
-	if !ok {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+		return nil, err
 	}
 
 	// Verify caller is a member
@@ -1793,14 +1782,10 @@ func (m *GroupDMManager) AddMember(id, newAgentID, callerAgentID string) (*Group
 // The group is deleted if fewer than 2 members remain.
 func (m *GroupDMManager) LeaveGroup(id, agentID string) error {
 	m.mu.Lock()
-	if m.deleting[id] {
+	g, err := m.liveGroupLocked(id)
+	if err != nil {
 		m.mu.Unlock()
-		return fmt.Errorf("%w: %s", ErrGroupNotFound, id)
-	}
-	g, ok := m.groups[id]
-	if !ok {
-		m.mu.Unlock()
-		return fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+		return err
 	}
 
 	// Find and remove the member. Snapshot the original member list for
