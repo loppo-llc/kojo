@@ -91,7 +91,12 @@ type Server struct {
 	// system-message chat so the agent can resume immediately.
 	// sourceDeviceID identifies the originating peer (for the
 	// arrival notification prompt).
-	onAgentSyncFinalized func(ctx context.Context, agentID, rawToken, sourceDeviceID string) error
+	// opID is the orchestrator-minted UUID for this particular
+	// switch attempt; carried through so the arrival-chat dedup
+	// can key on (agentID, opID) instead of agentID alone — without
+	// that, the in-memory dedup map never clears and subsequent
+	// switches back to this peer silently skip their auto-continue.
+	onAgentSyncFinalized func(ctx context.Context, agentID, rawToken, sourceDeviceID, opID string) error
 	// onAgentReleasedAsSource fires after the orchestrator's
 	// successful complete + finalize. Source peer drops the
 	// agent from its local AgentLockGuard so a target lease
@@ -1083,7 +1088,7 @@ func (s *Server) SetOnAgentSynced(fn func(ctx context.Context, agentID string) e
 // SetOnAgentSyncFinalized installs the post-complete hook that
 // the orchestrator's /api/v1/peers/agent-sync/finalize endpoint
 // invokes. See onAgentSyncFinalized for the contract.
-func (s *Server) SetOnAgentSyncFinalized(fn func(ctx context.Context, agentID, rawToken, sourceDeviceID string) error) {
+func (s *Server) SetOnAgentSyncFinalized(fn func(ctx context.Context, agentID, rawToken, sourceDeviceID, opID string) error) {
 	s.onAgentSyncFinalized = fn
 }
 

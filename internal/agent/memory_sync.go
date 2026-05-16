@@ -731,6 +731,380 @@ func memoryEntryDiskPath(agentID, kind, name string) string {
 	return filepath.Join(dir, "topics", name+".md")
 }
 
+// LockAgentMemorySync acquires the per-agent memorySyncMu and returns
+// the release callback. Exported so the §3.7 agent-sync HTTP handler
+// can hold the lock across BOTH the DB write (store.SyncAgentFromPeer)
+// AND the disk materialize step — otherwise a concurrent prepareChat
+// could grab the lock between the commit and our materialize, walk
+// stale disk, and UPSERT yesterday's bodies back into the DB the sync
+// just refreshed.
+//
+// Caller MUST defer the returned func. Reentrant use within the same
+// goroutine deadlocks (sync.Mutex is not reentrant); the matching
+// MaterializeAgentSyncToDiskHeld variant assumes the lock is already
+// held precisely so this stays clean.
+func LockAgentMemorySync(agentID string) func() {
+	return lockMemorySync(agentID)
+}
+
+// ReconcileAgentDiskFromDBHeld rewrites the agent's MEMORY.md and
+// memory/* tree to match the AUTHORITATIVE post-commit DB state.
+// Caller MUST hold the per-agent memorySyncMu (via
+// LockAgentMemorySync) so the read-and-write sequence here can't
+// race a concurrent disk→DB sync.
+//
+// Reads DB state instead of the wire payload because:
+//
+//  1. Incremental mode ships only the delta — pre-existing stale
+//     disk for non-delta rows would not be healed by a delta-only
+//     materializer (the bug source for the original peer→hub
+//     diary-rollback report). Reading the live DB set covers
+//     every row, not just the changed ones.
+//
+//  2. The DB already filtered through schema CHECK + insert
+//     validation, so we don't have to defensively skip "kind/name
+//     looks bad" rows from the wire payload that wouldn't have
+//     made it into the DB anyway. The containment check stays as
+//     a paranoid last-line defense.
+//
+//  3. SyncAgentFromPeer is the only writer between us and the lock
+//     release, and it just committed — so reading from the DB
+//     reflects exactly the state we want disk to mirror.
+//
+// Strategy per surface:
+//
+//   - MEMORY.md: write if DB row is live and disk body differs;
+//     remove if DB has no live row (covers nil-from-source AND
+//     tombstoned-on-source).
+//
+//   - memory_entries: list every live row; for each, write its
+//     body to the canonical disk path (skip if disk sha matches
+//     to avoid unnecessary I/O). Then scan disk and remove any
+//     *.md whose (kind, name) isn't in the live set (drops
+//     tombstoned rows + any orphan file source no longer has).
+//
+// containmentCheck failures and other per-entry write errors are
+// surfaced via the returned error — silently skipping a corrupt
+// row would leave DB and disk inconsistent and could mask a real
+// bug or attack attempt. The handler maps a non-nil return to
+// HTTP 500 so the orchestrator retries.
+func ReconcileAgentDiskFromDBHeld(ctx context.Context, st *store.Store, agentID string, logger *slog.Logger) error {
+	if st == nil || agentID == "" {
+		return nil
+	}
+
+	var firstErr error
+	captureErr := func(err error) {
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	// MEMORY.md.
+	memPath := filepath.Join(agentDir(agentID), "MEMORY.md")
+	mem, merr := st.GetAgentMemory(ctx, agentID)
+	switch {
+	case merr == nil && mem != nil && mem.DeletedAt == nil:
+		// Live DB row. Only rewrite if disk content actually differs
+		// (sha mismatch). This is the common case after a sync
+		// where MEMORY.md didn't change; cheap to detect.
+		needWrite := true
+		if existing, rerr := os.ReadFile(memPath); rerr == nil {
+			if store.SHA256Hex(existing) == mem.BodySHA256 {
+				needWrite = false
+			}
+		}
+		if needWrite {
+			if err := os.MkdirAll(filepath.Dir(memPath), 0o755); err != nil {
+				if logger != nil {
+					logger.Warn("disk-reconcile: MEMORY.md mkdir failed",
+						"agent", agentID, "err", err)
+				}
+				captureErr(err)
+			} else if err := atomicfile.WriteBytes(memPath, []byte(mem.Body), 0o644); err != nil {
+				if logger != nil {
+					logger.Warn("disk-reconcile: MEMORY.md write failed",
+						"agent", agentID, "err", err)
+				}
+				captureErr(err)
+			}
+		}
+	case errors.Is(merr, store.ErrNotFound) || (merr == nil && (mem == nil || mem.DeletedAt != nil)):
+		// No live DB row → mirror by removing disk file.
+		if err := os.Remove(memPath); err != nil && !os.IsNotExist(err) {
+			if logger != nil {
+				logger.Warn("disk-reconcile: MEMORY.md remove failed",
+					"agent", agentID, "err", err)
+			}
+			captureErr(err)
+		}
+	case merr != nil:
+		if logger != nil {
+			logger.Warn("disk-reconcile: GetAgentMemory failed",
+				"agent", agentID, "err", merr)
+		}
+		captureErr(merr)
+	}
+
+	// memory_entries.
+	//
+	// expectedComplete tracks whether `expectedPaths` reliably
+	// represents every disk path the DB-canonical layout demands.
+	// The orphan-remove phase keys off this set, so any error that
+	// leaves the set partial (DB list failure, containment escape,
+	// validation failure) MUST skip the remove phase — otherwise
+	// we'd delete legitimate disk files whose DB rows simply didn't
+	// make it into the set.
+	//
+	// Keying by FULL canonical path (instead of just (kind, name))
+	// lets us catch the alias-duplicate case: when both
+	// `memory/zzz.md` and `memory/topics/zzz.md` exist, the scanner
+	// classifies BOTH as kind=topic, name=zzz, but only
+	// memory/topics/zzz.md is the v1 canonical layout. The legacy
+	// flat-form file at memory/zzz.md must be removed so the next
+	// prepareChat disk→DB sync doesn't oscillate between the two
+	// bodies depending on scan order.
+	expectedPaths := make(map[string]bool)
+	expectedComplete := true
+
+	const pageSize = 500
+	var cursor int64
+listLoop:
+	for {
+		recs, lerr := st.ListMemoryEntries(ctx, agentID, store.MemoryEntryListOptions{
+			Limit:  pageSize,
+			Cursor: cursor,
+		})
+		if lerr != nil {
+			if logger != nil {
+				logger.Warn("disk-reconcile: ListMemoryEntries failed; skipping orphan remove",
+					"agent", agentID, "err", lerr)
+			}
+			captureErr(lerr)
+			expectedComplete = false
+			break listLoop
+		}
+		if len(recs) == 0 {
+			break
+		}
+		for _, rec := range recs {
+			cursor = rec.Seq
+			if rec.DeletedAt != nil {
+				// Tombstoned rows are filtered out of ListMemoryEntries
+				// by default, but guard defensively in case the option
+				// shape changes.
+				continue
+			}
+			if rec.Kind == "" || rec.Name == "" {
+				// A DB row with empty kind/name is a corruption
+				// signal — surface so the operator notices. Mark
+				// expectedComplete=false because we can't represent
+				// this row in the orphan-key set, so the remove
+				// phase has to stay home or it might wipe whatever
+				// disk path the corruption pointed at.
+				err := fmt.Errorf("memory_entries id=%s has empty kind/name", rec.ID)
+				if logger != nil {
+					logger.Warn("disk-reconcile: empty kind/name", "agent", agentID, "id", rec.ID)
+				}
+				captureErr(err)
+				expectedComplete = false
+				continue
+			}
+			path := memoryEntryDiskPath(agentID, rec.Kind, rec.Name)
+			if err := containmentCheck(agentID, path, rec.Kind, rec.Name); err != nil {
+				// Hostile / corrupt name escaped the schema CHECK.
+				// Refuse to write — surface as the handler's 500 so
+				// the operator sees something is wrong. Skip orphan
+				// remove for the same incomplete-set reason.
+				if logger != nil {
+					logger.Warn("disk-reconcile: containment check failed",
+						"agent", agentID, "id", rec.ID,
+						"kind", rec.Kind, "name", rec.Name, "err", err)
+				}
+				captureErr(err)
+				expectedComplete = false
+				continue
+			}
+			if err := validateMemoryEntryRoundTrip(agentID, rec.Kind, rec.Name); err != nil {
+				// Cross-kind / intra-kind alias: (kind, name)
+				// resolves to a disk path that classifies back to
+				// a DIFFERENT (kind, name). Writing this row would
+				// shadow whatever other row owns that path. Refuse
+				// + surface so the operator can dedupe in DB.
+				if logger != nil {
+					logger.Warn("disk-reconcile: round-trip mismatch",
+						"agent", agentID, "id", rec.ID,
+						"kind", rec.Kind, "name", rec.Name, "err", err)
+				}
+				captureErr(err)
+				expectedComplete = false
+				continue
+			}
+			expectedPaths[path] = true
+			// Skip write when disk already matches DB to avoid
+			// rewriting hundreds of unchanged daily entries on every
+			// sync.
+			if existing, rerr := os.ReadFile(path); rerr == nil {
+				if store.SHA256Hex(existing) == rec.BodySHA256 {
+					continue
+				}
+			}
+			if err := hydrateMemoryEntryToDisk(agentID, rec); err != nil {
+				if logger != nil {
+					logger.Warn("disk-reconcile: entry hydrate failed",
+						"agent", agentID, "id", rec.ID,
+						"kind", rec.Kind, "name", rec.Name, "err", err)
+				}
+				captureErr(err)
+				// A failed hydrate also leaves the entry's expected
+				// disk state ambiguous; safer to skip orphan remove.
+				expectedComplete = false
+			}
+		}
+		if len(recs) < pageSize {
+			break
+		}
+	}
+
+	// Orphan-remove phase. Scan disk; remove any *.md whose
+	// (kind, name) isn't in the expected live set.
+	//
+	// SKIP this phase if `expected` is known to be incomplete (DB
+	// list failure, validation failure, hydrate failure) — running
+	// against a partial set would clobber legitimate rows whose
+	// disk files we couldn't represent in `expected`. firstErr
+	// already surfaces the reason to the caller.
+	if !expectedComplete {
+		return firstErr
+	}
+	disk, scanErr := scanMemoryDir(agentID, logger)
+	if scanErr != nil {
+		if logger != nil {
+			logger.Warn("disk-reconcile: scanMemoryDir partial; skipping orphan remove",
+				"agent", agentID, "err", scanErr)
+		}
+		captureErr(scanErr)
+		return firstErr
+	}
+	for _, e := range disk {
+		if expectedPaths[e.Path] {
+			continue
+		}
+		if err := os.Remove(e.Path); err != nil && !os.IsNotExist(err) {
+			if logger != nil {
+				logger.Warn("disk-reconcile: orphan remove failed",
+					"agent", agentID, "kind", e.Kind, "name", e.Name,
+					"path", e.Path, "err", err)
+			}
+			captureErr(err)
+		}
+	}
+
+	return firstErr
+}
+
+// ReconcileAgentDiskFromDB is the convenience wrapper that acquires
+// memorySyncMu internally. Suitable for callers (tests, ad-hoc
+// tools) that don't already hold the lock. The §3.7 agent-sync
+// handler holds the lock across BOTH SyncAgentFromPeer and the
+// reconcile — use ReconcileAgentDiskFromDBHeld there.
+func ReconcileAgentDiskFromDB(ctx context.Context, st *store.Store, agentID string, logger *slog.Logger) error {
+	if agentID == "" {
+		return nil
+	}
+	release := lockMemorySync(agentID)
+	defer release()
+	return ReconcileAgentDiskFromDBHeld(ctx, st, agentID, logger)
+}
+
+// containmentCheck verifies path resolves under the agent's memory
+// dir. Defends against a corrupt or hostile rec.Kind/rec.Name that
+// snuck past the schema CHECK + insert validation. Used by the
+// agent-sync materializer's tombstone-remove branch where we don't
+// have the body-write branch's atomicfile.WriteBytes to fall back on.
+func containmentCheck(agentID, path, kind, name string) error {
+	memRoot := filepath.Join(agentDir(agentID), "memory")
+	rel, err := filepath.Rel(memRoot, path)
+	if err != nil {
+		return fmt.Errorf("containment check: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("memory entry path escapes memory root: kind=%s name=%s",
+			kind, name)
+	}
+	return nil
+}
+
+// classifyDiskRel mirrors scanMemoryDir + scanMemorySubdir's
+// path→(kind, name) classification for ONE relative path. `rel` is
+// the path under memory/ WITH the .md suffix. Used by
+// validateMemoryEntryRoundTrip to detect cross-row alias collisions:
+// two different DB rows whose canonical paths point at the same
+// file. Without this, the reconciler would write both, racing on
+// scan order, and disk would only retain whichever wrote last.
+//
+// Returns ("", "") when rel doesn't end in .md (caller should skip).
+func classifyDiskRel(rel string) (kind, name string) {
+	if !strings.HasSuffix(rel, ".md") {
+		return "", ""
+	}
+	rel = strings.TrimSuffix(filepath.ToSlash(rel), ".md")
+	if rel == "" {
+		return "", ""
+	}
+	parts := strings.SplitN(rel, "/", 2)
+	if len(parts) == 1 {
+		// Top-level: daily if name matches YYYY-MM-DD else topic.
+		if memoryDailyDateRe.MatchString(parts[0]) {
+			return "daily", parts[0]
+		}
+		return "topic", parts[0]
+	}
+	// Has a subdir. Canonical subdir → that kind, name = remainder
+	// (which may itself contain "/" for v0-style nested topic
+	// notes). Unknown subdir → kind=topic, name keeps the subdir
+	// prefix (the v0 importer's fallthrough form).
+	if canonical, ok := canonicalMemoryKindDirs[parts[0]]; ok {
+		return canonical, parts[1]
+	}
+	return "topic", parts[0] + "/" + parts[1]
+}
+
+// validateMemoryEntryRoundTrip refuses DB rows whose (kind, name)
+// would write to a disk path that classifies BACK to a different
+// (kind, name). Catches the cross-kind alias collision case:
+//
+//   - row A: (kind=topic, name="people/bob")  → memory/people/bob.md
+//   - row B: (kind=people, name="bob")        → memory/people/bob.md
+//
+// Both rows are valid by the schema's UNIQUE(kind, name, deleted_at)
+// index — they're distinct (kind, name) pairs — but they write to
+// the same file. Without this guard the reconciler writes whichever
+// row processed last and the next disk→DB sync resurrects only one
+// of them with the wrong (kind, name).
+//
+// Also catches name-with-slash redirection inside a single kind:
+//
+//   - (topic, "topics/x") → memory/topics/x.md, same as (topic, "x")
+//
+// containmentCheck (which protects against ".." escapes) already
+// runs separately; this guard is the next layer that asserts the
+// path-to-row mapping is BIJECTIVE.
+func validateMemoryEntryRoundTrip(agentID, kind, name string) error {
+	path := memoryEntryDiskPath(agentID, kind, name)
+	memRoot := filepath.Join(agentDir(agentID), "memory")
+	rel, err := filepath.Rel(memRoot, path)
+	if err != nil {
+		return fmt.Errorf("round-trip rel: %w", err)
+	}
+	bk, bn := classifyDiskRel(rel)
+	if bk != kind || bn != name {
+		return fmt.Errorf("memory entry round-trip mismatch: (%s, %q) → %s → reclassifies as (%s, %q)",
+			kind, name, rel, bk, bn)
+	}
+	return nil
+}
+
 // hydrateMemoryEntryToDisk writes one memory_entries row's body to its
 // canonical disk path, creating intermediate directories. Used by
 // syncMemoryEntriesToDB's diskUninitialized branch on first boot

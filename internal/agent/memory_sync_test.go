@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/configdir"
 	"github.com/loppo-llc/kojo/internal/store"
@@ -401,6 +402,326 @@ func TestSyncMemoryEntriesToDB_HydratesWhenDiskUninitialized(t *testing.T) {
 		if _, err := st.FindMemoryEntryByName(ctx, "ag_hydrate", c.kind, c.name); err != nil {
 			t.Errorf("%s/%s lost after idempotent sync: %v", c.kind, c.name, err)
 		}
+	}
+}
+
+// TestReconcileAgentDiskFromDB_OverwritesStaleLive covers the core
+// peer→hub bug: target has a stale memory_entries file on disk; an
+// agent-sync push lands the NEW body in DB; the reconciler MUST
+// overwrite disk so the next disk→DB sync doesn't roll back to the
+// stale body.
+func TestReconcileAgentDiskFromDB_OverwritesStaleLive(t *testing.T) {
+	st := memorySyncTestEnv(t, "ag_rec_live")
+	ctx := context.Background()
+	root := filepath.Join(agentDir("ag_rec_live"), "memory")
+	// Stale file on target disk.
+	if err := os.WriteFile(filepath.Join(root, "2026-05-03.md"), []byte("stale"), 0o644); err != nil {
+		t.Fatalf("seed stale: %v", err)
+	}
+	// Fresh DB row from peer.
+	if _, err := st.InsertMemoryEntry(ctx, &store.MemoryEntryRecord{
+		ID: newMemoryEntryID(), AgentID: "ag_rec_live",
+		Kind: "daily", Name: "2026-05-03", Body: "fresh from peer",
+	}, store.MemoryEntryInsertOptions{}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	if err := ReconcileAgentDiskFromDB(ctx, st, "ag_rec_live", quietLogger()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "2026-05-03.md"))
+	if err != nil {
+		t.Fatalf("read after reconcile: %v", err)
+	}
+	if string(got) != "fresh from peer" {
+		t.Errorf("disk body = %q, want %q", string(got), "fresh from peer")
+	}
+}
+
+// TestReconcileAgentDiskFromDB_RemovesOrphan covers the
+// orphan-cleanup path: a disk file with no matching live DB row is
+// stale (either tombstoned or never had a row) and must be removed
+// so the next disk→DB sync doesn't resurrect it as a ghost row.
+func TestReconcileAgentDiskFromDB_RemovesOrphan(t *testing.T) {
+	st := memorySyncTestEnv(t, "ag_rec_orphan")
+	ctx := context.Background()
+	root := filepath.Join(agentDir("ag_rec_orphan"), "memory")
+	orphanPath := filepath.Join(root, "2026-05-02.md")
+	if err := os.WriteFile(orphanPath, []byte("orphan"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// DB has no row for 2026-05-02.
+
+	if err := ReconcileAgentDiskFromDB(ctx, st, "ag_rec_orphan", quietLogger()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if _, err := os.Stat(orphanPath); !os.IsNotExist(err) {
+		t.Errorf("orphan should be removed; stat err = %v", err)
+	}
+}
+
+// TestReconcileAgentDiskFromDB_HealsIncrementalStale covers the
+// incremental-mode follow-up bug codex called out: an unchanged DB
+// row whose disk file was corrupted by a previous buggy sync. The
+// reconciler reads the AUTHORITATIVE DB body and rewrites disk —
+// even if the row wasn't in this sync's delta.
+func TestReconcileAgentDiskFromDB_HealsIncrementalStale(t *testing.T) {
+	st := memorySyncTestEnv(t, "ag_rec_heal")
+	ctx := context.Background()
+	root := filepath.Join(agentDir("ag_rec_heal"), "memory")
+	if _, err := st.InsertMemoryEntry(ctx, &store.MemoryEntryRecord{
+		ID: newMemoryEntryID(), AgentID: "ag_rec_heal",
+		Kind: "daily", Name: "2026-04-15", Body: "correct body",
+	}, store.MemoryEntryInsertOptions{}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	// Plant stale disk (simulates prior buggy state).
+	if err := os.WriteFile(filepath.Join(root, "2026-04-15.md"), []byte("CORRUPTED"), 0o644); err != nil {
+		t.Fatalf("seed stale: %v", err)
+	}
+
+	if err := ReconcileAgentDiskFromDB(ctx, st, "ag_rec_heal", quietLogger()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got, _ := os.ReadFile(filepath.Join(root, "2026-04-15.md"))
+	if string(got) != "correct body" {
+		t.Errorf("stale disk not healed; body = %q", string(got))
+	}
+}
+
+// TestReconcileAgentDiskFromDB_MemoryNoRowRemovesDisk verifies the
+// MEMORY.md removal: DB has no live row → disk must be wiped so the
+// next disk→DB sync doesn't resurrect the stale local copy.
+func TestReconcileAgentDiskFromDB_MemoryNoRowRemovesDisk(t *testing.T) {
+	st := memorySyncTestEnv(t, "ag_rec_memnil")
+	ctx := context.Background()
+	memPath := filepath.Join(agentDir("ag_rec_memnil"), "MEMORY.md")
+	if err := os.WriteFile(memPath, []byte("stale memory"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := ReconcileAgentDiskFromDB(ctx, st, "ag_rec_memnil", quietLogger()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if _, err := os.Stat(memPath); !os.IsNotExist(err) {
+		t.Errorf("MEMORY.md should be removed; stat err = %v", err)
+	}
+}
+
+// TestReconcileAgentDiskFromDB_MemoryLiveOverwrites checks the
+// common case: DB has a fresh MEMORY.md body; disk has a stale one.
+// The reconciler rewrites disk so the next prepareChat disk→DB sync
+// observes a sha-matching file and stays as a no-op.
+func TestReconcileAgentDiskFromDB_MemoryLiveOverwrites(t *testing.T) {
+	st := memorySyncTestEnv(t, "ag_rec_memlive")
+	ctx := context.Background()
+	memPath := filepath.Join(agentDir("ag_rec_memlive"), "MEMORY.md")
+	if err := os.WriteFile(memPath, []byte("stale memory"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := st.UpsertAgentMemory(ctx, "ag_rec_memlive", "fresh from peer", "", store.AgentMemoryInsertOptions{
+		AllowOverwrite: true,
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := ReconcileAgentDiskFromDB(ctx, st, "ag_rec_memlive", quietLogger()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got, err := os.ReadFile(memPath)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "fresh from peer" {
+		t.Errorf("body = %q, want %q", string(got), "fresh from peer")
+	}
+}
+
+// TestReconcileAgentDiskFromDB_NoOpWhenInSync verifies the sha
+// short-circuit: a disk file already matching the DB body is NOT
+// rewritten (avoids unnecessary I/O on every sync for the hundreds
+// of unchanged daily diary files an agent accumulates).
+func TestReconcileAgentDiskFromDB_NoOpWhenInSync(t *testing.T) {
+	st := memorySyncTestEnv(t, "ag_rec_noop")
+	ctx := context.Background()
+	root := filepath.Join(agentDir("ag_rec_noop"), "memory")
+	body := "stable body"
+	if _, err := st.InsertMemoryEntry(ctx, &store.MemoryEntryRecord{
+		ID: newMemoryEntryID(), AgentID: "ag_rec_noop",
+		Kind: "daily", Name: "2026-05-03", Body: body,
+	}, store.MemoryEntryInsertOptions{}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	path := filepath.Join(root, "2026-05-03.md")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("seed disk: %v", err)
+	}
+	// Snapshot mtime so we can verify the file wasn't rewritten.
+	pre, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat pre: %v", err)
+	}
+	preMTime := pre.ModTime()
+	// Sleep a bit so a re-write would have a clearly newer mtime
+	// (filesystems with coarse-grained timestamps need this).
+	time.Sleep(20 * time.Millisecond)
+
+	if err := ReconcileAgentDiskFromDB(ctx, st, "ag_rec_noop", quietLogger()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	post, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat post: %v", err)
+	}
+	if !post.ModTime().Equal(preMTime) {
+		t.Errorf("disk was rewritten unnecessarily: mtime %v → %v",
+			preMTime, post.ModTime())
+	}
+}
+
+// TestReconcileAgentDiskFromDB_CanceledContextSkipsOrphan covers the
+// critical fail-safe: if ListMemoryEntries returns an error (here we
+// trigger it via a canceled context), the orphan-remove phase MUST
+// stay home — the expected set is incomplete and removing based on
+// it would clobber legitimate disk files. The reconciler returns the
+// error so the caller surfaces 500; disk is left untouched.
+func TestReconcileAgentDiskFromDB_CanceledContextSkipsOrphan(t *testing.T) {
+	st := memorySyncTestEnv(t, "ag_rec_cancel")
+	root := filepath.Join(agentDir("ag_rec_cancel"), "memory")
+
+	// Plant a disk file that LOOKS orphaned if expected is empty.
+	// If the reconciler runs orphan remove against the empty set
+	// produced by a failed list, this would be wrongly deleted.
+	keepPath := filepath.Join(root, "important.md")
+	if err := os.WriteFile(keepPath, []byte("important"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Pre-canceled context forces ListMemoryEntries to fail.
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := ReconcileAgentDiskFromDB(canceledCtx, st, "ag_rec_cancel", quietLogger())
+	if err == nil {
+		t.Errorf("expected an error from canceled context")
+	}
+	// Disk must be untouched.
+	if got, rerr := os.ReadFile(keepPath); rerr != nil || string(got) != "important" {
+		t.Errorf("orphan-remove ran on incomplete set; body = %q err=%v", got, rerr)
+	}
+}
+
+// TestReconcileAgentDiskFromDB_RemovesAliasDuplicate covers the
+// scanner-alias case: legacy v0 layout puts a topic at
+// memory/zzz.md while the v1 canonical path is memory/topics/zzz.md.
+// scanMemoryDir classifies BOTH as (kind=topic, name=zzz). Only the
+// canonical file is rewritten by the reconciler; the legacy alias
+// MUST be removed so the next disk→DB sync doesn't oscillate
+// between two bodies depending on scan order.
+func TestReconcileAgentDiskFromDB_RemovesAliasDuplicate(t *testing.T) {
+	st := memorySyncTestEnv(t, "ag_rec_alias")
+	ctx := context.Background()
+	root := filepath.Join(agentDir("ag_rec_alias"), "memory")
+	if err := os.MkdirAll(filepath.Join(root, "topics"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	legacyAlias := filepath.Join(root, "zzz.md")
+	canonical := filepath.Join(root, "topics", "zzz.md")
+	if err := os.WriteFile(legacyAlias, []byte("legacy"), 0o644); err != nil {
+		t.Fatalf("seed legacy: %v", err)
+	}
+	if err := os.WriteFile(canonical, []byte("v1"), 0o644); err != nil {
+		t.Fatalf("seed canonical: %v", err)
+	}
+	if _, err := st.InsertMemoryEntry(ctx, &store.MemoryEntryRecord{
+		ID: newMemoryEntryID(), AgentID: "ag_rec_alias",
+		Kind: "topic", Name: "zzz", Body: "v1",
+	}, store.MemoryEntryInsertOptions{}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	if err := ReconcileAgentDiskFromDB(ctx, st, "ag_rec_alias", quietLogger()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if _, err := os.Stat(legacyAlias); !os.IsNotExist(err) {
+		t.Errorf("legacy alias should be removed; stat err = %v", err)
+	}
+	if got, err := os.ReadFile(canonical); err != nil || string(got) != "v1" {
+		t.Errorf("canonical body = %q err=%v", got, err)
+	}
+}
+
+// TestReconcileAgentDiskFromDB_RejectsCrossKindAlias covers the
+// round-trip guard: two DB rows can have distinct (kind, name)
+// pairs yet resolve to the same canonical disk path. For example
+// (topic, "people/bob") and (people, "bob") both write to
+// memory/people/bob.md. The reconciler refuses to write the
+// aliasing row (and skips orphan remove for safety) so disk
+// reflects the unambiguous row only.
+func TestReconcileAgentDiskFromDB_RejectsCrossKindAlias(t *testing.T) {
+	st := memorySyncTestEnv(t, "ag_rec_alias_cross")
+	ctx := context.Background()
+	root := filepath.Join(agentDir("ag_rec_alias_cross"), "memory")
+	if err := os.MkdirAll(filepath.Join(root, "people"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Plant a legitimate (people, "bob") row + its disk file.
+	if _, err := st.InsertMemoryEntry(ctx, &store.MemoryEntryRecord{
+		ID: newMemoryEntryID(), AgentID: "ag_rec_alias_cross",
+		Kind: "people", Name: "bob", Body: "person-bob",
+	}, store.MemoryEntryInsertOptions{}); err != nil {
+		t.Fatalf("insert people/bob: %v", err)
+	}
+	bobPath := filepath.Join(root, "people", "bob.md")
+	if err := os.WriteFile(bobPath, []byte("person-bob"), 0o644); err != nil {
+		t.Fatalf("seed bob file: %v", err)
+	}
+	// Plant a colliding (topic, "people/bob") row. The sync
+	// upserts (insert at the DB layer) accept this because the
+	// schema's UNIQUE index is over (kind, name) — the pair is
+	// distinct from (people, "bob").
+	if _, err := st.InsertMemoryEntry(ctx, &store.MemoryEntryRecord{
+		ID: newMemoryEntryID(), AgentID: "ag_rec_alias_cross",
+		Kind: "topic", Name: "people/bob", Body: "WRONG-alias",
+	}, store.MemoryEntryInsertOptions{}); err != nil {
+		t.Fatalf("insert topic/people/bob: %v", err)
+	}
+
+	// Reconcile MUST surface an error (caller maps to 500) AND
+	// MUST NOT overwrite people/bob.md with the alias row's body.
+	if err := ReconcileAgentDiskFromDB(ctx, st, "ag_rec_alias_cross", quietLogger()); err == nil {
+		t.Errorf("expected round-trip mismatch error")
+	}
+	if got, err := os.ReadFile(bobPath); err != nil || string(got) != "person-bob" {
+		t.Errorf("legitimate people/bob.md got clobbered by alias: %q err=%v", got, err)
+	}
+}
+
+// TestReconcileAgentDiskFromDB_LegacyTopicSlashName covers the
+// resolver-consistency case: a v0-imported "topic" row with a name
+// containing "/" must round-trip through memoryEntryDiskPath for
+// both writes AND the orphan-scan match.
+func TestReconcileAgentDiskFromDB_LegacyTopicSlashName(t *testing.T) {
+	st := memorySyncTestEnv(t, "ag_rec_legacy")
+	ctx := context.Background()
+	root := filepath.Join(agentDir("ag_rec_legacy"), "memory")
+	legacyDir := filepath.Join(root, "oddball")
+	if err := os.MkdirAll(legacyDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	legacyPath := filepath.Join(legacyDir, "x.md")
+	if err := os.WriteFile(legacyPath, []byte("old"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := st.InsertMemoryEntry(ctx, &store.MemoryEntryRecord{
+		ID: newMemoryEntryID(), AgentID: "ag_rec_legacy",
+		Kind: "topic", Name: "oddball/x", Body: "updated",
+	}, store.MemoryEntryInsertOptions{}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	if err := ReconcileAgentDiskFromDB(ctx, st, "ag_rec_legacy", quietLogger()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got, err := os.ReadFile(legacyPath); err != nil || string(got) != "updated" {
+		t.Errorf("legacy slash body = %q err=%v", got, err)
 	}
 }
 

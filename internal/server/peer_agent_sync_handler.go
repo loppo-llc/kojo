@@ -3,12 +3,14 @@ package server
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/auth"
@@ -364,6 +366,19 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 			"since_memory_entry_seq is not a valid delta cursor; use since_memory_entry_updated_at")
 		return
 	}
+
+	// Hold memorySyncMu across BOTH the DB write and the disk
+	// materialize. Without one lock spanning both, a concurrent
+	// prepareChat on this peer could slip between commit and
+	// materialize, scan the STALE disk, and UPSERT the old bodies
+	// back into the DB — silently rolling back what we just synced.
+	// The lock is per-agent, so concurrent syncs for OTHER agents
+	// are unaffected.
+	releaseMemSync := agent.LockAgentMemorySync(req.Agent.ID)
+
+	incrementalMessages := req.SinceMessageSeq > 0
+	incrementalMemoryEntries := req.SinceMemoryEntryUpdatedAt > 0
+
 	if err := s.agents.Store().SyncAgentFromPeer(r.Context(), store.AgentSyncPayload{
 		Agent:                    req.Agent,
 		Persona:                  req.Persona,
@@ -371,9 +386,10 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 		Messages:                 req.Messages,
 		MemoryEntries:            req.MemoryEntries,
 		Tasks:                    req.Tasks,
-		IncrementalMessages:      req.SinceMessageSeq > 0,
-		IncrementalMemoryEntries: req.SinceMemoryEntryUpdatedAt > 0,
+		IncrementalMessages:      incrementalMessages,
+		IncrementalMemoryEntries: incrementalMemoryEntries,
 	}); err != nil {
+		releaseMemSync()
 		if sessionRollback != nil {
 			sessionRollback()
 		}
@@ -385,6 +401,45 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 	}
 	if sessionCommit != nil {
 		sessionCommit()
+	}
+
+	// Reconcile target's MEMORY.md + memory/* tree against the
+	// authoritative post-commit DB state. Without this, target's
+	// STALE local files (left over from a previous time it hosted
+	// the agent) look "canonical" to the next prepareChat / Load
+	// sync, which walks the disk and UPSERTs the old bodies back
+	// into the DB — silently rolling back peer→hub's new state
+	// (notably today's diary entries).
+	//
+	// Reading from DB (rather than the wire payload's delta) makes
+	// the incremental path safe too: source might have shipped
+	// only the changed rows, but target still needs every UNCHANGED
+	// row's disk file to match its DB body — otherwise stale disk
+	// for those rows triggers the same rollback bug.
+	//
+	// A reconcile failure here is a hard failure — leaving stale
+	// disk in place would re-trigger the rollback bug on the next
+	// prepareChat. The 500 lets the orchestrator retry agent-sync;
+	// SyncAgentFromPeer is idempotent (UPSERT-by-id) so the DB
+	// side replays cleanly.
+	//
+	// Use a fresh Background-rooted ctx (NOT r.Context()) so a
+	// client cancel / HTTP timeout between SyncAgentFromPeer's
+	// commit and the reconcile can't strand target with the DB
+	// updated but disk still stale — that's the exact state the
+	// reconciler exists to prevent. 60s is generous; the typical
+	// agent has fewer than a thousand memory_entries and reads
+	// finish in milliseconds.
+	reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	merr := agent.ReconcileAgentDiskFromDBHeld(reconcileCtx, s.agents.Store(), req.Agent.ID, s.logger)
+	reconcileCancel()
+	releaseMemSync()
+	if merr != nil {
+		s.logger.Error("peer agent-sync: disk reconcile failed; surface 500 so orchestrator retries",
+			"agent", req.Agent.ID, "err", merr)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"reconcile disk: "+merr.Error())
+		return
 	}
 
 	// Minimal post-write hook: refresh agent.Manager's in-memory

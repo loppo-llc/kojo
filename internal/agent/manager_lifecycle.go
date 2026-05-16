@@ -579,25 +579,46 @@ func (m *Manager) ActivateAgentRuntime(agentID string) {
 }
 
 // arrivalNotified deduplicates NotifyDeviceSwitchArrival across
-// finalize retries. A finalize hook failure (e.g. kv commit error)
-// causes the orchestrator to retry, which re-fires the hook
-// including NotifyDeviceSwitchArrival. Without dedup, the agent
-// would receive duplicate "device switch complete" system messages.
-// Keyed by agentID; value is irrelevant.
+// finalize retries for ONE specific switch attempt. A finalize hook
+// failure (e.g. transient kv commit error) causes the orchestrator
+// to retry, which re-fires the hook including
+// NotifyDeviceSwitchArrival. Without dedup, the agent would receive
+// duplicate "device switch complete" system messages for the same
+// op.
+//
+// Keyed by (agentID, opID) so a SUBSEQUENT switch back to this peer
+// (different opID) is NOT deduped — earlier versions keyed by
+// agentID alone, never cleared the entry, and silently skipped every
+// switch-back-to-this-peer beyond the first one for the daemon's
+// lifetime. The chat would fire on switch #1 but the auto-continue
+// would be missing on switches #2, #3, … leaving claude with no
+// input to resume from. Same-op dedup is what we actually want; the
+// agentID-only key was overly broad.
 var arrivalNotified sync.Map
+
+type arrivalDedupKey struct {
+	agentID string
+	opID    string
+}
 
 // NotifyDeviceSwitchArrival sends a system message to the agent so
 // it can immediately resume work on this peer after a device switch.
 // Runs async — the caller doesn't need to wait for the chat to
 // finish. If the agent is already busy (e.g. a cron tick landed at
 // the same instant) the system message is skipped silently.
-// Idempotent: a second call for the same agentID is a no-op (guards
-// against finalize retry).
-func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName string) {
+//
+// Idempotent across finalize retries for the SAME opID; a fresh
+// opID (a future switch back to this peer for the same agent) fires
+// its own arrival chat. opID may be empty for legacy / test callers,
+// in which case the dedup keys on agentID alone — accept that the
+// retry-safety degrades to old behavior rather than impose an opID
+// requirement on every caller.
+func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string) {
 	if m == nil || agentID == "" {
 		return
 	}
-	if _, dup := arrivalNotified.LoadOrStore(agentID, struct{}{}); dup {
+	key := arrivalDedupKey{agentID: agentID, opID: opID}
+	if _, dup := arrivalNotified.LoadOrStore(key, struct{}{}); dup {
 		return
 	}
 	go func() {
@@ -607,20 +628,24 @@ func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName string) {
 		prompt := "デバイス転移完了。転移元: " + sourcePeerName + "。このデバイスで作業を継続してください。直前の会話の流れを確認し、中断された作業があれば再開してください。"
 		events, err := m.Chat(ctx, agentID, prompt, "system", nil, BusySourceNotification)
 		if err != nil {
-			// Clear dedup so a future switch can try again.
-			arrivalNotified.Delete(agentID)
+			// Clear dedup so a finalize retry for the SAME op can
+			// fire — the chat never landed, retry is benign.
+			arrivalNotified.Delete(key)
 			if m.logger != nil {
-				m.logger.Info("device-switch arrival chat skipped", "agent", agentID, "err", err)
+				m.logger.Info("device-switch arrival chat skipped", "agent", agentID, "op_id", opID, "err", err)
 			}
 			return
 		}
 		// Drain events — the chat runs to completion in the
 		// background. Transcript is persisted via the normal
-		// processChatEvents path.
+		// processChatEvents path. The dedup entry stays in place
+		// so a manual finalize retry days later doesn't re-fire
+		// the arrival chat for the same op; a subsequent switch
+		// with a fresh opID is unaffected.
 		for range events {
 		}
 		if m.logger != nil {
-			m.logger.Info("device-switch arrival chat completed", "agent", agentID)
+			m.logger.Info("device-switch arrival chat completed", "agent", agentID, "op_id", opID)
 		}
 	}()
 }

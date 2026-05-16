@@ -838,7 +838,7 @@ func main() {
 		// runs after the orchestrator's complete succeeds;
 		// an aborted switch fires drop instead, leaving the
 		// rows present but not actively claimed by this peer.
-		srv.SetOnAgentSyncFinalized(func(hookCtx context.Context, agentID, rawToken, sourceDeviceID string) error {
+		srv.SetOnAgentSyncFinalized(func(hookCtx context.Context, agentID, rawToken, sourceDeviceID, opID string) error {
 			// Step order is durability-first: write the durable
 			// arrived marker BEFORE touching token / lock-guard
 			// state, THEN best-effort clear any prior released
@@ -894,7 +894,7 @@ func main() {
 						sourceName = rec.Name
 					}
 				}
-				agentMgr.NotifyDeviceSwitchArrival(agentID, sourceName)
+				agentMgr.NotifyDeviceSwitchArrival(agentID, sourceName, opID)
 			}
 			return nil
 		})

@@ -110,7 +110,7 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if s.onAgentSyncFinalized != nil {
-		if err := s.onAgentSyncFinalized(r.Context(), req.AgentID, entry.RawToken, req.SourceDeviceID); err != nil {
+		if err := s.onAgentSyncFinalized(r.Context(), req.AgentID, entry.RawToken, req.SourceDeviceID, req.OpID); err != nil {
 			// Hook failed (e.g. transient kv write error on
 			// AdoptAgentTokenFromPeer). Leave the pending
 			// entry in place so a retry can pick it up; the
