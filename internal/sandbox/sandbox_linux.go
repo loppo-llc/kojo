@@ -121,13 +121,23 @@ func ExecSandboxed(args []string) {
 	}
 }
 
-// landlockABI queries the kernel for the best supported Landlock ABI version.
+// landlockABI queries the kernel for the best supported Landlock ABI
+// version.
+//
+// The version-probe form of landlock_create_ruleset requires BOTH the attr
+// pointer to be NULL AND size to be 0. The kernel checks this explicitly
+// (see security/landlock/syscalls.c: the LANDLOCK_CREATE_RULESET_VERSION
+// branch returns -EINVAL unless `!attr && !size`). An earlier revision of
+// this function passed a non-nil pointer to a zero-value struct, which
+// looks harmless but is treated by the kernel as a malformed call:
+// landlockABI always returned EINVAL on every supported kernel, Available()
+// fell through to false, and the sandbox was never enabled in practice.
+// The NULL form below is the only form that actually returns the ABI.
 func landlockABI() (int, error) {
-	attr := unix.LandlockRulesetAttr{}
 	r, _, errno := syscall.Syscall(
 		unix.SYS_LANDLOCK_CREATE_RULESET,
-		uintptr(unsafe.Pointer(&attr)),
-		0, // size=0 with LANDLOCK_CREATE_RULESET_VERSION flag
+		0, // attr must be NULL for the version probe
+		0, // size must be 0 for the version probe
 		unix.LANDLOCK_CREATE_RULESET_VERSION,
 	)
 	if errno != 0 {
