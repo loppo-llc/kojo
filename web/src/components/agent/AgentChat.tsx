@@ -8,6 +8,13 @@ import { useAgentWebSocket } from "../../hooks/useAgentWebSocket";
 import { useTTSAutoToggle, useTTSPlayer } from "../../hooks/useTTS";
 import { ChatMessage, StreamingMessage } from "./ChatMessage";
 import { AgentAvatar } from "./AgentAvatar";
+import {
+  appendSystemErrorIfNew,
+  appendUniqueMessage,
+  applyDoneMessage,
+  applyToolResult,
+  newToolFromEvent,
+} from "./chatEventReducer";
 
 const PAGE_SIZE = 30;
 
@@ -173,43 +180,22 @@ export function AgentChat() {
           liveStreamThinkingRef.current += event.delta ?? "";
           setStreamThinking((prev) => prev + (event.delta ?? ""));
           break;
-        case "tool_use":
-          if (event.toolName) {
-            const tool = { id: event.toolUseId ?? "", name: event.toolName!, input: event.toolInput ?? "", output: null };
+        case "tool_use": {
+          const tool = newToolFromEvent(event);
+          if (tool) {
             liveStreamToolsRef.current = [...liveStreamToolsRef.current, tool];
             setStreamTools((prev) => [...prev, tool]);
           }
           break;
+        }
         case "tool_result": {
-          const matchById = (t: { id: string; name: string; output: string | null }) =>
-            event.toolUseId ? t.id === event.toolUseId : t.name === event.toolName && t.output === null;
-          const liveTools = [...liveStreamToolsRef.current];
-          for (let i = liveTools.length - 1; i >= 0; i--) {
-            if (matchById(liveTools[i])) {
-              liveTools[i] = { ...liveTools[i], output: event.toolOutput ?? "" };
-              break;
-            }
-          }
-          liveStreamToolsRef.current = liveTools;
-          setStreamTools((prev) => {
-            const copy = [...prev];
-            for (let i = copy.length - 1; i >= 0; i--) {
-              if (matchById(copy[i])) {
-                copy[i] = { ...copy[i], output: event.toolOutput ?? "" };
-                break;
-              }
-            }
-            return copy;
-          });
+          liveStreamToolsRef.current = applyToolResult(liveStreamToolsRef.current, event);
+          setStreamTools((prev) => applyToolResult(prev, event));
           break;
         }
         case "message": {
           if (event.message) {
-            setMessages((prev) =>
-              prev.some((m) => m.id === event.message!.id)
-                ? prev
-                : [...prev, event.message!],
-            );
+            setMessages((prev) => appendUniqueMessage(prev, event.message!));
           }
           break;
         }
@@ -219,24 +205,15 @@ export function AgentChat() {
 
           if (abortedId) {
             // Abort message was already committed by handleAbort.
-            // If the server delivered a more complete version, upgrade it.
+            // applyDoneMessage handles the upgrade-or-drop branch
+            // for the synthetic marker; when event.message is absent
+            // it falls through to a copy (the marker stays).
             if (event.message) {
-              setMessages((prev) => {
-                // If server's message already exists (e.g. stale synthesized
-                // terminal from a prior turn), just remove the synthetic abort.
-                if (prev.some((m) => m.id === event.message!.id && m.id !== abortedId)) {
-                  return prev.filter((m) => m.id !== abortedId);
-                }
-                return prev.map((m) => m.id === abortedId ? event.message! : m);
-              });
+              setMessages((prev) => applyDoneMessage(prev, event, abortedId));
             }
           } else if (event.message) {
-            // Normal completion — deduplicate by message ID
-            setMessages((prev) =>
-              prev.some((m) => m.id === event.message!.id)
-                ? prev
-                : [...prev, event.message!],
-            );
+            // Normal completion — appendUniqueMessage dedupes by id.
+            setMessages((prev) => applyDoneMessage(prev, event, null));
             // Auto-play if both agent has TTS enabled AND the user has
             // the header toggle on. abortedId == null already guarantees
             // this is a real completion, not a synthesized abort marker.
@@ -266,21 +243,9 @@ export function AgentChat() {
           // Show process error as system message (e.g. auth failures, stderr).
           if (event.errorMessage) {
             const errorContent = `⚠️ Error: ${event.errorMessage}`;
-            setMessages((prev) => {
-              const last = prev[prev.length - 1];
-              if (last?.role === "system" && last.content === errorContent) {
-                return prev;
-              }
-              return [
-                ...prev,
-                {
-                  id: "error_" + Date.now(),
-                  role: "system",
-                  content: errorContent,
-                  timestamp: localRFC3339(),
-                },
-              ];
-            });
+            setMessages((prev) =>
+              appendSystemErrorIfNew(prev, errorContent, Date.now, localRFC3339),
+            );
           }
           resetStream();
           break;
@@ -288,22 +253,9 @@ export function AgentChat() {
         case "error": {
           abortedIdRef.current = null; // Clear on every terminal path
           const errorContent = `⚠️ Error: ${event.errorMessage || "An error occurred"}`;
-          setMessages((prev) => {
-            // Skip if already shown (e.g. loaded from transcript on reconnect)
-            const last = prev[prev.length - 1];
-            if (last?.role === "system" && last.content === errorContent) {
-              return prev;
-            }
-            return [
-              ...prev,
-              {
-                id: "error_" + Date.now(),
-                role: "system",
-                content: errorContent,
-                timestamp: localRFC3339(),
-              },
-            ];
-          });
+          setMessages((prev) =>
+            appendSystemErrorIfNew(prev, errorContent, Date.now, localRFC3339),
+          );
           resetStream();
           break;
         }
