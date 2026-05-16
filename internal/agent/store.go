@@ -409,13 +409,14 @@ func (st *agentStore) upsertAgentRow(ctx context.Context, a *Agent, created, upd
 // — or (b) body is empty AND no prior row exists (creating an empty
 // row would etag-churn it on the next real persona write).
 //
-// Lock ordering: callers reach this method without holding
-// personaSyncMu; the per-agent mutex is acquired here. The outer
-// store.mu in Manager.save and friends is therefore released BEFORE
-// this lock is taken, matching the project-wide store.mu →
-// personaSyncMu ordering. PutAgentPersona / syncPersona take the
-// same mutex themselves so the read-then-upsert pair below cannot
-// race a concurrent Web-client PUT.
+// Lock ordering: this method does NOT take store.mu itself, but its
+// callers (Manager.save / Upsert / SaveAgentRowOnly via upsertAgent
+// → upsertAgentInner) typically hold store.mu when they reach
+// here. The per-agent personaSyncMu is acquired here, so the
+// effective acquisition order is store.mu → personaSyncMu — the
+// established project-wide ordering. PutAgentPersona / syncPersona
+// take personaSyncMu themselves so the read-then-upsert pair below
+// cannot race a concurrent Web-client PUT.
 func (st *agentStore) syncAgentPersonaRow(ctx context.Context, a *Agent, updated int64) error {
 	releaseSync := lockPersonaSync(a.ID)
 	defer releaseSync()

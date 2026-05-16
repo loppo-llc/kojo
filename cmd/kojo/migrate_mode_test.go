@@ -5,18 +5,17 @@ import "testing"
 // TestClassifyStartupMode locks in the flag → mode mapping that
 // applyStartupGate dispatches on. Invariants:
 //
-//   - At most one primary mode flag may be set; multiple = Invalid.
-//   - rollbackExternal wins over the others when only it is set.
-//   - migrateRestart wins over migrate when only those two are set
-//     (operator override semantics: --migrate-restart is the "force
-//     redo" variant).
+//   - At most one primary mode flag may be set; multiple = Invalid
+//     (this includes the migrate + migrateRestart combo — they are
+//     siblings, NOT a layered "restart wins" relationship).
+//   - rollbackExternal-only → RollbackExternal.
 //   - migrate-only → Migrate.
+//   - migrateRestart-only → MigrateRestart.
 //   - fresh-only → Fresh.
-//   - No flags → Normal.
+//   - No primary flags → Normal.
 //
-// The migrateRestart-and-nothing-else case explicitly does NOT also
-// set migrate=true; we only document what the gate does when given
-// a sane primary-mode bitset.
+// Each case sets exactly one primary flag; the Invalid cases pin
+// the multi-set behavior.
 func TestClassifyStartupMode(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -41,6 +40,15 @@ func TestClassifyStartupMode(t *testing.T) {
 		{
 			name:  "migrateRestart + fresh = invalid",
 			flags: migrationFlags{migrateRestart: true, fresh: true},
+			want:  startupModeInvalid,
+		},
+		{
+			// Codex-flagged case: migrate + migrateRestart are siblings
+			// in primaryModeCount, NOT a layered relationship where
+			// migrateRestart overrides migrate. Both true counts as 2
+			// primary flags → Invalid.
+			name:  "migrate + migrateRestart = invalid",
+			flags: migrationFlags{migrate: true, migrateRestart: true},
 			want:  startupModeInvalid,
 		},
 		{

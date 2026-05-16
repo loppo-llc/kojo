@@ -68,31 +68,38 @@ export function newToolFromEvent(event: ChatEvent): StreamingTool | null {
 
 /**
  * Append a message unless an entry with the same id is already
- * present. Used by `message` and the no-abort `done` path. Returns a
- * new array; the input is never mutated.
+ * present. Used by `message` and the no-abort `done` path.
+ *
+ * Returns the SAME array reference when the dedupe fires — that
+ * matches React's referential-equality fast path so setMessages
+ * with this result is a no-op and the parent component does not
+ * re-render. The readonly cast in the return type is the caller's
+ * problem to widen if needed (every call site treats the result
+ * as immutable).
  */
 export function appendUniqueMessage(
-  msgs: readonly AgentMessage[],
+  msgs: AgentMessage[],
   m: AgentMessage,
 ): AgentMessage[] {
-  return msgs.some((x) => x.id === m.id) ? msgs.slice() : [...msgs, m];
+  return msgs.some((x) => x.id === m.id) ? msgs : [...msgs, m];
 }
 
 /**
  * Append a system-error entry to msgs unless the trailing entry is
- * already an identical system message. Returns the array unchanged
- * (new copy) when the dedupe fires. id factory + timestamp factory
- * are parameters so tests can pin them.
+ * already an identical system message. Returns the SAME array
+ * reference on dedupe (same React-fast-path reason as
+ * appendUniqueMessage). id factory + timestamp factory are
+ * parameters so tests can pin them.
  */
 export function appendSystemErrorIfNew(
-  msgs: readonly AgentMessage[],
+  msgs: AgentMessage[],
   errorContent: string,
   nowMs: () => number,
   timestamp: () => string,
 ): AgentMessage[] {
   const last = msgs[msgs.length - 1];
   if (last && last.role === "system" && last.content === errorContent) {
-    return msgs.slice();
+    return msgs;
   }
   return [
     ...msgs,
@@ -122,11 +129,15 @@ export function appendSystemErrorIfNew(
  * reducer.
  */
 export function applyDoneMessage(
-  msgs: readonly AgentMessage[],
+  msgs: AgentMessage[],
   event: ChatEvent,
   abortedId: string | null,
 ): AgentMessage[] {
-  if (event.type !== "done" || !event.message) return msgs.slice();
+  // Non-done / no-message events are a no-op; return the SAME
+  // array so React's setState referential fast-path elides the
+  // re-render (matches the pre-refactor inline behavior of falling
+  // through the switch case).
+  if (event.type !== "done" || !event.message) return msgs;
   const incoming = event.message;
   if (abortedId) {
     if (msgs.some((m) => m.id === incoming.id && m.id !== abortedId)) {

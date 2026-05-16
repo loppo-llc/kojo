@@ -123,12 +123,12 @@ describe("appendUniqueMessage", () => {
     expect(after.map((m) => m.id)).toEqual(["a", "b", "c"]);
   });
 
-  it("is a no-op (copy) when the id already exists", () => {
+  it("returns the SAME array reference when the id already exists (React fast-path)", () => {
     const prev = [msg("a", "user"), msg("b", "assistant")];
     const after = appendUniqueMessage(prev, msg("a", "user", "different content"));
     expect(after.map((m) => m.id)).toEqual(["a", "b"]);
     expect(after[0].content).toBe(""); // original kept, NOT replaced
-    expect(after).not.toBe(prev);
+    expect(after).toBe(prev);
   });
 });
 
@@ -148,14 +148,13 @@ describe("appendSystemErrorIfNew", () => {
     expect(after[1].id).toBe("error_1700000000000");
   });
 
-  it("dedupes when the trailing entry is an identical system error", () => {
+  it("returns the SAME array reference when the trailing entry is an identical system error", () => {
     const prev: AgentMessage[] = [
       msg("a", "user", "hi"),
       msg("error_old", "system", "⚠️ Error: oops"),
     ];
     const after = appendSystemErrorIfNew(prev, "⚠️ Error: oops", nowMs, ts);
-    expect(after.length).toBe(2);
-    expect(after[1].id).toBe("error_old"); // original kept
+    expect(after).toBe(prev); // React state setter fast-paths on identity
   });
 
   it("does NOT dedupe when the tail is a non-system entry with matching content", () => {
@@ -197,17 +196,15 @@ describe("applyDoneMessage", () => {
     expect(after[0].content).toBe("earlier completion"); // existing entry NOT clobbered
   });
 
-  it("returns a copy when event.message is absent", () => {
+  it("returns the SAME array reference when event.message is absent", () => {
     const prev = [msg("a", "user")];
     const after = applyDoneMessage(prev, { type: "done" }, null);
-    expect(after).toEqual(prev);
-    expect(after).not.toBe(prev);
+    expect(after).toBe(prev);
   });
 
-  it("returns a copy for non-done events", () => {
+  it("returns the SAME array reference for non-done events", () => {
     const prev = [msg("a", "user")];
     const after = applyDoneMessage(prev, { type: "text", delta: "x" } as ChatEvent, null);
-    expect(after).toEqual(prev);
-    expect(after).not.toBe(prev);
+    expect(after).toBe(prev);
   });
 });
