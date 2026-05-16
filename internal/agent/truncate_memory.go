@@ -441,6 +441,113 @@ func truncateClaudeSessions(agentDirPath string, since time.Time, logger *slog.L
 // timestamp boundary" case without nibbling at completed turns.
 //
 // If every line would be dropped, the file is removed instead.
+// claudeSessionEntry is the post-classification view of one raw line
+// from a Claude session JSONL. raw is the original bytes (including
+// the trailing newline) so a no-op rewrite is byte-identical. typ /
+// real / toolUseIDs / toolResultIDs are filled in only when the line
+// parses as JSON with a known "type"; otherwise everything but raw is
+// zero, and the line is preserved verbatim by every downstream pass.
+type claudeSessionEntry struct {
+	raw           []byte
+	typ           string
+	real          bool     // for type=="user": real user msg vs tool_result feedback
+	toolUseIDs    []string // tool_use ids contained in an assistant message
+	toolResultIDs []string // tool_use_id refs contained in a synthetic user message
+}
+
+// classifyClaudeSessionLines walks rawLines once, dropping entries whose
+// timestamp is at-or-after `since` and tagging the survivors with the
+// type / tool-block-id metadata pruneOrphanTailEntries needs. Lines
+// that are blank or fail JSON parsing are preserved verbatim (only the
+// raw field is set); they never participate in the timestamp gate.
+func classifyClaudeSessionLines(rawLines [][]byte, since time.Time) (keep []claudeSessionEntry, timestampDropped int) {
+	keep = make([]claudeSessionEntry, 0, len(rawLines))
+	for _, raw := range rawLines {
+		stripped := raw
+		if len(stripped) > 0 && stripped[len(stripped)-1] == '\n' {
+			stripped = stripped[:len(stripped)-1]
+			if len(stripped) > 0 && stripped[len(stripped)-1] == '\r' {
+				stripped = stripped[:len(stripped)-1]
+			}
+		}
+		if len(stripped) == 0 {
+			keep = append(keep, claudeSessionEntry{raw: raw})
+			continue
+		}
+		var entry struct {
+			Type      string          `json:"type"`
+			Timestamp string          `json:"timestamp"`
+			Message   json.RawMessage `json:"message"`
+		}
+		if json.Unmarshal(stripped, &entry) != nil {
+			keep = append(keep, claudeSessionEntry{raw: raw})
+			continue
+		}
+		if entry.Timestamp != "" {
+			if t, perr := time.Parse(time.RFC3339Nano, entry.Timestamp); perr == nil && !t.Before(since) {
+				timestampDropped++
+				continue
+			}
+		}
+		k := claudeSessionEntry{raw: raw, typ: entry.Type}
+		switch entry.Type {
+		case "user":
+			k.real = isRealUserEntry(entry.Message)
+			if !k.real {
+				k.toolResultIDs = collectToolResultIDs(entry.Message)
+			}
+		case "assistant":
+			k.toolUseIDs = collectToolUseIDs(entry.Message)
+		}
+		keep = append(keep, k)
+	}
+	return keep, timestampDropped
+}
+
+// pruneOrphanTailEntries removes trailing synthetic-user (tool_result)
+// entries that reference a tool_use_id no longer present, and then any
+// assistant tail entries those drops have orphaned (assistant turns
+// whose tool_use blocks lack a downstream tool_result match). The
+// loop runs until the tail is stable.
+//
+// Healthy trailing assistant turns (no orphaned tool_use blocks) are
+// left alone so a no-op truncation does not damage a healthy session.
+func pruneOrphanTailEntries(keep []claudeSessionEntry) (after []claudeSessionEntry, dropped int) {
+	for {
+		n := len(keep)
+		if n == 0 {
+			break
+		}
+		matched := make(map[string]bool)
+		for _, k := range keep {
+			for _, id := range k.toolResultIDs {
+				if id != "" {
+					matched[id] = true
+				}
+			}
+		}
+		last := keep[n-1]
+		drop := false
+		switch {
+		case last.typ == "user" && !last.real:
+			drop = true
+		case last.typ == "assistant" && len(last.toolUseIDs) > 0:
+			for _, id := range last.toolUseIDs {
+				if id != "" && !matched[id] {
+					drop = true
+					break
+				}
+			}
+		}
+		if !drop {
+			break
+		}
+		keep = keep[:n-1]
+		dropped++
+	}
+	return keep, dropped
+}
+
 func truncateClaudeSessionFile(path string, since time.Time) (removed int, deleted bool, err error) {
 	src, oerr := os.Open(path)
 	if oerr != nil {
@@ -468,89 +575,13 @@ func truncateClaudeSessionFile(path string, since time.Time) (removed int, delet
 	}
 	src.Close()
 
-	type kept struct {
-		raw           []byte
-		typ           string
-		real          bool     // for type=="user": real user msg vs tool_result feedback
-		toolUseIDs    []string // tool_use ids contained in an assistant message
-		toolResultIDs []string // tool_use_id refs contained in a synthetic user message
-	}
-	keep := make([]kept, 0, len(rawLines))
-	timestampDropped := 0
-	for _, raw := range rawLines {
-		stripped := raw
-		if len(stripped) > 0 && stripped[len(stripped)-1] == '\n' {
-			stripped = stripped[:len(stripped)-1]
-			if len(stripped) > 0 && stripped[len(stripped)-1] == '\r' {
-				stripped = stripped[:len(stripped)-1]
-			}
-		}
-		if len(stripped) == 0 {
-			keep = append(keep, kept{raw: raw})
-			continue
-		}
-		var entry struct {
-			Type      string          `json:"type"`
-			Timestamp string          `json:"timestamp"`
-			Message   json.RawMessage `json:"message"`
-		}
-		if json.Unmarshal(stripped, &entry) != nil {
-			keep = append(keep, kept{raw: raw})
-			continue
-		}
-		if entry.Timestamp != "" {
-			if t, perr := time.Parse(time.RFC3339Nano, entry.Timestamp); perr == nil && !t.Before(since) {
-				removed++
-				timestampDropped++
-				continue
-			}
-		}
-		k := kept{raw: raw, typ: entry.Type}
-		switch entry.Type {
-		case "user":
-			k.real = isRealUserEntry(entry.Message)
-			if !k.real {
-				k.toolResultIDs = collectToolResultIDs(entry.Message)
-			}
-		case "assistant":
-			k.toolUseIDs = collectToolUseIDs(entry.Message)
-		}
-		keep = append(keep, k)
-	}
+	keep, timestampDropped := classifyClaudeSessionLines(rawLines, since)
+	removed = timestampDropped
 
 	if timestampDropped > 0 {
-		for {
-			n := len(keep)
-			if n == 0 {
-				break
-			}
-			matched := make(map[string]bool)
-			for _, k := range keep {
-				for _, id := range k.toolResultIDs {
-					if id != "" {
-						matched[id] = true
-					}
-				}
-			}
-			last := keep[n-1]
-			drop := false
-			switch {
-			case last.typ == "user" && !last.real:
-				drop = true
-			case last.typ == "assistant" && len(last.toolUseIDs) > 0:
-				for _, id := range last.toolUseIDs {
-					if id != "" && !matched[id] {
-						drop = true
-						break
-					}
-				}
-			}
-			if !drop {
-				break
-			}
-			keep = keep[:n-1]
-			removed++
-		}
+		var orphanDropped int
+		keep, orphanDropped = pruneOrphanTailEntries(keep)
+		removed += orphanDropped
 	}
 
 	// No-op early return: a session whose timestamps were all pre-T must
