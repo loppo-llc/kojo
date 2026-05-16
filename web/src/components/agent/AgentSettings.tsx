@@ -31,7 +31,6 @@ export function AgentSettings() {
   const [silentStart, setSilentStart] = useState("");
   const [silentEnd, setSilentEnd] = useState("");
   const [notifyDuringSilent, setNotifyDuringSilent] = useState(false);
-  const [cronMessage, setCronMessage] = useState("");
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [archiving, setArchiving] = useState(false);
@@ -135,11 +134,25 @@ export function AgentSettings() {
   const [forkIncludeTranscript, setForkIncludeTranscript] = useState(false);
   const [forking, setForking] = useState(false);
   const [forkError, setForkError] = useState("");
+  const [userContext, setUserContext] = useState("");
+  const [userContextDirty, setUserContextDirty] = useState(false);
+  const [savingUserContext, setSavingUserContext] = useState(false);
+  const [cronMessage, setCronMessage] = useState("");
+  // Track whether cronMessage diverges from what's persisted in checkin.md.
+  // Manual check-in runs against the persisted file, so editing the textarea
+  // without saving would silently fire with stale instructions. We block the
+  // button when this is true (see handleCheckin).
+  const [savedCronMessage, setSavedCronMessage] = useState("");
+  const cronMessageDirty = cronMessage !== savedCronMessage;
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!id) return;
-    agentApi.get(id).then((a) => {
+    Promise.all([
+      agentApi.get(id),
+      agentApi.userContext.get(id),
+      agentApi.getCheckinFile(id),
+    ]).then(([a, uc, checkin]) => {
       setAgent(a);
       setName(a.name);
       setPersona(a.persona);
@@ -157,7 +170,6 @@ export function AgentSettings() {
       setSilentStart(a.silentStart ?? "");
       setSilentEnd(a.silentEnd ?? "");
       setNotifyDuringSilent(a.notifyDuringSilent ?? true);
-      setCronMessage(a.cronMessage ?? "");
       setAllowedTools(a.allowedTools ?? []);
       setAllowProtectedPaths(a.allowProtectedPaths ?? []);
       setPrivileged(a.privileged ?? false);
@@ -165,6 +177,9 @@ export function AgentSettings() {
       setTTSModel(a.tts?.model ?? "");
       setTTSVoice(a.tts?.voice ?? "");
       setTTSStylePrompt(a.tts?.stylePrompt ?? "");
+      setUserContext(uc);
+      setCronMessage(checkin.content);
+      setSavedCronMessage(checkin.content);
     }).catch(() => navigate("/"));
   }, [id, navigate]);
 
@@ -190,36 +205,45 @@ export function AgentSettings() {
     setError("");
     setSuccess(false);
     try {
-      const updated = await agentApi.update(id!, {
-        name: name.trim(),
-        persona: persona.trim(),
-        ...(publicProfileOverride ? { publicProfile: publicProfile.trim() } : {}),
-        publicProfileOverride,
-        model: model.trim(),
-        effort: supportsEffort(tool) ? effort : undefined,
-        tool: tool.trim(),
-        customBaseURL: needsCustomURL ? customBaseURL.trim() : undefined,
-        thinkingMode: tool === "llama.cpp" ? thinkingMode : undefined,
-        workDir: workDir.trim(),
-        intervalMinutes,
-        timeoutMinutes,
-        resumeIdleMinutes,
-        silentStart,
-        silentEnd,
-        notifyDuringSilent,
-        cronMessage,
-        allowedTools: (tool === "custom") ? allowedTools : undefined,
-        allowProtectedPaths: (tool === "claude" || tool === "custom") ? allowProtectedPaths : undefined,
-        tts: {
-          enabled: ttsEnabled,
-          model: ttsModel || undefined,
-          voice: ttsVoice || undefined,
-          stylePrompt: ttsStylePrompt.trim() || undefined,
-        },
-      });
+      const [updated, , savedCheckin] = await Promise.all([
+        agentApi.update(id!, {
+          name: name.trim(),
+          persona: persona.trim(),
+          ...(publicProfileOverride ? { publicProfile: publicProfile.trim() } : {}),
+          publicProfileOverride,
+          model: model.trim(),
+          effort: supportsEffort(tool) ? effort : undefined,
+          tool: tool.trim(),
+          customBaseURL: needsCustomURL ? customBaseURL.trim() : undefined,
+          thinkingMode: tool === "llama.cpp" ? thinkingMode : undefined,
+          workDir: workDir.trim(),
+          intervalMinutes,
+          timeoutMinutes,
+          resumeIdleMinutes,
+          silentStart,
+          silentEnd,
+          notifyDuringSilent,
+          allowedTools: (tool === "custom") ? allowedTools : undefined,
+          allowProtectedPaths: (tool === "claude" || tool === "custom") ? allowProtectedPaths : undefined,
+          tts: {
+            enabled: ttsEnabled,
+            model: ttsModel || undefined,
+            voice: ttsVoice || undefined,
+            stylePrompt: ttsStylePrompt.trim() || undefined,
+          },
+        }),
+        agentApi.userContext.set(id!, userContext),
+        agentApi.putCheckinFile(id!, cronMessage),
+      ]);
       setAgent(updated);
       setPublicProfile(updated.publicProfile ?? "");
       setPublicProfileOverride(updated.publicProfileOverride ?? false);
+      setUserContextDirty(false);
+      // Sync the textarea to the server-normalized value (WriteCheckinFile
+      // trims whitespace) so the UI matches what was actually persisted, and
+      // reset the dirty flag so manual check-in unblocks.
+      setCronMessage(savedCheckin);
+      setSavedCronMessage(savedCheckin);
       setSuccess(true);
       setTimeout(() => setSuccess(false), 2000);
     } catch (err) {
@@ -230,24 +254,22 @@ export function AgentSettings() {
   };
 
   const handleCheckin = async () => {
-    // The server runs the check-in against the persisted agent record, not
-    // the in-flight edits in this form. Bail with a notice instead of
-    // silently using stale cronMessage/timeoutMinutes — fixing this with
-    // an auto-save would mean committing other unrelated dirty fields too.
-    // Match the same normalisations the load path applies so an agent that
-    // hasn't been touched doesn't read as dirty:
-    //   - timeoutMinutes: 0 (server default) is shown as 10 in the UI, so
-    //     compare against the same "|| 10" coercion done at load.
-    //   - cronMessage: the server trims on save, so a saved value of "x"
-    //     stays equal to "x" no matter how many spaces the textarea adds.
+    // The server runs the check-in against the persisted agent record and
+    // the persisted checkin.md, not the in-flight edits in this form. Bail
+    // with a notice if either Timeout or Check-in Message has unsaved
+    // changes — fixing this with an auto-save would mean committing other
+    // unrelated dirty fields too.
     const savedTimeout = agent ? (agent.timeoutMinutes || 10) : timeoutMinutes;
-    const savedMessage = (agent?.cronMessage ?? "").trim();
-    if (
-      agent &&
-      (cronMessage.trim() !== savedMessage || savedTimeout !== timeoutMinutes)
-    ) {
+    if (agent && savedTimeout !== timeoutMinutes) {
       setCheckinNotice(
-        "Save your changes first — manual check-in uses the saved Check-in Message and Timeout.",
+        "Save your changes first — manual check-in uses the saved Timeout.",
+      );
+      setTimeout(() => setCheckinNotice(""), 5000);
+      return;
+    }
+    if (cronMessageDirty) {
+      setCheckinNotice(
+        "Save your changes first — manual check-in uses the saved Check-in Message.",
       );
       setTimeout(() => setCheckinNotice(""), 5000);
       return;
@@ -579,6 +601,23 @@ export function AgentSettings() {
           </div>
         </div>
 
+        {/* User Context */}
+        <div>
+          <label className="block text-sm text-neutral-400 mb-2">
+            User Context
+          </label>
+          <textarea
+            value={userContext}
+            onChange={(e) => { setUserContext(e.target.value); setUserContextDirty(true); }}
+            rows={6}
+            placeholder="Record information about users and collaborators (agents also update this through conversation)"
+            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm resize-none focus:outline-none focus:border-neutral-500"
+          />
+          <p className="mt-1 text-xs text-neutral-600">
+            Injected into system prompt. Agents can also update this via their tools.
+          </p>
+        </div>
+
         {/* Public Profile */}
         <div>
           <div className="flex items-center justify-between mb-2">
@@ -827,8 +866,6 @@ export function AgentSettings() {
           silentEnd={silentEnd}
           onSilentStartChange={setSilentStart}
           onSilentEndChange={setSilentEnd}
-          cronMessage={cronMessage}
-          onCronMessageChange={setCronMessage}
           nextCronAt={agent.nextCronAt}
           scheduleDirty={
             // Schedule-affecting fields differ from the persisted agent —
@@ -843,6 +880,8 @@ export function AgentSettings() {
           // user doesn't fire repeated 409s in quick succession before the
           // server-side run actually gets going.
           checkingIn={checkingIn || checkinNotice !== ""}
+          cronMessage={cronMessage}
+          onCronMessageChange={setCronMessage}
         />
 
         {/* Notify During Silent Hours */}

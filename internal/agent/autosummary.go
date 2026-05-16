@@ -500,51 +500,51 @@ func loadSessionMessages(agentID, tool string, transcriptPath string, limit int,
 	defer f.Close()
 
 	var msgs []*Message
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	br := bufio.NewReader(f)
 
-	for scanner.Scan() {
-		var raw struct {
-			Type    string          `json:"type"`
-			Message json.RawMessage `json:"message"`
-		}
-		if json.Unmarshal(scanner.Bytes(), &raw) != nil {
-			continue
-		}
+	for {
+		line, readErr := br.ReadBytes('\n')
+		if len(line) > 0 {
+			var raw struct {
+				Type    string          `json:"type"`
+				Message json.RawMessage `json:"message"`
+			}
+			if json.Unmarshal(line, &raw) == nil {
+				switch raw.Type {
+				case "user":
+					var msg struct {
+						Content json.RawMessage `json:"content"`
+					}
+					if json.Unmarshal(raw.Message, &msg) == nil {
+						var text string
+						if json.Unmarshal(msg.Content, &text) == nil && text != "" {
+							msgs = append(msgs, &Message{Role: "user", Content: text})
+						}
+					}
 
-		switch raw.Type {
-		case "user":
-			var msg struct {
-				Content json.RawMessage `json:"content"`
-			}
-			if json.Unmarshal(raw.Message, &msg) != nil {
-				continue
-			}
-			// Try as plain string
-			var text string
-			if json.Unmarshal(msg.Content, &text) == nil && text != "" {
-				msgs = append(msgs, &Message{Role: "user", Content: text})
-			}
-
-		case "assistant":
-			var msg struct {
-				Content []struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"content"`
-			}
-			if json.Unmarshal(raw.Message, &msg) != nil {
-				continue
-			}
-			var text strings.Builder
-			for _, block := range msg.Content {
-				if block.Type == "text" && block.Text != "" {
-					text.WriteString(block.Text)
+				case "assistant":
+					var msg struct {
+						Content []struct {
+							Type string `json:"type"`
+							Text string `json:"text"`
+						} `json:"content"`
+					}
+					if json.Unmarshal(raw.Message, &msg) == nil {
+						var text strings.Builder
+						for _, block := range msg.Content {
+							if block.Type == "text" && block.Text != "" {
+								text.WriteString(block.Text)
+							}
+						}
+						if text.Len() > 0 {
+							msgs = append(msgs, &Message{Role: "assistant", Content: text.String()})
+						}
+					}
 				}
 			}
-			if text.Len() > 0 {
-				msgs = append(msgs, &Message{Role: "assistant", Content: text.String()})
-			}
+		}
+		if readErr != nil {
+			break
 		}
 	}
 

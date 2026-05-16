@@ -4,15 +4,15 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 )
 
-// maxPersonaSummaryRunes is the threshold above which we use an LLM-generated
-// summary instead of the full persona text in the system prompt.
-const maxPersonaSummaryRunes = 500
+// maxBootstrapRunes is the per-file character limit for workspace files
+// (persona.md, user.md) injected into the system prompt.
+// Files under this limit are injected in full; files over it are head/tail truncated.
+const maxBootstrapRunes = 1500
 
 // curlFlagsForAPI builds the curl flag string used in every
 // system-prompt example targeting the kojo agent API. Examples must
@@ -85,6 +85,60 @@ func longestBacktickRun(data []byte) int {
 	return max
 }
 
+// DefaultCheckinContent is the template shown in the UI for new/unedited agents.
+const DefaultCheckinContent = `# Check-in Instructions
+
+Tasks to perform on each scheduled check-in.
+The token ` + "`{date}`" + ` is replaced with today's date (YYYY-MM-DD) at runtime.
+
+- Record recent events or observations in memory/{date}.md
+- Check and respond to pending notifications
+- Review and update active todos
+`
+
+// readCheckinFile reads checkin.md for an agent.
+// Returns "" if the file doesn't exist (caller uses default behavior).
+func readCheckinFile(agentID string) string {
+	data, err := os.ReadFile(filepath.Join(agentDir(agentID), "checkin.md"))
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// WriteCheckinFile writes checkin content to checkin.md.
+// Empty content removes the file. No size limit — checkin prompts must not be
+// truncated as that could break the check-in workflow.
+func WriteCheckinFile(agentID string, content string) error {
+	trimmed := strings.TrimSpace(content)
+	p := filepath.Join(agentDir(agentID), "checkin.md")
+	if trimmed == "" {
+		err := os.Remove(p)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	return os.WriteFile(p, []byte(trimmed), 0o644)
+}
+
+// ReadCheckinFileOrDefault reads checkin.md, returning DefaultCheckinContent
+// if the file doesn't exist. Used by the API to show a template in the UI.
+// Returns (content, isDefault, err). Only os.IsNotExist falls back to the
+// default template; other I/O errors (permission denied, partial disk failure,
+// etc.) are surfaced so the API layer can respond with 500 instead of silently
+// masking the failure.
+func ReadCheckinFileOrDefault(agentID string) (string, bool, error) {
+	data, err := os.ReadFile(filepath.Join(agentDir(agentID), "checkin.md"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return DefaultCheckinContent, true, nil
+		}
+		return "", false, err
+	}
+	return string(data), false, nil
+}
+
 // readPersonaFile reads the full content of persona.md for an agent.
 // Returns (content, true) on success (including empty file and missing file).
 // Missing file returns ("", true) — treated as "persona cleared".
@@ -114,74 +168,77 @@ func writePersonaFile(agentID string, content string) error {
 	return os.WriteFile(p, []byte(content), 0o644)
 }
 
-// truncatePersona returns the first maxPersonaSummaryRunes of persona text.
-func truncatePersona(persona string) string {
-	runes := []rune(persona)
-	if len(runes) > maxPersonaSummaryRunes {
-		return string(runes[:maxPersonaSummaryRunes]) + "…"
+// truncateBootstrapFile performs head/tail truncation on a workspace file.
+// When the content exceeds maxBootstrapRunes, it keeps the first 75% and last 25%
+// with a marker in between pointing to the full file path.
+func truncateBootstrapFile(content string, filePath string) string {
+	runes := []rune(content)
+	if len(runes) <= maxBootstrapRunes {
+		return content
 	}
-	return persona
+	marker := fmt.Sprintf("\n\n[...truncated — full file: %s ...]\n\n", filePath)
+	markerRunes := []rune(marker)
+	budget := maxBootstrapRunes - len(markerRunes)
+	if budget < 100 {
+		return string(runes[:maxBootstrapRunes]) + "…"
+	}
+	headSize := int(float64(budget) * 0.75)
+	tailSize := budget - headSize
+	return string(runes[:headSize]) + marker + string(runes[len(runes)-tailSize:])
 }
 
-// getPersonaSummary returns a concise summary of the persona for system prompt injection.
-// It caches the summary in persona_summary.md and regenerates when persona.md is newer.
-// Fallback chain: agent's own CLI tool → other available CLI tools → truncation.
-func getPersonaSummary(agentID string, persona string, tool string, logger *slog.Logger) string {
-	dir := agentDir(agentID)
-	personaPath := filepath.Join(dir, "persona.md")
-	summaryPath := filepath.Join(dir, "persona_summary.md")
-
-	// Use cached summary if persona.md hasn't changed since last generation
-	pInfo, pErr := os.Stat(personaPath)
-	sInfo, sErr := os.Stat(summaryPath)
-	if sErr == nil && pErr == nil && !pInfo.ModTime().After(sInfo.ModTime()) {
-		if data, err := os.ReadFile(summaryPath); err == nil && len(data) > 0 {
-			return string(data)
+// readUserFile reads the content of user.md for an agent.
+func readUserFile(agentID string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(agentDir(agentID), "user.md"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", true
 		}
+		return "", false
 	}
-
-	// 1. Try agent's own CLI tool (claude / codex / gemini)
-	var summary string
-	if result, err := SummarizeWithCLI(tool, persona); err != nil {
-		logger.Warn("CLI persona summary failed", "agent", agentID, "tool", tool, "err", err)
-	} else {
-		summary = result
-	}
-
-	// 2. Fallback: try other available CLI tools
-	if summary == "" {
-		for _, fallback := range []string{"claude", "codex", "gemini"} {
-			if fallback == tool {
-				continue
-			}
-			if _, err := exec.LookPath(fallback); err != nil {
-				continue
-			}
-			if result, err := SummarizeWithCLI(fallback, persona); err != nil {
-				logger.Warn("CLI persona summary fallback failed", "agent", agentID, "tool", fallback, "err", err)
-			} else {
-				summary = result
-				break
-			}
-		}
-	}
-
-	// 3. Final fallback: truncation
-	if summary == "" {
-		summary = truncatePersona(persona)
-	}
-
-	// Cache — but only if persona.md hasn't been updated since we started.
-	// This prevents a slow background goroutine from overwriting a newer summary.
-	if pErr != nil {
-		// persona.md didn't exist at start — cache unconditionally
-		_ = os.WriteFile(summaryPath, []byte(summary), 0o644)
-	} else if pNow, err := os.Stat(personaPath); err == nil &&
-		pNow.ModTime().Equal(pInfo.ModTime()) {
-		_ = os.WriteFile(summaryPath, []byte(summary), 0o644)
-	}
-	return summary
+	return string(data), true
 }
+
+// ReadUserFile is the exported wrapper for readUserFile.
+func ReadUserFile(agentID string) (string, bool) { return readUserFile(agentID) }
+
+// ReadUserFileOrDefault returns user.md content, falling back to
+// DefaultUserContent when the file does not exist. Used by the API layer
+// so the UI shows the fill-in template for agents that haven't configured
+// user context yet, without persisting the template to disk.
+func ReadUserFileOrDefault(agentID string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(agentDir(agentID), "user.md"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return DefaultUserContent, true
+		}
+		return "", false
+	}
+	return string(data), true
+}
+
+// WriteUserFile writes user context content to user.md.
+func WriteUserFile(agentID string, content string) error {
+	return os.WriteFile(filepath.Join(agentDir(agentID), "user.md"), []byte(content), 0o644)
+}
+
+// DefaultUserContent is the template pre-populated when a user opens the
+// User Context settings for an agent that has no user.md yet. It is NOT
+// written to disk until the user explicitly saves — this keeps unfilled
+// templates out of the system prompt.
+const DefaultUserContent = `# About the User
+
+(Not much is known yet. This file is updated as the agent learns through conversation.)
+
+## Primary User
+- Name:
+- Timezone:
+- Interests / Expertise:
+- Communication preferences:
+
+## Other People
+(Notes about collaborators encountered via Slack, etc.)
+`
 
 // buildSystemPrompt constructs the system prompt for an agent chat.
 //
@@ -228,6 +285,8 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	sb.WriteString(fmt.Sprintf("    - DO NOT drop newly generated artifacts directly at %s. For new outputs, always pick either temp/ or a purpose-named subdirectory.\n", fileDir))
 	sb.WriteString("    - When unsure whether something is keep-worthy, default to temp/. Promoting a file out of temp/ later is cheap; cleaning up a polluted root is not.\n")
 	sb.WriteString(fmt.Sprintf("- %s contains notes about who you are. You can edit it as you grow and change.\n", personaPath))
+	userPath := filepath.Join(dir, "user.md")
+	sb.WriteString(fmt.Sprintf("- %s contains information about the people you work with. Update it as you learn about them.\n", userPath))
 	sb.WriteString("- Speak naturally, as yourself.\n")
 	sb.WriteString("- The current date and time is supplied at the top of each user message in a `<context>` block. Read it from there when you need it — it intentionally is NOT in this system prompt so the prompt cache stays warm across turns.\n")
 
@@ -328,6 +387,13 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	} else if memoryOversized {
 		sb.WriteString(fmt.Sprintf("\n### MEMORY.md is over the injection budget\n\n"))
 		sb.WriteString(fmt.Sprintf("%s exceeds %d bytes so it was NOT prepended to this prompt. Read it manually and then trim it to the lean-index rules above — extract long sections to %s/archive/ or %s/projects/ and replace them with one-line pointers.\n", memoryIndexPath, memoryInjectMaxBytes, memoryRoot, memoryRoot))
+	}
+
+	// User Context — injected from user.md
+	if userContent, ok := readUserFile(a.ID); ok && userContent != "" {
+		sb.WriteString("\n# User Context\n\n")
+		sb.WriteString(truncateBootstrapFile(userContent, userPath))
+		sb.WriteString("\n\n")
 	}
 
 	// Credentials — only shown when the credential store is available
@@ -437,18 +503,9 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 
 	// Identity
 	if a.Persona != "" {
-		runes := []rune(a.Persona)
-		if len(runes) > maxPersonaSummaryRunes {
-			summary := getPersonaSummary(a.ID, a.Persona, a.Tool, logger)
-			sb.WriteString("\n# Who You Are\n\n")
-			sb.WriteString(summary)
-			sb.WriteString("\n\n")
-			sb.WriteString(fmt.Sprintf("Full details about yourself: %s\n\n", personaPath))
-		} else {
-			sb.WriteString("\n# Who You Are\n\n")
-			sb.WriteString(a.Persona)
-			sb.WriteString("\n\n")
-		}
+		sb.WriteString("\n# Who You Are\n\n")
+		sb.WriteString(truncateBootstrapFile(a.Persona, personaPath))
+		sb.WriteString("\n\n")
 	}
 
 	return sb.String()

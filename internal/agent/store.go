@@ -119,6 +119,22 @@ func (st *store) Load() ([]*Agent, error) {
 		a.LegacyActiveStart = ""
 		a.LegacyActiveEnd = ""
 
+		// Migrate CronMessage → checkin.md file.
+		// If the agent has a non-empty CronMessage and no checkin.md exists,
+		// write the content to checkin.md and clear the JSON field.
+		if a.CronMessage != "" {
+			checkinPath := filepath.Join(agentDir(a.ID), "checkin.md")
+			if _, err := os.Stat(checkinPath); os.IsNotExist(err) {
+				if err := os.WriteFile(checkinPath, []byte(a.CronMessage), 0o644); err != nil {
+					st.logger.Warn("failed to migrate cronMessage to checkin.md", "agent", a.ID, "err", err)
+				} else {
+					st.logger.Info("migrated cronMessage → checkin.md", "agent", a.ID)
+				}
+			}
+			a.CronMessage = ""
+			needsSave = true
+		}
+
 		// Validate loaded silent hours — clear invalid values
 		if err := ValidSilentHours(a.SilentStart, a.SilentEnd); err != nil {
 			st.logger.Warn("invalid silent hours in stored data, clearing", "agent", a.ID, "start", a.SilentStart, "end", a.SilentEnd, "err", err)

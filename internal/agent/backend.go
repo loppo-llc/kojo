@@ -33,6 +33,14 @@ type ChatOptions struct {
 	// guard on session resets: there is no interactive conversation to
 	// preserve, so token conservation wins over continuity.
 	AutomatedTrigger bool
+
+	// SessionKey, when non-empty, overrides the default agent-ID-based
+	// session identifier. The key is hashed to a deterministic UUID, so
+	// callers can pass any unique string (e.g. "slack:<channel>:<thread>")
+	// to get an independent Claude session. Used for Slack thread-level
+	// session resumption where each conversation thread maintains its own
+	// Claude context.
+	SessionKey string
 }
 
 // ChatBackend abstracts a CLI tool for agent chat.
@@ -46,6 +54,24 @@ type ChatBackend interface {
 
 	// Available returns true if the CLI tool is installed and accessible.
 	Available() bool
+}
+
+// backendSupportsSessionKey reports whether the backend honors
+// ChatOptions.SessionKey when building its CLI invocation. Backends that
+// ignore SessionKey will interpret !OneShot as "resume the agent's latest
+// session" — which is the wrong behavior for callers that pass SessionKey
+// to isolate a Slack thread (or similar) from the agent's main session.
+// Keep this list in sync with the backends that actually read opts.SessionKey.
+func backendSupportsSessionKey(b ChatBackend) bool {
+	if b == nil {
+		return false
+	}
+	switch b.Name() {
+	case "claude":
+		return true
+	default:
+		return false
+	}
 }
 
 // kojoAPIBase is the URL agents use to reach kojo's auth-required API

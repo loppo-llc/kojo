@@ -55,7 +55,6 @@ export interface AgentInfo {
   silentStart?: string;
   silentEnd?: string;
   notifyDuringSilent?: boolean;
-  cronMessage?: string;
   // RFC3339 timestamp of the next scheduled cron run, accounting for silent
   // hours. Empty/absent if cron is disabled, the agent is archived, or no
   // schedule is registered. Server-derived; never sent on update.
@@ -111,7 +110,6 @@ export interface AgentConfig {
   silentStart?: string;
   silentEnd?: string;
   notifyDuringSilent?: boolean;
-  cronMessage?: string;
 }
 
 export interface AgentUpdateParams extends Partial<AgentConfig> {
@@ -321,6 +319,12 @@ export const agentApi = {
 
   checkin: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/checkin`),
 
+  getCheckinFile: (id: string) =>
+    get<{ content: string; isDefault: boolean }>(`/api/v1/agents/${id}/checkin-file`),
+
+  putCheckinFile: (id: string, content: string) =>
+    put<{ content: string; isDefault: boolean }>(`/api/v1/agents/${id}/checkin-file`, { content }).then((r) => r.content),
+
   fork: (id: string, params: { name: string; includeTranscript: boolean }) =>
     post<AgentInfo>(`/api/v1/agents/${id}/fork`, params),
 
@@ -512,6 +516,15 @@ export const agentApi = {
 
     delete: (provider: string) =>
       del<unknown>(`/api/v1/api-keys/${provider}`),
+  },
+
+  userContext: {
+    get: (agentId: string) =>
+      get<{ content: string }>(`/api/v1/agents/${agentId}/user-context`).then(
+        (r) => r.content ?? "",
+      ),
+    set: (agentId: string, content: string) =>
+      put<{ content: string }>(`/api/v1/agents/${agentId}/user-context`, { content }),
   },
 
   embeddingModel: {

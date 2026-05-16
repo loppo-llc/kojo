@@ -20,7 +20,7 @@ import (
 // agent.Manager satisfies this interface directly — no adapter needed.
 type ChatManager interface {
 	Chat(ctx context.Context, agentID, message, role string, attachments []agent.MessageAttachment, source ...agent.BusySource) (<-chan agent.ChatEvent, error)
-	ChatOneShot(ctx context.Context, agentID, message string) (<-chan agent.ChatEvent, error)
+	ChatOneShot(ctx context.Context, agentID, message string, opts ...agent.OneShotOpts) (<-chan agent.ChatEvent, error)
 }
 
 // Bot manages a single Slack Socket Mode connection for one agent.
@@ -68,6 +68,15 @@ const (
 
 	// typingStatus is the assistant status text shown while processing a message.
 	typingStatus = "Thinking…"
+
+	// slackSystemPrompt is appended to the system prompt when the message
+	// originates from Slack. It tells the agent how Slack replies work so it
+	// responds naturally instead of trying to use MCP tools to reply.
+	slackSystemPrompt = `## Slack Conversation
+
+This message was received via Slack. Your text response will be automatically posted to the Slack thread — just respond normally. Do NOT use Slack MCP tools (slack_post_message, slack_reply_to_thread, etc.) to reply to this conversation.
+
+Slack MCP tools are still available for other actions: posting to a different channel, adding reactions, uploading files, listing channels/users, etc.`
 )
 
 // NewBot creates a new Bot instance. Call Run() to start it.
@@ -361,7 +370,11 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		sb.WriteString(chathistory.FormatForInjection(history, b.botUserID, chathistory.DefaultMaxMessages, chathistory.DefaultMaxChars))
 		sb.WriteString("\n---\n\n")
 	}
-	sb.WriteString(fmt.Sprintf("[Slack @%s] %s", displayName, text))
+	if replyTS != "" {
+		sb.WriteString(fmt.Sprintf("[Slack @%s | channel:%s thread:%s] %s", displayName, channel, replyTS, text))
+	} else {
+		sb.WriteString(fmt.Sprintf("[Slack @%s | channel:%s] %s", displayName, channel, text))
+	}
 	message := sb.String()
 
 	// From here on, the thread handle used for posting/streaming.
@@ -374,7 +387,15 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		Status:    typingStatus,
 	})
 
-	events, err := b.mgr.ChatOneShot(ctx, b.agentID, message)
+	// Build a session key that maps 1:1 to the chat_history file unit
+	// (per-thread or per-channel). This gives each Slack conversation its
+	// own Claude session with full context resumption across messages.
+	slackSessionKey := b.agentID + ":slack:" + channel + ":" + threadTS
+
+	events, err := b.mgr.ChatOneShot(ctx, b.agentID, message, agent.OneShotOpts{
+		SessionKey:        slackSessionKey,
+		SystemPromptExtra: slackSystemPrompt,
+	})
 	if err != nil {
 		b.clearAssistantStatus(ctx, channel, threadTS)
 		b.logger.Warn("failed to start agent chat from slack", "err", err)
@@ -388,52 +409,94 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	var lastAppend time.Time
 	hasError := false
 	streamFailed := false // true if StartStream failed, use fallback
-	filter := &agent.ReplyTagFilter{}
+
+	// startStream initializes the Slack stream if not already started.
+	// Returns true if the stream is active (either already started or just created).
+	startStream := func() bool {
+		if streamTS != "" {
+			return true
+		}
+		if streamFailed {
+			return false
+		}
+		opts := []slack.MsgOption{}
+		if threadTS != "" {
+			opts = append(opts, slack.MsgOptionTS(threadTS))
+		}
+		_, ts, err := b.api.StartStreamContext(ctx, channel, opts...)
+		if err != nil {
+			b.logger.Warn("failed to start slack stream, falling back to batch post", "err", err)
+			streamFailed = true
+			return false
+		}
+		streamTS = ts
+		lastAppend = time.Now()
+		return true
+	}
 
 	for evt := range events {
 		switch evt.Type {
 		case "text":
-			// Only forward text inside <reply>...</reply> tags.
-			delta := filter.Feed(evt.Delta)
-			if delta == "" {
-				continue
-			}
-			response.WriteString(delta)
-			pendingDelta.WriteString(delta)
+			response.WriteString(evt.Delta)
+			pendingDelta.WriteString(evt.Delta)
 
 			// Start stream on first text event
-			if streamTS == "" && !streamFailed {
-				opts := []slack.MsgOption{}
-				if threadTS != "" {
-					opts = append(opts, slack.MsgOptionTS(threadTS))
-				}
-				_, ts, err := b.api.StartStreamContext(ctx, channel, opts...)
-				if err != nil {
-					b.logger.Warn("failed to start slack stream, falling back to batch post", "err", err)
-					streamFailed = true
-					continue
-				}
-				streamTS = ts
-				lastAppend = time.Now()
+			if !startStream() {
+				continue
 			}
 
 			// Throttled append
-			if streamTS != "" && pendingDelta.Len() > 0 && time.Since(lastAppend) >= streamAppendInterval {
+			if pendingDelta.Len() > 0 && time.Since(lastAppend) >= streamAppendInterval {
 				b.appendStream(ctx, channel, streamTS, pendingDelta.String())
 				pendingDelta.Reset()
 				lastAppend = time.Now()
 			}
 
+		case "tool_use":
+			// Update assistant status to show which tool is running
+			status := toolStatusText(evt.ToolName)
+			_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
+				ChannelID: channel,
+				ThreadTS:  threadTS,
+				Status:    status,
+			})
+
+			// Append tool status indicator to the stream so the user can
+			// see progress even during long tool executions. The final
+			// UpdateMessage replaces the stream with clean response text,
+			// so these ephemeral indicators are automatically removed.
+			//
+			// Note: status indicators bypass the streamAppendInterval throttle
+			// because tool_use events fire at most once per tool invocation
+			// (not in a tight loop like text deltas) and a user who sees no
+			// updates during a long-running tool has no way to tell the agent
+			// is still working. If the very first event is tool_use,
+			// throttling would suppress the indicator until any subsequent
+			// text — which may never come if the tool takes minutes.
+			if startStream() {
+				// Flush any pending text delta first so the status appears after
+				// whatever the assistant has said so far.
+				if pendingDelta.Len() > 0 {
+					b.appendStream(ctx, channel, streamTS, pendingDelta.String())
+					pendingDelta.Reset()
+				}
+				b.appendStream(ctx, channel, streamTS, "\n\n_⏳ "+status+"_")
+				lastAppend = time.Now()
+			}
+
+		case "tool_result":
+			// Revert assistant status to "Thinking…" while the agent
+			// processes the tool result and decides the next action.
+			_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
+				ChannelID: channel,
+				ThreadTS:  threadTS,
+				Status:    typingStatus,
+			})
+
 		case "error":
 			hasError = true
 			b.logger.Warn("agent returned error during slack chat", "err", evt.ErrorMessage)
 		}
-	}
-
-	// Flush any remaining buffered reply content.
-	if remaining := filter.Flush(); remaining != "" {
-		response.WriteString(remaining)
-		pendingDelta.WriteString(remaining)
 	}
 
 	// Use a separate context for finalization so that cleanup API calls
@@ -457,11 +520,14 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		// Replace stream content with the full response via chat.update.
 		// This ensures complete text even if AppendStream calls were lost
 		// due to rate limiting, stream timeout, or transient errors.
+		// Use MsgOptionMarkdownText (markdown_text param) so Slack uses the
+		// same full-Markdown renderer as chat.appendStream; the legacy mrkdwn
+		// renderer (text param) does not support tables, headings, etc.
 		if response.Len() > 0 {
-			text := PlainToSlack(response.String())
+			text := response.String()
 			chunks := SplitMessage(text, slackMaxMsgLen)
 			// First chunk: update the streaming message in-place
-			updateOpts := []slack.MsgOption{slack.MsgOptionText(chunks[0], false)}
+			updateOpts := []slack.MsgOption{slack.MsgOptionMarkdownText(chunks[0])}
 			if threadTS != "" {
 				updateOpts = append(updateOpts, slack.MsgOptionTS(threadTS))
 			}
@@ -475,7 +541,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		}
 	} else if response.Len() > 0 {
 		// Fallback: traditional batch post (StartStream failed or no streaming support)
-		text := PlainToSlack(response.String())
+		text := response.String()
 		chunks := SplitMessage(text, slackMaxMsgLen)
 		for _, chunk := range chunks {
 			b.postMessage(finCtx, channel, threadTS, chunk)
@@ -507,6 +573,37 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		}
 	}
 
+}
+
+// toolStatusText returns a human-readable status string for the given tool name.
+func toolStatusText(toolName string) string {
+	switch toolName {
+	case "Bash":
+		return "Running command…"
+	case "Read":
+		return "Reading file…"
+	case "Write":
+		return "Writing file…"
+	case "Edit":
+		return "Editing file…"
+	case "Grep":
+		return "Searching code…"
+	case "Glob":
+		return "Finding files…"
+	case "Agent":
+		return "Running sub-agent…"
+	case "WebFetch":
+		return "Fetching web page…"
+	case "WebSearch":
+		return "Searching the web…"
+	case "NotebookEdit":
+		return "Editing notebook…"
+	default:
+		if toolName == "" {
+			return "Working…"
+		}
+		return "Using " + toolName + "…"
+	}
 }
 
 // appendStream appends text to a streaming Slack message with rate limit retry.
@@ -545,7 +642,7 @@ func (b *Bot) clearAssistantStatus(ctx context.Context, channel, threadTS string
 
 func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) {
 	opts := []slack.MsgOption{
-		slack.MsgOptionText(text, false),
+		slack.MsgOptionMarkdownText(text),
 	}
 	if threadTS != "" {
 		opts = append(opts, slack.MsgOptionTS(threadTS))

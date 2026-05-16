@@ -261,7 +261,7 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 	}
 
 	// Check silent hours and read agent config
-	var silentStart, silentEnd, cronMessage string
+	var silentStart, silentEnd string
 	var timeoutMinutes int
 	if a, ok := cs.mgr.Get(agentID); ok {
 		// Archived guard: a tick may have queued just before Archive ran
@@ -273,13 +273,14 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 		}
 		silentStart, silentEnd = a.SilentStart, a.SilentEnd
 		timeoutMinutes = a.TimeoutMinutes
-		cronMessage = a.CronMessage
 		if IsInSilentHours(silentStart, silentEnd) {
 			cs.logger.Debug("cron job skipped (silent hours)", "agent", agentID,
 				"silentStart", silentStart, "silentEnd", silentEnd)
 			return
 		}
 	}
+
+	cronMessage := readCheckinFile(agentID)
 
 	// Cross-process guard: atomic lock file prevents duplicate execution
 	if !acquireCronLock(agentID) {

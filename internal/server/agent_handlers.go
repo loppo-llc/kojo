@@ -258,6 +258,59 @@ func (s *Server) handleCheckin(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusAccepted, map[string]bool{"ok": true})
 }
 
+// handleGetCheckinFile returns the checkin.md content for an agent.
+// Returns DefaultCheckinContent if the file doesn't exist.
+func (s *Server) handleGetCheckinFile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	p := auth.FromContext(r.Context())
+	if !p.CanReadFull(id) {
+		writeError(w, http.StatusForbidden, "forbidden", "not allowed to read this agent's check-in file")
+		return
+	}
+	content, isDefault, err := agent.ReadCheckinFileOrDefault(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to read checkin.md")
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"content": content, "isDefault": isDefault})
+}
+
+// handlePutCheckinFile writes checkin.md content for an agent.
+func (s *Server) handlePutCheckinFile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	p := auth.FromContext(r.Context())
+	if !p.CanMutateSelf(id) {
+		writeError(w, http.StatusForbidden, "forbidden", "agents may only PUT their own check-in file")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var body struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+		return
+	}
+	if err := agent.WriteCheckinFile(id, body.Content); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to write checkin.md")
+		return
+	}
+	content, isDefault, err := agent.ReadCheckinFileOrDefault(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to read checkin.md after write")
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"content": content, "isDefault": isDefault})
+}
+
 func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	p := auth.FromContext(r.Context())
@@ -1132,6 +1185,53 @@ func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// --- User Context Handlers ---
+
+func (s *Server) handleGetUserContext(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	p := auth.FromContext(r.Context())
+	if !p.CanReadFull(id) {
+		writeError(w, http.StatusForbidden, "forbidden", "not allowed to read this agent's user context")
+		return
+	}
+	content, ok := agent.ReadUserFileOrDefault(id)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to read user.md")
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]string{"content": content})
+}
+
+func (s *Server) handleSetUserContext(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	p := auth.FromContext(r.Context())
+	if !p.CanMutateSelf(id) {
+		writeError(w, http.StatusForbidden, "forbidden", "agents may only PUT their own user context")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var body struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	if err := agent.WriteUserFile(id, body.Content); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]string{"content": body.Content})
 }
 
 // --- Pre-Compact Handler ---

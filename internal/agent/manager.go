@@ -339,16 +339,10 @@ func (m *Manager) syncPersona(agentID string) {
 		return
 	}
 	a.Persona = content
-	tool := a.Tool
 	override := a.PublicProfileOverride
 	a.UpdatedAt = time.Now().Format(time.RFC3339)
 	m.mu.Unlock()
 	m.save()
-
-	// Pre-generate persona summary in background so it's cached for next chat
-	if len([]rune(content)) > maxPersonaSummaryRunes {
-		go getPersonaSummary(agentID, content, tool, m.logger)
-	}
 
 	// Regenerate or clear public profile when persona changes via file edit (unless overridden)
 	if !override {
@@ -506,19 +500,6 @@ func (m *Manager) regeneratePublicProfile(agentID, persona string) {
 
 // Update updates an agent's configuration. Only non-nil fields are applied.
 func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
-	// Pure-input validations that don't depend on existing state run first so
-	// a malformed payload can't trigger any I/O (persona.md write, avatar
-	// fetch) or partial in-memory mutations below.
-	var nextCronMessage string
-	cronMessageDirty := false
-	if cfg.CronMessage != nil {
-		v, err := validateCronMessage(*cfg.CronMessage)
-		if err != nil {
-			return nil, err
-		}
-		nextCronMessage = v
-		cronMessageDirty = true
-	}
 	// Reject invalid resume-idle presets up front so a malformed PATCH cannot
 	// land partial mutations (Persona / Name / Model are applied before the
 	// later validation block, so deferring this check would let a bad value
@@ -670,9 +651,6 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 			return nil, fmt.Errorf("unsupported thinkingMode: %q", *cfg.ThinkingMode)
 		}
 		a.ThinkingMode = NormalizeThinkingMode(*cfg.ThinkingMode)
-	}
-	if cronMessageDirty {
-		a.CronMessage = nextCronMessage
 	}
 	if cfg.TTS != nil {
 		// Already validated up-front before any I/O / mutation.
@@ -1025,10 +1003,34 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 }
 
 // ChatOneShot runs a one-shot chat that does not save to transcript
-// (messages.jsonl) and does not resume the CLI session. Used for external
-// platform conversations (Slack, Discord) that carry their own context.
+// (messages.jsonl). Used for external platform conversations (Slack, Discord)
+// that carry their own context.
 // Memory (MEMORY.md, diary) access is still available via system prompt.
-func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string) (<-chan ChatEvent, error) {
+//
+// OneShotOpts configures a one-shot chat session.
+type OneShotOpts struct {
+	// SessionKey enables session resumption with a deterministic session ID
+	// derived from this key (e.g. per Slack thread). When empty, the chat
+	// runs as a fresh ephemeral session with no resumption.
+	SessionKey string
+
+	// SystemPromptExtra is appended to the system prompt for this session.
+	// Use it to inject platform-specific context (e.g. Slack reply behavior)
+	// without modifying the shared system prompt builder.
+	SystemPromptExtra string
+}
+
+// ChatOneShot runs a non-persistent chat that doesn't save to the transcript.
+//
+// When opts.SessionKey is non-empty, the chat uses session resumption so the
+// agent maintains Claude context across messages in the same conversation
+// (e.g. Slack thread), isolated from the WebUI session and other threads.
+func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string, opts ...OneShotOpts) (<-chan ChatEvent, error) {
+	var cfg OneShotOpts
+	if len(opts) > 0 {
+		cfg = opts[0]
+	}
+
 	prep, err := m.prepareChat(agentID, userMessage, false, false)
 	if err != nil {
 		return nil, err
@@ -1045,16 +1047,6 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	osID := m.trackOneShot(agentID, cancel)
 	outCh := make(chan ChatEvent, 64)
 
-	// Slack messages: instruct the agent to separate thinking from reply.
-	if strings.Contains(userMessage, "[Slack @") {
-		prep.sysPrompt += "\n\n## Slack Response Format\n\n" +
-			"This message is from Slack. Your text output will be posted to Slack.\n" +
-			"Wrap ONLY your final reply in <reply>...</reply> tags.\n" +
-			"Text outside these tags is your internal workspace — use it freely to think, reason, plan, and execute tools.\n" +
-			"Only the content inside <reply> will be shown to the Slack user.\n" +
-			"Always include exactly one <reply> block at the end of your response.\n"
-	}
-
 	// NOTE: No appendMessage — one-shot chats are not saved to transcript.
 
 	// Prepend volatile context for the same reason as the persistent
@@ -1064,7 +1056,39 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	if prep.volatileContext != "" {
 		effectiveMessage = prep.volatileContext + userMessage
 	}
-	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{OneShot: true, MCPServers: prep.mcpServers})
+
+	// Append platform-specific system prompt extra (e.g. Slack context).
+	// This goes at the end of the system prompt so it doesn't break
+	// the prompt cache prefix shared across turns within the same session.
+	sysPrompt := prep.sysPrompt
+	if cfg.SystemPromptExtra != "" {
+		sysPrompt += "\n\n" + cfg.SystemPromptExtra
+	}
+
+	// Build chat options.
+	//
+	// SessionKey-scoped resumption is only honored by backends that read
+	// opts.SessionKey when building their CLI args (currently: claude).
+	// Other backends like gemini interpret !OneShot as "resume the agent's
+	// latest session", which would incorrectly mix Slack thread context
+	// with the agent's normal WebUI context — or with a different Slack
+	// thread's session. For those backends we force OneShot=true so the
+	// chat stays ephemeral, mirroring the no-SessionKey path.
+	var chatOpts ChatOptions
+	if cfg.SessionKey != "" && backendSupportsSessionKey(prep.backend) {
+		chatOpts = ChatOptions{
+			MCPServers:       prep.mcpServers,
+			AutomatedTrigger: true,
+			SessionKey:       cfg.SessionKey,
+		}
+	} else {
+		chatOpts = ChatOptions{
+			OneShot:    true,
+			MCPServers: prep.mcpServers,
+		}
+	}
+
+	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, sysPrompt, chatOpts)
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
@@ -1323,8 +1347,9 @@ func (m *Manager) Checkin(agentID string) error {
 		return fmt.Errorf("%w: %s", ErrAgentArchived, agentID)
 	}
 	timeoutMinutes := a.TimeoutMinutes
-	cronMessage := a.CronMessage
 	m.mu.Unlock()
+
+	cronMessage := readCheckinFile(agentID)
 
 	timeout := cronTimeout
 	if timeoutMinutes > 0 {

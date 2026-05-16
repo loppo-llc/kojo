@@ -186,6 +186,9 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		if agent.Model != "" {
 			threadParams["model"] = agent.Model
 		}
+		if systemPrompt != "" {
+			threadParams["baseInstructions"] = systemPrompt
+		}
 		threadStartID = sendRPC("thread/start", threadParams)
 
 		// Wait for thread/start response to get thread ID
@@ -224,15 +227,10 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		}
 
 		// Step 4: Start turn with user message
-		fullMessage := userMessage
-		if systemPrompt != "" {
-			fullMessage = systemPrompt + "\n\n---\n\n" + userMessage
-		}
-
 		turnStartID = sendRPC("turn/start", map[string]any{
 			"threadId": threadID,
 			"input": []map[string]any{
-				{"type": "text", "text": fullMessage},
+				{"type": "text", "text": userMessage},
 			},
 		})
 
