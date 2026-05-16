@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/sandbox"
 )
 
 // CodexBackend implements ChatBackend for the Codex CLI using app-server
@@ -47,7 +49,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	for name, srv := range opts.MCPServers {
 		args = append(args, "-c", fmt.Sprintf("mcp_servers.%s.url=%q", name, srv.URL))
 	}
-	cmd := exec.CommandContext(ctx, codexPath, args...)
+	cmd := sandbox.WrapCommand(ctx, codexPath, args, sandboxConfig(agent, b.logger))
 	cmd.Dir = dir
 	cmd.Env = filterEnv([]string{"AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
 

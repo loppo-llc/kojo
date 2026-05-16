@@ -35,13 +35,14 @@ func TestTokenStore_OwnerAndAgent(t *testing.T) {
 		t.Fatalf("AgentToken not idempotent: %q vs %q", again, tok)
 	}
 
-	// Reload from disk and ensure tokens persist.
+	// Agent tokens are ephemeral (in-memory only). A fresh store must NOT
+	// find the previous agent token, but the owner token persists on disk.
 	st2, err := NewTokenStore(dir, "")
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	if id, ok := st2.LookupAgent(tok); !ok || id != "ag_alice" {
-		t.Fatalf("after reopen: got (%q,%v)", id, ok)
+	if _, ok := st2.LookupAgent(tok); ok {
+		t.Fatal("agent token survived reopen — should be ephemeral")
 	}
 	if st2.OwnerToken() != st.OwnerToken() {
 		t.Fatal("owner token changed across reopen")

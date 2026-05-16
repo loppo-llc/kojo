@@ -18,18 +18,30 @@ const maxPersonaSummaryRunes = 500
 // system-prompt example targeting the kojo agent API. Examples must
 // always include the per-agent token because the auth listener gates
 // every /api/v1/* request — without the header an agent's curl lands
-// as a Guest principal and is rejected with 403. The ${KOJO_AGENT_TOKEN}
-// env var is exported into the PTY by filterEnv (see backend.go).
+// as a Guest principal and is rejected with 403.
+//
+// The token is embedded literally in the prompt so the examples are
+// copy-pasteable without requiring the agent to know it must reference
+// $KOJO_AGENT_TOKEN. The same token is also exported as KOJO_AGENT_TOKEN
+// in the agent's environment (see filterEnv) for the Claude PreCompact
+// hook and any agent-issued shell command that prefers env-var transport.
+//
+// Note on cross-agent secrecy: literal embedding does NOT provide
+// isolation between agents on the same host. Phase 1 Landlock restricts
+// writes only, so any same-UID process can read another agent's
+// /proc/{pid}/environ, /proc/{pid}/cmdline, and on-disk session files.
+// Cross-agent token isolation requires per-agent UIDs and is tracked as
+// future work — see filterEnv in backend.go for the full discussion.
 //
 // `-sk` is used for HTTPS endpoints to skip TLS verification because
 // the Tailscale listener uses a self-signed cert. The auth listener is
 // HTTP-on-loopback in the current design, so `-s` is the common case.
-func curlFlagsForAPI(apiBase string) string {
+func curlFlagsForAPI(apiBase, agentToken string) string {
 	flags := "-s"
 	if strings.HasPrefix(apiBase, "https://") {
 		flags = "-sk" // skip TLS verification for Tailscale self-signed certs
 	}
-	return flags + ` -H "X-Kojo-Token: ${KOJO_AGENT_TOKEN}"`
+	return flags + fmt.Sprintf(` -H "X-Kojo-Token: %s"`, agentToken)
 }
 
 // memoryInjectMaxBytes caps the MEMORY.md size eligible for inline system-
@@ -199,7 +211,11 @@ func getPersonaSummary(agentID string, persona string, tool string, logger *slog
 // edits it (low frequency) — one cache_creation per edit is acceptable.
 //
 // apiBase is the server URL for group DM API access (e.g. "http://127.0.0.1:8080").
-func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*GroupDM, hasCreds bool) string {
+// agentToken is the literal auth token embedded in curl examples so the
+// agent can authenticate with the kojo API without needing to know about
+// $KOJO_AGENT_TOKEN. The same value is also exported as that env var by
+// filterEnv — see curlFlagsForAPI for the cross-agent-secrecy caveat.
+func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase, agentToken string, groups []*GroupDM, hasCreds bool) string {
 	dir := agentDir(a.ID)
 	personaPath := filepath.Join(dir, "persona.md")
 	// Note: do not capture wall-clock / weekday / holiday into the prompt
@@ -336,7 +352,7 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 		sb.WriteString("Your credentials are stored in an encrypted database and accessible only via API.\n")
 		sb.WriteString("Do NOT try to read credentials from files.\n")
 		if apiBase != "" {
-			cf := curlFlagsForAPI(apiBase)
+			cf := curlFlagsForAPI(apiBase, agentToken)
 			base := fmt.Sprintf("%s/api/v1/agents/%s/credentials", apiBase, a.ID)
 			sb.WriteString("\n**List credentials** (labels/usernames only, secrets masked):\n")
 			sb.WriteString(fmt.Sprintf("```\ncurl %s %s\n```\n", cf, base))
@@ -347,12 +363,12 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 			sb.WriteString("\nReplace CRED_ID with the credential's `id` from the list response.\n")
 			sb.WriteString("\n**IMPORTANT: Shell escaping** — Passwords often contain special characters (`$`, `!`, `\"`, `'`, `\\`, `&`, etc.) that break when interpolated into shell strings.\n")
 			sb.WriteString("When using a retrieved password in another command, use Python to avoid shell escaping:\n")
-			// Auth header is required by kojo's auth listener — read
-			// the token straight from $KOJO_AGENT_TOKEN.
+			// Auth header uses the literal token injected into the
+			// prompt — no env var reference needed.
 			if strings.HasPrefix(apiBase, "https://") {
-				sb.WriteString(fmt.Sprintf("```python\nimport json, os, ssl, urllib.request\n# Skip TLS verification for local/Tailscale self-signed cert only\nctx = ssl.create_default_context()\nctx.check_hostname = False\nctx.verify_mode = ssl.CERT_NONE\nreq = urllib.request.Request('%s/CRED_ID/password', headers={'X-Kojo-Token': os.environ['KOJO_AGENT_TOKEN']})\nwith urllib.request.urlopen(req, context=ctx) as resp:\n    password = json.loads(resp.read())['password']\n# Use password directly in Python — never paste into shell strings\n```\n", base))
+				sb.WriteString(fmt.Sprintf("```python\nimport json, ssl, urllib.request\n# Skip TLS verification for local/Tailscale self-signed cert only\nctx = ssl.create_default_context()\nctx.check_hostname = False\nctx.verify_mode = ssl.CERT_NONE\nreq = urllib.request.Request('%s/CRED_ID/password', headers={'X-Kojo-Token': '%s'})\nwith urllib.request.urlopen(req, context=ctx) as resp:\n    password = json.loads(resp.read())['password']\n# Use password directly in Python — never paste into shell strings\n```\n", base, agentToken))
 			} else {
-				sb.WriteString(fmt.Sprintf("```python\nimport json, os, urllib.request\nreq = urllib.request.Request('%s/CRED_ID/password', headers={'X-Kojo-Token': os.environ['KOJO_AGENT_TOKEN']})\nwith urllib.request.urlopen(req) as resp:\n    password = json.loads(resp.read())['password']\n# Use password directly in Python — never paste into shell strings\n```\n", base))
+				sb.WriteString(fmt.Sprintf("```python\nimport json, urllib.request\nreq = urllib.request.Request('%s/CRED_ID/password', headers={'X-Kojo-Token': '%s'})\nwith urllib.request.urlopen(req) as resp:\n    password = json.loads(resp.read())['password']\n# Use password directly in Python — never paste into shell strings\n```\n", base, agentToken))
 			}
 			sb.WriteString("Pass secrets via stdin when possible, or environment variables if the tool requires it. Never interpolate into shell strings.\n")
 		}
@@ -363,7 +379,7 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 
 	// Group DM API
 	if apiBase != "" {
-		curlFlags := curlFlagsForAPI(apiBase)
+		curlFlags := curlFlagsForAPI(apiBase, agentToken)
 
 		sb.WriteString("\n## Group DM\n\n")
 		sb.WriteString(fmt.Sprintf("Your agent ID: `%s`\n\n", a.ID))
@@ -422,7 +438,7 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 
 	// Task API
 	if apiBase != "" {
-		curlFlags := curlFlagsForAPI(apiBase)
+		curlFlags := curlFlagsForAPI(apiBase, agentToken)
 		sb.WriteString("\n## Persistent Todo API\n\n")
 		sb.WriteString("Use these endpoints to track todos that must survive across conversation sessions.\n")
 		sb.WriteString("Todos are persisted server-side and re-injected at the top of every user message (in the `<context>` block) — they are immune to context compaction.\n")

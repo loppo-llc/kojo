@@ -16,6 +16,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/sandbox"
 )
 
 // ClaudeBackend implements ChatBackend using the Claude CLI with stream-json output.
@@ -53,7 +55,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 	args := b.buildClaudeArgs(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers, opts.AutomatedTrigger)
 
-	cmd := exec.CommandContext(ctx, claudePath, args...)
+	cmd := sandbox.WrapCommand(ctx, claudePath, args, sandboxConfig(agent, b.logger))
 	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
 	// Token conservation: agents persist state in files (MEMORY.md, memory/),
 	// not in Claude's conversation history. 1M context only inflates

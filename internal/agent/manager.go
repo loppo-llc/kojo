@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -594,13 +593,9 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 	if cfg.WorkDir != nil {
 		if *cfg.WorkDir != "" {
-			if !filepath.IsAbs(*cfg.WorkDir) {
+			if err := validateWorkDir(*cfg.WorkDir); err != nil {
 				m.mu.Unlock()
-				return nil, fmt.Errorf("workDir must be an absolute path: %s", *cfg.WorkDir)
-			}
-			if info, err := os.Stat(*cfg.WorkDir); err != nil || !info.IsDir() {
-				m.mu.Unlock()
-				return nil, fmt.Errorf("workDir does not exist or is not a directory: %s", *cfg.WorkDir)
+				return nil, err
 			}
 		}
 		a.WorkDir = *cfg.WorkDir
@@ -891,7 +886,16 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool, skip
 	// - Codex: -c flag override (in backend_codex.go)
 	// - Gemini: .gemini/settings.json mcpServers (in backend_gemini.go)
 
-	sysPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
+	// Look up the agent's auth token for direct injection into the system
+	// prompt. The token is NOT passed via environment variable to avoid
+	// /proc/{pid}/environ exposure to other agents on the same host.
+	var agentToken string
+	if agentTokenLookup != nil {
+		if tok, ok := agentTokenLookup(agentID); ok {
+			agentToken = tok
+		}
+	}
+	sysPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, agentToken, groups, m.creds != nil)
 
 	// Refresh the memory index, but emit query-based recall through the
 	// volatile context (per-turn user message), NOT the system prompt —

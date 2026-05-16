@@ -26,13 +26,17 @@ func validateAgentID(id string) error {
 	return nil
 }
 
-// TokenStore persists owner / agent tokens on disk (mode 0600) and keeps
-// an in-memory index for O(1) reverse lookup.
+// TokenStore keeps owner / agent tokens and provides O(1) reverse lookup.
 //
-// Layout:
+// Owner token layout:
 //
 //	<base>/owner.token            — owner secret (single line, hex)
-//	<base>/agent_tokens/<id>      — per-agent secret (single line, hex)
+//
+// Agent tokens are ephemeral and live only in memory — they are NOT
+// persisted to disk. A fresh token is generated for each agent on every
+// server restart and injected directly into the agent's system prompt.
+// This eliminates a file-system based token-theft vector where one agent
+// could read another agent's token file and impersonate it via the API.
 //
 // The store does NOT depend on the agent package; agent.Manager is the
 // caller that drives EnsureAgentToken / RemoveAgentToken on agent
@@ -46,18 +50,17 @@ type TokenStore struct {
 	idIndex map[string]string // agentID -> token
 }
 
-// NewTokenStore initializes a store rooted at base. It creates the
-// directory tree if missing and loads any existing tokens. The owner
-// token is created on first use if absent unless overrideOwner is
-// non-empty (in which case overrideOwner is treated as the canonical
-// owner token and is *not* persisted to disk).
+// NewTokenStore initializes a store rooted at base. The owner token is
+// created on first use if absent unless overrideOwner is non-empty (in
+// which case overrideOwner is treated as the canonical owner token and
+// is *not* persisted to disk).
+//
+// Agent tokens are NOT loaded from disk — they are generated in memory
+// on demand. Any legacy token files under <base>/agent_tokens/ are
+// ignored.
 func NewTokenStore(base string, overrideOwner string) (*TokenStore, error) {
 	if base == "" {
 		return nil, errors.New("auth: token store base path is empty")
-	}
-	dir := filepath.Join(base, "agent_tokens")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("auth: mkdir %s: %w", dir, err)
 	}
 	st := &TokenStore{
 		base:    base,
@@ -73,35 +76,6 @@ func NewTokenStore(base string, overrideOwner string) (*TokenStore, error) {
 			return nil, err
 		}
 		st.owner = owner
-	}
-
-	// Load any existing per-agent tokens.
-	entries, err := os.ReadDir(dir)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("auth: read agent_tokens: %w", err)
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		id := e.Name()
-		// Skip files whose name does not match the strict agent ID
-		// pattern. Anything else is suspicious — a stray backup file,
-		// a manual edit, or a corrupted entry — and is not worth
-		// surfacing as a valid principal.
-		if validateAgentID(id) != nil {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(dir, id))
-		if err != nil {
-			continue // skip unreadable tokens; they will be regenerated on next agent load if applicable
-		}
-		tok := trimToken(data)
-		if tok == "" {
-			continue
-		}
-		st.tokens[tok] = id
-		st.idIndex[id] = tok
 	}
 	return st, nil
 }
@@ -121,8 +95,9 @@ func (s *TokenStore) LookupAgent(token string) (string, bool) {
 	return id, ok
 }
 
-// AgentToken returns the token for the given agent ID, generating and
-// persisting one if it does not already exist.
+// AgentToken returns the token for the given agent ID, generating one
+// in memory if it does not already exist. Tokens are ephemeral — they
+// live only in memory and are regenerated on every server restart.
 func (s *TokenStore) AgentToken(agentID string) (string, error) {
 	if err := validateAgentID(agentID); err != nil {
 		return "", err
@@ -134,7 +109,7 @@ func (s *TokenStore) AgentToken(agentID string) (string, error) {
 	}
 	s.mu.RUnlock()
 
-	// Generate + persist under write lock; double-check in case of race.
+	// Generate under write lock; double-check in case of race.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if t, ok := s.idIndex[agentID]; ok {
@@ -142,9 +117,6 @@ func (s *TokenStore) AgentToken(agentID string) (string, error) {
 	}
 	tok, err := generateToken()
 	if err != nil {
-		return "", err
-	}
-	if err := s.persistAgentToken(agentID, tok); err != nil {
 		return "", err
 	}
 	s.tokens[tok] = agentID
@@ -158,7 +130,7 @@ func (s *TokenStore) EnsureAgentToken(agentID string) error {
 	return err
 }
 
-// RemoveAgentToken deletes the on-disk and in-memory token for an agent.
+// RemoveAgentToken deletes the in-memory token for an agent.
 // Safe to call on an unknown ID. Invalid IDs are ignored.
 func (s *TokenStore) RemoveAgentToken(agentID string) {
 	if validateAgentID(agentID) != nil {
@@ -171,23 +143,9 @@ func (s *TokenStore) RemoveAgentToken(agentID string) {
 		delete(s.tokens, tok)
 		delete(s.idIndex, agentID)
 	}
-	_ = os.Remove(filepath.Join(s.base, "agent_tokens", agentID))
 }
 
 // --- internals -------------------------------------------------------
-
-func (s *TokenStore) persistAgentToken(agentID, token string) error {
-	path := filepath.Join(s.base, "agent_tokens", agentID)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(token+"\n"), 0o600); err != nil {
-		return fmt.Errorf("auth: write %s: %w", path, err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("auth: rename %s: %w", path, err)
-	}
-	return nil
-}
 
 func loadOrCreateOwner(path string) (string, error) {
 	if data, err := os.ReadFile(path); err == nil {
