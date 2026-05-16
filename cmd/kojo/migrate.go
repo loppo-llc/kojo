@@ -61,6 +61,53 @@ func (f migrationFlags) primaryModeCount() int {
 	return n
 }
 
+// startupMode enumerates the primary action the operator requested.
+// Used by classifyStartupMode to separate "what did they ask for"
+// (pure, testable) from "what side effects does that imply" (still
+// in applyStartupGate).
+type startupMode int
+
+const (
+	// startupModeNormal is the no-primary-flag boot path: applyStartupGate
+	// falls through to the 5.3 trigger table.
+	startupModeNormal startupMode = iota
+	// startupModeMigrate runs runMigrate against a v0 dir, refusing if v1
+	// is already complete (unless migrateRestart is also set).
+	startupModeMigrate
+	// startupModeMigrateRestart is migrate with the "force redo" override.
+	startupModeMigrateRestart
+	// startupModeFresh starts a clean v1 install, refusing if v1 is non-empty.
+	startupModeFresh
+	// startupModeRollbackExternal undoes the claude/codex/gemini CLI
+	// symlinks the migrator installed. Independent of v1 dir state.
+	startupModeRollbackExternal
+	// startupModeInvalid means multiple primary flags were set; the caller
+	// must print the mutually-exclusive error and exit.
+	startupModeInvalid
+)
+
+// classifyStartupMode returns the primary action requested by f. Pure:
+// looks at flag values only, no I/O. The actual dispatch (and its
+// per-mode side effects) lives in applyStartupGate; tests pin this
+// function to lock in flag-combination semantics without spinning up
+// the migrator.
+func classifyStartupMode(f migrationFlags) startupMode {
+	if f.primaryModeCount() > 1 {
+		return startupModeInvalid
+	}
+	switch {
+	case f.rollbackExternal:
+		return startupModeRollbackExternal
+	case f.migrateRestart:
+		return startupModeMigrateRestart
+	case f.migrate:
+		return startupModeMigrate
+	case f.fresh:
+		return startupModeFresh
+	}
+	return startupModeNormal
+}
+
 // dirState is what mainline cares about: which of {v0, v1, complete file}
 // exist on disk at startup. This drives the 5.3 trigger table.
 type dirState struct {
@@ -96,7 +143,8 @@ func probeDirs() dirState {
 // Any non-recoverable condition is communicated by exiting via os.Exit so the
 // caller never sees a half-initialized state.
 func applyStartupGate(ctx context.Context, flags migrationFlags, logger *slog.Logger, version string) (proceed bool) {
-	if flags.primaryModeCount() > 1 {
+	mode := classifyStartupMode(flags)
+	if mode == startupModeInvalid {
 		fmt.Fprintln(os.Stderr,
 			"kojo: --migrate, --migrate-restart, --fresh and --rollback-external-cli are mutually exclusive.")
 		os.Exit(1)
@@ -106,7 +154,7 @@ func applyStartupGate(ctx context.Context, flags migrationFlags, logger *slog.Lo
 
 	// rollback-external-cli is independent of v1 dir state; it only touches
 	// claude / codex symlinks and gemini projects.json. Run it first if set.
-	if flags.rollbackExternal {
+	if mode == startupModeRollbackExternal {
 		if err := runRollbackExternalCLI(st, logger); err != nil {
 			logger.Error("rollback-external-cli failed", "err", err)
 			fmt.Fprintf(os.Stderr, "kojo: %v\n", err)
@@ -118,13 +166,13 @@ func applyStartupGate(ctx context.Context, flags migrationFlags, logger *slog.Lo
 		return false
 	}
 
-	if flags.migrate || flags.migrateRestart {
+	if mode == startupModeMigrate || mode == startupModeMigrateRestart {
 		if !st.v0Exists {
 			fmt.Fprintf(os.Stderr, "kojo: --migrate requires v0 data at %s, but the directory does not exist.\n", st.v0Path)
 			fmt.Fprintln(os.Stderr, "       use --fresh for a clean v1 install.")
 			os.Exit(1)
 		}
-		if st.v1Complete && !flags.migrateRestart {
+		if st.v1Complete && mode != startupModeMigrateRestart {
 			fmt.Fprintf(os.Stderr, "kojo: v1 directory is already migrated (%s/%s).\n", st.v1Path, migrate.CompleteFileName)
 			fmt.Fprintln(os.Stderr, "       remove --migrate to start normally.")
 			fmt.Fprintf(os.Stderr, "       to soft-delete the v0 dir at %s, run `kojo --clean v0 --clean-apply`\n", st.v0Path)
@@ -147,7 +195,7 @@ func applyStartupGate(ctx context.Context, flags migrationFlags, logger *slog.Lo
 		return false
 	}
 
-	if flags.fresh {
+	if mode == startupModeFresh {
 		// User explicitly opted out of importing v0. Refuse if a v1 dir
 		// is already present in any non-empty / non-complete state — we
 		// cannot safely "start fresh" on top of someone else's data
