@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
@@ -316,6 +317,16 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 			}
 			out = append(out, a)
 		}
+		// Best-effort: refresh the remote agents' lastMessage timestamp by
+		// asking each holder peer for its latest message. Without this the
+		// list reflects only what oplog has already replicated to our local
+		// store — during an active handoff that lag puts the agent in a
+		// stale sort position relative to local agents. Bounded total
+		// deadline keeps the list endpoint responsive when peers are slow.
+		// Restrict to the agents we're actually returning so we don't spend
+		// peer-signed HTTP budget enriching rows the caller never sees
+		// (archived filter, etc.).
+		s.enrichRemoteAgentsLatestActivity(r.Context(), out)
 		writeJSONResponse(w, http.StatusOK, map[string]any{"agents": out})
 		return
 	}
@@ -326,6 +337,22 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	// onlyArchived flags are silently ignored at this layer (an
 	// agent's own archived self is also filtered out — they should be
 	// asking the owner to revive them, not poking the API).
+	//
+	// Enrich only the agent's own (full-record) row — a directory view
+	// strips lastMessage/updatedAt anyway, so a peer fetch for those rows
+	// would be wasted budget.
+	var selfEnrich []*agent.Agent
+	for _, a := range all {
+		if a.Archived {
+			continue
+		}
+		if p.IsAgent() && p.AgentID == a.ID {
+			selfEnrich = append(selfEnrich, a)
+		}
+	}
+	if len(selfEnrich) > 0 {
+		s.enrichRemoteAgentsLatestActivity(r.Context(), selfEnrich)
+	}
 	out := make([]any, 0, len(all))
 	for _, a := range all {
 		if a.Archived {
@@ -1094,6 +1121,158 @@ func (s *Server) proxyPeerGetMessages(w http.ResponseWriter, r *http.Request, ag
 	w.WriteHeader(http.StatusOK)
 	io.Copy(w, io.LimitReader(resp.Body, 32<<20))
 	return true
+}
+
+// enrichRemoteAgentsLatestActivity refreshes the LastMessage preview and
+// UpdatedAt of every agent in `all` that lives on a remote peer (HolderPeer
+// != ""). Each enrichment is a one-message GET /messages?limit=1 against
+// the holder, parallel-fanned with a hard total deadline so a slow peer
+// can't stall the list endpoint.
+//
+// Mutates `all` in place. Best effort: agents whose holder is unreachable,
+// unsigned-peer, or whose response we can't parse are left with whatever
+// the local store had — the UI surfaces them as "転移中" anyway.
+func (s *Server) enrichRemoteAgentsLatestActivity(ctx context.Context, all []*agent.Agent) {
+	if s.peerID == nil || s.agents.Store() == nil {
+		return
+	}
+	// Collect work items first so we know whether to bother spinning up
+	// the deadline goroutine at all.
+	type work struct {
+		idx   int
+		agent *agent.Agent
+	}
+	var jobs []work
+	for i, a := range all {
+		if a == nil || a.HolderPeer == "" {
+			continue
+		}
+		jobs = append(jobs, work{idx: i, agent: a})
+	}
+	if len(jobs) == 0 {
+		return
+	}
+
+	// Hard deadline: keep ListAgents snappy even when several remote
+	// agents' holders are slow. Picked to be larger than a healthy
+	// LAN round-trip but well under the dashboard's 5s poll cadence.
+	deadline := 1500 * time.Millisecond
+	ctx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(len(jobs))
+	for _, j := range jobs {
+		go func(j work) {
+			defer wg.Done()
+			ts, role, content, ok := s.fetchRemoteLatestMessage(ctx, j.agent.ID, j.agent.HolderPeer)
+			if !ok || ts == "" {
+				return
+			}
+			// Update both sort keys. UpdatedAt drives the dashboard's
+			// primary sort; LastMessage.Timestamp is the displayed "ago".
+			if isRFC3339After(ts, j.agent.UpdatedAt) {
+				j.agent.UpdatedAt = ts
+			}
+			if j.agent.LastMessage == nil || isRFC3339After(ts, j.agent.LastMessage.Timestamp) {
+				preview := truncateForPreview(content)
+				j.agent.LastMessage = &agent.MessagePreview{
+					Content:   preview,
+					Role:      role,
+					Timestamp: ts,
+				}
+			}
+		}(j)
+	}
+	wg.Wait()
+}
+
+// fetchRemoteLatestMessage asks the holder peer for one message
+// (?limit=1) and returns (timestamp, role, content, ok). ok=false on
+// any signing / transport / decode failure — caller treats as "no
+// fresh data".
+func (s *Server) fetchRemoteLatestMessage(ctx context.Context, agentID, holderDeviceID string) (string, string, string, bool) {
+	st := s.agents.Store()
+	if st == nil {
+		return "", "", "", false
+	}
+	peerRec, err := st.GetPeer(ctx, holderDeviceID)
+	if err != nil || peerRec == nil || peerRec.Status != store.PeerStatusOnline {
+		return "", "", "", false
+	}
+	addr, err := peer.NormalizeAddress(peerRec.Name)
+	if err != nil {
+		return "", "", "", false
+	}
+	targetURL := addr + "/api/v1/agents/" + agentID + "/messages?limit=1"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return "", "", "", false
+	}
+	nonce, err := peer.MakeNonce()
+	if err != nil {
+		return "", "", "", false
+	}
+	if err := peer.SignRequest(req, s.peerID.DeviceID, s.peerID.PrivateKey, nonce, holderDeviceID); err != nil {
+		return "", "", "", false
+	}
+
+	client := peer.NoKeepAliveHTTPClient(1500 * time.Millisecond)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", "", false
+	}
+	var body struct {
+		Messages []struct {
+			Role      string `json:"role"`
+			Content   string `json:"content"`
+			Timestamp string `json:"timestamp"`
+		} `json:"messages"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
+		return "", "", "", false
+	}
+	if len(body.Messages) == 0 {
+		return "", "", "", false
+	}
+	m := body.Messages[len(body.Messages)-1]
+	return m.Timestamp, m.Role, m.Content, true
+}
+
+// isRFC3339After reports whether a is strictly after b. Empty b is
+// treated as the zero time so any valid a wins; an unparseable a or
+// b leaves the answer false (the caller keeps the existing value).
+func isRFC3339After(a, b string) bool {
+	at, err := time.Parse(time.RFC3339, a)
+	if err != nil {
+		return false
+	}
+	if b == "" {
+		return true
+	}
+	bt, err := time.Parse(time.RFC3339, b)
+	if err != nil {
+		return true
+	}
+	return at.After(bt)
+}
+
+// truncateForPreview clips long bodies to a list-preview-friendly size,
+// matching the budget Manager.refreshLastMessage applies via
+// truncatePreview. Kept here to avoid exporting the runes-aware helper
+// from the agent package just for this proxy path.
+func truncateForPreview(s string) string {
+	const maxLen = 100
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "…"
 }
 
 func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {

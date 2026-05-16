@@ -122,6 +122,11 @@ export interface AgentInfo {
   // update — use the dedicated `expectedEtag` parameter instead.
   etag?: string;
   tts?: TTSConfig;
+  // HolderPeer is set when the agent's runtime currently lives on a remote
+  // peer (e.g. via §3.7 device-switch). Empty / absent means this server
+  // owns the runtime. The dashboard surfaces this as a "転移中" badge and
+  // hides the (necessarily stale) lastMessage preview.
+  holderPeer?: string;
 }
 
 // TTSConfig mirrors internal/agent.TTSConfig in the Go backend.

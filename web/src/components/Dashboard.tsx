@@ -275,6 +275,9 @@ export function Dashboard() {
                       {isCollapsed ? (
                         <div className="flex items-center gap-2 flex-1 min-w-0">
                           <span className="font-medium text-sm truncate">{agent.name}</span>
+                          {agent.holderPeer && (
+                            <span className="text-[10px] text-amber-400/80 shrink-0">転移中</span>
+                          )}
                           <span className="text-[10px] text-neutral-600 font-mono">{agent.tool}</span>
                           <span className="text-[10px] text-neutral-600 shrink-0 ml-auto">
                             {agent.lastMessage
@@ -293,11 +296,13 @@ export function Dashboard() {
                             </span>
                           </div>
                           <div className="text-xs text-neutral-500 truncate mt-0.5">
-                            {agent.lastMessage
-                              ? `${agent.lastMessage.role === "user" ? "You: " : ""}${agent.lastMessage.content}`
-                              : agent.persona
-                                ? agent.persona.slice(0, 60) + (agent.persona.length > 60 ? "..." : "")
-                                : "No messages yet"}
+                            {agent.holderPeer
+                              ? "転移中 — 最新発言はこの端末では未反映"
+                              : agent.lastMessage
+                                ? `${agent.lastMessage.role === "user" ? "You: " : ""}${agent.lastMessage.content}`
+                                : agent.persona
+                                  ? agent.persona.slice(0, 60) + (agent.persona.length > 60 ? "..." : "")
+                                  : "No messages yet"}
                           </div>
                           <div className="flex items-center gap-2 mt-1">
                             <span className="text-[10px] text-neutral-600 font-mono">{agent.tool}</span>
