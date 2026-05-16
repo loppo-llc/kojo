@@ -28,6 +28,66 @@ UPDATE agent_messages
    SET deleted_at = ?, updated_at = ?, version = ?, etag = ?
  WHERE id = ? AND deleted_at IS NULL`
 
+// insertMessageSQL is the single INSERT used by both AppendMessage and
+// BulkAppendMessages. Column order matches the bind sequence emitted
+// from each call site.
+const insertMessageSQL = `
+INSERT INTO agent_messages (
+  id, agent_id, seq, role, content, thinking, tool_uses, attachments, usage,
+  version, etag, created_at, updated_at, deleted_at, peer_id
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
+
+// validateMessageInsertInput rejects nil / empty-id / empty-agent /
+// invalid-role records. errPrefix scopes errors to the caller's name
+// ("store.AppendMessage" / "store.BulkAppendMessages"). Used before
+// any tx is opened.
+//
+// agentIDMatch, when non-empty, additionally enforces rec.AgentID ==
+// agentIDMatch so a misrouted slice can't poison the batch — only the
+// bulk caller passes this.
+func validateMessageInsertInput(rec *MessageRecord, errPrefix, agentIDMatch string, indexHint int) error {
+	indexSuffix := ""
+	if indexHint >= 0 {
+		indexSuffix = fmt.Sprintf(" at index %d", indexHint)
+	}
+	if rec == nil {
+		return fmt.Errorf("%s: nil record%s", errPrefix, indexSuffix)
+	}
+	if rec.ID == "" {
+		return fmt.Errorf("%s: id required%s", errPrefix, indexSuffix)
+	}
+	if agentIDMatch == "" {
+		if rec.AgentID == "" {
+			return fmt.Errorf("%s: agent_id required%s", errPrefix, indexSuffix)
+		}
+	} else if rec.AgentID != agentIDMatch {
+		return fmt.Errorf("%s: agent_id %q%s does not match batch %q",
+			errPrefix, rec.AgentID, indexSuffix, agentIDMatch)
+	}
+	if !validRoles[rec.Role] {
+		return fmt.Errorf("%s: invalid role %q%s", errPrefix, rec.Role, indexSuffix)
+	}
+	return nil
+}
+
+// normalizeMessageJSON normalizes the three opaque-JSON columns of rec
+// in place. On failure returns the offending column name (one of
+// "tool_uses", "attachments", "usage") and the underlying error so the
+// caller can build its own contextual wrap. Pure: no DB I/O.
+func normalizeMessageJSON(rec *MessageRecord) (string, error) {
+	var err error
+	if rec.ToolUses, err = nullJSON(rec.ToolUses); err != nil {
+		return "tool_uses", err
+	}
+	if rec.Attachments, err = nullJSON(rec.Attachments); err != nil {
+		return "attachments", err
+	}
+	if rec.Usage, err = nullJSON(rec.Usage); err != nil {
+		return "usage", err
+	}
+	return "", nil
+}
+
 // MessageRecord mirrors the `agent_messages` table. Tool/attachment/usage
 // payloads are kept as opaque JSON so message-shape upgrades don't require a
 // schema migration; downstream consumers are expected to validate their own
@@ -129,17 +189,8 @@ type MessageInsertOptions struct {
 //
 // Returns the inserted record with seq/etag/timestamps filled in.
 func (s *Store) AppendMessage(ctx context.Context, rec *MessageRecord, opts MessageInsertOptions) (*MessageRecord, error) {
-	if rec == nil {
-		return nil, errors.New("store.AppendMessage: nil record")
-	}
-	if rec.ID == "" {
-		return nil, errors.New("store.AppendMessage: id required")
-	}
-	if rec.AgentID == "" {
-		return nil, errors.New("store.AppendMessage: agent_id required")
-	}
-	if !validRoles[rec.Role] {
-		return nil, fmt.Errorf("store.AppendMessage: invalid role %q", rec.Role)
+	if err := validateMessageInsertInput(rec, "store.AppendMessage", "", -1); err != nil {
+		return nil, err
 	}
 
 	now := opts.Now
@@ -216,29 +267,15 @@ func (s *Store) AppendMessage(ctx context.Context, rec *MessageRecord, opts Mess
 	out.UpdatedAt = updated
 	out.PeerID = opts.PeerID
 	out.DeletedAt = nil
-	out.ToolUses, err = nullJSON(out.ToolUses)
-	if err != nil {
-		return nil, fmt.Errorf("store.AppendMessage: tool_uses: %w", err)
-	}
-	out.Attachments, err = nullJSON(out.Attachments)
-	if err != nil {
-		return nil, fmt.Errorf("store.AppendMessage: attachments: %w", err)
-	}
-	out.Usage, err = nullJSON(out.Usage)
-	if err != nil {
-		return nil, fmt.Errorf("store.AppendMessage: usage: %w", err)
+	if field, jerr := normalizeMessageJSON(&out); jerr != nil {
+		return nil, fmt.Errorf("store.AppendMessage: %s: %w", field, jerr)
 	}
 	out.ETag, err = computeMessageETag(&out)
 	if err != nil {
 		return nil, err
 	}
 
-	const q = `
-INSERT INTO agent_messages (
-  id, agent_id, seq, role, content, thinking, tool_uses, attachments, usage,
-  version, etag, created_at, updated_at, deleted_at, peer_id
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
-	if _, err := tx.ExecContext(ctx, q,
+	if _, err := tx.ExecContext(ctx, insertMessageSQL,
 		out.ID, out.AgentID, out.Seq, out.Role,
 		nullableText(out.Content), nullableText(out.Thinking),
 		nullableRaw(out.ToolUses), nullableRaw(out.Attachments), nullableRaw(out.Usage),
@@ -321,18 +358,8 @@ func (s *Store) BulkAppendMessages(ctx context.Context, agentID string, recs []*
 		return 0, errors.New("store.BulkAppendMessages: opts.Seq not supported; set rec.Seq per record")
 	}
 	for i, rec := range recs {
-		if rec == nil {
-			return 0, fmt.Errorf("store.BulkAppendMessages: nil record at index %d", i)
-		}
-		if rec.ID == "" {
-			return 0, fmt.Errorf("store.BulkAppendMessages: id required at index %d", i)
-		}
-		if rec.AgentID != agentID {
-			return 0, fmt.Errorf("store.BulkAppendMessages: agent_id %q at index %d does not match batch %q",
-				rec.AgentID, i, agentID)
-		}
-		if !validRoles[rec.Role] {
-			return 0, fmt.Errorf("store.BulkAppendMessages: invalid role %q at index %d", rec.Role, i)
+		if err := validateMessageInsertInput(rec, "store.BulkAppendMessages", agentID, i); err != nil {
+			return 0, err
 		}
 	}
 
@@ -373,12 +400,7 @@ func (s *Store) BulkAppendMessages(ctx context.Context, agentID string, recs []*
 		nextSeq = maxSeq.Int64 + 1
 	}
 
-	const q = `
-INSERT INTO agent_messages (
-  id, agent_id, seq, role, content, thinking, tool_uses, attachments, usage,
-  version, etag, created_at, updated_at, deleted_at, peer_id
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
-	stmt, err := tx.PrepareContext(ctx, q)
+	stmt, err := tx.PrepareContext(ctx, insertMessageSQL)
 	if err != nil {
 		return 0, err
 	}
@@ -416,17 +438,8 @@ INSERT INTO agent_messages (
 		out.UpdatedAt = updated
 		out.PeerID = opts.PeerID
 		out.DeletedAt = nil
-		out.ToolUses, err = nullJSON(out.ToolUses)
-		if err != nil {
-			return 0, fmt.Errorf("store.BulkAppendMessages: tool_uses at index %d: %w", i, err)
-		}
-		out.Attachments, err = nullJSON(out.Attachments)
-		if err != nil {
-			return 0, fmt.Errorf("store.BulkAppendMessages: attachments at index %d: %w", i, err)
-		}
-		out.Usage, err = nullJSON(out.Usage)
-		if err != nil {
-			return 0, fmt.Errorf("store.BulkAppendMessages: usage at index %d: %w", i, err)
+		if field, jerr := normalizeMessageJSON(&out); jerr != nil {
+			return 0, fmt.Errorf("store.BulkAppendMessages: %s at index %d: %w", field, i, jerr)
 		}
 		out.ETag, err = computeMessageETag(&out)
 		if err != nil {
