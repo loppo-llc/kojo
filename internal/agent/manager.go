@@ -994,6 +994,66 @@ func (m *Manager) regeneratePublicProfile(agentID, persona string) {
 	}
 }
 
+// validateUpdateConfigPure runs every PATCH-config check that only
+// depends on cfg itself (no live-agent / cross-field state). Returns
+// the parsed nextCronMessage and whether the caller should treat
+// CronMessage as dirty; on validation failure all returns are zero
+// and the error.
+//
+// Pure: no I/O beyond os.Stat for the WorkDir existence probe (kept
+// here because it's a syntactic shape check of the payload, not a
+// live-agent decision).
+//
+// LegacyIntervalMinutes rejection is intentionally NOT here —
+// callers reject that field BEFORE AcquireMutation so an old client
+// doesn't burn a mutation slot. Cross-field checks (Effort vs Model,
+// Tool vs CustomBaseURL, SilentStart vs SilentEnd) are also kept at
+// the caller because they need the prospective post-PATCH pair
+// against the current agent state.
+func validateUpdateConfigPure(cfg *AgentUpdateConfig) (nextCronMessage string, cronMessageDirty bool, err error) {
+	if cfg.CronMessage != nil {
+		v, verr := validateCronMessage(*cfg.CronMessage)
+		if verr != nil {
+			return "", false, verr
+		}
+		nextCronMessage = v
+		cronMessageDirty = true
+	}
+	if cfg.ResumeIdleMinutes != nil && !ValidResumeIdle(*cfg.ResumeIdleMinutes) {
+		return "", false, fmt.Errorf("unsupported resumeIdle: %d minutes", *cfg.ResumeIdleMinutes)
+	}
+	// Empty CronExpr is a valid value (= disable scheduling); only non-empty
+	// values are run through the parser.
+	if cfg.CronExpr != nil && *cfg.CronExpr != "" {
+		if verr := ValidateCronExpr(*cfg.CronExpr); verr != nil {
+			return "", false, verr
+		}
+	}
+	if cfg.TimeoutMinutes != nil && !ValidTimeout(*cfg.TimeoutMinutes) {
+		return "", false, fmt.Errorf("%w: %d minutes", ErrUnsupportedTimeout, *cfg.TimeoutMinutes)
+	}
+	if cfg.Effort != nil && !ValidEffort(*cfg.Effort) {
+		return "", false, fmt.Errorf("unsupported effort level: %q", *cfg.Effort)
+	}
+	if cfg.WorkDir != nil && *cfg.WorkDir != "" {
+		if !filepath.IsAbs(*cfg.WorkDir) {
+			return "", false, fmt.Errorf("workDir must be an absolute path: %s", *cfg.WorkDir)
+		}
+		if info, ierr := os.Stat(*cfg.WorkDir); ierr != nil || !info.IsDir() {
+			return "", false, fmt.Errorf("workDir does not exist or is not a directory: %s", *cfg.WorkDir)
+		}
+	}
+	if cfg.ThinkingMode != nil && !ValidThinkingMode(*cfg.ThinkingMode) {
+		return "", false, fmt.Errorf("unsupported thinkingMode: %q", *cfg.ThinkingMode)
+	}
+	if cfg.TTS != nil {
+		if verr := ValidateTTS(cfg.TTS); verr != nil {
+			return "", false, verr
+		}
+	}
+	return nextCronMessage, cronMessageDirty, nil
+}
+
 // Update updates an agent's configuration. Only non-nil fields are applied.
 //
 // Validation order (codex review): every cfg field with a Valid*
@@ -1022,53 +1082,17 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		return nil, err
 	}
 	defer releaseMut()
-	// Pure-input validations that don't depend on existing state run first so
-	// a malformed payload can't trigger any I/O (persona.md write, avatar
-	// fetch) or partial in-memory mutations below.
-	var nextCronMessage string
-	cronMessageDirty := false
-	if cfg.CronMessage != nil {
-		v, err := validateCronMessage(*cfg.CronMessage)
-		if err != nil {
-			return nil, err
-		}
-		nextCronMessage = v
-		cronMessageDirty = true
-	}
-	if cfg.ResumeIdleMinutes != nil && !ValidResumeIdle(*cfg.ResumeIdleMinutes) {
-		return nil, fmt.Errorf("unsupported resumeIdle: %d minutes", *cfg.ResumeIdleMinutes)
-	}
-	// Empty CronExpr is a valid value (= disable scheduling); only non-empty
-	// values are run through the parser. Validated up-front like the other
-	// pure-input fields so a malformed expression can't land partial mutations.
-	if cfg.CronExpr != nil && *cfg.CronExpr != "" {
-		if err := ValidateCronExpr(*cfg.CronExpr); err != nil {
-			return nil, err
-		}
-	}
-	if cfg.TimeoutMinutes != nil && !ValidTimeout(*cfg.TimeoutMinutes) {
-		return nil, fmt.Errorf("%w: %d minutes", ErrUnsupportedTimeout, *cfg.TimeoutMinutes)
-	}
-	if cfg.Effort != nil && !ValidEffort(*cfg.Effort) {
-		return nil, fmt.Errorf("unsupported effort level: %q", *cfg.Effort)
-	}
-	if cfg.WorkDir != nil && *cfg.WorkDir != "" {
-		if !filepath.IsAbs(*cfg.WorkDir) {
-			return nil, fmt.Errorf("workDir must be an absolute path: %s", *cfg.WorkDir)
-		}
-		if info, err := os.Stat(*cfg.WorkDir); err != nil || !info.IsDir() {
-			return nil, fmt.Errorf("workDir does not exist or is not a directory: %s", *cfg.WorkDir)
-		}
-	}
-	if cfg.ThinkingMode != nil && !ValidThinkingMode(*cfg.ThinkingMode) {
-		return nil, fmt.Errorf("unsupported thinkingMode: %q", *cfg.ThinkingMode)
-	}
-	// Same reasoning for TTS — checked here so a bad model/voice can't
-	// trigger persona.md write or partial sibling-field mutations below.
-	if cfg.TTS != nil {
-		if err := ValidateTTS(cfg.TTS); err != nil {
-			return nil, err
-		}
+	// Pure-input validations that don't depend on existing state run after
+	// AcquireMutation (so Switching's refusal still beats validation errors,
+	// matching the pre-refactor ordering) but before any I/O so a malformed
+	// payload can't trigger persona.md write or avatar fetch. Cross-field
+	// validation against the live agent state (Effort vs Model, Tool vs
+	// CustomBaseURL, SilentStart vs SilentEnd) runs under m.mu further down
+	// — those need the prospective post-PATCH pair, which requires reading
+	// the current agent state.
+	nextCronMessage, cronMessageDirty, err := validateUpdateConfigPure(&cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	// Check agent exists before any file I/O
