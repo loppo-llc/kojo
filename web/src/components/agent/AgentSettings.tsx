@@ -9,6 +9,7 @@ import { ScheduleEditor } from "./ScheduleEditor";
 import { NotifySourcesEditor } from "./NotifySourcesEditor";
 import { SlackBotSettings } from "./SlackBotSettings";
 import { defaultModelForTool, modelsForTool, effortLevelsForModel, defaultEffortForModel, supportsEffort, type EffortLevel } from "../../lib/toolModels";
+import { buildAgentSavePayload } from "./agentSettingsPayload";
 
 export function AgentSettings() {
   const { id } = useParams<{ id: string }>();
@@ -192,17 +193,17 @@ export function AgentSettings() {
     try {
       const updated = await agentApi.update(
         id!,
-        {
-          name: name.trim(),
-          persona: persona.trim(),
-          ...(publicProfileOverride ? { publicProfile: publicProfile.trim() } : {}),
+        buildAgentSavePayload({
+          name,
+          persona,
+          publicProfile,
           publicProfileOverride,
-          model: model.trim(),
-          effort: supportsEffort(tool) ? effort : undefined,
-          tool: tool.trim(),
-          customBaseURL: needsCustomURL ? customBaseURL.trim() : undefined,
-          thinkingMode: tool === "llama.cpp" ? thinkingMode : undefined,
-          workDir: workDir.trim(),
+          model,
+          effort,
+          tool,
+          customBaseURL,
+          thinkingMode,
+          workDir,
           cronExpr,
           timeoutMinutes,
           resumeIdleMinutes,
@@ -210,15 +211,15 @@ export function AgentSettings() {
           silentEnd,
           notifyDuringSilent,
           cronMessage,
-          allowedTools: (tool === "custom") ? allowedTools : undefined,
-          allowProtectedPaths: (tool === "claude" || tool === "custom") ? allowProtectedPaths : undefined,
+          allowedTools,
+          allowProtectedPaths,
           tts: {
             enabled: ttsEnabled,
-            model: ttsModel || undefined,
-            voice: ttsVoice || undefined,
-            stylePrompt: ttsStylePrompt.trim() || undefined,
+            model: ttsModel,
+            voice: ttsVoice,
+            stylePrompt: ttsStylePrompt,
           },
-        },
+        }),
         // The form's snapshot etag — captured at GET time, NOT a global
         // cache lookup. Without this If-Match the server happily accepts
         // a stale form's overwrite even when another tab has saved newer
