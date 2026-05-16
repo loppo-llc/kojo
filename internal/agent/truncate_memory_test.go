@@ -237,6 +237,64 @@ func TestTruncateClaudeSessionFileDeletesWhenAllAfter(t *testing.T) {
 	}
 }
 
+// TestTruncateClaudeSessionFileKeepsMalformedLines locks in the
+// current behavior for non-JSON / corrupt entries: they are kept
+// verbatim, never participate in the timestamp comparison, and never
+// trigger orphan trimming. This is a characterization test: the
+// codec extraction planned next must preserve these semantics so a
+// session file with one bad line in the middle is not silently
+// truncated to nothing.
+func TestTruncateClaudeSessionFileKeepsMalformedLines(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sess.jsonl")
+	lines := []string{
+		claudeLine(t, map[string]any{
+			"type":      "user",
+			"timestamp": "2026-05-09T00:00:00.000Z",
+			"message":   map[string]any{"role": "user", "content": "before"},
+		}),
+		`{this is not valid json}`,
+		``,
+		claudeLine(t, map[string]any{
+			"type":      "user",
+			"timestamp": "2026-05-09T05:00:00.000Z",
+			"message":   map[string]any{"role": "user", "content": "after"},
+		}),
+		`garbage with no braces`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	since := mustParseRFC3339(t, "2026-05-09T01:00:00Z")
+	removed, deleted, err := truncateClaudeSessionFile(path, since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted {
+		t.Fatal("file should not be deleted: malformed + valid-before lines remain")
+	}
+	if removed != 1 {
+		t.Errorf("removed = %d, want 1 (only the post-since valid entry)", removed)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "{this is not valid json}") {
+		t.Error("malformed JSON line was dropped; expected verbatim retention")
+	}
+	if !strings.Contains(got, "garbage with no braces") {
+		t.Error("non-JSON garbage line was dropped; expected verbatim retention")
+	}
+	if strings.Contains(got, `"content":"after"`) {
+		t.Error("post-since valid entry was retained; expected drop")
+	}
+	if !strings.Contains(got, `"content":"before"`) {
+		t.Error("pre-since valid entry was dropped; expected retention")
+	}
+}
+
 func TestTruncateClaudeSessionFileTrimsTrailingToolResult(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sess.jsonl")
