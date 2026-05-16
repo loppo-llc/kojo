@@ -488,9 +488,32 @@ export function AgentChat() {
               const idx = modes.indexOf((agent.thinkingMode ?? "") as typeof modes[number]);
               const next = modes[(idx + 1) % modes.length];
               try {
-                const updated = await agentApi.update(agent.id, { thinkingMode: next });
+                // Pass agent.etag as the optimistic-concurrency token.
+                // Without this the toggle would be an unconditional
+                // PATCH and could overwrite a settings-page edit that
+                // landed since this AgentChat fetched the agent.
+                const updated = await agentApi.update(
+                  agent.id,
+                  { thinkingMode: next },
+                  agent.etag,
+                );
                 setAgent(updated);
-              } catch {}
+              } catch (err) {
+                // 412 → refetch and retry once. Any other failure is
+                // swallowed (existing behavior); the button visibly
+                // doesn't change so the user sees nothing happened.
+                if (err instanceof Error && err.name === "PreconditionFailedError") {
+                  try {
+                    const fresh = await agentApi.get(agent.id);
+                    const updated = await agentApi.update(
+                      agent.id,
+                      { thinkingMode: next },
+                      fresh.etag,
+                    );
+                    setAgent(updated);
+                  } catch { /* give up — user can retry */ }
+                }
+              }
             }}
             className={`px-2 py-1 rounded text-xs font-mono ${
               agent.thinkingMode === "on"
@@ -575,16 +598,63 @@ export function AgentChat() {
               onEdit={
                 editable
                   ? async (msgId, content) => {
-                      const updated = await agentApi.updateMessage(agent.id, msgId, content);
-                      setMessages((prev) => prev.map((m) => (m.id === msgId ? { ...m, ...updated } : m)));
+                      // Pass the message's current etag so the server can
+                      // reject the edit with 412 if someone else changed
+                      // the row in the meantime. The msg here came from
+                      // the most recent setMessages() so it carries the
+                      // freshest etag we have.
+                      try {
+                        const updated = await agentApi.updateMessage(
+                          agent.id,
+                          msgId,
+                          content,
+                          msg.etag,
+                        );
+                        setMessages((prev) => prev.map((m) => (m.id === msgId ? { ...m, ...updated } : m)));
+                      } catch (err) {
+                        // 412 means our cached etag is stale — refetch the
+                        // transcript so subsequent edits start from the
+                        // current row. We rethrow so the ChatMessage's
+                        // edit UI can show the error (the form stays open
+                        // with the user's draft intact).
+                        if (err instanceof Error && err.name === "PreconditionFailedError") {
+                          const fresh = await agentApi.messages(agent.id, 30);
+                          setMessages(fresh.messages);
+                        }
+                        throw err;
+                      }
                     }
                   : undefined
               }
               onDelete={
                 editable
                   ? async (msgId) => {
-                      await agentApi.deleteMessage(agent.id, msgId);
-                      setMessages((prev) => prev.filter((m) => m.id !== msgId));
+                      try {
+                        await agentApi.deleteMessage(agent.id, msgId, msg.etag);
+                        setMessages((prev) => prev.filter((m) => m.id !== msgId));
+                      } catch (err) {
+                        // Two stale-state shapes both want a refetch:
+                        //   - 412: row was edited under us (etag advanced)
+                        //   - 404 with conditional delete: row already
+                        //     vanished. The store distinguishes this from
+                        //     "row never existed" — the conditional
+                        //     SoftDelete returns ErrNotFound only for
+                        //     tombstoned/missing rows, and the deleteMessage
+                        //     pre-read maps unrelated 404s the same way.
+                        //     Either way the local view is stale; refetch
+                        //     is the safe move. We do NOT auto-retry —
+                        //     delete is destructive and the user should
+                        //     re-confirm against fresh content.
+                        const isStale =
+                          err instanceof Error &&
+                          (err.name === "PreconditionFailedError" ||
+                            (msg.etag && /^404:/.test(err.message)));
+                        if (isStale) {
+                          const fresh = await agentApi.messages(agent.id, 30);
+                          setMessages(fresh.messages);
+                        }
+                        throw err;
+                      }
                     }
                   : undefined
               }
@@ -607,23 +677,52 @@ export function AgentChat() {
                       setStreamStatus("thinking");
                       setStreamStartTime(Date.now());
                       try {
-                        await agentApi.regenerateMessage(agent.id, msgId);
+                        // Pass msg.etag to catch the case where another
+                        // device edited this row between the user clicking
+                        // regenerate and the request landing — without the
+                        // precondition the server would happily truncate
+                        // against a stale view of the conversation.
+                        await agentApi.regenerateMessage(agent.id, msgId, msg.etag);
                       } catch (e) {
-                        // Server rejected before regen started (400/404/409/5xx).
-                        // Roll back optimistic state and show the error inline
-                        // — the backend never streamed, so no WS error will
-                        // arrive.
-                        const errorContent = `⚠️ Error: ${e instanceof Error ? e.message : String(e)}`;
-                        setMessages([
-                          ...snapshot,
-                          {
-                            id: "error_" + Date.now(),
-                            role: "system",
-                            content: errorContent,
-                            timestamp: localRFC3339(),
-                          },
-                        ]);
-                        resetStream();
+                        // Server rejected before regen started (400/404/409/412/5xx).
+                        // The backend never streamed, so no WS error will
+                        // arrive — we own the rollback. On 412 we refetch so
+                        // the user sees the fresh transcript before deciding
+                        // whether to re-confirm regenerate (no auto-retry:
+                        // regen is destructive and may now target a different
+                        // row). For everything else, restore the snapshot
+                        // and surface an inline error.
+                        //
+                        // The try/finally ensures resetStream() runs even
+                        // if the 412-refetch itself fails — without it we'd
+                        // leave the chat stuck in optimistic-truncated +
+                        // streaming-spinner state forever.
+                        try {
+                          if (e instanceof Error && e.name === "PreconditionFailedError") {
+                            try {
+                              const fresh = await agentApi.messages(agent.id, 30);
+                              setMessages(fresh.messages);
+                            } catch {
+                              // Refetch failed too — fall back to the
+                              // snapshot so the user at least sees the
+                              // transcript they had before clicking.
+                              setMessages(snapshot);
+                            }
+                            return;
+                          }
+                          const errorContent = `⚠️ Error: ${e instanceof Error ? e.message : String(e)}`;
+                          setMessages([
+                            ...snapshot,
+                            {
+                              id: "error_" + Date.now(),
+                              role: "system",
+                              content: errorContent,
+                              timestamp: localRFC3339(),
+                            },
+                          ]);
+                        } finally {
+                          resetStream();
+                        }
                       }
                     }
                   : undefined

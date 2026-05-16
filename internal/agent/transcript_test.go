@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -13,8 +14,9 @@ func TestLoadMessagesPaginated(t *testing.T) {
 	t.Setenv("HOME", tmpDir)
 
 	agentID := "ag_test_pagination"
-	dir := filepath.Join(tmpDir, ".config", "kojo", "agents", agentID)
+	dir := filepath.Join(tmpDir, ".config", "kojo-v1", "agents", agentID)
 	os.MkdirAll(dir, 0o755)
+	transcriptTestSetup(t, agentID)
 
 	// Write test messages
 	for i, content := range []string{"msg1", "msg2", "msg3", "msg4", "msg5"} {
@@ -97,10 +99,11 @@ func TestUpdateAndDeleteMessage(t *testing.T) {
 	t.Setenv("HOME", tmpDir)
 
 	agentID := "ag_test_edit"
-	dir := filepath.Join(tmpDir, ".config", "kojo", "agents", agentID)
+	dir := filepath.Join(tmpDir, ".config", "kojo-v1", "agents", agentID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	transcriptTestSetup(t, agentID)
 
 	ids := []string{"m_a", "m_b", "m_c"}
 	for i, id := range ids {
@@ -116,12 +119,15 @@ func TestUpdateAndDeleteMessage(t *testing.T) {
 	}
 
 	t.Run("update content", func(t *testing.T) {
-		updated, err := updateMessageContent(agentID, "m_b", "edited")
+		updated, etag, err := updateMessageContent(agentID, "m_b", "edited", "")
 		if err != nil {
 			t.Fatal(err)
 		}
 		if updated.Content != "edited" {
 			t.Errorf("expected edited, got %q", updated.Content)
+		}
+		if etag == "" {
+			t.Error("expected non-empty etag from store update")
 		}
 		msgs, _, err := loadMessagesPaginated(agentID, 0, "")
 		if err != nil {
@@ -139,14 +145,46 @@ func TestUpdateAndDeleteMessage(t *testing.T) {
 	})
 
 	t.Run("update nonexistent", func(t *testing.T) {
-		_, err := updateMessageContent(agentID, "m_zzz", "x")
+		_, _, err := updateMessageContent(agentID, "m_zzz", "x", "")
 		if !errors.Is(err, ErrMessageNotFound) {
 			t.Errorf("expected ErrMessageNotFound, got %v", err)
 		}
 	})
 
+	t.Run("update with stale If-Match", func(t *testing.T) {
+		_, _, err := updateMessageContent(agentID, "m_a", "again", "v0-stale")
+		if !errors.Is(err, ErrMessageETagMismatch) {
+			t.Errorf("expected ErrMessageETagMismatch, got %v", err)
+		}
+	})
+
+	t.Run("update with matching If-Match", func(t *testing.T) {
+		// Read the current etag, then send it back as ifMatch — must succeed.
+		msgs, _, err := loadMessagesPaginated(agentID, 0, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var current string
+		for _, m := range msgs {
+			if m.ID == "m_a" {
+				current = m.ETag
+				break
+			}
+		}
+		if current == "" {
+			t.Fatal("m_a has no etag — recordToMessage broken")
+		}
+		_, newETag, err := updateMessageContent(agentID, "m_a", "matched", current)
+		if err != nil {
+			t.Fatalf("matching ifMatch should succeed, got %v", err)
+		}
+		if newETag == current {
+			t.Error("etag should advance after update")
+		}
+	})
+
 	t.Run("delete message", func(t *testing.T) {
-		if err := deleteMessage(agentID, "m_a"); err != nil {
+		if err := deleteMessage(agentID, "m_a", ""); err != nil {
 			t.Fatal(err)
 		}
 		msgs, _, err := loadMessagesPaginated(agentID, 0, "")
@@ -164,9 +202,59 @@ func TestUpdateAndDeleteMessage(t *testing.T) {
 	})
 
 	t.Run("delete nonexistent", func(t *testing.T) {
-		err := deleteMessage(agentID, "m_zzz")
+		err := deleteMessage(agentID, "m_zzz", "")
 		if !errors.Is(err, ErrMessageNotFound) {
 			t.Errorf("expected ErrMessageNotFound, got %v", err)
+		}
+	})
+
+	t.Run("delete with stale If-Match", func(t *testing.T) {
+		err := deleteMessage(agentID, "m_b", "v0-stale")
+		if !errors.Is(err, ErrMessageETagMismatch) {
+			t.Errorf("expected ErrMessageETagMismatch, got %v", err)
+		}
+		// Row must still be alive — the precondition failed before the write.
+		msgs, _, err := loadMessagesPaginated(agentID, 0, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var stillThere bool
+		for _, m := range msgs {
+			if m.ID == "m_b" {
+				stillThere = true
+			}
+		}
+		if !stillThere {
+			t.Error("m_b should not be deleted on stale If-Match")
+		}
+	})
+
+	t.Run("delete with matching If-Match", func(t *testing.T) {
+		msgs, _, err := loadMessagesPaginated(agentID, 0, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var current string
+		for _, m := range msgs {
+			if m.ID == "m_b" {
+				current = m.ETag
+				break
+			}
+		}
+		if current == "" {
+			t.Fatal("m_b has no etag — recordToMessage broken")
+		}
+		if err := deleteMessage(agentID, "m_b", current); err != nil {
+			t.Fatalf("matching If-Match should succeed, got %v", err)
+		}
+	})
+
+	t.Run("delete with If-Match against vanished row", func(t *testing.T) {
+		// m_b is now tombstoned — a conditional follow-up must surface
+		// not-found so the caller can refetch instead of silently no-op.
+		err := deleteMessage(agentID, "m_b", "v0-anything")
+		if !errors.Is(err, ErrMessageNotFound) {
+			t.Errorf("expected ErrMessageNotFound for tombstoned row, got %v", err)
 		}
 	})
 }
@@ -176,10 +264,11 @@ func TestFindRegenerateTargetAndTruncate(t *testing.T) {
 	t.Setenv("HOME", tmpDir)
 
 	agentID := "ag_test_regen"
-	dir := filepath.Join(tmpDir, ".config", "kojo", "agents", agentID)
+	dir := filepath.Join(tmpDir, ".config", "kojo-v1", "agents", agentID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	transcriptTestSetup(t, agentID, "ag_test_regen_bad")
 
 	type row struct {
 		id, role, content string
@@ -204,50 +293,88 @@ func TestFindRegenerateTargetAndTruncate(t *testing.T) {
 	}
 
 	t.Run("assistant target cuts inclusive", func(t *testing.T) {
-		target, keep, err := findRegenerateTarget(agentID, "m_a2")
+		rt, err := findRegenerateTarget(context.Background(), agentID, "m_a2", "")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if target.ID != "m_u2" {
-			t.Errorf("expected m_u2 as source, got %s", target.ID)
+		if rt.SourceID != "m_u2" {
+			t.Errorf("expected source m_u2, got %s", rt.SourceID)
 		}
-		if keep != 3 {
-			t.Errorf("expected keepCount=3, got %d", keep)
+		if rt.PivotID != "m_a2" {
+			t.Errorf("expected pivot m_a2, got %s", rt.PivotID)
+		}
+		if !rt.KillPivot {
+			t.Errorf("assistant mode should kill pivot")
 		}
 	})
 
 	t.Run("user target cuts exclusive", func(t *testing.T) {
-		target, keep, err := findRegenerateTarget(agentID, "m_u2")
+		rt, err := findRegenerateTarget(context.Background(), agentID, "m_u2", "")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if target.ID != "m_u2" {
-			t.Errorf("expected m_u2 as source, got %s", target.ID)
+		if rt.SourceID != "m_u2" {
+			t.Errorf("expected source m_u2, got %s", rt.SourceID)
 		}
-		if keep != 3 {
-			t.Errorf("expected keepCount=3, got %d", keep)
+		if rt.PivotID != "m_u2" {
+			t.Errorf("expected pivot m_u2, got %s", rt.PivotID)
+		}
+		if rt.KillPivot {
+			t.Errorf("user mode must keep pivot")
 		}
 	})
 
 	t.Run("assistant with no preceding user", func(t *testing.T) {
 		// Fresh agent with only assistant messages.
 		otherID := "ag_test_regen_bad"
-		if err := os.MkdirAll(filepath.Join(tmpDir, ".config", "kojo", "agents", otherID), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(tmpDir, ".config", "kojo-v1", "agents", otherID), 0o755); err != nil {
 			t.Fatal(err)
 		}
 		if err := appendMessage(otherID, &Message{ID: "m_x", Role: "assistant", Content: "orphan", Timestamp: "2024-01-01T00:00:00Z"}); err != nil {
 			t.Fatal(err)
 		}
-		_, _, err := findRegenerateTarget(otherID, "m_x")
+		_, err := findRegenerateTarget(context.Background(), otherID, "m_x", "")
 		if !errors.Is(err, ErrInvalidRegenerate) {
 			t.Errorf("expected ErrInvalidRegenerate, got %v", err)
 		}
 	})
 
 	t.Run("not found", func(t *testing.T) {
-		_, _, err := findRegenerateTarget(agentID, "m_zzz")
+		_, err := findRegenerateTarget(context.Background(), agentID, "m_zzz", "")
 		if !errors.Is(err, ErrMessageNotFound) {
 			t.Errorf("expected ErrMessageNotFound, got %v", err)
+		}
+	})
+
+	t.Run("stale If-Match on clicked message", func(t *testing.T) {
+		_, err := findRegenerateTarget(context.Background(), agentID, "m_a2", "v0-stale")
+		if !errors.Is(err, ErrMessageETagMismatch) {
+			t.Errorf("expected ErrMessageETagMismatch, got %v", err)
+		}
+	})
+
+	t.Run("matching If-Match on clicked message", func(t *testing.T) {
+		// Read the live etag of m_a2 and feed it back — must succeed.
+		msgs, _, err := loadMessagesPaginated(agentID, 0, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var current string
+		for _, m := range msgs {
+			if m.ID == "m_a2" {
+				current = m.ETag
+				break
+			}
+		}
+		if current == "" {
+			t.Fatal("m_a2 has no etag")
+		}
+		rt, err := findRegenerateTarget(context.Background(), agentID, "m_a2", current)
+		if err != nil {
+			t.Fatalf("matching ifMatch should succeed, got %v", err)
+		}
+		if rt.SourceID != "m_u2" || rt.PivotID != "m_a2" || !rt.KillPivot {
+			t.Errorf("unexpected result: %+v", rt)
 		}
 	})
 

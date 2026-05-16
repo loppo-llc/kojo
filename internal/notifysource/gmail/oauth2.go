@@ -45,15 +45,20 @@ func NewOAuth2Manager() *OAuth2Manager {
 	}
 }
 
-// StartAuthFlow begins an OAuth2 authorization flow and returns the URL to redirect the user to.
-func (m *OAuth2Manager) StartAuthFlow(clientID, agentID, sourceID, redirectURI string) (string, error) {
+// StartAuthFlow begins an OAuth2 authorization flow and returns the
+// URL to redirect the user to AND the freshly-generated `state`
+// parameter so the caller can echo it back to the client (the editor
+// uses it to correlate the postMessage callback against a specific
+// popup — necessary when the user opens two consecutive popups for
+// the same source and we need to drop the older one's late callback).
+func (m *OAuth2Manager) StartAuthFlow(clientID, agentID, sourceID, redirectURI string) (string, string, error) {
 	state, err := randomString(32)
 	if err != nil {
-		return "", fmt.Errorf("generate state: %w", err)
+		return "", "", fmt.Errorf("generate state: %w", err)
 	}
 	codeVerifier, err := randomString(64)
 	if err != nil {
-		return "", fmt.Errorf("generate code verifier: %w", err)
+		return "", "", fmt.Errorf("generate code verifier: %w", err)
 	}
 
 	// PKCE S256 challenge
@@ -89,7 +94,7 @@ func (m *OAuth2Manager) StartAuthFlow(clientID, agentID, sourceID, redirectURI s
 		"prompt":                {"consent"},
 	}
 
-	return googleAuthURL + "?" + params.Encode(), nil
+	return googleAuthURL + "?" + params.Encode(), state, nil
 }
 
 // PeekPending returns the pending auth for a state without consuming it.

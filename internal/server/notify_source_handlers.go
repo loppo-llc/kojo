@@ -2,12 +2,16 @@ package server
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/notifysource"
 	gmailpkg "github.com/loppo-llc/kojo/internal/notifysource/gmail"
 )
@@ -30,8 +34,20 @@ func (s *Server) handleListNotifySources(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleCreateNotifySource(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	a, ok := s.agents.Get(id)
-	if !ok {
+	// Parse If-Match before any side-effect so a malformed precondition
+	// (weak etag, comma-list, missing quotes) is rejected before the
+	// agent lookup or body decode. Notify-source rows are stored as a
+	// JSON slice on the agent row, so the parent agent's etag is the
+	// resource etag — same scope as PATCH /agents/{id}.
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
+	if _, ok := s.agents.Get(id); !ok {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
 		return
 	}
@@ -64,12 +80,36 @@ func (s *Server) handleCreateNotifySource(w http.ResponseWriter, r *http.Request
 		Options:         req.Options,
 	}
 
-	sources := append(a.NotifySources, cfg)
+	// Per-agent serialization across precheck → UpdateNotifySources →
+	// ETag echo. Without this, two concurrent mutations carrying the
+	// same If-Match would both observe the same store etag, both pass
+	// the precheck, and both succeed. Re-snapshot the agent's source
+	// list under the lock so a concurrent unrelated mutation that
+	// landed between the initial Get() and LockPatch() (e.g. another
+	// notify-source edit) is not clobbered when we append.
+	release := s.agents.LockPatch(id)
+	defer release()
+	if !s.agentIfMatchPrecheck(w, r, id, ifMatch, ifMatchPresent) {
+		return
+	}
+	current, ok := s.agents.Get(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	sources := append(current.NotifySources, cfg)
 	if err := s.agents.UpdateNotifySources(id, sources); err != nil {
+		if errors.Is(err, agent.ErrAgentBusy) {
+			writeError(w, http.StatusConflict, "agent_busy", err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 
+	if newETag := s.readAgentETag(r, id); newETag != "" {
+		w.Header().Set("ETag", quoteETag(newETag))
+	}
 	writeJSONResponse(w, http.StatusCreated, map[string]any{"source": cfg})
 }
 
@@ -77,8 +117,18 @@ func (s *Server) handleUpdateNotifySource(w http.ResponseWriter, r *http.Request
 	agentID := r.PathValue("id")
 	sourceID := r.PathValue("sourceId")
 
-	a, ok := s.agents.Get(agentID)
-	if !ok {
+	// Parse If-Match before any side-effect. The notify-source row is a
+	// JSON entry on the parent agent's row, so the precondition gates
+	// on the parent agent's etag — same scope as PATCH /agents/{id}.
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
+	if _, ok := s.agents.Get(agentID); !ok {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+agentID)
 		return
 	}
@@ -91,6 +141,22 @@ func (s *Server) handleUpdateNotifySource(w http.ResponseWriter, r *http.Request
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON")
+		return
+	}
+
+	// Per-agent serialization across precheck → UpdateNotifySources →
+	// ETag echo (see handleCreateNotifySource for rationale).
+	release := s.agents.LockPatch(agentID)
+	defer release()
+	if !s.agentIfMatchPrecheck(w, r, agentID, ifMatch, ifMatchPresent) {
+		return
+	}
+
+	// Re-snapshot under the lock so concurrent unrelated edits to the
+	// agent (or to a sibling source) are not clobbered.
+	a, ok := s.agents.Get(agentID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+agentID)
 		return
 	}
 
@@ -144,10 +210,17 @@ func (s *Server) handleUpdateNotifySource(w http.ResponseWriter, r *http.Request
 	}
 
 	if err := s.agents.UpdateNotifySources(agentID, sources); err != nil {
+		if errors.Is(err, agent.ErrAgentBusy) {
+			writeError(w, http.StatusConflict, "agent_busy", err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 
+	if newETag := s.readAgentETag(r, agentID); newETag != "" {
+		w.Header().Set("ETag", quoteETag(newETag))
+	}
 	for _, cfg := range sources {
 		if cfg.ID == sourceID {
 			writeJSONResponse(w, http.StatusOK, map[string]any{"source": cfg})
@@ -160,6 +233,41 @@ func (s *Server) handleDeleteNotifySource(w http.ResponseWriter, r *http.Request
 	agentID := r.PathValue("id")
 	sourceID := r.PathValue("sourceId")
 
+	// Parse If-Match before any side-effect. Gates on the parent
+	// agent's etag (see handleUpdateNotifySource).
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
+	// §3.7 device-switch gate: hold one AcquireMutation across
+	// the config update AND the token cleanup so a switching
+	// flip between them cannot escape quiesce — without it,
+	// UpdateNotifySources' internal AcquireMutation would refuse
+	// after a switch arrives, leaving NotifySources untouched
+	// but the DeleteTokensBySource still firing on stale state.
+	releaseMut, mutErr := s.agents.AcquireMutation(agentID)
+	if mutErr != nil {
+		writeError(w, http.StatusConflict, "agent_busy", mutErr.Error())
+		return
+	}
+	defer releaseMut()
+	if _, ok := s.agents.Get(agentID); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+agentID)
+		return
+	}
+
+	release := s.agents.LockPatch(agentID)
+	defer release()
+	if !s.agentIfMatchPrecheck(w, r, agentID, ifMatch, ifMatchPresent) {
+		return
+	}
+
+	// Re-snapshot under the lock so concurrent edits to a sibling
+	// source are not clobbered when we filter.
 	a, ok := s.agents.Get(agentID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+agentID)
@@ -183,16 +291,22 @@ func (s *Server) handleDeleteNotifySource(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := s.agents.UpdateNotifySources(agentID, sources); err != nil {
+	// No-guard variant: outer AcquireMutation is held above.
+	if err := s.agents.UpdateNotifySourcesAlreadyGuarded(agentID, sources); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 
-	// Clean up tokens for this source
+	// Clean up tokens for this source — still under the outer
+	// mutation hold so a switching flip can't sneak in between
+	// UpdateNotifySources and this delete.
 	if s.agents.HasCredentials() && sourceType != "" {
 		s.agents.Credentials().DeleteTokensBySource(sourceType, agentID, sourceID)
 	}
 
+	if newETag := s.readAgentETag(r, agentID); newETag != "" {
+		w.Header().Set("ETag", quoteETag(newETag))
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -246,13 +360,18 @@ func (s *Server) handleNotifySourceAuth(w http.ResponseWriter, r *http.Request) 
 	redirectURI := fmt.Sprintf("%s://%s/oauth2/callback", scheme, r.Host)
 
 	oauth2Mgr := s.getOAuth2Manager()
-	authURL, err := oauth2Mgr.StartAuthFlow(clientID, agentID, sourceID, redirectURI)
+	authURL, state, err := oauth2Mgr.StartAuthFlow(clientID, agentID, sourceID, redirectURI)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 
-	writeJSONResponse(w, http.StatusOK, map[string]any{"authUrl": authURL})
+	// Echo `state` so the editor can correlate the eventual
+	// postMessage callback against this exact popup (rather than a
+	// stale one from a previous double-click). The state is also
+	// embedded in authURL itself; we surface it explicitly so the
+	// client doesn't have to URL-parse to extract it.
+	writeJSONResponse(w, http.StatusOK, map[string]any{"authUrl": authURL, "state": state})
 }
 
 func (s *Server) handleOAuth2Callback(w http.ResponseWriter, r *http.Request) {
@@ -260,28 +379,66 @@ func (s *Server) handleOAuth2Callback(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
 	errParam := r.URL.Query().Get("error")
 
+	oauth2Mgr := s.getOAuth2Manager()
+
+	// Provider-side denial includes the original `state` so we can
+	// resolve sourceID for postMessage correlation. The editor
+	// matches incoming messages on activeAuthState (the per-popup
+	// nonce) — denied-with-state messages need to carry both
+	// sourceId AND state so the editor can tell which popup the
+	// denial belongs to. Without this lookup, denied-at-provider
+	// would arrive with empty sourceId and would only correlate via
+	// state, which still works but loses one piece of context the
+	// editor uses for its banner copy.
+	deniedSourceID := ""
+	if errParam != "" && state != "" {
+		if pending := oauth2Mgr.PeekPending(state); pending != nil {
+			deniedSourceID = pending.SourceID
+		}
+	}
+
+	// Every error from this point on returns the OAuth-error HTML
+	// (postMessage to opener + window.close()) — without it the
+	// popup hangs with raw text and the editor never gets feedback.
 	if errParam != "" {
-		http.Error(w, "Authorization denied: "+errParam, http.StatusBadRequest)
+		writeOAuthErrorHTML(w, http.StatusBadRequest, "denied",
+			"Authorization denied: "+errParam, deniedSourceID, state)
 		return
 	}
 	if code == "" || state == "" {
-		http.Error(w, "Missing code or state", http.StatusBadRequest)
+		writeOAuthErrorHTML(w, http.StatusBadRequest, "bad_request",
+			"Missing code or state", "", state)
 		return
 	}
-
-	oauth2Mgr := s.getOAuth2Manager()
 
 	// Look up the pending auth to determine the source type (peek only, don't consume)
 	pending := oauth2Mgr.PeekPending(state)
 	if pending == nil {
-		http.Error(w, "Unknown or expired state", http.StatusBadRequest)
+		writeOAuthErrorHTML(w, http.StatusBadRequest, "expired",
+			"Unknown or expired state", "", state)
 		return
 	}
 
-	// Get the source config to determine provider type
+	// Pre-exchange agent / source / archived check. Concurrent
+	// Delete/Archive (serialized via LockPatch on the lifecycle
+	// methods) cannot land mid-callback once we acquire the patch
+	// lock below — so the post-CompleteAuthFlow re-check under the
+	// lock is what catches a transition that lands during the token
+	// exchange round-trip. The pre-exchange check here is the fast
+	// fail for the common case where the transition already
+	// happened before we got the callback: refuse cleanly without
+	// burning the OAuth code (CompleteAuthFlow consumes it from the
+	// pending map AND can be replayed once at the provider side, so
+	// we want to skip that step on a known-doomed callback).
 	a, ok := s.agents.Get(pending.AgentID)
 	if !ok {
-		http.Error(w, "Agent not found", http.StatusBadRequest)
+		writeOAuthErrorHTML(w, http.StatusGone, "agent_gone",
+			"Agent no longer exists.", pending.SourceID, state)
+		return
+	}
+	if a.Archived {
+		writeOAuthErrorHTML(w, http.StatusConflict, "agent_archived",
+			"Agent was archived before authorization completed; unarchive before re-authorizing.", pending.SourceID, state)
 		return
 	}
 	var provider string
@@ -292,36 +449,167 @@ func (s *Server) handleOAuth2Callback(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if provider == "" {
-		http.Error(w, "Source not found", http.StatusBadRequest)
+		writeOAuthErrorHTML(w, http.StatusGone, "source_gone",
+			"Notification source was removed before authorization completed; please re-add it.", pending.SourceID, state)
 		return
 	}
 
 	if !s.agents.HasCredentials() {
-		http.Error(w, "Credential store not available", http.StatusInternalServerError)
+		writeOAuthErrorHTML(w, http.StatusInternalServerError, "no_credstore",
+			"Credential store not available", pending.SourceID, state)
 		return
 	}
 	creds := s.agents.Credentials()
 	clientID, err := creds.GetToken(provider, "", "", "client_id")
 	if err != nil {
-		http.Error(w, "OAuth client_id not found", http.StatusInternalServerError)
+		writeOAuthErrorHTML(w, http.StatusInternalServerError, "no_client_id",
+			"OAuth client_id not found", pending.SourceID, state)
 		return
 	}
 	clientSecret, err := creds.GetToken(provider, "", "", "client_secret")
 	if err != nil {
-		http.Error(w, "OAuth client_secret not found", http.StatusInternalServerError)
+		writeOAuthErrorHTML(w, http.StatusInternalServerError, "no_client_secret",
+			"OAuth client_secret not found", pending.SourceID, state)
 		return
 	}
+
+	// §3.7 device switch gate: take ONE mutation hold for the
+	// entire callback — token exchange round-trip AND token
+	// persistence + Enable flip. Holding through the round-trip
+	// means a switch that starts during the OAuth exchange will
+	// be blocked from quiescing until we're done, instead of
+	// landing mid-callback and forcing us to 409 after the
+	// auth code has already been consumed by the provider.
+	// AcquireMutation is per-agent, not global, so this only
+	// blocks switches of THIS agent — other agents proceed.
+	releaseMut, mutErr := s.agents.AcquireMutation(pending.AgentID)
+	if mutErr != nil {
+		writeOAuthErrorHTML(w, http.StatusConflict, "agent_busy",
+			mutErr.Error(), pending.SourceID, state)
+		return
+	}
+	defer releaseMut()
 
 	auth, tokenResp, err := oauth2Mgr.CompleteAuthFlow(r.Context(), state, code, clientID, clientSecret)
 	if err != nil {
-		http.Error(w, "Token exchange failed: "+err.Error(), http.StatusInternalServerError)
+		writeOAuthErrorHTML(w, http.StatusInternalServerError, "token_failed",
+			"Token exchange failed: "+err.Error(), pending.SourceID, state)
+		return
+	}
+	// auth.AgentID should always match pending.AgentID — the
+	// state cookie binds them. If they diverge the callback's
+	// invariants are broken; refuse rather than write tokens
+	// for a different agent than the mutation hold protects.
+	if auth.AgentID != pending.AgentID {
+		writeOAuthErrorHTML(w, http.StatusInternalServerError, "agent_mismatch",
+			"OAuth callback resolved an agent different from the pending state",
+			auth.SourceID, auth.State)
 		return
 	}
 
-	// Store tokens — check each operation for errors
-	expiry := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
+	// Take the per-agent patch lock for the rest of the callback —
+	// covers token persistence AND the Enable flip, so a concurrent
+	// DELETE notify-source cannot land between (a) the source-still-
+	// exists check and the token writes (which would orphan tokens
+	// on a vanished source) or (b) the token writes and the Enable
+	// flip (which would silently no-op the for-loop and leave the
+	// user looking at a "succeeded" page that did nothing). The lock
+	// is the same one the CRUD handlers use, so the callback queues
+	// behind any in-flight notify-source mutation.
+	release := s.agents.LockPatch(auth.AgentID)
+	defer release()
 
-	// Store client_id and client_secret per-source so the source can refresh tokens independently
+	// Re-verify the source still exists AND the agent is not archived
+	// under the lock. A concurrent DELETE that landed during the OAuth
+	// round-trip would otherwise produce orphan token rows the user
+	// has no way to clean up. A concurrent Archive would leave the
+	// source intact but inert — saving tokens + flipping Enabled on
+	// an archived agent would (a) lie to the user via "success" page
+	// and (b) burn the OAuth grant against an agent that won't poll.
+	updatedA, ok := s.agents.Get(auth.AgentID)
+	if !ok {
+		writeOAuthErrorHTML(w, http.StatusGone, "agent_gone",
+			"Agent no longer exists.", auth.SourceID, auth.State)
+		return
+	}
+	if updatedA.Archived {
+		writeOAuthErrorHTML(w, http.StatusConflict, "agent_archived",
+			"Agent was archived during authorization; unarchive before re-authorizing.", auth.SourceID, auth.State)
+		return
+	}
+	sourceExists := false
+	for _, cfg := range updatedA.NotifySources {
+		if cfg.ID == auth.SourceID {
+			sourceExists = true
+			break
+		}
+	}
+	if !sourceExists {
+		// Source was deleted while the OAuth flow was in flight.
+		// Don't save tokens against a row that no longer exists.
+		writeOAuthErrorHTML(w, http.StatusGone, "source_gone",
+			"Notification source was removed during authorization; please re-add it.", auth.SourceID, auth.State)
+		return
+	}
+
+	// Snapshot any existing tokens BEFORE we start overwriting. A
+	// re-auth flow that fails mid-write would otherwise leave the
+	// user with partial new tokens AND no working old ones —
+	// blanket-deleting the orphans (the original cleanup) is just as
+	// destructive (sweeps the still-valid old tokens away). Snapshot
+	// + restore-on-failure preserves the previous working state when
+	// possible, and only deletes when there was nothing to preserve.
+	tokenKeys := []string{"client_id", "client_secret", "access_token", "refresh_token"}
+	type tokenSnapshot struct {
+		key   string
+		value string
+		exp   time.Time
+		had   bool
+	}
+	snapshots := make([]tokenSnapshot, 0, len(tokenKeys))
+	for _, k := range tokenKeys {
+		v, exp, err := creds.GetTokenExpiry(provider, auth.AgentID, auth.SourceID, k)
+		snap := tokenSnapshot{key: k}
+		switch {
+		case err == nil:
+			snap.value = v
+			snap.exp = exp
+			snap.had = true
+		case errors.Is(err, sql.ErrNoRows):
+			// Genuinely missing — first-time auth for this source.
+			// rollback (if it runs) will DeleteToken which is a no-op.
+		default:
+			// Transient DB / decrypt error. Treating this as
+			// "missing" would let a later rollback delete a token
+			// that actually exists. Bail before any write so the
+			// existing state is preserved untouched.
+			writeOAuthErrorHTML(w, http.StatusInternalServerError, "snapshot_failed",
+				"Failed to read existing token for "+k+": "+err.Error(),
+				auth.SourceID, auth.State)
+			return
+		}
+		snapshots = append(snapshots, snap)
+	}
+	rollbackTokens := func() {
+		// Best-effort: log the cleanup failure but keep going. If the
+		// snapshot says we had a value, restore it (overwrites
+		// whatever partial value may now be there). If we didn't,
+		// delete so we don't leave a partial new token behind.
+		for _, snap := range snapshots {
+			if snap.had {
+				_ = creds.SetToken(provider, auth.AgentID, auth.SourceID, snap.key, snap.value, snap.exp)
+			} else {
+				_ = creds.DeleteToken(provider, auth.AgentID, auth.SourceID, snap.key)
+			}
+		}
+	}
+
+	// Store tokens — check each operation for errors. Inside the
+	// lock so concurrent DELETE / token cleanup can't race with us.
+	// On any failure we restore from snapshot so a partial save
+	// doesn't either leave orphan rows OR clobber a working prior
+	// configuration.
+	expiry := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
 	for _, kv := range []struct{ k, v string }{
 		{"client_id", clientID},
 		{"client_secret", clientSecret},
@@ -332,43 +620,124 @@ func (s *Server) handleOAuth2Callback(w http.ResponseWriter, r *http.Request) {
 			exp = expiry
 		}
 		if err := creds.SetToken(provider, auth.AgentID, auth.SourceID, kv.k, kv.v, exp); err != nil {
-			http.Error(w, "Failed to save token: "+err.Error(), http.StatusInternalServerError)
+			rollbackTokens()
+			writeOAuthErrorHTML(w, http.StatusInternalServerError, "token_save_failed",
+				"Failed to save token: "+err.Error(), auth.SourceID, auth.State)
 			return
 		}
 	}
 	if tokenResp.RefreshToken != "" {
 		if err := creds.SetToken(provider, auth.AgentID, auth.SourceID, "refresh_token", tokenResp.RefreshToken, time.Time{}); err != nil {
-			http.Error(w, "Failed to save refresh token: "+err.Error(), http.StatusInternalServerError)
+			rollbackTokens()
+			writeOAuthErrorHTML(w, http.StatusInternalServerError, "token_save_failed",
+				"Failed to save refresh token: "+err.Error(), auth.SourceID, auth.State)
 			return
 		}
 	}
 
-	// Enable the source
-	updatedA, ok := s.agents.Get(auth.AgentID)
+	// Enable the source. Re-snapshot under the lock so a concurrent
+	// edit on a sibling source that landed before our LockPatch is
+	// not clobbered.
+	current, ok := s.agents.Get(auth.AgentID)
 	if ok {
-		sources := make([]notifysource.Config, len(updatedA.NotifySources))
-		copy(sources, updatedA.NotifySources)
+		sources := make([]notifysource.Config, len(current.NotifySources))
+		copy(sources, current.NotifySources)
 		for i := range sources {
 			if sources[i].ID == auth.SourceID {
 				sources[i].Enabled = true
 				break
 			}
 		}
-		if err := s.agents.UpdateNotifySources(auth.AgentID, sources); err != nil {
-			http.Error(w, "Failed to enable source: "+err.Error(), http.StatusInternalServerError)
+		// AlreadyGuarded: the outer AcquireMutation(pending.AgentID)
+		// at the top of this callback (and the auth.AgentID ==
+		// pending.AgentID invariant verified just below it) still
+		// covers us here. A re-entrant AcquireMutation would fail-
+		// closed if a switch flipped `switching` between the token
+		// save above and this Enable flip — leaving freshly-written
+		// tokens with Enabled=false until the operator re-runs OAuth.
+		if err := s.agents.UpdateNotifySourcesAlreadyGuarded(auth.AgentID, sources); err != nil {
+			rollbackTokens()
+			writeOAuthErrorHTML(w, http.StatusInternalServerError, "enable_failed",
+				"Failed to enable source: "+err.Error(), auth.SourceID, auth.State)
 			return
 		}
 	}
 
-	// Notify the opener window and close
+	// Notify the opener window and close. Include sourceID AND state
+	// so the editor can correlate this message with its active popup
+	// — without that, a stale message from a previous popup (same
+	// source, double-clicked Auth) could overwrite a fresh banner.
+	// state is the per-popup nonce, so it discriminates same-source
+	// retries that sourceId alone cannot. Marshal as one JSON object
+	// (quoted keys) so the postMessage argument is also valid JSON
+	// — see writeOAuthErrorHTML for the rationale.
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, `<!DOCTYPE html><html><body>
+	payload, _ := json.Marshal(map[string]string{
+		"type":     "oauth_complete",
+		"sourceId": auth.SourceID,
+		"state":    auth.State,
+	})
+	fmt.Fprintf(w, `<!DOCTYPE html><html><body>
 <p>Authorization successful.</p>
 <script>
-if(window.opener){window.opener.postMessage({type:"oauth_complete"},"*")}
+if(window.opener){window.opener.postMessage(%s,"*")}
 window.close()
 </script>
-</body></html>`)
+</body></html>`, payload)
+}
+
+// writeOAuthErrorHTML emits an HTML error page that mirrors the
+// success-page contract: postMessage to the opener (so the editor can
+// surface the failure) and window.close(). Without this, a plain
+// http.Error response from inside the popup would (a) leave the
+// popup open with raw error text the user has to manually dismiss,
+// and (b) never reach the parent window — NotifySourcesEditor's
+// "oauth_complete" listener would just never fire and the user would
+// see no feedback at all.
+//
+// reason is a short machine-readable string ("agent_gone", "source_gone",
+// "token_failed") so the listener can branch on cause if needed.
+// detail is the human-readable string baked into the popup body.
+// sourceID is the notify-source whose authorization failed; empty
+// when the failure happened before we resolved a source (e.g. invalid
+// state parameter).
+// state is the OAuth2 `state` parameter the editor minted when it
+// opened this popup; the editor uses it to correlate against the
+// active popup so a stale message from a prior popup (same source,
+// double-click) can't overwrite a fresh banner. Empty when the
+// callback failed before we could resolve state (truly unknown popup).
+func writeOAuthErrorHTML(w http.ResponseWriter, status int, reason, detail, sourceID, state string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	// Marshal the full payload as a single JSON object so keys are
+	// quoted — keeps the postMessage argument valid JSON instead of
+	// relying on JS's looser object-literal grammar. Lets unit tests
+	// parse the body with encoding/json without resorting to a JS
+	// runtime, and any future caller who pipes payload through
+	// JSON.parse on the receiver side stays happy.
+	payload, _ := json.Marshal(map[string]string{
+		"type":     "oauth_error",
+		"reason":   reason,
+		"detail":   detail,
+		"sourceId": sourceID,
+		"state":    state,
+	})
+	fmt.Fprintf(w, `<!DOCTYPE html><html><body>
+<p>Authorization failed: %s</p>
+<script>
+if(window.opener){window.opener.postMessage(%s,"*")}
+window.close()
+</script>
+</body></html>`, htmlEscape(detail), payload)
+}
+
+// htmlEscape is a 4-byte minimal escaper for the visible <p> body.
+// json.Marshal handles the postMessage payload separately so the JS
+// strings are always well-formed even if detail contains a "</script>"
+// sequence.
+func htmlEscape(s string) string {
+	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&#39;")
+	return r.Replace(s)
 }
 
 // --- OAuth Client Configuration ---

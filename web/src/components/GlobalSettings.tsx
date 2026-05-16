@@ -4,6 +4,7 @@ import { ApiKeysSection } from "./globalsettings/ApiKeysSection";
 import { ArchivedAgentsSection } from "./globalsettings/ArchivedAgentsSection";
 import { ChatPreferencesSection } from "./globalsettings/ChatPreferencesSection";
 import { OAuthClientsSection } from "./globalsettings/OAuthClientsSection";
+import { PeersSection } from "./globalsettings/PeersSection";
 import { useEmbeddingModel } from "./globalsettings/useEmbeddingModel";
 import { useGeminiApiKey } from "./globalsettings/useGeminiApiKey";
 import { useOAuthClients } from "./globalsettings/useOAuthClients";
@@ -52,6 +53,7 @@ export function GlobalSettings() {
         <ApiKeysSection gemini={gemini} embedding={embedding} />
         <OAuthClientsSection oauth={oauth} />
         <ChatPreferencesSection enterSends={enterSends} setEnterSends={setEnterSends} />
+        <PeersSection setError={setError} flashSuccess={flashSuccess} />
         <ArchivedAgentsSection setError={setError} flashSuccess={flashSuccess} />
 
         {error && (

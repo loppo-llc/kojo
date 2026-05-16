@@ -4,9 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -41,12 +40,24 @@ func setupGroupDMTest(t *testing.T) (*GroupDMManager, *Manager) {
 
 	mgr := newTestManager(t)
 
-	// Create two agents directly in the manager's map
-	mgr.mu.Lock()
-	mgr.agents["ag_alice"] = &Agent{ID: "ag_alice", Name: "Alice", Tool: "claude"}
-	mgr.agents["ag_bob"] = &Agent{ID: "ag_bob", Name: "Bob", Tool: "claude"}
-	mgr.agents["ag_charlie"] = &Agent{ID: "ag_charlie", Name: "Charlie", Tool: "claude"}
-	mgr.mu.Unlock()
+	// Create three agents in BOTH the in-memory map and the DB. The DB
+	// seed is required because AppendGroupDMMessage's author validation
+	// queries the agents table — pre-cutover tests only needed the
+	// in-memory map because messages.jsonl had no FK constraint. The
+	// in-memory map is still required so groupdm_manager's runtime
+	// member-name overlay (m.agentMgr.Get) finds the live records.
+	for _, a := range []*Agent{
+		{ID: "ag_alice", Name: "Alice", Tool: "claude"},
+		{ID: "ag_bob", Name: "Bob", Tool: "claude"},
+		{ID: "ag_charlie", Name: "Charlie", Tool: "claude"},
+	} {
+		mgr.mu.Lock()
+		mgr.agents[a.ID] = a
+		mgr.mu.Unlock()
+		if err := mgr.store.Upsert(a); err != nil {
+			t.Fatalf("seed agent %s: %v", a.ID, err)
+		}
+	}
 
 	gdm := NewGroupDMManager(mgr, mgr.logger)
 	return gdm, mgr
@@ -61,16 +72,24 @@ func newTestManager(t *testing.T) *Manager {
 	t.Setenv("APPDATA", "")
 
 	logger := testLogger()
+	st, err := newStore(logger)
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
 	m := &Manager{
 		agents:     make(map[string]*Agent),
 		backends:   make(map[string]ChatBackend),
-		store:      &store{dir: tmp + "/agents", logger: logger},
+		store:      st,
 		logger:     logger,
 		busy:       make(map[string]busyEntry),
 		resetting:  make(map[string]bool),
+		editing:    make(map[string]bool),
 		profileGen: make(map[string]bool),
 		memIndexes: make(map[string]*MemoryIndex),
+		patchMus:   make(map[string]*sync.Mutex),
 	}
+	_ = tmp // tmp is captured by t.Setenv via configdir.Path() resolution
 	return m
 }
 
@@ -1034,36 +1053,11 @@ func TestGroupDMManager_RenderNotificationVenueHint(t *testing.T) {
 	}
 }
 
-func TestGroupDMManager_LoadNormalizesLegacyStyle(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-	t.Setenv("APPDATA", "")
-
-	mgr := newTestManager(t)
-	mgr.mu.Lock()
-	mgr.agents["ag_alice"] = &Agent{ID: "ag_alice", Name: "Alice", Tool: "claude"}
-	mgr.agents["ag_bob"] = &Agent{ID: "ag_bob", Name: "Bob", Tool: "claude"}
-	mgr.mu.Unlock()
-
-	// Write a legacy groups.json without the style field.
-	dir := groupdmsDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	legacy := `[{"id":"gd_legacy","name":"Legacy","members":[{"agentId":"ag_alice","agentName":"Alice"},{"agentId":"ag_bob","agentName":"Bob"}],"cooldown":0,"createdAt":"2025-01-01T00:00:00Z","updatedAt":"2025-01-01T00:00:00Z"}]`
-	if err := os.WriteFile(filepath.Join(dir, "groups.json"), []byte(legacy), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	gdm := NewGroupDMManager(mgr, mgr.logger)
-	g, ok := gdm.Get("gd_legacy")
-	if !ok {
-		t.Fatal("expected legacy group to be loaded")
-	}
-	if g.Style != GroupDMStyleEfficient {
-		t.Errorf("legacy style = %q, want %q", g.Style, GroupDMStyleEfficient)
-	}
-}
+// Legacy groups.json file-based normalization moved to the v0→v1
+// importer (internal/migrate/importers) and to the store layer's
+// InsertGroupDM (which forces style="efficient" when empty). The
+// runtime load path no longer reads groups.json, so the obsolete file-
+// fixture test was removed in slice 3 of the cutover.
 
 // --- CAS / latestMessageId tests ---
 
@@ -1272,10 +1266,17 @@ func TestGroupDMManager_LoadBootstrapsLatestMessageIDFromDisk(t *testing.T) {
 	t.Setenv("APPDATA", "")
 
 	mgr := newTestManager(t)
-	mgr.mu.Lock()
-	mgr.agents["ag_alice"] = &Agent{ID: "ag_alice", Name: "Alice", Tool: "claude"}
-	mgr.agents["ag_bob"] = &Agent{ID: "ag_bob", Name: "Bob", Tool: "claude"}
-	mgr.mu.Unlock()
+	for _, a := range []*Agent{
+		{ID: "ag_alice", Name: "Alice", Tool: "claude"},
+		{ID: "ag_bob", Name: "Bob", Tool: "claude"},
+	} {
+		mgr.mu.Lock()
+		mgr.agents[a.ID] = a
+		mgr.mu.Unlock()
+		if err := mgr.store.Upsert(a); err != nil {
+			t.Fatalf("seed agent %s: %v", a.ID, err)
+		}
+	}
 
 	// Create + post via one manager instance, then drop it.
 	gdm := NewGroupDMManager(mgr, mgr.logger)
@@ -1285,7 +1286,7 @@ func TestGroupDMManager_LoadBootstrapsLatestMessageIDFromDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Spin up a fresh manager: latest must be reloaded from the jsonl on disk.
+	// Spin up a fresh manager: latest must be reloaded from groupdm_messages in the DB.
 	gdm2 := NewGroupDMManager(mgr, mgr.logger)
 	if got := gdm2.LatestMessageID(g.ID); got != posted.ID {
 		t.Errorf("post-restart latestID = %q, want %q", got, posted.ID)
@@ -1488,13 +1489,13 @@ func TestGroupDMManager_PostMessage_ConcurrentCAS(t *testing.T) {
 func TestGroupDMManager_Messages_AfterDeleteReturnsNotFound(t *testing.T) {
 	// A group that has been deleted must surface as ErrGroupNotFound
 	// rather than as a silent "" + empty slice — loadGroupMessages turns
-	// the missing transcript file into an empty result, so without an
-	// explicit existence guard a deleted group would look like an empty
+	// a missing group into an empty result at the store layer, so without
+	// an explicit existence guard a deleted group would look like an empty
 	// one to the HTTP layer.
 	//
 	// Note: this test only exercises the *pre-read* existence check.
 	// The post-read recheck (which catches a Delete that lands while the
-	// jsonl read is in flight) does not have a deterministic in-process
+	// DB read is in flight) does not have a deterministic in-process
 	// reproduction without a test-only hook in production code; that
 	// branch is verified by inspection.
 	gdm, _ := setupGroupDMTest(t)

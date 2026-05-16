@@ -2,8 +2,10 @@ package agent
 
 import (
 	"bufio"
+	"context"
 	"crypto/md5"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // secretPatterns matches common secret formats for redaction.
@@ -38,15 +42,30 @@ const (
 	// preCompactMaxPromptBytes caps the summarization prompt size.
 	preCompactMaxPromptBytes = 64 * 1024
 
-	// autoSummaryMarkerFile records the last successful summary's
-	// timestamp and content fingerprint. Used to suppress redundant
-	// summaries when the PreCompact hook fires repeatedly with no new
-	// material — Claude can fire PreCompact multiple times per minute on
-	// long, busy turns, and each redundant generate-summary call wastes
-	// LLM tokens, drifts the volatile-context block (forcing a fresh
+	// autoSummaryMarkerFile is the legacy v0 filename for the per-agent
+	// autosummary marker. In v1 the marker lives in the kv table
+	// (namespace=autosummaryKVNamespace, key=agentID, type=json,
+	// scope=global). The constant survives only to address the legacy
+	// path during read-time migration and reset/cleanup unlinks; new
+	// reads + writes go through the kv layer.
+	//
+	// What the marker records: the last successful summary's timestamp
+	// and content fingerprint. Used to suppress redundant summaries
+	// when the PreCompact hook fires repeatedly with no new material —
+	// Claude can fire PreCompact multiple times per minute on long,
+	// busy turns, and each redundant generate-summary call wastes LLM
+	// tokens, drifts the volatile-context block (forcing a fresh
 	// cache_creation on the next turn), and inflates the diary with
 	// near-duplicate "## Pre-compaction summary" sections.
 	autoSummaryMarkerFile = "autosummary_marker"
+
+	// autosummaryKVNamespace is the kv namespace for per-agent
+	// autosummary markers. Per design doc §2.3 (table row
+	// "autosummary_marker → agent_flags (KV)") the rows are global-
+	// scoped so cross-device fires share the rate-limit state — a
+	// summary generated on the desktop suppresses a redundant one on
+	// the phone within the same fingerprint window.
+	autosummaryKVNamespace = "autosummary"
 
 	// recentSummaryFile is the canonical short-term memory file that
 	// the per-turn volatile context reads from. Overwritten on every
@@ -182,32 +201,493 @@ type autoSummaryMarker struct {
 	LastN    int       `json:"lastN"`
 }
 
-// readMarker loads the marker from disk. Missing or unreadable marker
-// returns a zero-value marker (which always passes the rate-limit checks
-// — the first run should never be suppressed).
-func readMarker(agentID string) autoSummaryMarker {
-	var m autoSummaryMarker
-	data, err := os.ReadFile(filepath.Join(agentDir(agentID), autoSummaryMarkerFile))
+// markerKVTimeout bounds each kv read / write. The marker is touched
+// at most once per PreCompact fire (gated by per-agent preCompactMu)
+// so a generous bound is fine — the deadline is purely a guard against
+// a wedged DB blocking the summary path.
+const markerKVTimeout = 5 * time.Second
+
+// markerLegacyPath returns the v0 on-disk location for the autosummary
+// marker. Used by the migration read in readMarker (one-shot mirror to
+// kv + unlink) and by reset/delete cleanup (unlink only — kv DELETE is
+// the authoritative wipe).
+func markerLegacyPath(agentID string) string {
+	return filepath.Join(agentDir(agentID), autoSummaryMarkerFile)
+}
+
+// markerKVMigrationTestHook is a test-only injection point fired
+// AFTER the initial kv GetKV miss but BEFORE the legacy file read.
+// Tests use it to land a colliding kv row so the (kv miss + file
+// ENOENT) retry branch executes against a real concurrent migrator
+// scenario rather than the trivial kv-hit fast path. Production
+// keeps it nil — the if-guard is one nil-pointer compare in the
+// already-cold migration branch.
+var markerKVMigrationTestHook func()
+
+// markerRetryAfterMissAndENOENT resolves the (kv miss → file ENOENT)
+// ambiguity with a single GetKV retry. Two interpretations of that
+// state:
+//
+//	(a) genuinely fresh — no marker has ever existed for this agent.
+//	(b) a concurrent migrator (peer replication, parallel reader on
+//	    the same daemon) mirrored the legacy file into kv and unlinked
+//	    it between our initial GetKV and our os.ReadFile. kv now
+//	    holds the marker but our earlier GetKV missed it.
+//
+// A single retry distinguishes the two cheaply. Single retry is
+// sufficient because the only race that justifies retrying is the
+// migrator that just completed — that migrator already removed the
+// file we'd otherwise re-read, so a further iteration adds no
+// information.
+//
+// Returns three values so callers can distinguish error policies:
+//
+//	(marker, true,  nil)        — retry hit a valid row.
+//	(zero,   false, nil)        — retry hit ErrNotFound. Genuine
+//	                              fresh install (interpretation (a)).
+//	(zero,   false, err)        — kv read failure or row-shape /
+//	                              JSON validation failure on the
+//	                              retried row. The fail-soft caller
+//	                              (readMarker) collapses this to
+//	                              "fresh"; the error-strict caller
+//	                              (readMarkerErr / copyMarker)
+//	                              propagates so a transient kv
+//	                              hiccup at exactly the racy moment
+//	                              doesn't silently drop the marker
+//	                              from a fork.
+func markerRetryAfterMissAndENOENT(ctx context.Context, st *store.Store, agentID string, logger *slog.Logger) (autoSummaryMarker, bool, error) {
+	rec, err := st.GetKV(ctx, autosummaryKVNamespace, agentID)
 	if err != nil {
-		return m
+		if errors.Is(err, store.ErrNotFound) {
+			return autoSummaryMarker{}, false, nil
+		}
+		return autoSummaryMarker{}, false, fmt.Errorf("retry get: %w", err)
 	}
-	_ = json.Unmarshal(data, &m)
+	m, ok := decodeMarkerKVRow(rec, agentID, logger)
+	if !ok {
+		return autoSummaryMarker{}, false, errors.New("retry: kv row shape or JSON invalid")
+	}
+	return m, true, nil
+}
+
+// decodeMarkerKVRow validates a kv row's shape and decodes its value
+// as autoSummaryMarker JSON. Returns ok=false on any of:
+//   - wrong type (must be json), wrong scope (must be global), or a
+//     row marked Secret (would have empty Value and live in
+//     ValueEncrypted — markers are not secrets).
+//   - JSON unmarshal failure.
+//
+// Failure paths log a Warn so an operator chasing missing summaries
+// can see the malformed row in their telemetry. Caller treats !ok as
+// zero-value (first-run-equivalent), preserving the v0 fail-soft
+// contract: at worst one extra summary, never lost data.
+func decodeMarkerKVRow(rec *store.KVRecord, agentID string, logger *slog.Logger) (autoSummaryMarker, bool) {
+	if rec == nil {
+		return autoSummaryMarker{}, false
+	}
+	if rec.Type != store.KVTypeJSON || rec.Scope != store.KVScopeGlobal || rec.Secret {
+		logger.Warn("autosummary: kv marker row shape mismatch; treating as zero",
+			"agent", agentID, "type", rec.Type, "scope", rec.Scope, "secret", rec.Secret)
+		return autoSummaryMarker{}, false
+	}
+	var m autoSummaryMarker
+	if err := json.Unmarshal([]byte(rec.Value), &m); err != nil {
+		logger.Warn("autosummary: kv marker corrupt JSON; treating as zero",
+			"agent", agentID, "err", err)
+		return autoSummaryMarker{}, false
+	}
+	return m, true
+}
+
+// readMarker loads the marker for agentID. Lookup order:
+//
+//  1. kv row (namespace="autosummary", key=agentID).
+//  2. On kv miss, the legacy on-disk file under agentDir/autosummary_marker.
+//     If present, mirror it into kv (best effort) and unlink. The
+//     migration is fail-soft: a kv-write failure preserves the file
+//     for the next boot to retry.
+//
+// Missing / unreadable / corrupt marker returns a zero-value marker so
+// the rate-limit checks always allow the first run — better to do one
+// extra summary than to silently suppress on garbage state. Errors are
+// logged at Warn (or Debug for the common "not found" case) so an
+// operator chasing missing summaries can correlate.
+func readMarker(agentID string) autoSummaryMarker {
+	logger := slog.Default()
+	ctx, cancel := context.WithTimeout(context.Background(), markerKVTimeout)
+	defer cancel()
+
+	st := getGlobalStore()
+	if st == nil {
+		// NewManager hasn't run (test fixture poking *Manager
+		// directly). Fall back to legacy file so unit tests that
+		// pre-seeded the marker can still observe it; production
+		// always has a store handle.
+		return readMarkerLegacyOnly(agentID, logger)
+	}
+
+	rec, err := st.GetKV(ctx, autosummaryKVNamespace, agentID)
+	switch {
+	case err == nil:
+		m, ok := decodeMarkerKVRow(rec, agentID, logger)
+		if !ok {
+			// Bad row shape or corrupt JSON. Treat as zero so
+			// the next writeMarker clobbers it; do NOT unlink
+			// the legacy file (it may still hold the only valid
+			// state).
+			return autoSummaryMarker{}
+		}
+		// kv is canonical: opportunistically clean up a stray
+		// legacy file from a partial migration.
+		if rmErr := os.Remove(markerLegacyPath(agentID)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			logger.Debug("autosummary: legacy marker unlink (post-kv-hit) failed",
+				"agent", agentID, "err", rmErr)
+		}
+		return m
+	case errors.Is(err, store.ErrNotFound):
+		// Fall through to legacy migration.
+	default:
+		// kv read failure — return zero (first-run-equivalent).
+		// Tolerating one extra summary is cheaper than wedging
+		// the PreCompact path on a transient DB hiccup.
+		logger.Warn("autosummary: kv marker read failed; using zero",
+			"agent", agentID, "err", err)
+		return autoSummaryMarker{}
+	}
+
+	// kv miss. Test hook fires here so a colliding write can be
+	// landed before we observe the file (or its absence).
+	if markerKVMigrationTestHook != nil {
+		markerKVMigrationTestHook()
+	}
+
+	// Check for legacy file.
+	data, ferr := os.ReadFile(markerLegacyPath(agentID))
+	if ferr != nil {
+		if errors.Is(ferr, os.ErrNotExist) {
+			// (kv miss + file ENOENT) ambiguity — see
+			// markerRetryAfterMissAndENOENT for the full
+			// rationale + race description. fail-soft: a
+			// retry error or malformed retried row collapses
+			// to "fresh" (zero) — same posture as the rest
+			// of readMarker.
+			m, ok, rerr := markerRetryAfterMissAndENOENT(ctx, st, agentID, logger)
+			if rerr != nil {
+				logger.Warn("autosummary: kv retry after legacy ENOENT failed; using zero",
+					"agent", agentID, "err", rerr)
+			}
+			if ok {
+				return m
+			}
+			return autoSummaryMarker{}
+		}
+		logger.Warn("autosummary: legacy marker read failed",
+			"agent", agentID, "err", ferr)
+		return autoSummaryMarker{}
+	}
+	var m autoSummaryMarker
+	if jerr := json.Unmarshal(data, &m); jerr != nil {
+		logger.Warn("autosummary: legacy marker corrupt JSON; using zero",
+			"agent", agentID, "err", jerr)
+		// Don't unlink — leave the bad file for an operator to
+		// inspect. The kv path will be empty and a fresh write
+		// will eventually clobber it via the cleanup branch.
+		return autoSummaryMarker{}
+	}
+
+	// Mirror the parsed marker into kv. IfMatchAny so a colliding
+	// peer-replicated insert can't be clobbered.
+	mig := &store.KVRecord{
+		Namespace: autosummaryKVNamespace,
+		Key:       agentID,
+		Value:     string(data),
+		Type:      store.KVTypeJSON,
+		Scope:     store.KVScopeGlobal,
+	}
+	switch _, perr := st.PutKV(ctx, mig, store.KVPutOptions{IfMatchETag: store.IfMatchAny}); {
+	case perr == nil:
+		// Won the race; safe to drop the file.
+		if rmErr := os.Remove(markerLegacyPath(agentID)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			logger.Warn("autosummary: legacy marker unlink failed after kv mirror",
+				"agent", agentID, "err", rmErr)
+		}
+	case errors.Is(perr, store.ErrETagMismatch):
+		// Concurrent write landed first (peer replication / two
+		// processes booting). Re-read and honour whatever's
+		// there — but only treat the post-collision row as
+		// authoritative when both the read and the row-shape
+		// validation succeed. On any failure path we keep the
+		// legacy file in place so the next boot can retry the
+		// migration; otherwise a transient kv hiccup at exactly
+		// the wrong moment would silently destroy the only
+		// surviving copy of the marker.
+		rec2, gerr := st.GetKV(ctx, autosummaryKVNamespace, agentID)
+		if gerr != nil {
+			logger.Warn("autosummary: post-collision kv re-read failed; keeping legacy file for retry",
+				"agent", agentID, "err", gerr)
+			return m
+		}
+		winner, ok := decodeMarkerKVRow(rec2, agentID, logger)
+		if !ok {
+			// Row-shape mismatch or corrupt JSON. Keep the
+			// file; a future write will replace the bad row
+			// and let the migration retry land.
+			return m
+		}
+		m = winner
+		if rmErr := os.Remove(markerLegacyPath(agentID)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			logger.Debug("autosummary: legacy marker unlink failed after collision-resolve",
+				"agent", agentID, "err", rmErr)
+		}
+	default:
+		// PutKV failed for some other reason — leave file in
+		// place; next readMarker retries. The local m is still
+		// valid for this fire (it came from the file).
+		logger.Warn("autosummary: legacy marker kv mirror failed; will retry next read",
+			"agent", agentID, "err", perr)
+	}
 	return m
 }
 
-// writeMarker persists the marker. Failures are logged but non-fatal:
-// a stale or missing marker only causes one extra summary, never lost
-// data.
+// readMarkerLegacyOnly is the test-fallback path used when the global
+// store handle is nil (NewManager has not run). Production always has
+// a store handle, so this branch only exists to keep older test
+// scaffolding that pokes *Manager directly working.
+func readMarkerLegacyOnly(agentID string, logger *slog.Logger) autoSummaryMarker {
+	var m autoSummaryMarker
+	data, err := os.ReadFile(markerLegacyPath(agentID))
+	if err != nil {
+		return m
+	}
+	if jerr := json.Unmarshal(data, &m); jerr != nil {
+		logger.Warn("autosummary: legacy-only marker corrupt JSON; using zero",
+			"agent", agentID, "err", jerr)
+		return autoSummaryMarker{}
+	}
+	return m
+}
+
+// writeMarker persists the marker to kv and best-effort removes the
+// legacy file. Failures are logged but non-fatal: a stale or missing
+// marker only causes one extra summary, never lost data — preserving
+// the v0 fail-soft contract that callers rely on.
 func writeMarker(agentID string, m autoSummaryMarker, logger *slog.Logger) {
 	data, err := json.Marshal(m)
 	if err != nil {
 		logger.Warn("autosummary: marshal marker failed", "agent", agentID, "err", err)
 		return
 	}
-	path := filepath.Join(agentDir(agentID), autoSummaryMarkerFile)
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		logger.Warn("autosummary: write marker failed", "agent", agentID, "err", err)
+
+	st := getGlobalStore()
+	if st == nil {
+		// Test fixture without NewManager — fall back to file
+		// so the test scaffolding observes the write.
+		writeMarkerLegacyOnly(agentID, data, logger)
+		return
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), markerKVTimeout)
+	defer cancel()
+	rec := &store.KVRecord{
+		Namespace: autosummaryKVNamespace,
+		Key:       agentID,
+		Value:     string(data),
+		Type:      store.KVTypeJSON,
+		Scope:     store.KVScopeGlobal,
+	}
+	if _, err := st.PutKV(ctx, rec, store.KVPutOptions{}); err != nil {
+		logger.Warn("autosummary: kv write marker failed", "agent", agentID, "err", err)
+		return
+	}
+
+	// kv is canonical; drop a stray legacy file if one survived a
+	// partial migration. Errors are silent at Debug — this is
+	// purely opportunistic.
+	if err := os.Remove(markerLegacyPath(agentID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		logger.Debug("autosummary: legacy marker unlink (post-write) failed",
+			"agent", agentID, "err", err)
+	}
+}
+
+// writeMarkerLegacyOnly mirrors the v0 file write. Only used by
+// readMarkerLegacyOnly's sibling code path (no global store).
+func writeMarkerLegacyOnly(agentID string, data []byte, logger *slog.Logger) {
+	if err := os.WriteFile(markerLegacyPath(agentID), data, 0o644); err != nil {
+		logger.Warn("autosummary: legacy-only write marker failed", "agent", agentID, "err", err)
+	}
+}
+
+// deleteMarker removes the marker from both kv and the legacy file.
+// Used by the reset path (manager_lifecycle) and any future agent-
+// delete cleanup. Failures are logged but non-fatal: a leftover row
+// only causes one extra suppression on the next fire, never lost
+// data — same fail-soft contract as readMarker / writeMarker.
+func deleteMarker(agentID string, logger *slog.Logger) {
+	if st := getGlobalStore(); st != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), markerKVTimeout)
+		defer cancel()
+		if err := st.DeleteKV(ctx, autosummaryKVNamespace, agentID, ""); err != nil && !errors.Is(err, store.ErrNotFound) {
+			logger.Warn("autosummary: kv delete marker failed", "agent", agentID, "err", err)
+		}
+	}
+	if err := os.Remove(markerLegacyPath(agentID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		logger.Warn("autosummary: legacy marker unlink failed", "agent", agentID, "err", err)
+	}
+}
+
+// copyMarker mirrors srcID's marker (if any) onto dstID. Used by the
+// fork path so the new agent inherits the source's rate-limit state.
+// Reads via readMarkerErr (kv first, legacy fallback) and writes via
+// writeMarkerErr so failures on EITHER side propagate.
+//
+// Why error-strict on read: the fail-soft readMarker collapses kv
+// errors and corrupt rows to "no marker", which is the right call
+// for the PreCompact rate-limit path (one extra summary is cheaper
+// than a wedged hook). For copy that bias is wrong — silently
+// dropping the rate-limit state on a transient read failure means
+// the forked agent re-summarises from scratch and the operator
+// never sees the failure. ErrNotFound (no marker yet) IS still
+// soft: it's indistinguishable from a fresh src agent and the fork
+// should proceed.
+//
+// On success the dst kv row holds the same marker the src kv row
+// (or legacy file) had at copy time. Concurrent writes to either
+// agent after this call are not synchronised — copy is a one-shot
+// snapshot.
+func copyMarker(srcID, dstID string, logger *slog.Logger) error {
+	m, err := readMarkerErr(srcID)
+	if err != nil {
+		return fmt.Errorf("autosummary: copy marker %s → %s: read src: %w", srcID, dstID, err)
+	}
+	if (m == autoSummaryMarker{}) {
+		// Source has no marker (ErrNotFound or genuinely empty).
+		// Nothing to copy. Caller treats absence as "no prior
+		// summary" — same outcome as if we wrote a zero row,
+		// without the kv churn.
+		return nil
+	}
+	if err := writeMarkerErr(dstID, m); err != nil {
+		return fmt.Errorf("autosummary: copy marker %s → %s: %w", srcID, dstID, err)
+	}
+	return nil
+}
+
+// readMarkerErr is the error-returning sibling of readMarker. The
+// fail-soft variant exists for the PreCompact rate-limit path where
+// "treat unreadable state as zero" is the right semantic; this
+// variant is for callers (copyMarker / future fork-flavoured paths)
+// that need to tell apart "no marker yet" from "kv read failed".
+//
+// Returns:
+//   - (zero, nil)    — no marker exists (kv ErrNotFound + no legacy file)
+//   - (marker, nil)  — marker found and valid
+//   - (zero, err)    — kv read failure, row-shape mismatch, or corrupt
+//                     JSON in BOTH kv and the legacy fallback. The
+//                     caller decides whether to abort or continue.
+func readMarkerErr(agentID string) (autoSummaryMarker, error) {
+	logger := slog.Default()
+	st := getGlobalStore()
+	if st == nil {
+		// Test-fixture fallback: just read the file.
+		data, err := os.ReadFile(markerLegacyPath(agentID))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return autoSummaryMarker{}, nil
+			}
+			return autoSummaryMarker{}, fmt.Errorf("legacy-only read: %w", err)
+		}
+		var m autoSummaryMarker
+		if err := json.Unmarshal(data, &m); err != nil {
+			return autoSummaryMarker{}, fmt.Errorf("legacy-only unmarshal: %w", err)
+		}
+		return m, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), markerKVTimeout)
+	defer cancel()
+	rec, err := st.GetKV(ctx, autosummaryKVNamespace, agentID)
+	switch {
+	case err == nil:
+		m, ok := decodeMarkerKVRow(rec, agentID, logger)
+		if !ok {
+			return autoSummaryMarker{}, errors.New("kv row shape or JSON invalid")
+		}
+		return m, nil
+	case errors.Is(err, store.ErrNotFound):
+		// Test hook (shared with readMarker) fires before the
+		// legacy file read so the kv-miss → ENOENT race is
+		// reachable from a single-goroutine test.
+		if markerKVMigrationTestHook != nil {
+			markerKVMigrationTestHook()
+		}
+		// Fall through to legacy file. ENOENT there means
+		// either "no marker" or "concurrent migrator just
+		// mirrored+unlinked"; the same retry that readMarker
+		// uses disambiguates. Any other I/O error surfaces.
+		data, ferr := os.ReadFile(markerLegacyPath(agentID))
+		if ferr != nil {
+			if errors.Is(ferr, os.ErrNotExist) {
+				// Error-strict: a retry kv error or a
+				// malformed retried row surfaces as an
+				// error instead of being collapsed to
+				// "fresh" — silently dropping a marker
+				// inside the racy window would let
+				// copyMarker / fork lose the rate-limit
+				// state with no operator-visible signal.
+				m, ok, rerr := markerRetryAfterMissAndENOENT(ctx, st, agentID, logger)
+				if rerr != nil {
+					return autoSummaryMarker{}, fmt.Errorf("kv retry after legacy ENOENT: %w", rerr)
+				}
+				if ok {
+					return m, nil
+				}
+				return autoSummaryMarker{}, nil
+			}
+			return autoSummaryMarker{}, fmt.Errorf("legacy read: %w", ferr)
+		}
+		var m autoSummaryMarker
+		if jerr := json.Unmarshal(data, &m); jerr != nil {
+			return autoSummaryMarker{}, fmt.Errorf("legacy unmarshal: %w", jerr)
+		}
+		return m, nil
+	default:
+		return autoSummaryMarker{}, fmt.Errorf("kv get: %w", err)
+	}
+}
+
+// writeMarkerErr is the error-returning sibling of writeMarker. The
+// non-error variant preserves the v0 fail-soft contract for callers
+// that genuinely don't care (post-summary persistence — a lost
+// marker only causes one extra summary on the next fire). Callers
+// that DO care (copyMarker / fork) use this variant so failures
+// propagate.
+func writeMarkerErr(agentID string, m autoSummaryMarker) error {
+	data, err := json.Marshal(m)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	st := getGlobalStore()
+	if st == nil {
+		// Test-fixture fallback: write the legacy file. Surface
+		// errors so the test sees them.
+		if err := os.WriteFile(markerLegacyPath(agentID), data, 0o644); err != nil {
+			return fmt.Errorf("legacy-only write: %w", err)
+		}
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), markerKVTimeout)
+	defer cancel()
+	rec := &store.KVRecord{
+		Namespace: autosummaryKVNamespace,
+		Key:       agentID,
+		Value:     string(data),
+		Type:      store.KVTypeJSON,
+		Scope:     store.KVScopeGlobal,
+	}
+	if _, err := st.PutKV(ctx, rec, store.KVPutOptions{}); err != nil {
+		return fmt.Errorf("kv put: %w", err)
+	}
+	return nil
 }
 
 // messagesFingerprint returns a stable hash of the messages' content,
@@ -226,8 +706,9 @@ func messagesFingerprint(msgs []*Message) string {
 // PreCompactSummarize is called by the PreCompact hook (via API) just before
 // Claude Code compacts the conversation. It reads from Claude's live session
 // JSONL (which contains the full current context including pending tool uses)
-// rather than kojo's messages.jsonl (which may lag behind).
-// Falls back to messages.jsonl if session JSONL is unavailable.
+// rather than kojo's persisted transcript (agent_messages, which may lag
+// behind). Falls back to the agent_messages transcript via loadMessages if
+// the session JSONL is unavailable.
 //
 // transcriptPath, when non-empty, is the JSONL path that Claude's PreCompact
 // hook supplied via stdin. It is validated to live under the agent's claude
@@ -444,7 +925,8 @@ func stripVolatileContext(msgs []*Message) []*Message {
 
 // loadSessionMessages reads recent messages from the CLI's live session file
 // (e.g. Claude's JSONL) which has the most up-to-date context including
-// in-flight tool uses that haven't been persisted to messages.jsonl yet.
+// in-flight tool uses that haven't been persisted to the agent_messages
+// transcript yet.
 //
 // transcriptPath, when non-empty, is the JSONL path supplied by Claude's
 // PreCompact hook (passed through stdin → API → here). It's preferred

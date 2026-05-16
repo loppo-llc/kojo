@@ -1,12 +1,17 @@
 package agent
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/blob"
+	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // ForkOptions controls what state is copied into the forked agent.
@@ -17,8 +22,12 @@ type ForkOptions struct {
 
 // Fork creates a new agent by deep-copying the source agent's metadata and
 // data files. Memory (MEMORY.md, memory/, persona, avatar) is always copied.
-// Transcript (messages.jsonl) and its derived state (index/, autosummary marker,
-// tasks.json) are copied only when IncludeTranscript is true.
+// The transcript (agent_messages) and its derived state — the on-disk
+// memory index, the autosummary marker (kv: autosummary/<agentID>), and
+// tasks (cloned via cloneAgentTasks against agent_tasks) — are copied
+// only when IncludeTranscript is true. Tasks are cloned with fresh
+// per-row ids so the destination's primary keys don't collide with
+// the source's.
 //
 // External integrations are intentionally NOT copied: SlackBot, NotifySources,
 // and credentials all require per-agent tokens that cannot be safely shared.
@@ -26,10 +35,10 @@ type ForkOptions struct {
 // fresh session. WorkDir is cleared so the fork does not share external output
 // storage with the source.
 //
-// Known limitations: Manager.Update and the task API can write to persona.md /
-// tasks.json without honoring the resetting flag, so the snapshot is not fully
-// atomic against concurrent PATCH /agents/{id} or task mutations. The same
-// looseness applies to Reset today.
+// Known limitations: Manager.Update and the task API can write to persona.md
+// or agent_tasks without honoring the resetting flag, so the snapshot is not
+// fully atomic against concurrent PATCH /agents/{id} or task mutations. The
+// same looseness applies to Reset today.
 func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 	if strings.TrimSpace(opts.Name) == "" {
 		return nil, fmt.Errorf("name is required")
@@ -79,7 +88,7 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 	fork.AvatarHash = ""
 	fork.SlackBot = nil
 	fork.NotifySources = nil
-	fork.LegacyCronExpr = ""
+	fork.LegacyIntervalMinutes = 0
 	// Forking an archived agent must produce an *active* fork. Otherwise the
 	// new agent would be born dormant and silently inherit ArchivedAt from
 	// the source.
@@ -105,16 +114,49 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 		return nil, fmt.Errorf("create fork dir: %w", err)
 	}
 
+	// Pre-register the fork's agents row so copyTranscript can satisfy
+	// agent_messages' FK-on-agent_id check during AppendMessage. The
+	// trailing m.save() would also write the row but happens after the
+	// transcript replay; pre-registering closes the FK gap. The cleanup
+	// defer tombstones this row on rollback so a failure between here
+	// and final registration leaves no observable agent.
+	if err := m.store.Upsert(fork); err != nil {
+		return nil, fmt.Errorf("pre-register fork in store: %w", err)
+	}
+
 	// Remove the partially-populated fork directory and its auth token
-	// if anything below fails before the agent is fully registered.
+	// if anything below fails before the agent is fully registered. The
+	// DB row pre-registered above is tombstoned in the same defer so
+	// the failure path leaves no observable agent.
 	forkRegistered := false
 	defer func() {
 		if !forkRegistered {
+			if err := m.store.Delete(fork.ID); err != nil {
+				m.logger.Warn("failed to tombstone half-forked agent", "agent", fork.ID, "err", err)
+			}
 			if err := os.RemoveAll(dstDir); err != nil {
 				m.logger.Warn("failed to clean up partial fork dir", "dir", dstDir, "err", err)
 			}
 			if m.tokenStore != nil {
 				m.tokenStore.RemoveAgentToken(fork.ID)
+			}
+			// kv has no FK on agents, so a copyMarker that landed
+			// before a later step failed leaves an orphan
+			// autosummary row. Wipe it as part of the same
+			// rollback that drops the dir + token; deleteMarker
+			// is idempotent (silent on ErrNotFound) so it's
+			// safe even when copyMarker never ran.
+			deleteMarker(fork.ID, m.logger)
+			// Same rationale for the avatar blob: blob_refs has
+			// no FK on agents, so a SaveAvatar that landed for
+			// the new fork before a later step failed would
+			// leave an orphan blob keyed by the half-created
+			// fork id. DeleteAvatar is idempotent (silent on
+			// ErrNotFound across every probed extension) so it's
+			// safe to call regardless of whether the avatar copy
+			// reached SaveAvatar.
+			if err := DeleteAvatar(m.blobStore, fork.ID); err != nil {
+				m.logger.Warn("failed to clean up partial fork avatar", "agent", fork.ID, "err", err)
 			}
 		}
 	}()
@@ -159,32 +201,66 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 		return nil, fmt.Errorf("ensure memory dir: %w", err)
 	}
 
-	// Avatar — copy the single avatar file (any extension) if present.
-	if p := avatarFilePath(srcID); p != "" {
-		if err := copyFileIfExists(p, filepath.Join(dstDir, filepath.Base(p))); err != nil {
-			return nil, fmt.Errorf("copy avatar: %w", err)
+	// Avatar — copy the single published blob (any extension) if
+	// present. Phase 2c-2 slice 13 moved the avatar off the agent
+	// dir onto blob.ScopeGlobal/agents/<id>/avatar.<ext>; the fork
+	// re-publishes via SaveAvatar so the destination row goes
+	// through the same Put path (etag, sha256, blob_refs row) as a
+	// fresh upload. A nil blobStore (test fixture) silently skips
+	// the avatar copy — matches the v0 behaviour where an absent
+	// avatar file produced no error.
+	if m.blobStore != nil {
+		if ext, _, ok := resolveAvatarBlob(m.blobStore, srcID); ok {
+			rc, _, err := m.blobStore.Get(blob.ScopeGlobal, avatarBlobPath(srcID, ext))
+			if err != nil && !errors.Is(err, blob.ErrNotFound) {
+				return nil, fmt.Errorf("copy avatar: open src: %w", err)
+			}
+			if err == nil {
+				err := SaveAvatar(m.blobStore, fork.ID, rc, ext)
+				rc.Close()
+				if err != nil {
+					return nil, fmt.Errorf("copy avatar: %w", err)
+				}
+			}
 		}
 	}
 
 	// Transcript & derived state — opt-in. Active todos travel with the
 	// transcript because they describe ongoing work in that conversation.
+	//
+	// The transcript itself lives in agent_messages: copyTranscript
+	// replays every src row into the fork's per-agent seq sequence so
+	// the fork starts as a deep copy. The remaining derived state
+	// breaks down as: the FTS index dir is still on disk and is
+	// rsync-style copied below; the autosummary marker has moved to kv
+	// (autosummary/<agentID>) and is cloned via copyMarker; tasks live
+	// in agent_tasks and are cloned via cloneAgentTasks.
 	if opts.IncludeTranscript {
-		if err := copyFileIfExists(filepath.Join(srcDir, messagesFile), filepath.Join(dstDir, messagesFile)); err != nil {
+		if err := copyTranscript(srcID, fork.ID); err != nil {
 			return nil, fmt.Errorf("copy messages: %w", err)
 		}
 		if err := copyDirIfExists(filepath.Join(srcDir, indexDir), filepath.Join(dstDir, indexDir)); err != nil {
 			return nil, fmt.Errorf("copy index: %w", err)
 		}
-		if err := copyFileIfExists(filepath.Join(srcDir, autoSummaryMarkerFile), filepath.Join(dstDir, autoSummaryMarkerFile)); err != nil {
+		// autosummary marker now lives in kv (Phase 2c-2 slice 9).
+		// Read source via readMarker (kv first, legacy fallback so a
+		// pre-migration source still copies cleanly) and write the
+		// destination via writeMarker so it always lands in kv.
+		// Surface destination-write failures up to Fork (matching
+		// the v0 file-copy semantic — silently dropping the marker
+		// would leave the new agent summarising from scratch and
+		// the operator would never know).
+		if err := copyMarker(srcID, fork.ID, m.logger); err != nil {
 			return nil, fmt.Errorf("copy autosummary marker: %w", err)
 		}
-		if err := copyFileIfExists(filepath.Join(srcDir, tasksFile), filepath.Join(dstDir, tasksFile)); err != nil {
+		if err := m.cloneAgentTasks(context.Background(), srcID, fork.ID); err != nil {
 			return nil, fmt.Errorf("copy tasks: %w", err)
 		}
 	}
 
-	// Refresh avatar metadata on the in-memory fork now that the file is copied.
-	has, hash := avatarMeta(fork.ID)
+	// Refresh avatar metadata on the in-memory fork now that the
+	// blob is copied.
+	has, hash := m.avatarMeta(fork.ID)
 	applyAvatarMeta(fork, has, hash)
 
 	// Seed LastMessage from the copied transcript so the list view reflects it.
@@ -217,7 +293,22 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 	forkRegistered = true
 	m.save()
 
-	if expr := intervalToCron(fork.IntervalMinutes, fork.ID); expr != "" {
+	// Sync the freshly-copied MEMORY.md and memory/ tree into the
+	// fork's DB rows so cross-device readers see the forked content
+	// immediately. m.save() above persists the agent record, which
+	// is what UpsertAgentMemory's parent-existence check needs.
+	// Best-effort — a sync failure here is logged but doesn't abort
+	// the fork (the file copies on disk are the canonical state
+	// regardless; the next sync hook will reconcile).
+	if st := getGlobalStore(); st != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := SyncAgentMemoryFromDisk(ctx, st, fork.ID, m.logger); err != nil {
+			m.logger.Warn("memory sync after fork failed", "agent", fork.ID, "err", err)
+		}
+		cancel()
+	}
+
+	if expr := fork.CronExpr; expr != "" {
 		if err := m.cron.Schedule(fork.ID, expr); err != nil {
 			m.logger.Warn("failed to schedule cron for fork", "agent", fork.ID, "err", err)
 		}
@@ -320,6 +411,47 @@ func copyDirIfExists(src, dst string) error {
 		}
 		if err := copyFileIfExists(srcPath, dstPath); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// copyTranscript replays every live message from srcID into dstID via
+// AppendMessage so the fork's transcript starts as a deep copy. seq is
+// re-allocated per-agent on the destination — preserving src seq would
+// require InsertOptions.Seq, but per-agent seq is monotonic-from-1 by
+// design and the fork's seq space starts fresh.
+//
+// New message IDs are minted for the fork because v0's m_xxxxxxxx ids
+// are random hex with collision probability negligible at the per-agent
+// level but global-uniqueness is enforced by the agent_messages PRIMARY
+// KEY: reusing src ids would conflict.
+func copyTranscript(srcID, dstID string) error {
+	db := getGlobalStore()
+	if db == nil {
+		return errStoreNotReady
+	}
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+
+	recs, err := db.ListMessages(ctx, srcID, store.MessageListOptions{Order: "asc"})
+	if err != nil {
+		return err
+	}
+	for _, src := range recs {
+		dst := *src
+		dst.ID = generateMessageID()
+		dst.AgentID = dstID
+		dst.Seq = 0       // reallocate
+		dst.Version = 0   // reset
+		dst.ETag = ""     // recompute
+		dst.PeerID = ""   // local fork
+		dst.DeletedAt = nil
+		if _, err := db.AppendMessage(ctx, &dst, store.MessageInsertOptions{
+			CreatedAt: src.CreatedAt,
+			UpdatedAt: src.UpdatedAt,
+		}); err != nil {
+			return fmt.Errorf("append fork message %s: %w", dst.ID, err)
 		}
 	}
 	return nil

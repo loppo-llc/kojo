@@ -292,7 +292,7 @@ func TestCredentialStore_KeyCorruption(t *testing.T) {
 	cs1.Close()
 
 	// Corrupt the key
-	keyPath := tmp + "/.config/kojo/credentials.key"
+	keyPath := tmp + "/.config/kojo-v1/credentials.key"
 	if err := os.WriteFile(keyPath, []byte("short"), 0o600); err != nil {
 		t.Fatal(err)
 	}

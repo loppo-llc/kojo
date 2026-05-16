@@ -151,6 +151,22 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
+				// §3.7 per-frame fencing: the WS upgrade is a
+				// GET so AgentFencingMiddleware lets it pass,
+				// but every "message" frame here triggers a
+				// Chat that writes to the agent's tables.
+				// Re-check the lock holder so a handoff that
+				// landed mid-conversation refuses follow-up
+				// turns on this peer instead of silently
+				// writing under the new holder's nose.
+				if !s.fencingAllowsAgentWrite(ctx, agentID) {
+					_ = writeJSON(ctx, conn, map[string]string{
+						"type":         "error",
+						"errorMessage": "agent_lock is held by another peer; reload to reconnect to the holder",
+					})
+					continue
+				}
+
 				// Check if agent is busy
 				if s.agents.IsBusy(agentID) {
 					_ = writeJSON(ctx, conn, map[string]string{

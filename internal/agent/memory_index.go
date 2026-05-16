@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -177,7 +178,9 @@ func (w *indexWriter) insert(source, content, timestamp string) {
 	}
 }
 
-// IndexMessages indexes messages from the JSONL transcript.
+// IndexMessages indexes the agent's full transcript by reading every
+// row from agent_messages via loadMessages and rebuilding the message
+// portion of memory_fts/chunks from scratch.
 func (idx *MemoryIndex) IndexMessages(agentID string) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -208,15 +211,22 @@ func (idx *MemoryIndex) IndexMessages(agentID string) error {
 		w.insert("message", msg.Role+": "+msg.Content, msg.Timestamp)
 	}
 
-	// Update message_count to stay in sync with incremental indexing
+	// Update message_count to stay in sync with incremental indexing.
+	// The legacy "message_file_size" cursor is dropped: with the DB-backed
+	// transcript there is no JSONL file to stat; CountMessages is the
+	// authoritative cursor and is itself O(rows touched) (uses the
+	// (agent_id, seq) index).
 	if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_count", fmt.Sprintf("%d", len(msgs))); err != nil {
 		idx.logger.Debug("failed to update message_count meta", "err", err)
 	}
-	// Save file size for fast-path check in IndexNewMessages
-	transcriptPath := filepath.Join(agentDir(agentID), messagesFile)
-	if fi, err := os.Stat(transcriptPath); err == nil {
-		if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_file_size", fmt.Sprintf("%d", fi.Size())); err != nil {
-			idx.logger.Debug("failed to update message_file_size meta", "err", err)
+	// Stamp the transcript revision so IndexNewMessages can short-circuit
+	// when nothing has changed. Best-effort lookup — a DB error here just
+	// forces a full re-scan on the next call.
+	if db := getGlobalStore(); db != nil {
+		if _, rev, err := db.TranscriptRevision(context.Background(), agentID); err == nil {
+			if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_revision", fmt.Sprintf("%d", rev)); err != nil {
+				idx.logger.Debug("failed to update message_revision meta", "err", err)
+			}
 		}
 	}
 	idx.updateMeta("message")
@@ -290,32 +300,43 @@ func (idx *MemoryIndex) Reindex(agentID string) error {
 	return nil
 }
 
-// IndexNewMessages incrementally indexes only new messages since last index.
+// IndexNewMessages incrementally indexes only new messages since last
+// index. Fast-path uses (count, max(updated_at)) as the change cursor:
+// count alone would miss edit-in-place (regenerate, content fix), and
+// max(updated_at) alone would miss a delete that brings the value back
+// to a prior maximum. Together they detect every observable transcript
+// change without an O(rows) scan.
 func (idx *MemoryIndex) IndexNewMessages(agentID string) {
-	// Fast path: check if transcript file size has changed since last index.
-	// This avoids reading and parsing the entire JSONL on every chat turn.
-	transcriptPath := filepath.Join(agentDir(agentID), messagesFile)
-	fi, err := os.Stat(transcriptPath)
-	if err != nil {
-		return // no transcript file
+	db := getGlobalStore()
+	if db == nil {
+		return // store not yet initialized (test fixture)
 	}
-	currentSize := fi.Size()
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+	currentCount, currentRev, err := db.TranscriptRevision(ctx, agentID)
+	if err != nil {
+		return
+	}
 
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	var lastSize int64
-	idx.db.QueryRow("SELECT CAST(indexed_at AS INTEGER) FROM index_meta WHERE source = 'message_file_size'").Scan(&lastSize)
-	if lastSize > 0 && currentSize == lastSize {
-		return // file hasn't changed
-	}
-
-	// Get total message count last processed (stored in index_meta)
+	// Get last-indexed (count, revision) from index_meta. The 'message_count'
+	// key holds the count; 'message_revision' is new in slice 2 of the
+	// cutover. A row written by an older binary will have count but no
+	// revision; in that case we treat revision as 0, which forces a
+	// re-index on first run after upgrade — acceptable one-time cost.
 	var lastCount int
+	var lastRev int64
 	hasMeta := true
 	if err := idx.db.QueryRow("SELECT CAST(indexed_at AS INTEGER) FROM index_meta WHERE source = 'message_count'").Scan(&lastCount); err != nil {
 		lastCount = 0
 		hasMeta = false
+	}
+	idx.db.QueryRow("SELECT CAST(indexed_at AS INTEGER) FROM index_meta WHERE source = 'message_revision'").Scan(&lastRev)
+
+	if lastCount == int(currentCount) && lastRev == currentRev {
+		return // no change since last index
 	}
 
 	msgs, err := loadMessages(agentID, 0)
@@ -325,19 +346,30 @@ func (idx *MemoryIndex) IndexNewMessages(agentID string) {
 
 	// Migration: if message_count meta doesn't exist but FTS already has rows,
 	// use FTS row count as baseline to avoid re-inserting existing data.
+	// Stamp BOTH message_count and message_revision so the next call's
+	// fast-path can short-circuit; otherwise the same-count edit case
+	// would silently miss until something else triggered a full re-index.
 	if !hasMeta {
 		var ftsCount int
 		if err := idx.db.QueryRow("SELECT COUNT(*) FROM memory_fts WHERE source = 'message'").Scan(&ftsCount); err == nil && ftsCount > 0 {
-			// Existing DB without message_count tracking. Save current total and skip.
 			if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_count", fmt.Sprintf("%d", len(msgs))); err != nil {
 				idx.logger.Debug("failed to save message_count baseline", "err", err)
+			}
+			if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_revision", fmt.Sprintf("%d", currentRev)); err != nil {
+				idx.logger.Debug("failed to save message_revision baseline", "err", err)
 			}
 			return
 		}
 	}
 
-	// If messages were truncated/rebuilt (count shrank), do a full reindex
-	if len(msgs) < lastCount {
+	// Force a full reindex when:
+	//   - count shrank (truncation, deletes)
+	//   - count is unchanged but max(updated_at) advanced (edit-in-place,
+	//     regenerate that replaced an existing assistant message). The
+	//     incremental path below assumes msgs[lastCount:] is the only
+	//     new content, which would silently miss the edited row.
+	editedInPlace := lastRev != 0 && currentRev > lastRev && len(msgs) == lastCount
+	if len(msgs) < lastCount || editedInPlace {
 		if _, err := idx.db.Exec("DELETE FROM memory_fts WHERE source = 'message'"); err != nil {
 			idx.logger.Debug("failed to clear FTS messages for reindex", "err", err)
 		}
@@ -349,12 +381,25 @@ func (idx *MemoryIndex) IndexNewMessages(agentID string) {
 			if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_count", "0"); err != nil {
 				idx.logger.Debug("failed to reset message_count", "err", err)
 			}
+			if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_revision", fmt.Sprintf("%d", currentRev)); err != nil {
+				idx.logger.Debug("failed to reset message_revision", "err", err)
+			}
 			return
 		}
 	}
 
 	if len(msgs) <= lastCount {
-		return // no new messages
+		// Migration / no-op: count unchanged but the legacy index_meta
+		// entry didn't carry a revision (lastRev=0). Stamp it now so
+		// the next call's fast-path can short-circuit instead of paying
+		// the loadMessages tax again. Best-effort — a write failure here
+		// just defers the optimization to a later run.
+		if lastRev != currentRev {
+			if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_revision", fmt.Sprintf("%d", currentRev)); err != nil {
+				idx.logger.Debug("failed to stamp message_revision after migration", "err", err)
+			}
+		}
+		return
 	}
 
 	w, err := idx.newIndexWriter()
@@ -373,9 +418,8 @@ func (idx *MemoryIndex) IndexNewMessages(agentID string) {
 	if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_count", fmt.Sprintf("%d", len(msgs))); err != nil {
 		idx.logger.Debug("failed to update message_count", "err", err)
 	}
-	// Save file size for fast-path check on next call
-	if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_file_size", fmt.Sprintf("%d", currentSize)); err != nil {
-		idx.logger.Debug("failed to update message_file_size", "err", err)
+	if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_revision", fmt.Sprintf("%d", currentRev)); err != nil {
+		idx.logger.Debug("failed to update message_revision", "err", err)
 	}
 	idx.updateMeta("message")
 }

@@ -561,11 +561,20 @@ func (lw *limitedWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// claudeEncodePath encodes a directory path using Claude's project path scheme:
-// "/" (or separator), ".", "_" are all replaced with "-".
+// claudeEncodePath encodes a directory path using Claude's project
+// path scheme. Replaces "/", "\", ":", ".", "_" with "-" so the
+// result is portable across macOS / Linux (POSIX) and Windows
+// (`C:\Users\alice\foo` → `-C--Users-alice-foo`). Using a fixed
+// replacer (not filepath.Separator alone) is essential: a
+// Windows path that survived an across-OS round-trip with only
+// one separator translated would land at a different project
+// dir on the new host and claude --continue would lose the
+// transcript.
 func claudeEncodePath(dir string) string {
 	return strings.NewReplacer(
-		string(filepath.Separator), "-",
+		"/", "-",
+		"\\", "-",
+		":", "-",
 		".", "-",
 		"_", "-",
 	).Replace(dir)

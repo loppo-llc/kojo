@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/loppo-llc/kojo/internal/store"
 )
 
 const (
@@ -106,8 +107,27 @@ func (m *Manager) GetCustomBaseURL() string {
 	return m.customBaseURL
 }
 
-func NewManager(logger *slog.Logger) *Manager {
-	st := newStore(logger)
+// ManagerOptions tunes Manager construction. Zero-value is the
+// minimal-effects posture: no v0 → v1 session fallback. Callers that
+// know migration is complete (the startup gate confirmed v1Complete)
+// supply a non-empty V0LegacyDir so the v0 dir's sessions.json can
+// be picked up on first Load.
+type ManagerOptions struct {
+	// V0LegacyDir is the v0 config directory (configdir.V0Path()).
+	// Empty means: do not consult the v0 dir at all — the runtime
+	// opted out (e.g. --fresh) or there is no v0 install to fall
+	// back to. Non-empty enables the v0-side fallback inside
+	// internal/session.Store.Load(): kv miss → v1 dir → v0 dir.
+	V0LegacyDir string
+}
+
+// NewManager constructs a session.Manager. db is the kv-backed
+// persistence layer (Phase 2c-2 slice 28); pass nil to disable
+// persistence (test scaffolding that exercises Manager methods
+// without a configured store). The runtime path always passes a
+// real *store.Store via server.Config.
+func NewManager(logger *slog.Logger, db *store.Store, opts ManagerOptions) *Manager {
+	st := newStore(logger, db, opts.V0LegacyDir)
 	m := &Manager{
 		sessions: make(map[string]*Session),
 		logger:   logger,

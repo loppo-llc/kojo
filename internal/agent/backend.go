@@ -67,6 +67,45 @@ var agentTokenLookup func(agentID string) (string, bool)
 // (disables token injection).
 func SetAgentTokenLookup(fn func(string) (string, bool)) { agentTokenLookup = fn }
 
+// peerCountLookup, when set, returns the number of OTHER peers
+// (excluding the local self row) currently registered in
+// peer_registry. Wired up by cmd/kojo/main.go after the peer
+// registrar starts. Used by SyncDeviceSwitchSkill to suppress the
+// kojo-switch-device skill on single-node installs (no target =
+// no useful skill to expose).
+//
+// Unset (callback nil) is treated as "unknown peer count → assume
+// zero" so a misconfigured boot doesn't fail open and spam the
+// skill into a single-node setup.
+var peerCountLookup func() int
+
+// SetPeerCountLookup wires the peer-count callback. May be nil
+// (disables the device-switch skill auto-install).
+func SetPeerCountLookup(fn func() int) { peerCountLookup = fn }
+
+// LookupPeerCount returns the number of OTHER registered peers via
+// the wired callback. Returns 0 when no callback is set.
+func LookupPeerCount() int {
+	if peerCountLookup == nil {
+		return 0
+	}
+	return peerCountLookup()
+}
+
+// LookupAgentToken returns the raw $KOJO_AGENT_TOKEN value for the
+// given agent_id via the wired callback. Returns ("", false) when
+// the callback is unset or the agent has no available raw value
+// (e.g. post-restart on a peer that only holds the kv hash, not
+// the raw — see auth.ErrTokenRawUnavailable). Used by the §3.7
+// orchestrator to capture the source's raw so it can be replayed
+// to target's TokenStore via /api/v1/peers/agent-sync.
+func LookupAgentToken(agentID string) (string, bool) {
+	if agentTokenLookup == nil {
+		return "", false
+	}
+	return agentTokenLookup(agentID)
+}
+
 // filterEnv returns a copy of os.Environ() with entries matching any of the
 // given prefixes removed, and AGENT_BROWSER_SESSION / AGENT_BROWSER_COOKIE_DIR
 // vars set to agentID / dataDir. KOJO_AGENT_ID, KOJO_AGENT_TOKEN and

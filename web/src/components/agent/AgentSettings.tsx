@@ -25,7 +25,7 @@ export function AgentSettings() {
   const [customModels, setCustomModels] = useState<string[]>([]);
   const [thinkingMode, setThinkingMode] = useState("");
   const [workDir, setWorkDir] = useState("");
-  const [intervalMinutes, setIntervalMinutes] = useState(30);
+  const [cronExpr, setCronExpr] = useState("");
   const [timeoutMinutes, setTimeoutMinutes] = useState(10);
   const [resumeIdleMinutes, setResumeIdleMinutes] = useState(0);
   const [silentStart, setSilentStart] = useState("");
@@ -151,7 +151,7 @@ export function AgentSettings() {
       setCustomBaseURL(a.customBaseURL ?? "http://localhost:8080");
       setThinkingMode(a.thinkingMode ?? "");
       setWorkDir(a.workDir ?? "");
-      setIntervalMinutes(a.intervalMinutes);
+      setCronExpr(a.cronExpr ?? "");
       setTimeoutMinutes(a.timeoutMinutes || 10);
       setResumeIdleMinutes(a.resumeIdleMinutes ?? 0);
       setSilentStart(a.silentStart ?? "");
@@ -190,39 +190,72 @@ export function AgentSettings() {
     setError("");
     setSuccess(false);
     try {
-      const updated = await agentApi.update(id!, {
-        name: name.trim(),
-        persona: persona.trim(),
-        ...(publicProfileOverride ? { publicProfile: publicProfile.trim() } : {}),
-        publicProfileOverride,
-        model: model.trim(),
-        effort: supportsEffort(tool) ? effort : undefined,
-        tool: tool.trim(),
-        customBaseURL: needsCustomURL ? customBaseURL.trim() : undefined,
-        thinkingMode: tool === "llama.cpp" ? thinkingMode : undefined,
-        workDir: workDir.trim(),
-        intervalMinutes,
-        timeoutMinutes,
-        resumeIdleMinutes,
-        silentStart,
-        silentEnd,
-        notifyDuringSilent,
-        cronMessage,
-        allowedTools: (tool === "custom") ? allowedTools : undefined,
-        allowProtectedPaths: (tool === "claude" || tool === "custom") ? allowProtectedPaths : undefined,
-        tts: {
-          enabled: ttsEnabled,
-          model: ttsModel || undefined,
-          voice: ttsVoice || undefined,
-          stylePrompt: ttsStylePrompt.trim() || undefined,
+      const updated = await agentApi.update(
+        id!,
+        {
+          name: name.trim(),
+          persona: persona.trim(),
+          ...(publicProfileOverride ? { publicProfile: publicProfile.trim() } : {}),
+          publicProfileOverride,
+          model: model.trim(),
+          effort: supportsEffort(tool) ? effort : undefined,
+          tool: tool.trim(),
+          customBaseURL: needsCustomURL ? customBaseURL.trim() : undefined,
+          thinkingMode: tool === "llama.cpp" ? thinkingMode : undefined,
+          workDir: workDir.trim(),
+          cronExpr,
+          timeoutMinutes,
+          resumeIdleMinutes,
+          silentStart,
+          silentEnd,
+          notifyDuringSilent,
+          cronMessage,
+          allowedTools: (tool === "custom") ? allowedTools : undefined,
+          allowProtectedPaths: (tool === "claude" || tool === "custom") ? allowProtectedPaths : undefined,
+          tts: {
+            enabled: ttsEnabled,
+            model: ttsModel || undefined,
+            voice: ttsVoice || undefined,
+            stylePrompt: ttsStylePrompt.trim() || undefined,
+          },
         },
-      });
+        // The form's snapshot etag — captured at GET time, NOT a global
+        // cache lookup. Without this If-Match the server happily accepts
+        // a stale form's overwrite even when another tab has saved newer
+        // values; with it, the second writer gets 412 and we surface a
+        // "someone else changed this" message below.
+        agent?.etag,
+      );
       setAgent(updated);
       setPublicProfile(updated.publicProfile ?? "");
       setPublicProfileOverride(updated.publicProfileOverride ?? false);
+      // Re-sync cronExpr to whatever the server actually persisted. Without
+      // this, picking a Preset chip ("@preset:30") leaves the local state at
+      // the sentinel even though the saved row is the expanded form
+      // ("7,37 * * * *"); the dirty diff stays true forever.
+      setCronExpr(updated.cronExpr ?? "");
       setSuccess(true);
       setTimeout(() => setSuccess(false), 2000);
     } catch (err) {
+      // PreconditionFailedError is the etag-mismatch 412. Re-fetch the
+      // agent so the form rebases onto the server's current row before
+      // the user re-applies their edit (otherwise the next Save would
+      // 412 again with the same stale etag they started with).
+      if (err instanceof Error && err.name === "PreconditionFailedError") {
+        setError("Someone else updated this agent. Reloading…");
+        try {
+          const fresh = await agentApi.get(id!);
+          setAgent(fresh);
+          // Don't blow away the user's in-progress edits — only refresh
+          // the etag-bearing record. Form fields stay as-is so the user
+          // can decide what to do; clicking Save again will use the new
+          // etag and either succeed or 412 again if a third write
+          // landed in between.
+        } catch {
+          /* swallow — primary error is already shown */
+        }
+        return;
+      }
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSaving(false);
@@ -816,8 +849,8 @@ export function AgentSettings() {
 
         {/* Schedule */}
         <ScheduleEditor
-          intervalMinutes={intervalMinutes}
-          onIntervalChange={setIntervalMinutes}
+          cronExpr={cronExpr}
+          onCronExprChange={setCronExpr}
           timeoutMinutes={timeoutMinutes}
           onTimeoutChange={setTimeoutMinutes}
           resumeIdleMinutes={resumeIdleMinutes}
@@ -830,11 +863,12 @@ export function AgentSettings() {
           cronMessage={cronMessage}
           onCronMessageChange={setCronMessage}
           nextCronAt={agent.nextCronAt}
+          cronPausedGlobal={agent.cronPausedGlobal}
           scheduleDirty={
             // Schedule-affecting fields differ from the persisted agent —
             // nextCronAt is computed against the saved schedule so showing
             // it during edits would mislead.
-            agent.intervalMinutes !== intervalMinutes ||
+            (agent.cronExpr ?? "") !== cronExpr ||
             (agent.silentStart ?? "") !== silentStart ||
             (agent.silentEnd ?? "") !== silentEnd
           }
@@ -1090,7 +1124,13 @@ export function AgentSettings() {
 
         {/* ── Notifications ── */}
         <section className="rounded-xl border border-neutral-800 p-5">
-          <NotifySourcesEditor agentId={id!} />
+          <NotifySourcesEditor
+            agentId={id!}
+            agentEtag={agent?.etag ?? null}
+            onAgentEtagChange={(etag) =>
+              setAgent((a) => (a ? { ...a, etag: etag ?? a.etag } : a))
+            }
+          />
         </section>
 
         {/* ── Slack Bot ── */}

@@ -30,6 +30,42 @@ type Manager struct {
 	// Subscribe / Unsubscribe / Send-driven persists cannot race on the
 	// shared .tmp filename or commit out-of-order snapshots.
 	persistMu sync.Mutex
+	// vapidStore, when non-nil, is used for VAPID load / save in
+	// preference to the legacy vapid.json file. Phase 5 wires a kv-
+	// backed store with envelope-encrypted private key from main.go;
+	// tests and code paths that don't need encryption keep the file
+	// fallback by leaving this nil.
+	vapidStore VAPIDStore
+}
+
+// VAPIDStore is the persistence interface for the VAPID key pair.
+// Implementations in cmd/kojo/ wrap the kv table + envelope crypto so
+// the private key never lives on disk in plaintext on a v1 install.
+type VAPIDStore interface {
+	// LoadVAPID returns the persisted keys, or ("","",nil) if no
+	// keys are stored. Errors other than "absent" are surfaced so a
+	// boot doesn't silently regenerate keys (which would invalidate
+	// every existing browser subscription).
+	LoadVAPID() (priv, pub string, err error)
+
+	// SaveVAPID writes the keys atomically. Idempotent overwrite.
+	SaveVAPID(priv, pub string) error
+}
+
+// NewManagerWithVAPIDStore is the Phase-5 constructor that takes a
+// kv-backed VAPID store. The legacy NewManager keeps the file-only
+// path for tests.
+func NewManagerWithVAPIDStore(logger *slog.Logger, store VAPIDStore) (*Manager, error) {
+	m := &Manager{
+		logger:        logger,
+		subscriptions: make([]*webpush.Subscription, 0),
+		vapidStore:    store,
+	}
+	if err := m.loadOrGenerateVAPID(); err != nil {
+		return nil, err
+	}
+	m.loadSubscriptions()
+	return m, nil
 }
 
 type vapidKeys struct {
@@ -154,6 +190,32 @@ func (m *Manager) loadOrGenerateVAPID() error {
 	dir := configdir.Path()
 	path := filepath.Join(dir, vapidFile)
 
+	// Phase 5 path: kv-backed store with envelope-encrypted private key.
+	// Falls through to the file path on (a) no kv store wired (legacy
+	// callers) or (b) kv store empty AND no legacy file (fresh install).
+	if m.vapidStore != nil {
+		priv, pub, err := m.vapidStore.LoadVAPID()
+		if err != nil {
+			return fmt.Errorf("VAPID kv load: %w", err)
+		}
+		if priv != "" && pub != "" {
+			m.vapidPrivate = priv
+			m.vapidPublic = pub
+			m.logger.Info("loaded VAPID keys from kv")
+			// Belt-and-suspenders: if the legacy file still exists,
+			// remove it now that kv is authoritative. Errors are
+			// non-fatal — operator can `rm vapid.json` manually.
+			if _, statErr := os.Stat(path); statErr == nil {
+				if rmErr := os.Remove(path); rmErr != nil {
+					m.logger.Warn("could not remove legacy vapid.json after kv load", "err", rmErr)
+				} else {
+					m.logger.Info("removed legacy vapid.json (kv now authoritative)")
+				}
+			}
+			return nil
+		}
+	}
+
 	data, err := os.ReadFile(path)
 	if err == nil {
 		var keys vapidKeys
@@ -165,7 +227,21 @@ func (m *Manager) loadOrGenerateVAPID() error {
 		}
 		m.vapidPrivate = keys.PrivateKey
 		m.vapidPublic = keys.PublicKey
-		m.logger.Info("loaded VAPID keys")
+
+		// One-shot migration: if a kv store is configured but had no
+		// row, persist the file's keys into kv now so subsequent boots
+		// take the encrypted path. The file is then removed.
+		if m.vapidStore != nil {
+			if err := m.vapidStore.SaveVAPID(m.vapidPrivate, m.vapidPublic); err != nil {
+				return fmt.Errorf("VAPID kv migrate: %w", err)
+			}
+			if rmErr := os.Remove(path); rmErr != nil {
+				m.logger.Warn("could not remove legacy vapid.json after kv migrate", "err", rmErr)
+			}
+			m.logger.Info("migrated VAPID keys from file to kv")
+		} else {
+			m.logger.Info("loaded VAPID keys")
+		}
 		return nil
 	}
 
@@ -178,6 +254,14 @@ func (m *Manager) loadOrGenerateVAPID() error {
 
 	m.vapidPrivate = privKey
 	m.vapidPublic = pubKey
+
+	if m.vapidStore != nil {
+		if err := m.vapidStore.SaveVAPID(privKey, pubKey); err != nil {
+			return fmt.Errorf("VAPID kv save: %w", err)
+		}
+		m.logger.Info("generated new VAPID keys (kv-backed)")
+		return nil
+	}
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("failed to create config dir: %w", err)

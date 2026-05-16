@@ -360,7 +360,14 @@ const GROUP_DM_LEGACY_RE = /^\[Group DM: (.+)\] New message from (.+?)(?:\s+at\s
 // header so we never have to parse the untrusted message block to find
 // the latest sender. The suffix is optional to stay compatible with any
 // transcripts captured before the suffix landed.
-const GROUP_DM_BATCH_RE = /^\[Group DM: (.+?)\] (\d+) new message\(s\)(?: from (.+?))?\./;
+//
+// The sender capture uses `.*?` (not `.+?`) so a header whose sender field
+// resolved to an empty string — e.g. " from ." emitted when the recipient's
+// view of the sender's display name was blank (hard-deleted agent, or a
+// member loaded before the agents-JOIN ran) — still matches and renders
+// as a pill. Without this the regex falls through and the entire 10KB
+// notification body is shown raw with no close/expand toggle.
+const GROUP_DM_BATCH_RE = /^\[Group DM: (.+?)\] (\d+) new message\(s\)(?: from (.*?))?\./;
 
 /**
  * Compact pill for group-DM notifications. The full notification body now
@@ -381,7 +388,10 @@ function GroupDMNotificationPill({
   count?: number;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const senderLabel = sender ?? "?";
+  // Treat an empty-string sender the same as "missing" — the server emits
+  // " from ." when the resolved display name is blank, which leaves `sender`
+  // as "" after the regex capture rather than undefined.
+  const senderLabel = sender && sender.trim() !== "" ? sender : "?";
   return (
     <div className="flex justify-center my-1.5">
       <div className="flex flex-col items-center max-w-[90%] w-full">

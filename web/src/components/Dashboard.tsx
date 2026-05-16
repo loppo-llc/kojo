@@ -18,7 +18,11 @@ interface SessionGroup {
 function groupSessions(sessions: SessionInfo[]): SessionGroup[] {
   const sorted = [...sessions]
     .filter((s) => !s.internal)
-    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    .sort((a, b) => {
+      const diff = new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+      if (diff !== 0 && !Number.isNaN(diff)) return diff;
+      return a.id.localeCompare(b.id);
+    });
 
   const map = new Map<string, SessionInfo[]>();
   for (const s of sorted) {
@@ -46,7 +50,9 @@ function groupSessions(sessions: SessionInfo[]): SessionGroup[] {
     const aRunning = a.primary.status === "running" ? 1 : 0;
     const bRunning = b.primary.status === "running" ? 1 : 0;
     if (aRunning !== bRunning) return bRunning - aRunning;
-    return new Date(b.primary.createdAt).getTime() - new Date(a.primary.createdAt).getTime();
+    const diff = new Date(b.primary.createdAt).getTime() - new Date(a.primary.createdAt).getTime();
+    if (diff !== 0 && !Number.isNaN(diff)) return diff;
+    return a.key.localeCompare(b.key);
   });
 
   return groups;
@@ -103,9 +109,16 @@ export function Dashboard() {
 
   const groups = groupSessions(sessions);
   const hasAnySessions = sessions.some((s) => !s.internal);
-  const sortedAgents = [...agents].sort(
-    (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
-  );
+  // updatedAt is RFC3339 with seconds resolution, so agents touched in the
+  // same second tie. Manager.List() iterates a map, so input order is random
+  // per request; a 0-return comparator would let that randomness through
+  // (Array.sort is stable, but the tie group still re-shuffles each reload).
+  // Fall back to id for a deterministic order.
+  const sortedAgents = [...agents].sort((a, b) => {
+    const diff = new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+    if (diff !== 0 && !Number.isNaN(diff)) return diff;
+    return a.id.localeCompare(b.id);
+  });
 
   const toggleExpand = (key: string) => {
     setExpanded((prev) => {
@@ -202,7 +215,7 @@ export function Dashboard() {
         <section>
             <div className="flex items-center justify-between mb-2">
               <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">Agents</h2>
-              {agents.some((a) => a.intervalMinutes > 0) && (
+              {agents.some((a) => (a.cronExpr ?? "") !== "") && (
                 <button
                   onClick={() => {
                     const next = !cronPaused;
@@ -314,7 +327,11 @@ export function Dashboard() {
           )}
           <div className="space-y-2">
             {[...groupDMs]
-              .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+              .sort((a, b) => {
+                const diff = new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+                if (diff !== 0 && !Number.isNaN(diff)) return diff;
+                return a.id.localeCompare(b.id);
+              })
               .map((g) => {
                 const isCollapsed = collapsedGroupDMs.has(g.id);
                 return (

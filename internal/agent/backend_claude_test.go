@@ -71,7 +71,7 @@ func TestHasExistingSession(t *testing.T) {
 		t.Setenv("HOME", home)
 
 		// Use a path with dots and underscores to verify encoding
-		agentPath := filepath.Join(home, ".config", "kojo", "agents", "ag_test123")
+		agentPath := filepath.Join(home, ".config", "kojo-v1", "agents", "ag_test123")
 		os.MkdirAll(agentPath, 0o755)
 
 		absPath, _ := filepath.Abs(agentPath)
@@ -133,7 +133,7 @@ func setupRecoverTest(t *testing.T) (string, func([]map[string]any)) {
 	t.Setenv("HOME", home)
 
 	agentID := "ag_test_recover"
-	aDir := filepath.Join(home, ".config", "kojo", "agents", agentID)
+	aDir := filepath.Join(home, ".config", "kojo-v1", "agents", agentID)
 	os.MkdirAll(aDir, 0o755)
 
 	// Override agentsDir by setting HOME; agentDir uses agentsDir internally.
@@ -397,7 +397,7 @@ func TestRecoverFromSession_scannerError(t *testing.T) {
 	_ = write
 
 	home := os.Getenv("HOME")
-	aDir := filepath.Join(home, ".config", "kojo", "agents", agentID)
+	aDir := filepath.Join(home, ".config", "kojo-v1", "agents", agentID)
 	absDir, _ := filepath.Abs(aDir)
 	encoded := strings.NewReplacer(
 		string(filepath.Separator), "-",
@@ -519,7 +519,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	aDir := filepath.Join(home, ".config", "kojo", "agents", "ag_threshold_test")
+	aDir := filepath.Join(home, ".config", "kojo-v1", "agents", "ag_threshold_test")
 	os.MkdirAll(aDir, 0o755)
 
 	absDir, _ := filepath.Abs(aDir)

@@ -50,8 +50,104 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		return true
 	}
 
+	// WebDAV mount surface: the handler-side `webdavGate` is the
+	// canonical authorization point here because the credential a
+	// WebDAV client presents is HTTP Basic — AuthMiddleware can't
+	// resolve it to a Principal (only Bearer / X-Kojo-Token go
+	// through there), so we'd 403 a perfectly valid Basic-auth
+	// mount request before it ever reached the gate.
+	//
+	// Letting any principal through to the mux means the gate has
+	// to enforce both "no creds → 401 with Basic challenge" and
+	// "bad creds → 401" itself, which it does. The blast radius is
+	// bounded: only /api/v1/webdav/* opts out of policy-layer
+	// enforcement.
+	if strings.HasPrefix(path, "/api/v1/webdav/") || path == "/api/v1/webdav" {
+		return true
+	}
+
+	// RoleWebDAV is otherwise a dead-end — the token's only valid
+	// destination is the webdav mount above. Any other API path
+	// falls through to default-deny.
+	if p.IsWebDAV() {
+		return false
+	}
+
+	// RolePeer is scoped to the inter-peer surface (status push
+	// feed for §3.10, blob handoff for §3.7). Every other API
+	// path falls through to default-deny — a leaked peer signing
+	// key can't reach /api/v1/agents or any other route. Method
+	// gating is explicit so a future mutation handler under the
+	// same prefix doesn't inherit the read allowlist.
+	if p.IsPeer() {
+		if method == http.MethodGet {
+			if path == "/api/v1/peers/events" {
+				return true
+			}
+			if strings.HasPrefix(path, "/api/v1/peers/blobs/") {
+				return true
+			}
+		}
+		if method == http.MethodPost && path == "/api/v1/peers/pull" {
+			// Device-switch orchestration (§3.7 step 4): the
+			// Hub signs the pull dispatch as its own peer
+			// identity; the target's policy admits it as
+			// RolePeer. No other peer-auth POST surface is
+			// allowed — keep the method/path check tight so a
+			// future handler under /api/v1/peers/* doesn't
+			// inherit POST access by accident.
+			return true
+		}
+		if method == http.MethodPost && path == "/api/v1/peers/agent-sync" {
+			// Device-switch agent metadata push (§3.7 step
+			// 4-bis): source peer signs the payload, target
+			// applies via store.SyncAgentFromPeer. Same trust
+			// model as /peers/pull.
+			return true
+		}
+		if method == http.MethodPost &&
+			(path == "/api/v1/peers/agent-sync/finalize" ||
+				path == "/api/v1/peers/agent-sync/drop") {
+			// Two-phase agent-sync companions. finalize
+			// activates target runtime state after a
+			// successful complete; drop rolls back on abort.
+			return true
+		}
+		if method == http.MethodPost && path == "/api/v1/peers/agent-sync/state" {
+			// Incremental device-switch preflight (§3.7): source
+			// peer asks target for its high-water marks so the
+			// agent-sync payload ships only the delta. Read-only
+			// at the row level (no mutations on target);
+			// signer-equals-source and agent_lock holder check
+			// run inside the handler.
+			return true
+		}
+		// Blanket agent-path proxy surface (§3.7 device-switch):
+		// Hub's remoteAgentProxyMiddleware forwards any agent-
+		// scoped request from an authorised caller (Owner /
+		// Agent) to the holder peer, signing it with the Hub's
+		// Ed25519 identity. The target's handler still runs
+		// its own guards (If-Match, busy checks, lock holder,
+		// etc.). Loop prevention in the middleware ensures we
+		// never re-proxy a peer-signed request. Subsumes the
+		// earlier per-endpoint entries (WS, messages).
+		if strings.HasPrefix(path, "/api/v1/agents/") {
+			return true
+		}
+		return false
+	}
+
 	// Bare /api/v1/info — reduced view (version only) returned by the handler.
 	if method == http.MethodGet && path == "/api/v1/info" {
+		return true
+	}
+	// Peer list: agents need this to discover handoff targets
+	// by Tailscale machine name. The handler returns a reduced
+	// view (no public_key, no capabilities) for non-Owner
+	// principals so identity material doesn't leak. Other
+	// /api/v1/peers/* routes (POST, DELETE, /self, /rotate-key)
+	// stay owner-only via the handler-level gate.
+	if method == http.MethodGet && path == "/api/v1/peers" && p.IsAgent() {
 		return true
 	}
 	// Public agent reads.
@@ -66,7 +162,7 @@ func AllowNonOwner(p Principal, method, path string) bool {
 	}
 
 	// Per-agent {id} routes.
-	if id, sub, ok := splitAgentIDPath(path); ok {
+	if id, sub, ok := SplitAgentIDPath(path); ok {
 		// Avatar and agent-active status are public-readable.
 		if method == http.MethodGet && (sub == "/avatar" || sub == "/active") {
 			return true
@@ -91,6 +187,14 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			case "/fork", "/privilege":
 				// Owner-only — already filtered out above.
 				return false
+			case "/handoff/switch":
+				// Agent-self orchestrated device switch
+				// (§3.7). Only the agent itself may move
+				// itself between peers — Owner is handled by
+				// the IsOwner short-circuit at the top of
+				// AllowNonOwner. Other agents must NOT be
+				// able to migrate someone else's data.
+				return p.IsAgent() && p.AgentID == id
 			}
 		}
 		// Everything else is self-scoped read/write. The handler still
@@ -195,10 +299,10 @@ func isSelfScopedRoute(method, sub string) bool {
 	return false
 }
 
-// splitAgentIDPath parses /api/v1/agents/{id}{sub} into (id, sub, true)
+// SplitAgentIDPath parses /api/v1/agents/{id}{sub} into (id, sub, true)
 // where sub starts with "/" or is empty. Returns ok=false if the path
 // does not match.
-func splitAgentIDPath(path string) (id, sub string, ok bool) {
+func SplitAgentIDPath(path string) (id, sub string, ok bool) {
 	const prefix = "/api/v1/agents/"
 	if !strings.HasPrefix(path, prefix) {
 		return "", "", false
@@ -218,7 +322,7 @@ func splitAgentIDPath(path string) (id, sub string, ok bool) {
 // expected suffix ("" for the bare GET /agents/{id}). Used in the
 // allowlist for read-only endpoints exposed to Agent principals.
 func matchAgentSubpath(path, expectedSub string) bool {
-	_, sub, ok := splitAgentIDPath(path)
+	_, sub, ok := SplitAgentIDPath(path)
 	if !ok {
 		return false
 	}

@@ -1,9 +1,14 @@
 package agent
 
 import (
-	"os"
-	"path/filepath"
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // GroupDM represents a group conversation between agents.
@@ -95,6 +100,11 @@ type GroupDM struct {
 }
 
 // GroupMember is a participant in a group DM.
+//
+// AgentName is a denormalized read-only display field. The DB store
+// (members_json) does not persist it — it is rebuilt from the agents
+// table on every load (and on every Members copy in groupdm_manager).
+// Callers must not write AgentName expecting durability.
 type GroupMember struct {
 	AgentID   string `json:"agentId"`
 	AgentName string `json:"agentName"`
@@ -123,132 +133,337 @@ func generateGroupMessageID() string {
 	return generatePrefixedID("gm_")
 }
 
-// groupdmsDir returns the base directory for group DM data.
-func groupdmsDir() string {
-	return filepath.Join(agentsDir(), "groupdms")
-}
-
-// groupDir returns the directory for a specific group.
-func groupDir(groupID string) string {
-	return filepath.Join(groupdmsDir(), groupID)
-}
-
-// appendGroupMessage appends a message to a group's JSONL transcript.
+// appendGroupMessage inserts a message into the group's groupdm_messages
+// table. The store handles seq allocation, member-vs-author validation,
+// and CAS via ExpectedLatestSeq (here we always use 0 — the manager-level
+// CAS check is keyed on the latestMsgID cache).
 func appendGroupMessage(groupID string, msg *GroupMessage) error {
-	dir := groupDir(groupID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if msg == nil {
+		return errors.New("appendGroupMessage: nil message")
+	}
+	db := getGlobalStore()
+	if db == nil {
+		return errStoreNotReady
+	}
+	rec := &store.GroupDMMessageRecord{
+		ID:        msg.ID,
+		GroupDMID: groupID,
+		AgentID:   msg.AgentID,
+		Content:   msg.Content,
+	}
+	ts := parseAgentRFC3339Millis(msg.Timestamp)
+	if ts == 0 {
+		ts = store.NowMillis()
+	}
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+	if _, err := db.AppendGroupDMMessage(ctx, rec, store.GroupDMMessageInsertOptions{
+		CreatedAt: ts,
+		UpdatedAt: ts,
+	}); err != nil {
 		return err
 	}
-	return jsonlAppend(filepath.Join(dir, messagesFile), msg)
+	if msg.Timestamp == "" {
+		msg.Timestamp = millisToRFC3339(ts)
+	}
+	return nil
 }
 
-// loadGroupMessages reads messages from a group's JSONL transcript with
-// pagination, plus the current head ID derived from the *same* on-disk
-// read. Returning the head from the same snapshot is what lets the
-// HTTP-level GET expose a `latestMessageId` that is guaranteed to be
-// consistent with the `messages` slice — without that, a concurrent
-// PostMessage between two separate reads could surface a head that is
-// not represented in either `messages` or the cache.
+// loadGroupMessages reads messages for groupID with pagination, plus
+// the current head ID derived from the same snapshot.
 //
-// head is "" when the transcript is empty or missing.
+// Head/page consistency: when before == "" the head is taken from the
+// page itself (newest entry of the just-fetched recs) so a concurrent
+// AppendGroupDMMessage between separate "head" and "list" queries can't
+// surface a head-ID that isn't represented in the messages slice.
+// When before != "" the page can't include rows newer than the cursor,
+// so we issue a separate LatestGroupDMMessageID call — the head is
+// purely informational on a paginated request and the brief skew there
+// is acceptable.
+//
+// head is "" when the transcript is empty or the group is missing.
 func loadGroupMessages(groupID string, limit int, before string) ([]*GroupMessage, bool, string, error) {
-	path := filepath.Join(groupDir(groupID), messagesFile)
-	all, _, err := jsonlLoadPaginated(path, 0, "", func(m *GroupMessage) string { return m.ID })
+	db := getGlobalStore()
+	if db == nil {
+		return nil, false, "", errStoreNotReady
+	}
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+
+	var beforeSeq int64
+	if before != "" {
+		bs, ok, err := groupMessageSeq(ctx, db, groupID, before)
+		if err != nil {
+			return nil, false, "", fmt.Errorf("resolve before cursor: %w", err)
+		}
+		if ok {
+			beforeSeq = bs
+		}
+	}
+
+	listOpts := store.GroupDMMessageListOptions{
+		BeforeSeq: beforeSeq,
+		Order:     "desc",
+	}
+	if limit > 0 {
+		listOpts.Limit = limit + 1
+	}
+	recs, err := db.ListGroupDMMessages(ctx, groupID, listOpts)
 	if err != nil {
 		return nil, false, "", err
 	}
-	for _, m := range all {
-		m.Timestamp = normalizeTimestamp(m.Timestamp)
-	}
-
-	head := ""
-	if len(all) > 0 {
-		head = all[len(all)-1].ID
-	}
-
-	// Apply `before` cursor: keep only entries strictly older than the
-	// given ID. Mirrors the original jsonlLoadPaginated behaviour.
-	if before != "" {
-		idx := -1
-		for i, v := range all {
-			if v.ID == before {
-				idx = i
-				break
-			}
-		}
-		if idx >= 0 {
-			all = all[:idx]
-		}
-	}
-
 	hasMore := false
-	if limit > 0 && len(all) > limit {
+	if limit > 0 && len(recs) > limit {
 		hasMore = true
-		all = all[len(all)-limit:]
+		recs = recs[:limit]
 	}
-	return all, hasMore, head, nil
+
+	// Derive head from the same snapshot when we're loading the latest
+	// page; otherwise fall back to a separate query. "Latest page" here
+	// is beforeSeq==0, which covers both before=="" and before set to a
+	// stale ID we couldn't resolve — in both cases recs is the newest
+	// transcript window and recs[0] is the head.
+	var headID string
+	if beforeSeq == 0 {
+		if len(recs) > 0 {
+			headID = recs[0].ID // recs is desc-ordered, so recs[0] is newest
+		}
+	} else {
+		hid, _, err := db.LatestGroupDMMessageID(ctx, groupID)
+		if err != nil {
+			return nil, false, "", err
+		}
+		headID = hid
+	}
+
+	if len(recs) == 0 {
+		return nil, false, headID, nil
+	}
+	out := make([]*GroupMessage, len(recs))
+	for i, rec := range recs {
+		out[len(recs)-1-i] = groupRecordToMessage(rec)
+	}
+	if err := populateAgentNames(ctx, db, out); err != nil {
+		return nil, false, "", err
+	}
+	return out, hasMore, headID, nil
 }
 
-// loadLatestGroupMessageID returns the ID of the newest message in a group's
-// transcript. Returns ("", nil) if the file does not exist or is empty —
-// callers treat that as "no head yet" rather than an error so brand-new
-// groups stay consistent with on-disk state.
+// loadLatestGroupMessageID returns the ID of the newest message in a
+// group's transcript. Returns ("", nil) if the group has no messages.
 func loadLatestGroupMessageID(groupID string) (string, error) {
-	_, _, head, err := loadGroupMessages(groupID, 0, "")
-	return head, err
+	db := getGlobalStore()
+	if db == nil {
+		return "", errStoreNotReady
+	}
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+	id, _, err := db.LatestGroupDMMessageID(ctx, groupID)
+	return id, err
 }
 
-// loadGroupMessagesAfter returns messages strictly newer than afterID, capped
-// to the newest `limit` entries. hasMore is true when older diff entries had
-// to be dropped to fit the cap (so the caller can hint that the full
-// transcript is needed).
+// loadGroupMessagesAfter returns messages strictly newer than afterID,
+// capped to the newest `limit` entries. hasMore is true when older diff
+// entries had to be dropped to fit the cap.
 //
 // If afterID is empty, returns the newest `limit` messages from the
-// transcript. If afterID is not found in the transcript, the caller-supplied
-// cursor is treated as stale: the function returns the newest `limit`
-// messages with hasMore=true so the caller can render "we couldn't locate
-// your cursor, here's the latest state."
+// transcript. If afterID is not found in the transcript, the caller-
+// supplied cursor is treated as stale: the function returns the newest
+// `limit` messages with hasMore=true so the caller can render "we
+// couldn't locate your cursor, here's the latest state."
 func loadGroupMessagesAfter(groupID, afterID string, limit int) ([]*GroupMessage, bool, error) {
-	path := filepath.Join(groupDir(groupID), messagesFile)
-	all, _, err := jsonlLoadPaginated(path, 0, "", func(m *GroupMessage) string { return m.ID })
+	db := getGlobalStore()
+	if db == nil {
+		return nil, false, errStoreNotReady
+	}
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+
+	if afterID == "" {
+		listOpts := store.GroupDMMessageListOptions{Order: "desc"}
+		if limit > 0 {
+			listOpts.Limit = limit + 1
+		}
+		recs, err := db.ListGroupDMMessages(ctx, groupID, listOpts)
+		if err != nil {
+			return nil, false, err
+		}
+		hasMore := false
+		if limit > 0 && len(recs) > limit {
+			hasMore = true
+			recs = recs[:limit]
+		}
+		out := reverseToOldestFirst(recs)
+		if err := populateAgentNames(ctx, db, out); err != nil {
+			return nil, false, err
+		}
+		return out, hasMore, nil
+	}
+
+	// Resolve afterID's seq. A stale cursor (the message has been hard-
+	// deleted, the agent was wrong) falls back to "newest limit + flag
+	// hasMore", matching the legacy file-based loader.
+	afterSeq, ok, err := groupMessageSeq(ctx, db, groupID, afterID)
 	if err != nil {
 		return nil, false, err
 	}
-	for _, m := range all {
-		m.Timestamp = normalizeTimestamp(m.Timestamp)
+	if !ok {
+		listOpts := store.GroupDMMessageListOptions{Order: "desc"}
+		if limit > 0 {
+			listOpts.Limit = limit + 1
+		}
+		recs, err := db.ListGroupDMMessages(ctx, groupID, listOpts)
+		if err != nil {
+			return nil, false, err
+		}
+		hasMore := true
+		if limit > 0 && len(recs) > limit {
+			recs = recs[:limit]
+		}
+		out := reverseToOldestFirst(recs)
+		if err := populateAgentNames(ctx, db, out); err != nil {
+			return nil, false, err
+		}
+		return out, hasMore, nil
 	}
 
-	if afterID == "" {
-		hasMore := false
-		if limit > 0 && len(all) > limit {
-			hasMore = true
-			all = all[len(all)-limit:]
-		}
-		return all, hasMore, nil
+	listOpts := store.GroupDMMessageListOptions{
+		SinceSeq: afterSeq,
+		Order:    "desc",
 	}
-
-	idx := -1
-	for i, m := range all {
-		if m.ID == afterID {
-			idx = i
-			break
-		}
+	if limit > 0 {
+		listOpts.Limit = limit + 1
 	}
-	var diff []*GroupMessage
+	recs, err := db.ListGroupDMMessages(ctx, groupID, listOpts)
+	if err != nil {
+		return nil, false, err
+	}
 	hasMore := false
-	if idx < 0 {
-		// afterID is unknown (cursor older than the file remembers, or just
-		// wrong). Fall back to the newest `limit` and flag hasMore.
-		diff = all
+	if limit > 0 && len(recs) > limit {
 		hasMore = true
-	} else {
-		diff = all[idx+1:]
+		recs = recs[:limit]
 	}
-	if limit > 0 && len(diff) > limit {
-		hasMore = true
-		diff = diff[len(diff)-limit:]
+	out := reverseToOldestFirst(recs)
+	if err := populateAgentNames(ctx, db, out); err != nil {
+		return nil, false, err
 	}
-	return diff, hasMore, nil
+	return out, hasMore, nil
+}
+
+// reverseToOldestFirst converts a desc-ordered store result into the
+// oldest-first GroupMessage slice the v0 callers expect.
+func reverseToOldestFirst(recs []*store.GroupDMMessageRecord) []*GroupMessage {
+	if len(recs) == 0 {
+		return nil
+	}
+	out := make([]*GroupMessage, len(recs))
+	for i, rec := range recs {
+		out[len(recs)-1-i] = groupRecordToMessage(rec)
+	}
+	return out
+}
+
+// groupRecordToMessage converts the store's GroupDMMessageRecord into
+// the v0-shaped GroupMessage. AgentName is left blank — populateAgentNames
+// fills it in a single batched read.
+func groupRecordToMessage(rec *store.GroupDMMessageRecord) *GroupMessage {
+	return &GroupMessage{
+		ID:        rec.ID,
+		AgentID:   rec.AgentID,
+		Content:   rec.Content,
+		Timestamp: normalizeTimestamp(millisToRFC3339(rec.CreatedAt)),
+	}
+}
+
+// groupMessageSeq looks up a group message's seq by ID. ok=false means
+// "no such message in this group" (deleted, never existed, or belongs
+// to a different group). The agentdm-side caller uses this to decide
+// between "advance from cursor" and "fall back to newest N + hasMore".
+func groupMessageSeq(ctx context.Context, db *store.Store, groupID, msgID string) (int64, bool, error) {
+	// We don't have a direct GetGroupDMMessage helper; ListGroupDMMessages
+	// with a tight predicate isn't available either, so do a single
+	// SELECT through the *sql.DB handle the store exposes via DB().
+	row := db.DB().QueryRowContext(ctx,
+		`SELECT seq FROM groupdm_messages
+		  WHERE id = ? AND groupdm_id = ? AND deleted_at IS NULL`,
+		msgID, groupID,
+	)
+	var seq int64
+	err := row.Scan(&seq)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return seq, true, nil
+}
+
+// populateAgentNames fills msg.AgentName for every message in the
+// supplied slice using one SELECT per unique AgentID. The user-sender
+// sentinel and system messages get a fixed display label so the UI
+// never renders a blank author.
+func populateAgentNames(ctx context.Context, db *store.Store, msgs []*GroupMessage) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+	uniq := make(map[string]struct{}, len(msgs))
+	for _, m := range msgs {
+		if m.AgentID == "" || m.AgentID == store.UserSenderID {
+			continue
+		}
+		uniq[m.AgentID] = struct{}{}
+	}
+	names := make(map[string]string, len(uniq))
+	if len(uniq) > 0 {
+		// IN(?,?,...) with one bind per id; agent counts here are bounded
+		// by the group's member set (typically <=10) so the query stays
+		// tiny even on a transcript with thousands of messages.
+		ids := make([]string, 0, len(uniq))
+		for id := range uniq {
+			ids = append(ids, id)
+		}
+		placeholders := strings.Repeat("?,", len(ids))
+		placeholders = placeholders[:len(placeholders)-1]
+		args := make([]any, len(ids))
+		for i, id := range ids {
+			args[i] = id
+		}
+		rows, err := db.DB().QueryContext(ctx,
+			"SELECT id, name FROM agents WHERE deleted_at IS NULL AND id IN ("+placeholders+")",
+			args...,
+		)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, name string
+			if err := rows.Scan(&id, &name); err != nil {
+				return err
+			}
+			names[id] = name
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+	}
+	for _, m := range msgs {
+		switch {
+		case m.AgentID == "":
+			m.AgentName = "system"
+		case m.AgentID == store.UserSenderID:
+			m.AgentName = "user"
+		default:
+			if n, ok := names[m.AgentID]; ok {
+				m.AgentName = n
+			}
+			// Unknown agent (hard-deleted between transcript write and
+			// this read) leaves AgentName blank — the UI surfaces the
+			// AgentID so the audit trail stays legible.
+		}
+	}
+	return nil
 }
 
 func newGroupMessage(agentID, agentName, content string) *GroupMessage {

@@ -2,20 +2,15 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/loppo-llc/kojo/internal/atomicfile"
+	"github.com/loppo-llc/kojo/internal/store"
 )
-
-const groupdmsFile = "groups.json"
 
 // notifyTimeout is the maximum time allowed for a notification-triggered chat.
 const notifyTimeout = 60 * time.Minute
@@ -112,9 +107,35 @@ type GroupDMManager struct {
 	// paths that delete groups.
 	latestMsgID map[string]string
 
+	// deleting tracks groups whose tombstone is in-flight. PostMessage
+	// and other mutation paths early-reject when a group's id is in
+	// this set so a concurrent post can't land between the in-memory
+	// drop and the DB SoftDelete and surface a confusing FK error.
+	// Held under mu.
+	deleting map[string]bool
+
+	// persistGen counts in-memory mutations per group. Member mutations
+	// snapshot the gen before unlocking and persisting; on persist
+	// failure the rollback only proceeds if the gen is unchanged —
+	// otherwise a concurrent mutation has won and reverting would
+	// silently overwrite its result. Held under mu.
+	persistGen map[string]int64
+
 	// notify tracks cooldown + deferred notification state per (groupID:agentID).
 	notify   map[string]*notifyState
 	notifyMu sync.Mutex
+
+	// patchMus serializes If-Match-gated PATCHes per group. Mirrors
+	// Manager.patchMus for agents. The lock spans the handler's
+	// precondition-check → mutation → ETag-echo trio so two
+	// concurrent same-etag PATCHes can't both observe the same
+	// store etag and both succeed.
+	//
+	// Map entries are never deleted: group IDs are bounded and
+	// an unheld *sync.Mutex is small. Same trade-off as
+	// Manager.patchMus.
+	patchMusMu sync.Mutex
+	patchMus   map[string]*sync.Mutex
 }
 
 // NewGroupDMManager creates a new GroupDMManager.
@@ -125,9 +146,35 @@ func NewGroupDMManager(agentMgr *Manager, logger *slog.Logger) *GroupDMManager {
 		logger:      logger,
 		notify:      make(map[string]*notifyState),
 		latestMsgID: make(map[string]string),
+		deleting:    make(map[string]bool),
+		persistGen:  make(map[string]int64),
+		patchMus:    make(map[string]*sync.Mutex),
 	}
 	m.load()
 	return m
+}
+
+// LockPatch returns a per-group mutex acquired for the duration of
+// an If-Match-gated PATCH (groupdm rename, member-settings updates).
+// Mirrors Manager.LockPatch on the agent manager.
+//
+// The returned function MUST be called to release; callers should
+// `defer release()` immediately. Holding this lock across a precondition
+// check + manager mutation + ETag echo trio closes the TOCTOU window
+// inherent in reading the store etag at the handler boundary.
+//
+// Cross-process / cross-device write coordination is the store layer's
+// concern; LockPatch only serializes within one daemon process.
+func (m *GroupDMManager) LockPatch(groupID string) (release func()) {
+	m.patchMusMu.Lock()
+	mu, ok := m.patchMus[groupID]
+	if !ok {
+		mu = &sync.Mutex{}
+		m.patchMus[groupID] = mu
+	}
+	m.patchMusMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
 }
 
 // SetAPIBase sets the base URL for agent-facing API docs in system prompts.
@@ -191,10 +238,9 @@ func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int, s
 		g.Name = m.defaultGroupName(members)
 	}
 
-	// Ensure group directory exists
-	if err := os.MkdirAll(groupDir(g.ID), 0o755); err != nil {
-		return nil, fmt.Errorf("create group dir: %w", err)
-	}
+	// In v1 the per-group directory is no longer allocated — transcripts
+	// and metadata live in the DB. No mkdir or cleanup is needed at
+	// Create time.
 
 	m.mu.Lock()
 	// Re-check that every member is still active. Archive.RemoveAgent and
@@ -206,21 +252,57 @@ func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int, s
 		a, ok := m.agentMgr.Get(mem.AgentID)
 		if !ok {
 			m.mu.Unlock()
-			os.RemoveAll(groupDir(g.ID))
 			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, mem.AgentID)
 		}
 		if a.Archived {
 			m.mu.Unlock()
-			os.RemoveAll(groupDir(g.ID))
 			return nil, fmt.Errorf("%w: %s", ErrAgentArchived, mem.AgentID)
 		}
 	}
 	m.groups[g.ID] = g
-	m.mu.Unlock()
+	snapshot := m.copyGroup(g)
 
-	m.save()
+	// Persist the new group synchronously WHILE STILL HOLDING m.mu.
+	// Lock-during-DB-IO is the simplest sound fix for the stale-persist
+	// race: without it, a concurrent member mutation could land in the
+	// in-memory state and persist FIRST, and then our older snapshot's
+	// persist would overwrite the newer DB row. Serializing
+	// mutate+persist makes that race structurally impossible at the
+	// cost of ~30ms write-window contention per mutation. For
+	// kojo's chat-workload concurrency (tens of groups, rare member
+	// changes) the throughput hit is invisible.
+	if err := m.persistOne(snapshot); err != nil {
+		delete(m.groups, g.ID)
+		m.mu.Unlock()
+		return nil, fmt.Errorf("persist new group: %w", err)
+	}
+	m.mu.Unlock()
 	m.logger.Info("group DM created", "id", g.ID, "name", g.Name)
 	return m.copyGroup(g), nil
+}
+
+// persistOne synchronously upserts a single group's row, surfacing any
+// error to the caller. The argument MUST be a deep copy taken under
+// m.mu — passing the live *GroupDM pointer races with concurrent
+// mutations that touch the same fields (Members, UpdatedAt) and lets a
+// stale post-mutation snapshot land on the DB after a concurrent
+// Delete tombstoned the row. Use m.copyGroup(g) under the lock to make
+// the snapshot.
+//
+// Used by Create / AddMember / member-shrink (LeaveGroup, RemoveAgent)
+// — paths that must observe the persist before returning success.
+// save() is still the fire-and-forget fan-out for non-critical state
+// changes (cooldown updates, member rename overlays).
+func (m *GroupDMManager) persistOne(snapshot *GroupDM) error {
+	db := getGlobalStore()
+	if db == nil {
+		// Test fixture without a backing store; no-op so unit tests
+		// that don't exercise persistence still pass.
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return upsertGroupDM(ctx, db, snapshot)
 }
 
 // CheckMembership verifies that the group exists and the agent is a member.
@@ -271,6 +353,10 @@ func (m *GroupDMManager) Rename(id, name, callerAgentID string) (*GroupDM, error
 	}
 
 	m.mu.Lock()
+	if m.deleting[id] {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+	}
 	g, ok := m.groups[id]
 	if !ok {
 		m.mu.Unlock()
@@ -352,16 +438,39 @@ func (m *GroupDMManager) Delete(id string, notify bool) error {
 		copy(members, g.Members)
 		groupName = g.Name
 	}
+	// Mark deleting before unlocking. PostMessage / AddMember / etc.
+	// check m.deleting under the same lock and bail out, so a post
+	// landing between this unlock and the DB tombstone won't surface
+	// a confusing FK error from the store layer.
+	m.deleting[id] = true
+	m.mu.Unlock()
 
+	// Tombstone the DB row first. This is the point of no return: once
+	// the row is gone the group is invisible to API/peer mirrors. If
+	// the tombstone itself fails we clear the deleting marker and
+	// return so a retry can complete cleanly without orphaning the
+	// in-memory entry as undeletable.
+	if db := getGlobalStore(); db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := db.SoftDeleteGroupDM(ctx, id)
+		cancel()
+		if err != nil {
+			m.mu.Lock()
+			delete(m.deleting, id)
+			m.mu.Unlock()
+			return fmt.Errorf("tombstone groupdm: %w", err)
+		}
+	}
+
+	m.mu.Lock()
 	delete(m.groups, id)
 	delete(m.latestMsgID, id)
+	delete(m.deleting, id)
 	m.mu.Unlock()
 
 	// Clean up cooldown entries for this group
 	m.cleanNotifyKeys(id)
 
-	os.RemoveAll(groupDir(id))
-	m.save()
 	m.logger.Info("group DM deleted", "id", id, "notify", notify)
 
 	// Notify members after deletion
@@ -422,22 +531,35 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 	// The CAS check, append, and cache update must happen under the same
 	// lock acquisition — otherwise two writers could each see the same
 	// "current head", both pass the check, and both append. The append is
-	// a single jsonl line so the held-lock window is bounded; for chat
-	// workloads this serialization cost is invisible.
+	// a single DB INSERT (groupdm_messages) so the held-lock window is
+	// bounded; for chat workloads this serialization cost is invisible.
 	m.mu.Lock()
+	if m.deleting[groupID] {
+		// Tombstone is in flight. Bail with the same not-found shape
+		// the API surfaces for a hard-deleted group; the store-level
+		// AppendGroupDMMessage would also fail past this point but
+		// with a less recognizable error.
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
+	}
 	g, ok := m.groups[groupID]
 	if !ok {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
 	}
 
-	// Verify sender is a member
-	var senderName string
+	// Verify sender is a member. Membership is decided by AgentID only —
+	// the cached GroupMember.AgentName is denormalized away on save (v1
+	// schema strips it from members_json) and stays blank after a daemon
+	// restart until something overlays it from the live agents map.
+	// Reading mem.AgentName here propagated the blank into the persisted
+	// message row and ultimately into the "[Group DM: ...] N new
+	// message(s) from <sender>." notification header as "from .", which
+	// broke the Web UI's collapsible pill regex (it expected ≥1 char).
 	isMember := false
 	for _, mem := range g.Members {
 		if mem.AgentID == agentID {
 			isMember = true
-			senderName = mem.AgentName
 			break
 		}
 	}
@@ -446,16 +568,22 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 		return nil, fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, agentID, groupID)
 	}
 
-	// Archived/deleted members can't author messages. The agent process is
-	// dormant (or gone), so this only happens if a third party (or stale
-	// tooling) calls the API with an out-of-date agent ID — refuse rather
-	// than letting them impersonate.
+	// Resolve sender's current display name from the live agents map.
+	// This doubles as an existence/archived guard: a third party (or
+	// stale tooling) calling with a hard-deleted or archived agent ID
+	// is refused rather than letting them impersonate. The name we pin
+	// into the stored message is the agent's name at post time — later
+	// renames don't rewrite history (consistent with the rest of the
+	// transcript), but neither does a blank name leak in via the cache.
+	var senderName string
 	if a, ok := m.agentMgr.Get(agentID); !ok {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
 	} else if a.Archived {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrAgentArchived, agentID)
+	} else {
+		senderName = a.Name
 	}
 
 	// CAS check. Skipped when expectedLatestID is empty so the older
@@ -531,6 +659,10 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 // chatter of agents replying around them.
 func (m *GroupDMManager) PostUserMessage(ctx context.Context, groupID, content string, notify bool) (*GroupMessage, error) {
 	m.mu.Lock()
+	if m.deleting[groupID] {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
+	}
 	g, ok := m.groups[groupID]
 	if !ok {
 		m.mu.Unlock()
@@ -723,6 +855,10 @@ func (m *GroupDMManager) SetMemberNotifyMode(groupID, agentID string, mode Notif
 	}
 
 	m.mu.Lock()
+	if m.deleting[groupID] {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
+	}
 	g, ok := m.groups[groupID]
 	if !ok {
 		m.mu.Unlock()
@@ -795,6 +931,10 @@ func clampCooldown(seconds int) int {
 func (m *GroupDMManager) SetCooldown(id string, seconds int) (*GroupDM, error) {
 	seconds = clampCooldown(seconds)
 	m.mu.Lock()
+	if m.deleting[id] {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+	}
 	g, ok := m.groups[id]
 	if !ok {
 		m.mu.Unlock()
@@ -822,6 +962,10 @@ func (m *GroupDMManager) SetStyle(id string, style GroupDMStyle, callerAgentID s
 		return nil, err
 	}
 	m.mu.Lock()
+	if m.deleting[id] {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+	}
 	g, ok := m.groups[id]
 	if !ok {
 		m.mu.Unlock()
@@ -871,6 +1015,10 @@ func (m *GroupDMManager) SetVenue(id string, venue GroupDMVenue, callerAgentID s
 		return nil, err
 	}
 	m.mu.Lock()
+	if m.deleting[id] {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+	}
 	g, ok := m.groups[id]
 	if !ok {
 		m.mu.Unlock()
@@ -1252,14 +1400,23 @@ func (m *GroupDMManager) renderNotification(agentID, groupID, groupName, latestM
 	// Pending is in chronological order, so the last entry is newest.
 	// sanitizeHeaderField strips CR/LF so a sender named
 	// "Bob\nLatest message ID: gm_attacker" cannot forge a sibling line.
+	//
+	// When the resolved sender is blank (legacy rows from before the
+	// PostMessage fix, or a hard-deleted agent whose name is no longer
+	// recoverable), the " from " suffix is suppressed entirely. Emitting
+	// " from ." would otherwise produce a header that the Web UI's
+	// collapsible-pill regex rejects, falling back to a raw render with
+	// no close toggle.
 	var fromSuffix string
 	if n := len(pending); n > 0 {
 		latest := pending[n-1]
-		safeSender := sanitizeHeaderField(latest.sender)
-		if latest.senderIsUser {
-			fromSuffix = fmt.Sprintf(" from %s (human operator)", safeSender)
-		} else {
-			fromSuffix = fmt.Sprintf(" from %s", safeSender)
+		safeSender := strings.TrimSpace(sanitizeHeaderField(latest.sender))
+		if safeSender != "" {
+			if latest.senderIsUser {
+				fromSuffix = fmt.Sprintf(" from %s (human operator)", safeSender)
+			} else {
+				fromSuffix = fmt.Sprintf(" from %s", safeSender)
+			}
 		}
 	}
 
@@ -1533,6 +1690,10 @@ func (m *GroupDMManager) AddMember(id, newAgentID, callerAgentID string) (*Group
 	newMember := GroupMember{AgentID: a.ID, AgentName: a.Name}
 
 	m.mu.Lock()
+	if m.deleting[id] {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+	}
 	g, ok := m.groups[id]
 	if !ok {
 		m.mu.Unlock()
@@ -1582,8 +1743,14 @@ func (m *GroupDMManager) AddMember(id, newAgentID, callerAgentID string) (*Group
 		}
 	}
 
+	// Snapshot for rollback before mutating.
+	originalMembers := make([]GroupMember, len(g.Members))
+	copy(originalMembers, g.Members)
+	originalUpdatedAt := g.UpdatedAt
+
 	g.Members = append(g.Members, newMember)
 	g.UpdatedAt = time.Now().Format(time.RFC3339)
+	m.persistGen[id]++
 
 	// Collect recipients (all members except the new one)
 	var recipients []GroupMember
@@ -1594,9 +1761,22 @@ func (m *GroupDMManager) AddMember(id, newAgentID, callerAgentID string) (*Group
 	}
 	groupName := g.Name
 	cp := m.copyGroup(g)
-	m.mu.Unlock()
+	persistSnapshot := m.copyGroup(g)
 
-	m.save()
+	// Persist while still holding m.mu. Serializing mutate+persist closes
+	// the stale-persist race: a concurrent mutation cannot commit between
+	// our snapshot and our persist, so the DB never sees an out-of-order
+	// write that would clobber the newer state. Lock-during-DB-IO costs
+	// ~30ms; chat workload tolerance is fine.
+	if err := m.persistOne(persistSnapshot); err != nil {
+		if cur, ok := m.groups[id]; ok {
+			cur.Members = originalMembers
+			cur.UpdatedAt = originalUpdatedAt
+		}
+		m.mu.Unlock()
+		return nil, fmt.Errorf("persist new member: %w", err)
+	}
+	m.mu.Unlock()
 	m.logger.Info("member added to group DM", "group", id, "agent", newAgentID)
 
 	// Notify existing members about the addition
@@ -1613,13 +1793,22 @@ func (m *GroupDMManager) AddMember(id, newAgentID, callerAgentID string) (*Group
 // The group is deleted if fewer than 2 members remain.
 func (m *GroupDMManager) LeaveGroup(id, agentID string) error {
 	m.mu.Lock()
+	if m.deleting[id] {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+	}
 	g, ok := m.groups[id]
 	if !ok {
 		m.mu.Unlock()
 		return fmt.Errorf("%w: %s", ErrGroupNotFound, id)
 	}
 
-	// Find and remove the member
+	// Find and remove the member. Snapshot the original member list for
+	// the persist-failure rollback path so a restore reinstates the
+	// leaver's NotifyMode/DigestWindow exactly, not just AgentID/Name.
+	originalMembers := make([]GroupMember, len(g.Members))
+	copy(originalMembers, g.Members)
+	originalUpdatedAt := g.UpdatedAt
 	var leaverName string
 	var filtered []GroupMember
 	for _, mem := range g.Members {
@@ -1639,24 +1828,60 @@ func (m *GroupDMManager) LeaveGroup(id, agentID string) error {
 	remaining := make([]GroupMember, len(filtered))
 	copy(remaining, filtered)
 	groupName := g.Name
-
 	if deleteGroup {
-		delete(m.groups, id)
-		delete(m.latestMsgID, id)
-	} else {
-		g.Members = filtered
-		g.UpdatedAt = time.Now().Format(time.RFC3339)
+		// Mark deleting before unlocking so PostMessage rejects posts
+		// landing during the in-flight tombstone window. Same fail-fast
+		// ordering as the explicit Delete path.
+		m.deleting[id] = true
 	}
 	m.mu.Unlock()
 
 	if deleteGroup {
-		os.RemoveAll(groupDir(id))
+		if db := getGlobalStore(); db != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			err := db.SoftDeleteGroupDM(ctx, id)
+			cancel()
+			if err != nil {
+				m.mu.Lock()
+				delete(m.deleting, id)
+				m.mu.Unlock()
+				return fmt.Errorf("tombstone dissolved groupdm: %w", err)
+			}
+		}
+		m.mu.Lock()
+		delete(m.groups, id)
+		delete(m.latestMsgID, id)
+		delete(m.deleting, id)
+		m.mu.Unlock()
 		m.cleanNotifyKeys(id)
 	} else {
+		// Member-shrink path: mutate AND persist under the same lock so a
+		// concurrent member mutation can't commit between our snapshot
+		// and our persist (stale-persist clobber). The cleanNotify cleanup
+		// happens after persist returns so it doesn't run on a failure
+		// path that already restored the leaver.
+		m.mu.Lock()
+		cur, ok := m.groups[id]
+		if !ok {
+			m.mu.Unlock()
+			// Concurrent Delete dropped the group; the leaver is gone
+			// either way.
+			return nil
+		}
+		cur.Members = filtered
+		cur.UpdatedAt = time.Now().Format(time.RFC3339)
+		m.persistGen[id]++
+		snapshot := m.copyGroup(cur)
+		if err := m.persistOne(snapshot); err != nil {
+			cur.Members = originalMembers
+			cur.UpdatedAt = originalUpdatedAt
+			m.mu.Unlock()
+			return fmt.Errorf("persist member-shrink: %w", err)
+		}
+		m.mu.Unlock()
 		m.cleanNotifyKeys(id + ":" + agentID)
 	}
 
-	m.save()
 	m.logger.Info("agent left group DM", "group", id, "agent", agentID, "deleted", deleteGroup)
 
 	// Notify remaining members (including the last one when group is dissolved)
@@ -1682,44 +1907,193 @@ func (m *GroupDMManager) notifyMemberChange(agentID, groupID, groupName, actorNa
 }
 
 // RemoveAgent removes an agent from all groups. Groups with fewer than 2 members are deleted.
+//
+// Tombstone-first ordering: for each dissolved group we tombstone the
+// DB row before draining m.groups so a failed SoftDelete doesn't leave
+// the in-memory map and the DB out of sync (which would resurrect the
+// group on the next restart). Member-shrink groups are persisted via
+// persistOne; persist failures revert the in-memory mutation so the
+// next save sweep doesn't propagate a phantom drop.
 func (m *GroupDMManager) RemoveAgent(agentID string) {
+	// First pass: collect IDs of every group that contains agentID.
+	// Crucially DO NOT classify (toShrink vs toDelete) here, and DO
+	// NOT set m.deleting — that happens in the second pass under
+	// LockPatch(id). Setting m.deleting outside LockPatch would let
+	// a PATCH that holds LockPatch see the deleting flag mid-mutation
+	// and bail with ErrGroupNotFound for a group it had legitimately
+	// just etag-matched.
 	m.mu.Lock()
-	var toDelete []string
-	changed := false
+	var candidates []string
 	for id, g := range m.groups {
-		origLen := len(g.Members)
-		var filtered []GroupMember
 		for _, mem := range g.Members {
+			if mem.AgentID == agentID {
+				candidates = append(candidates, id)
+				break
+			}
+		}
+	}
+	m.mu.Unlock()
+
+	// Second pass under per-group LockPatch: re-read membership
+	// (concurrent leaves may have changed it), classify, and either
+	// shrink or dissolve. The lock-then-classify-then-act discipline
+	// keeps the deleting-flag and the dissolve decision strictly
+	// inside the critical section that PATCH /groupdms/{id} respects.
+	var toDelete []string
+	var toShrink []string
+	for _, id := range candidates {
+		releasePatch := m.LockPatch(id)
+		m.mu.Lock()
+		g, ok := m.groups[id]
+		if !ok {
+			m.mu.Unlock()
+			releasePatch()
+			continue
+		}
+		hits := false
+		for _, mem := range g.Members {
+			if mem.AgentID == agentID {
+				hits = true
+				break
+			}
+		}
+		if !hits {
+			// Concurrent leave already removed us. Nothing to do.
+			m.mu.Unlock()
+			releasePatch()
+			continue
+		}
+		newCount := len(g.Members) - 1
+		if newCount < 2 {
+			m.deleting[id] = true
+			toDelete = append(toDelete, id)
+			m.mu.Unlock()
+			releasePatch()
+			continue
+		}
+		toShrink = append(toShrink, id)
+		m.mu.Unlock()
+		releasePatch()
+	}
+
+	// Per-group shrink first so a concurrent leave that drops a group
+	// below 2 members between passes can promote it into the dissolve
+	// list — running dissolves first would leave that promoted group
+	// alive with the to-be-removed agent still as a member.
+	//
+	// Per-group shrink: lock, re-read current state, filter, snapshot,
+	// persist — all under one lock acquisition. This collapses
+	// mutate/snapshot/persist into one critical section so a concurrent
+	// AddMember on the same group can't slip its persist between our
+	// snapshot and our write. RemoveAgent runs from Archive (admin
+	// action) so the O(N_groups * 30ms) wall-clock is acceptable; in
+	// exchange there is no stale-snapshot window.
+	//
+	// If a concurrent leave shrunk the group below 2 members between
+	// passes, we move it onto the dissolve path so the to-be-removed
+	// agent doesn't linger as a member of a now-dead group.
+	for _, id := range toShrink {
+		// Acquire the per-group patch lock BEFORE m.mu so RemoveAgent's
+		// member-shrink serializes against PATCH /groupdms/{id} (which
+		// also takes LockPatch first). Without this, RemoveAgent could
+		// land between a PATCH's If-Match precheck and its mutation,
+		// silently bumping the etag and making the PATCH succeed
+		// against a now-different group.
+		releasePatch := m.LockPatch(id)
+		m.mu.Lock()
+		cur, ok := m.groups[id]
+		if !ok {
+			// Group was dissolved or hard-deleted between passes.
+			m.mu.Unlock()
+			releasePatch()
+			continue
+		}
+		// Re-filter against the *current* member set, not a stale copy
+		// from the first pass — another mutation may have changed it.
+		origMembers := make([]GroupMember, len(cur.Members))
+		copy(origMembers, cur.Members)
+		origUpdated := cur.UpdatedAt
+		filtered := cur.Members[:0:0]
+		for _, mem := range origMembers {
 			if mem.AgentID != agentID {
 				filtered = append(filtered, mem)
 			}
 		}
-		if len(filtered) == origLen {
-			continue // agent wasn't in this group
+		if len(filtered) == len(origMembers) {
+			// agentID isn't in this group anymore (concurrent leave).
+			m.mu.Unlock()
+			releasePatch()
+			continue
 		}
-		changed = true
 		if len(filtered) < 2 {
+			// Concurrent leave dropped the group below the 2-member
+			// floor. Promote to a dissolve so the agent we're removing
+			// doesn't live on as the sole member of a dead group.
+			// Mark deleting before unlocking so concurrent posts bail.
+			m.deleting[id] = true
+			m.mu.Unlock()
+			releasePatch()
 			toDelete = append(toDelete, id)
-		} else {
-			g.Members = filtered
-			g.UpdatedAt = time.Now().Format(time.RFC3339)
+			continue
+		}
+		cur.Members = filtered
+		cur.UpdatedAt = time.Now().Format(time.RFC3339)
+		m.persistGen[id]++
+		snapshot := m.copyGroup(cur)
+		if err := m.persistOne(snapshot); err != nil {
+			cur.Members = origMembers
+			cur.UpdatedAt = origUpdated
+			m.mu.Unlock()
+			releasePatch()
+			m.logger.Warn("failed to persist member-shrink during RemoveAgent",
+				"group", id, "err", err)
+			continue
+		}
+		m.mu.Unlock()
+		releasePatch()
+	}
+
+	// Tombstone dissolved groups (initial classification + any
+	// promotions from the shrink loop above when a concurrent leave
+	// dropped membership below 2). A failure for any one group leaves
+	// it in m.groups so a future save sweep picks it up; the rest of
+	// the dissolutions still proceed because they're independent.
+	if len(toDelete) > 0 {
+		db := getGlobalStore()
+		for _, id := range toDelete {
+			// Same per-group LockPatch ordering as the shrink loop:
+			// take it before any DB I/O so a PATCH waiting on the
+			// same lock observes the post-delete state cleanly.
+			releasePatch := m.LockPatch(id)
+			if db != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				err := db.SoftDeleteGroupDM(ctx, id)
+				cancel()
+				if err != nil {
+					m.mu.Lock()
+					delete(m.deleting, id)
+					m.mu.Unlock()
+					releasePatch()
+					m.logger.Warn("failed to tombstone groupdm during RemoveAgent", "group", id, "err", err)
+					continue
+				}
+			}
+			m.mu.Lock()
+			delete(m.groups, id)
+			delete(m.latestMsgID, id)
+			delete(m.deleting, id)
+			m.mu.Unlock()
+			releasePatch()
+			m.cleanNotifyKeys(id)
 		}
 	}
-	for _, id := range toDelete {
-		delete(m.groups, id)
-		delete(m.latestMsgID, id)
-	}
-	m.mu.Unlock()
 
-	for _, id := range toDelete {
-		os.RemoveAll(groupDir(id))
-		m.cleanNotifyKeys(id)
-	}
 	m.cleanNotifyKeys(agentID)
-
-	if changed {
-		m.save()
-	}
+	// All persistence happens inline (per-group tombstone or persistOne)
+	// in the loops above, so the legacy "if changed { m.save() }" trailing
+	// fan-out is gone. The fan-out would have re-upserted every still-
+	// live group in the manager regardless of whether the RemoveAgent
+	// pass mutated it — wasteful churn that the per-group paths skip.
 }
 
 // cleanNotifyKeys removes cooldown entries matching a group or agent prefix,
@@ -1741,7 +2115,19 @@ func (m *GroupDMManager) cleanNotifyKeys(prefix string) {
 
 // --- Persistence ---
 
+// save writes the current in-memory group set into the groupdms table.
+// The legacy groups.json file is no longer touched in v1.
+//
+// Pattern mirrors agent.Save: each group is upserted (insert if missing,
+// update otherwise), but auto-tombstone-on-missing is NOT done here —
+// removal is the explicit Delete path's job. A stale fire-and-forget
+// save() racing a concurrent Create cannot tombstone the new row.
 func (m *GroupDMManager) save() {
+	db := getGlobalStore()
+	if db == nil {
+		// Nothing to do during test fixtures that bypass NewManager.
+		return
+	}
 	m.mu.Lock()
 	groups := make([]*GroupDM, 0, len(m.groups))
 	for _, g := range m.groups {
@@ -1749,77 +2135,167 @@ func (m *GroupDMManager) save() {
 	}
 	m.mu.Unlock()
 
-	dir := groupdmsDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		m.logger.Warn("failed to create groupdms dir", "err", err)
-		return
-	}
-
-	if err := atomicfile.WriteJSON(filepath.Join(dir, groupdmsFile), groups, 0o644); err != nil {
-		m.logger.Warn("failed to save groups", "err", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, g := range groups {
+		if err := upsertGroupDM(ctx, db, g); err != nil {
+			m.logger.Warn("failed to upsert groupdm", "group", g.ID, "err", err)
+		}
 	}
 }
 
+// load rehydrates in-memory groups from the DB. Mirrors agent.Load's
+// post-processing (legacy field normalization, member sanitization,
+// latestMsgID cache bootstrap) without ever opening groups.json.
 func (m *GroupDMManager) load() {
-	path := filepath.Join(groupdmsDir(), groupdmsFile)
-	data, err := os.ReadFile(path)
-	if err != nil {
+	db := getGlobalStore()
+	if db == nil {
 		return
 	}
-	var groups []*GroupDM
-	if err := json.Unmarshal(data, &groups); err != nil {
-		m.logger.Warn("failed to unmarshal groups", "err", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	recs, err := db.ListGroupDMs(ctx)
+	if err != nil {
+		m.logger.Warn("failed to list groupdms", "err", err)
 		return
 	}
 	dirty := false
-	for _, g := range groups {
-		g.CreatedAt = normalizeTimestamp(g.CreatedAt)
-		g.UpdatedAt = normalizeTimestamp(g.UpdatedAt)
+	for _, rec := range recs {
+		g := groupRecordToGroupDM(rec)
 		// Normalize legacy groups that predate the style field.
 		if g.Style == "" || !ValidGroupDMStyles[g.Style] {
 			g.Style = GroupDMStyleEfficient
 		}
-		// Normalize legacy groups that predate the venue field. Empty stays
-		// empty in JSON (omitempty) but every read goes through groupVenue
-		// which falls back to defaultGroupDMVenue, so we don't force-write
-		// the field — that keeps legacy on-disk JSON byte-identical until
-		// the user actually changes a venue.
-		//
-		// Hand-edited / corrupted values are flipped back to "" *and* the
-		// group is marked dirty so the rewrite happens once. Without
-		// dirty=true the in-memory fix would be lost on the next load and
-		// we'd re-validate the same bad value every restart.
+		// Normalize hand-edited / corrupted venue. Empty is fine
+		// (defaulted at read time via groupVenue). Anything else not
+		// in the whitelist is reset and marked dirty so the rewrite
+		// happens once, not on every restart.
 		if g.Venue != "" && !ValidGroupDMVenues[g.Venue] {
 			m.logger.Warn("dropping unknown venue from loaded group", "group", g.ID, "venue", g.Venue)
 			g.Venue = ""
 			dirty = true
 		}
-		// Strip any legacy/hand-edited members that collide with the reserved
-		// UserSenderID ("user"). They could impersonate human-user messages in
-		// the UI and break PostMessage membership resolution.
+		// Strip any legacy/hand-edited members that collide with the
+		// reserved UserSenderID ("user"). They could impersonate human-
+		// user messages in the UI and break PostMessage membership
+		// resolution.
 		if m.stripReservedMembers(g) {
 			dirty = true
 		}
 		m.groups[g.ID] = g
 
-		// Bootstrap the latest-message cache from disk so CAS works after a
-		// restart. A missing/empty transcript leaves the entry unset (== "")
-		// which is correct: a brand-new group has no head yet. We log
-		// (non-fatal) read errors but otherwise continue — losing a cache
-		// entry just means CAS can't be enforced for that group until the
-		// next post lands; better than refusing to load the manager.
+		// Bootstrap the latest-message cache so CAS works after a
+		// restart. A missing/empty transcript leaves the entry unset
+		// (== "") which is correct: a brand-new group has no head yet.
 		if id, err := loadLatestGroupMessageID(g.ID); err != nil {
 			m.logger.Warn("failed to read latest message id during load", "group", g.ID, "err", err)
 		} else if id != "" {
 			m.latestMsgID[g.ID] = id
 		}
 	}
-	// Persist migration so the reject only runs once; groups reduced below the
-	// 2-member floor are kept as-is (read-only) — Delete is the user's call.
 	if dirty {
-		// save() takes m.mu; load() is called from NewGroupDMManager before
-		// the manager is published, so we can flush without recursion concerns.
+		// save() takes m.mu; load() is called from NewGroupDMManager
+		// before the manager is published, so we can flush without
+		// recursion concerns.
 		go m.save()
+	}
+}
+
+// upsertGroupDM is the single per-group write path used by save().
+// Insert-if-missing, daemon-internal update otherwise. AgentName is
+// stripped from the persisted member list — the v1 schema doesn't
+// store it (it's rebuilt from agents on every read).
+func upsertGroupDM(ctx context.Context, db *store.Store, g *GroupDM) error {
+	rec := groupDMToRecord(g)
+	created := parseAgentRFC3339Millis(g.CreatedAt)
+	updated := parseAgentRFC3339Millis(g.UpdatedAt)
+	if updated == 0 {
+		updated = store.NowMillis()
+	}
+	if created == 0 {
+		created = updated
+	}
+
+	cur, err := db.GetGroupDM(ctx, g.ID)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		if _, err := db.InsertGroupDM(ctx, rec, store.GroupDMInsertOptions{
+			CreatedAt: created,
+			UpdatedAt: updated,
+			// AllowDeadMembers covers the load-then-save round trip: a
+			// member's parent agent may have been hard-deleted between
+			// migration time and the daemon's first save. Without this
+			// the runtime save() pass would tombstone the group on its
+			// own data; the explicit member-update API path keeps the
+			// strict check.
+			AllowDeadMembers: true,
+		}); err != nil {
+			return fmt.Errorf("insert: %w", err)
+		}
+	case err != nil:
+		return fmt.Errorf("get: %w", err)
+	default:
+		_ = cur
+		if _, err := db.UpdateGroupDM(ctx, g.ID, "", func(r *store.GroupDMRecord) error {
+			r.Name = rec.Name
+			r.Members = rec.Members
+			r.Style = rec.Style
+			r.Cooldown = rec.Cooldown
+			r.Venue = rec.Venue
+			return nil
+		}); err != nil {
+			return fmt.Errorf("update: %w", err)
+		}
+	}
+	return nil
+}
+
+// groupDMToRecord drops the v0 in-memory display field (AgentName) and
+// translates enums to their store-layer string form.
+func groupDMToRecord(g *GroupDM) *store.GroupDMRecord {
+	members := make([]store.GroupDMMember, 0, len(g.Members))
+	for _, mem := range g.Members {
+		if mem.AgentID == "" {
+			continue
+		}
+		members = append(members, store.GroupDMMember{
+			AgentID:      mem.AgentID,
+			NotifyMode:   string(mem.NotifyMode),
+			DigestWindow: mem.DigestWindow,
+		})
+	}
+	return &store.GroupDMRecord{
+		ID:       g.ID,
+		Name:     g.Name,
+		Members:  members,
+		Style:    string(g.Style),
+		Cooldown: g.Cooldown,
+		Venue:    string(g.Venue),
+	}
+}
+
+// groupRecordToGroupDM converts a stored row back to the v0 in-memory
+// shape. AgentName is left blank for each member; copyGroup overlays it
+// against the live agents map on the way out to API clients.
+func groupRecordToGroupDM(rec *store.GroupDMRecord) *GroupDM {
+	members := make([]GroupMember, 0, len(rec.Members))
+	for _, mem := range rec.Members {
+		members = append(members, GroupMember{
+			AgentID:      mem.AgentID,
+			NotifyMode:   NotifyMode(mem.NotifyMode),
+			DigestWindow: mem.DigestWindow,
+		})
+	}
+	return &GroupDM{
+		ID:        rec.ID,
+		Name:      rec.Name,
+		Members:   members,
+		Cooldown:  rec.Cooldown,
+		Style:     GroupDMStyle(rec.Style),
+		Venue:     GroupDMVenue(rec.Venue),
+		CreatedAt: normalizeTimestamp(millisToRFC3339(rec.CreatedAt)),
+		UpdatedAt: normalizeTimestamp(millisToRFC3339(rec.UpdatedAt)),
 	}
 }
 

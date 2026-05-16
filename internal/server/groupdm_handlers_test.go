@@ -28,8 +28,14 @@ func newTestServerWithGroupDM(t *testing.T) (*Server, *agent.Manager) {
 	t.Setenv("XDG_CONFIG_HOME", tmp+"/.config")
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	mgr := agent.NewManager(logger)
-	t.Cleanup(func() { mgr.Shutdown() })
+	mgr, err := agent.NewManager(logger)
+	if err != nil {
+		t.Fatalf("agent.NewManager: %v", err)
+	}
+	t.Cleanup(func() {
+		mgr.Shutdown()
+		_ = mgr.Close()
+	})
 
 	gdm := agent.NewGroupDMManager(mgr, logger)
 

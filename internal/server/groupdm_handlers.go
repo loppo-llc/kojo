@@ -1,14 +1,70 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/auth"
+	"github.com/loppo-llc/kojo/internal/store"
 )
+
+// groupdmIfMatchPrecheck reads the current group-DM row from the v1
+// store and compares its etag against the caller's If-Match value.
+// Returns true to proceed, false after writing the appropriate error
+// response.
+//
+// `*` is accepted as "any current resource" per RFC 7232 §3.1; an
+// explicit etag must match exactly. ifMatchPresent=false short-circuits
+// the precheck (caller didn't opt in to OCC).
+//
+// This is a TOCTOU-window precheck — the underlying agent-layer
+// mutators run in their own per-group lock so a concurrent PATCH
+// inside the same daemon process serializes after this check, but
+// cross-device writers (other peers) could still drift the row
+// between our read and the agent-layer write. That's acceptable for
+// this slice; a future hardening can thread If-Match into the agent
+// methods themselves.
+func (s *Server) groupdmIfMatchPrecheck(w http.ResponseWriter, r *http.Request, groupID, ifMatch string, ifMatchPresent bool) bool {
+	ctx := r.Context()
+	if !ifMatchPresent {
+		// 428 transition gate — see enforceIfMatchPresence in
+		// etag.go. Off by default; on once operators promote
+		// strict If-Match mode. If-Match only — groupdm has no
+		// create-only path so If-None-Match: * is intentionally
+		// not accepted here.
+		if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+			return false
+		}
+		return true
+	}
+	st := s.agents.Store()
+	if st == nil {
+		writeError(w, http.StatusServiceUnavailable, "unavailable", "If-Match unsupported on this server")
+		return false
+	}
+	dbCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	rec, err := st.GetGroupDM(dbCtx, groupID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "group not found")
+			return false
+		}
+		s.logger.Error("groupdm If-Match precheck: read failed", "id", groupID, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return false
+	}
+	if ifMatch != "*" && rec.ETag != ifMatch {
+		writeError(w, http.StatusPreconditionFailed, "precondition_failed", "If-Match: etag mismatch")
+		return false
+	}
+	return true
+}
 
 // bindAgentIdentity reconciles body-supplied agentId-style fields with
 // the request Principal:
@@ -168,6 +224,17 @@ func (s *Server) handleGetGroupDM(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// Parse If-Match BEFORE reading the body so a malformed
+	// precondition surfaces as 400 cleanly (rather than after a
+	// partial body decode).
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
 	var req struct {
 		Name     string `json:"name"`
 		AgentID  string `json:"agentId"`
@@ -187,7 +254,19 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 	}
 	req.AgentID = bound
 
-	// Validate all fields before applying any changes to avoid partial writes.
+	// Validate all fields before applying any changes so a malformed
+	// request fails before ANY mutator runs.
+	//
+	// KNOWN LIMITATION: multi-field PATCH is not atomic — Cooldown /
+	// Style / Venue / Name each call a distinct manager method, and a
+	// failure mid-sequence leaves earlier fields applied while later
+	// ones don't. The per-group LockPatch below blocks parallel
+	// PATCHes from same-process callers, so the partial state is
+	// only visible to the caller and only when one of the mutators
+	// returns an error — but it IS observable. A future refactor can
+	// fold the four mutators into a single `UpdateGroupSettings`
+	// manager method that takes a per-field-pointer struct and
+	// commits atomically (matches Manager.Update on agents).
 	if req.Name == "" && req.Cooldown == nil && req.Style == "" && req.Venue == "" {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"name, cooldown, style, or venue is required")
@@ -209,11 +288,34 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Preflight: verify group exists and caller is a member (for rename).
+	// Same opaque-error treatment as handleSetGroupMemberSettings —
+	// non-Owner callers see 403 regardless of whether the group is
+	// missing or they're not a member, so a probe can't distinguish.
 	if req.AgentID != "" {
+		p := auth.FromContext(r.Context())
 		if err := s.groupdms.CheckMembership(id, req.AgentID); err != nil {
-			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			if p.IsOwner() {
+				writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+				return
+			}
+			s.logger.Debug("groupdm rename: membership check failed",
+				"group", id, "agent", req.AgentID, "err", err)
+			writeError(w, http.StatusForbidden, "forbidden",
+				"caller is not a member of this group")
 			return
 		}
+	}
+
+	// Per-group patch lock + If-Match precheck. The lock spans the
+	// precheck → mutation → ETag-echo trio so two concurrent
+	// same-etag PATCHes can't both pass the precheck and both
+	// succeed. Released at function exit; the underlying
+	// per-mutator manager locks (Rename / SetCooldown / etc.)
+	// nest inside this without inversion.
+	releasePatch := s.groupdms.LockPatch(id)
+	defer releasePatch()
+	if !s.groupdmIfMatchPrecheck(w, r, id, ifMatch, ifMatchPresent) {
+		return
 	}
 
 	var result *agent.GroupDM
@@ -257,12 +359,55 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 		}
 		result = g
 	}
+	// Echo the post-write etag so the caller can chain subsequent
+	// PATCHes without a fresh GET. Best-effort: a transient store
+	// read failure here doesn't fail the request — the caller can
+	// re-read on demand.
+	if st := s.agents.Store(); st != nil && result != nil {
+		dbCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		if rec, err := st.GetGroupDM(dbCtx, id); err == nil {
+			w.Header().Set("ETag", quoteETag(rec.ETag))
+		}
+		cancel()
+	}
 	writeJSONResponse(w, http.StatusOK, result)
 }
 
 func (s *Server) handleDeleteGroupDM(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	notify := r.URL.Query().Get("notify") == "true"
+
+	// If-Match optional but checked when present. Group DELETE
+	// mutates the row's tombstone flag and triggers member-side
+	// fan-out (notify=true), so a stale-view caller deleting a group
+	// that has just been renamed should get 412, not silently delete
+	// the renamed row. `*` rejected for the same reason as PATCH.
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
+	if ifMatchPresent && ifMatch == "*" {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"If-Match: * is not supported on DELETE /groupdms/{id}; send a specific etag or omit the header")
+		return
+	}
+
+	// Serialize against rename / member-settings PATCH via the same
+	// per-group lock so a Delete arriving between a PATCH's
+	// precheck and mutation can't bump the etag mid-way (which
+	// would otherwise let the PATCH succeed against a tombstoned
+	// group, or vice versa).
+	releasePatch := s.groupdms.LockPatch(id)
+	defer releasePatch()
+
+	if !s.groupdmIfMatchPrecheck(w, r, id, ifMatch, ifMatchPresent) {
+		return
+	}
+
 	if err := s.groupdms.Delete(id, notify); err != nil {
 		writeError(w, http.StatusNotFound, "not_found", err.Error())
 		return
@@ -420,10 +565,47 @@ func (s *Server) handleAddGroupMember(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "callerAgentId is required")
 		return
 	}
+
+	// If-Match optional. AddMember mutates the membership list (part
+	// of the group row). `*` rejected as elsewhere.
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
+	if ifMatchPresent && ifMatch == "*" {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"If-Match: * is not supported on POST /groupdms/{id}/members; send a specific etag or omit the header")
+		return
+	}
+
+	// Same per-group lock as PATCH paths so AddMember serializes
+	// against rename / member-settings, preventing the "etag
+	// drifted between PATCH precheck and mutation" race.
+	releasePatch := s.groupdms.LockPatch(id)
+	defer releasePatch()
+
+	if !s.groupdmIfMatchPrecheck(w, r, id, ifMatch, ifMatchPresent) {
+		return
+	}
+
 	g, err := s.groupdms.AddMember(id, req.AgentID, req.CallerAgentID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
+	}
+	// Echo the new etag so the caller can chain follow-up PATCH /
+	// AddMember / LeaveGroup against the just-bumped row without an
+	// intervening GET.
+	if st := s.agents.Store(); st != nil {
+		dbCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		if rec, err := st.GetGroupDM(dbCtx, id); err == nil {
+			w.Header().Set("ETag", quoteETag(rec.ETag))
+		}
+		cancel()
 	}
 	writeJSONResponse(w, http.StatusOK, g)
 }
@@ -444,6 +626,14 @@ func (s *Server) handleSetGroupMemberSettings(w http.ResponseWriter, r *http.Req
 	agentID := r.PathValue("agentId")
 	if agentID == "" {
 		writeError(w, http.StatusBadRequest, "bad_request", "agentId is required")
+		return
+	}
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
 		return
 	}
 	var req struct {
@@ -470,13 +660,57 @@ func (s *Server) handleSetGroupMemberSettings(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "bad_request", "notifyMode is required")
 		return
 	}
-	// SetMemberNotifyMode does its own caller membership + active check
-	// inside the lock, which closes the race window between the membership
-	// check and the mutation. The handler no longer pre-checks.
+	// Authorization first: a non-member probing groups must NOT be
+	// able to use the If-Match precheck (which surfaces 412 vs 404)
+	// to enumerate group existence. Skip the membership lookup only
+	// when callerAgentID is empty — that's the admin/UI shape that
+	// already bypasses membership in SetMemberNotifyMode.
+	//
+	// Wire response for both "group not found" and "not a member" is
+	// flattened to a single 403 message so a non-member probe can't
+	// distinguish "group doesn't exist" from "group exists but I'm
+	// not in it". The original error reaches the daemon log for
+	// triage but the wire stays opaque.
+	p := auth.FromContext(r.Context())
+	if req.CallerAgentID != "" && !p.IsOwner() {
+		if err := s.groupdms.CheckMembership(id, req.CallerAgentID); err != nil {
+			s.logger.Debug("groupdm member-settings: membership check failed",
+				"group", id, "agent", req.CallerAgentID, "err", err)
+			writeError(w, http.StatusForbidden, "forbidden",
+				"caller is not a member of this group")
+			return
+		}
+	} else if req.CallerAgentID != "" {
+		// Owner caller: still verify the group exists, but a
+		// non-existent group can be reported plainly since the
+		// owner already has full visibility.
+		if err := s.groupdms.CheckMembership(id, req.CallerAgentID); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+	}
+	// Per-group patch lock + If-Match precheck. Same lock-spans-trio
+	// pattern as handleRenameGroupDM. SetMemberNotifyMode does its
+	// own caller membership + active check inside its own
+	// manager-internal lock, but our patch lock here closes the
+	// outer precheck → mutation race window for same-etag concurrent
+	// PATCHes.
+	releasePatch := s.groupdms.LockPatch(id)
+	defer releasePatch()
+	if !s.groupdmIfMatchPrecheck(w, r, id, ifMatch, ifMatchPresent) {
+		return
+	}
 	g, err := s.groupdms.SetMemberNotifyMode(id, agentID, agent.NotifyMode(req.NotifyMode), req.DigestWindow, req.CallerAgentID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
+	}
+	if st := s.agents.Store(); st != nil && g != nil {
+		dbCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		if rec, err := st.GetGroupDM(dbCtx, id); err == nil {
+			w.Header().Set("ETag", quoteETag(rec.ETag))
+		}
+		cancel()
 	}
 	writeJSONResponse(w, http.StatusOK, g)
 }
@@ -493,9 +727,48 @@ func (s *Server) handleLeaveGroup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	// If-Match optional. LeaveGroup bumps the group etag (member
+	// list change). `*` rejected — the membership row must already
+	// exist (we 404 below otherwise).
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
+	if ifMatchPresent && ifMatch == "*" {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"If-Match: * is not supported on DELETE /groupdms/{id}/members/{agentId}; send a specific etag or omit the header")
+		return
+	}
+
+	// Same per-group lock as PATCH paths — LeaveGroup bumps the
+	// etag and we need that bump to serialize behind any in-flight
+	// PATCH's precheck → mutation window.
+	releasePatch := s.groupdms.LockPatch(id)
+	defer releasePatch()
+
+	if !s.groupdmIfMatchPrecheck(w, r, id, ifMatch, ifMatchPresent) {
+		return
+	}
+
 	if err := s.groupdms.LeaveGroup(id, agentID); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
+	}
+	// If the group still exists (the leaving member wasn't the last),
+	// echo the new etag for the caller's chain. If LeaveGroup
+	// dissolved the group (last member out), the row is gone and
+	// GetGroupDM returns ErrNotFound — silently skipped.
+	if st := s.agents.Store(); st != nil {
+		dbCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		if rec, err := st.GetGroupDM(dbCtx, id); err == nil {
+			w.Header().Set("ETag", quoteETag(rec.ETag))
+		}
+		cancel()
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }

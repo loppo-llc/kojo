@@ -75,10 +75,65 @@ func (s *Server) handleSetSlackBot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found")
 		return
 	}
+	// §3.7 device switch gate covers the WHOLE chain (token
+	// store, UpdateSlackBot, hub StartBot) — the inner
+	// UpdateSlackBot call would re-acquire if we relied on
+	// that alone, but the token write before it would slip
+	// past.
+	releaseMut, mutErr := s.agents.AcquireMutation(agentID)
+	if mutErr != nil {
+		writeError(w, http.StatusConflict, "agent_busy", mutErr.Error())
+		return
+	}
+	defer releaseMut()
+
+	// PUT /slackbot mutates the SlackBot field of the agent record. The
+	// caller's optimistic-concurrency view of that agent is checked
+	// against the v1 store's agent etag — same precondition the PATCH
+	// /agents/{id} path uses, since SlackBot is part of the same row.
+	// `*` is rejected on PUT because the row must already exist (we
+	// 404'd above on missing agent); "any current version" carries no
+	// useful semantics here.
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
+	if ifMatchPresent && ifMatch == "*" {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"If-Match: * is not supported on PUT /slackbot; send a specific etag or omit the header")
+		return
+	}
 
 	var req slackBotRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON")
+		return
+	}
+
+	// Per-agent serialization across precheck → UpdateSlackBot → ETag
+	// echo. Mirrors handleUpdateAgent: without the lock, two concurrent
+	// PUT /slackbot requests carrying the same If-Match would both pass
+	// the precheck, both succeed, and the second writer would silently
+	// stomp the first's effective config without observing its etag.
+	release := s.agents.LockPatch(agentID)
+	defer release()
+
+	// Re-check agent existence under the lock. The Get above ran
+	// before the lock acquisition, so a concurrent DELETE /agents/{id}
+	// could have removed the agent between then and now. Without this
+	// re-check (and with If-Match omitted, where agentIfMatchPrecheck
+	// is a no-op), we'd write Slack tokens to a credential store row
+	// for a freshly-deleted agent — orphaned secrets.
+	if _, ok := s.agents.Get(agentID); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found")
+		return
+	}
+
+	if !s.agentIfMatchPrecheck(w, r, agentID, ifMatch, ifMatchPresent) {
 		return
 	}
 
@@ -100,8 +155,19 @@ func (s *Server) handleSetSlackBot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.AppToken != "" || req.BotToken != "" {
-		// Load existing tokens so we can do partial updates
-		existingApp, existingBot, _ := slackbot.LoadTokens(creds, agentID)
+		// Load existing tokens so we can do partial updates. A
+		// LoadTokens failure means we cannot safely merge — falling
+		// back to "" would silently overwrite the present field with
+		// empty, losing data. Refuse the write so the caller can
+		// retry once the underlying credential store is reachable.
+		existingApp, existingBot, loadErr := slackbot.LoadTokens(creds, agentID)
+		if loadErr != nil && (req.AppToken == "" || req.BotToken == "") {
+			s.logger.Error("slackbot: load existing tokens for partial update failed",
+				"agent", agentID, "err", loadErr)
+			writeError(w, http.StatusInternalServerError, "internal_error",
+				"could not load existing Slack tokens for partial update; resend with both tokens or retry later")
+			return
+		}
 		appToken := req.AppToken
 		if appToken == "" {
 			appToken = existingApp
@@ -130,7 +196,12 @@ func (s *Server) handleSetSlackBot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update agent config
-	if err := s.agents.UpdateSlackBot(agentID, &cfg); err != nil {
+	// Use the no-guard variant: we already hold AcquireMutation
+	// at the top of this handler. Calling the guarded variant
+	// would re-Acquire; a SetSwitching landing between the two
+	// would refuse the inner Acquire after the token had
+	// already been saved, leaving partial state.
+	if err := s.agents.UpdateSlackBotAlreadyGuarded(agentID, &cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
@@ -144,14 +215,67 @@ func (s *Server) handleSetSlackBot(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Echo the new agent etag so the client can chain follow-up PATCH
+	// /agents/{id} or PUT /slackbot calls without an extra GET. The
+	// LockPatch above guarantees no other writer landed between
+	// UpdateSlackBot and this read.
+	if newETag := s.readAgentETag(r, agentID); newETag != "" {
+		w.Header().Set("ETag", quoteETag(newETag))
+	}
 	writeJSONResponse(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleDeleteSlackBot(w http.ResponseWriter, r *http.Request) {
+	// Wrap the whole delete flow (token Delete + UpdateSlackBot
+	// + hub StopBot) in one mutation guard so a handoff that
+	// lands mid-delete can't leave source with credentials but
+	// no config row.
+	if agentID := r.PathValue("id"); agentID != "" {
+		releaseMut, mutErr := s.agents.AcquireMutation(agentID)
+		if mutErr != nil {
+			writeError(w, http.StatusConflict, "agent_busy", mutErr.Error())
+			return
+		}
+		defer releaseMut()
+	}
 	agentID := r.PathValue("id")
 	_, ok := s.agents.Get(agentID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found")
+		return
+	}
+
+	// Same If-Match contract as PUT — DELETE /slackbot mutates the
+	// SlackBot field on the agent record, so the precondition checks
+	// against the agent etag. `*` is rejected for the same reason.
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
+	if ifMatchPresent && ifMatch == "*" {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"If-Match: * is not supported on DELETE /slackbot; send a specific etag or omit the header")
+		return
+	}
+
+	// Per-agent serialization across precheck → UpdateSlackBot → token
+	// delete. Holding the lock around the token cleanup matters here:
+	// without it, a concurrent PUT could re-store tokens we're about
+	// to drop, leaving a half-configured bot row.
+	release := s.agents.LockPatch(agentID)
+	defer release()
+
+	// Re-check existence under the lock — see handleSetSlackBot.
+	if _, ok := s.agents.Get(agentID); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found")
+		return
+	}
+
+	if !s.agentIfMatchPrecheck(w, r, agentID, ifMatch, ifMatchPresent) {
 		return
 	}
 
@@ -161,17 +285,41 @@ func (s *Server) handleDeleteSlackBot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Remove config
-	if err := s.agents.UpdateSlackBot(agentID, nil); err != nil {
+	// No-guard variant: we already hold AcquireMutation at the
+	// top of handleDeleteSlackBot.
+	if err := s.agents.UpdateSlackBotAlreadyGuarded(agentID, nil); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 
-	// Delete tokens
+	// Delete tokens. Surface failures: leaving Slack secrets in the
+	// credential store after a successful "delete" 200 response is
+	// the worst kind of partial-failure — the caller assumes the
+	// secrets are gone, but a future enable would re-load them and
+	// silently re-pair the bot. 5xx so the caller knows to retry.
+	//
+	// On cleanup failure echo the *new* agent ETag in the response
+	// header — without that, the same caller's If-Match would still
+	// be the pre-DELETE value and a retry would 412 against the
+	// just-bumped row, leaving the secrets stuck. Echoing the new
+	// ETag lets the caller chain its retry without an intervening
+	// GET.
 	creds := s.agents.Credentials()
 	if creds != nil {
-		_ = slackbot.DeleteTokens(creds, agentID)
+		if err := slackbot.DeleteTokens(creds, agentID); err != nil {
+			s.logger.Error("slackbot: token cleanup failed", "agent", agentID, "err", err)
+			if newETag := s.readAgentETag(r, agentID); newETag != "" {
+				w.Header().Set("ETag", quoteETag(newETag))
+			}
+			writeError(w, http.StatusInternalServerError, "internal_error",
+				"slackbot config cleared but token cleanup failed; retry to ensure secrets are removed")
+			return
+		}
 	}
 
+	if newETag := s.readAgentETag(r, agentID); newETag != "" {
+		w.Header().Set("ETag", quoteETag(newETag))
+	}
 	writeJSONResponse(w, http.StatusOK, map[string]any{"ok": true})
 }
 

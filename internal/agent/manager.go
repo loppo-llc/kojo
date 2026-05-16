@@ -11,8 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/blob"
 	"github.com/loppo-llc/kojo/internal/notifysource"
 	"github.com/loppo-llc/kojo/internal/notifysource/gmail"
+	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // BusySource identifies what triggered a busy state.
@@ -40,7 +42,7 @@ type Manager struct {
 	mu       sync.Mutex
 	agents   map[string]*Agent
 	backends map[string]ChatBackend
-	store    *store
+	store    *agentStore
 	creds    *CredentialStore
 	cron     *cronScheduler
 	logger   *slog.Logger
@@ -59,11 +61,53 @@ type Manager struct {
 	// chats but is invisible to chat WebSocket subscribers.
 	editing map[string]bool
 
+	// switching tracks agents in the middle of a §3.7 device
+	// switch (begin → sync → pull → complete). Blocks new
+	// Chat starts on this peer so no transcript / JSONL gets
+	// written between Step -1's quiesce and the post-complete
+	// drain — without the gate a cron tick or WS frame mid-
+	// switch would land state on source that target never
+	// receives. Cleared by SetSwitching(false) on every exit
+	// path of switch_device_handler.
+	switching map[string]bool
+
+	// mutating tracks the per-agent in-flight count of state
+	// mutations (persona / settings / notify / slackbot / task
+	// / credential / avatar / OAuth token) that don't route
+	// through Chat → busy. Every mutation entry uses
+	// AcquireMutation to bump the counter under busyMu (which
+	// also refuses when switching is set), and defers
+	// releaseMutation to bring it back down. WaitChatIdle
+	// drains the counter so Step -1's snapshot can't race a
+	// mutation that started just before SetSwitching landed.
+	mutating map[string]int
+
+	// preparing tracks agents whose Chat / ChatOneShot /
+	// Regenerate is INSIDE prepareChat (memory sync, system
+	// prompt build) but hasn't yet inserted its busy entry. A
+	// SetSwitching(true) that lands during this window would
+	// pass busy=empty in WaitChatIdle even though prepareChat
+	// has already done disk writes. Step -1's quiesce now
+	// waits for `preparing` to drain alongside busy, closing
+	// that race. Incremented per call (a map[id]int) so
+	// concurrent Slack one-shots don't clobber each other's
+	// guards.
+	preparing map[string]int
+
 	// profileGen tracks agents with in-flight publicProfile generation.
 	profileGen map[string]bool
 
 	// cronPaused globally pauses all cron jobs when true.
 	cronPaused bool
+
+	// cronToggleMu serializes SetCronPaused calls. Without it two
+	// concurrent toggles could interleave between the kv write and the
+	// in-memory update — the order of kv writes (last-wins) and memory
+	// writes (also last-wins) is independent, so a (false, true)
+	// concurrent pair could land kv="true" but cronPaused=false.
+	// Single-toggle granularity is fine: this is an operator-driven
+	// path, no contention pressure.
+	cronToggleMu sync.Mutex
 
 	// memIndexes caches open MemoryIndex instances per agent.
 	memIndexes   map[string]*MemoryIndex
@@ -93,6 +137,38 @@ type Manager struct {
 	// owned by the auth subsystem; agent.Manager only calls into the
 	// minimal AgentTokenStore interface.
 	tokenStore AgentTokenStore
+
+	// blobStore is the native blob store handle (Phase 3). Wired post-
+	// construction via SetBlobStore so Manager doesn't have to import
+	// internal/blob solely for the field type to be reachable. Avatar
+	// reads (avatarMeta, ServeAvatar fallback) and writes (SaveAvatar,
+	// fork copy, reset cleanup) consult this when non-nil; nil keeps
+	// the read paths fail-soft (no avatar = SVG fallback) so tests that
+	// don't wire blob still work.
+	blobStore *blob.Store
+
+	// patchMus serializes If-Match-gated mutations per agent. The HTTP
+	// PATCH handler holds the per-agent lock across precondition-check
+	// → Manager.Update → ETag echo so two concurrent requests carrying
+	// the same If-Match cannot both pass the check (they'd otherwise
+	// race because the precheck reads the store without holding m.mu,
+	// and m.mu itself is released between Update's in-memory mutation
+	// and m.save()'s store write).
+	//
+	// This is single-process serialization only — multi-device write
+	// coordination is the store-level optimistic-concurrency layer's
+	// job (see store.UpdateAgent's ifMatchETag parameter, which a
+	// future cutover slice will thread through Manager.Update).
+	patchMusMu sync.Mutex
+	patchMus   map[string]*sync.Mutex
+
+	// startSchedulersOnce guards StartSchedulers from double-firing
+	// the cron / notify-poller boot. schedulersStarted gates
+	// Shutdown so it short-circuits when the schedulers were never
+	// started (the notifyPoller.Stop path would otherwise wait on
+	// a never-launched goroutine).
+	startSchedulersOnce sync.Once
+	schedulersStarted   bool
 }
 
 // AgentTokenStore is the minimal contract the agent manager needs from
@@ -129,6 +205,59 @@ func (m *Manager) SetTokenStore(ts AgentTokenStore) {
 // tests or before SetTokenStore is called).
 func (m *Manager) AgentTokenStore() AgentTokenStore { return m.tokenStore }
 
+// SetBlobStore wires the native blob store handle. Called post-
+// construction by cmd/kojo after the blob.Store is built (it depends
+// on agentMgr.Store(), so the order is Manager → store → blob.Store
+// → SetBlobStore). Tests that don't exercise avatar I/O may leave
+// it nil; avatar read paths fall back to the generated-SVG branch
+// when blobStore is nil so a Get on an agent in those tests still
+// completes.
+func (m *Manager) SetBlobStore(bs *blob.Store) {
+	m.blobStore = bs
+}
+
+// BlobStore returns the wired blob store (may be nil during tests or
+// before SetBlobStore is called). Mirrors Store() / AgentTokenStore()
+// for subsystem composition.
+func (m *Manager) BlobStore() *blob.Store { return m.blobStore }
+
+// HydrateAgentBlobsAtLoad copies every loaded agent's blob_refs
+// entries (global + local scope, excluding avatar / index /
+// credentials) into agentDir(id) so the v1 CLI process — which
+// runs with cmd.Dir = agentDir — can `ls books/`, `cat
+// outputs/result.bvh`, etc. just like it could on v0. Without this
+// step, post-migration agent CWDs would appear empty to the CLI
+// even though the blob store has the files (under
+// <configdir>/{global,local}/agents/<id>/ rather than
+// agents/<id>/).
+//
+// Idempotent: existing leaves whose sha256 matches the blob_refs
+// row are skipped, so re-runs at every Load are O(stat) per ref.
+// Best-effort across agents: one agent's failure logs and the rest
+// proceed.
+//
+// Must be called AFTER SetBlobStore. cmd/kojo wires this in
+// initAgents() right after SetBlobStore so the first Chat picks up
+// a populated CWD.
+func (m *Manager) HydrateAgentBlobsAtLoad() {
+	if m.blobStore == nil || m.store == nil {
+		return
+	}
+	st := m.store.Store()
+	if st == nil {
+		return
+	}
+	m.mu.Lock()
+	ids := make([]string, 0, len(m.agents))
+	for id := range m.agents {
+		ids = append(ids, id)
+	}
+	m.mu.Unlock()
+	for _, id := range ids {
+		hydrateAgentBlobsAtLoad(st, m.blobStore, id, m.logger)
+	}
+}
+
 // IsPrivileged returns whether the agent has the Privileged flag set.
 // Used by auth.Resolver to map a per-agent token to RoleAgent vs
 // RolePrivAgent.
@@ -142,6 +271,11 @@ func (m *Manager) IsPrivileged(id string) bool {
 // SetPrivileged toggles the Privileged flag on the named agent and
 // persists the change. Owner-only mutation enforced at the API layer.
 func (m *Manager) SetPrivileged(id string, privileged bool) error {
+	releaseMut, err := m.AcquireMutation(id)
+	if err != nil {
+		return err
+	}
+	defer releaseMut()
 	m.mu.Lock()
 	a, ok := m.agents[id]
 	if !ok {
@@ -160,10 +294,22 @@ func (m *Manager) SetPrivileged(id string, privileged bool) error {
 }
 
 // NewManager creates a new agent manager.
-func NewManager(logger *slog.Logger) *Manager {
+//
+// Returns an error only if kojo.db cannot be opened — that path is
+// fatal for the daemon (without the store there is no agent metadata
+// at all), so callers should bubble the error to main and exit.
+// Per-agent load failures are logged and skipped, not returned, so a
+// single corrupt row doesn't prevent the rest of the daemon from
+// coming up.
+func NewManager(logger *slog.Logger) (*Manager, error) {
 	creds, err := NewCredentialStore()
 	if err != nil {
 		logger.Warn("failed to open credential store", "err", err)
+	}
+
+	st, err := newStore(logger)
+	if err != nil {
+		return nil, fmt.Errorf("open agent store: %w", err)
 	}
 
 	m := &Manager{
@@ -175,16 +321,20 @@ func NewManager(logger *slog.Logger) *Manager {
 			"custom":    NewCustomBackend(logger),
 			"llama.cpp": NewLlamaCppBackend(logger),
 		},
-		store:          newStore(logger),
+		store:          st,
 		creds:          creds,
 		logger:         logger,
 		busy:           make(map[string]busyEntry),
 		resetting:      make(map[string]bool),
+		switching:      make(map[string]bool),
+		preparing:      make(map[string]int),
+		mutating:       make(map[string]int),
 		editing:        make(map[string]bool),
 		profileGen:     make(map[string]bool),
 		memIndexes:     make(map[string]*MemoryIndex),
 		chatWatchers:   make(map[string]map[*chatWatcher]struct{}),
 		oneShotCancels: make(map[string]map[int64]context.CancelFunc),
+		patchMus:       make(map[string]*sync.Mutex),
 	}
 
 	m.cron = newCronScheduler(m, logger)
@@ -202,7 +352,7 @@ func NewManager(logger *slog.Logger) *Manager {
 		logger.Warn("failed to load agents", "err", err)
 	}
 	for _, a := range agents {
-		has, hash := avatarMeta(a.ID)
+		has, hash := m.avatarMeta(a.ID)
 		applyAvatarMeta(a, has, hash)
 		// Load last message preview
 		if msgs, err := loadMessages(a.ID, 1); err == nil && len(msgs) > 0 {
@@ -216,32 +366,79 @@ func NewManager(logger *slog.Logger) *Manager {
 		m.agents[a.ID] = a
 	}
 
-	// Start cron schedules. Skip archived agents — their cron stays detached
-	// until Unarchive re-schedules.
-	m.cron.Start()
-	for _, a := range m.agents {
-		if a.Archived {
-			continue
+	return m, nil
+}
+
+// StartSchedulers boots the cron loop and the notify poller and
+// schedules every non-archived agent's interval / notify sources.
+// Split out of NewManager (Phase G follow-up to codex review) so
+// cmd/kojo can interpose Phase D's HydrateAgentBlobsAtLoad between
+// agent load and scheduler start — without the gap, a cron tick
+// that fires before hydrate finishes would spawn the CLI process
+// in an empty CWD (books/, outputs/, etc. not yet on disk).
+//
+// Idempotent: a sync.Once guard pins the boot to a single execution
+// regardless of how many callers race here, so a stray double Start
+// can't double-launch the notify poller goroutine. Shutdown
+// short-circuits when StartSchedulers never ran (would otherwise
+// hang on notifyPoller.Stop's wait-for-loop-exit).
+func (m *Manager) StartSchedulers() {
+	if m == nil {
+		return
+	}
+	m.startSchedulersOnce.Do(func() {
+		// Cron: skip archived agents — their cron stays detached
+		// until Unarchive re-schedules.
+		m.cron.Start()
+		m.mu.Lock()
+		agents := make([]*Agent, 0, len(m.agents))
+		for _, a := range m.agents {
+			agents = append(agents, a)
 		}
-		if expr := intervalToCron(a.IntervalMinutes, a.ID); expr != "" {
-			if err := m.cron.Schedule(a.ID, expr); err != nil {
-				logger.Warn("failed to schedule cron", "agent", a.ID, "err", err)
+		m.mu.Unlock()
+		for _, a := range agents {
+			if a.Archived {
+				continue
+			}
+			if expr := a.CronExpr; expr != "" {
+				if err := m.cron.Schedule(a.ID, expr); err != nil {
+					m.logger.Warn("failed to schedule cron", "agent", a.ID, "err", err)
+				}
 			}
 		}
-	}
 
-	// Start notify poller and rebuild sources for all agents (skip archived).
-	m.notifyPoller.Start()
-	for _, a := range m.agents {
-		if a.Archived {
-			continue
+		// Notify poller: rebuild sources for all agents (skip archived).
+		m.notifyPoller.Start()
+		for _, a := range agents {
+			if a.Archived {
+				continue
+			}
+			if len(a.NotifySources) > 0 {
+				m.notifyPoller.RebuildSources(a.ID, a.NotifySources)
+			}
 		}
-		if len(a.NotifySources) > 0 {
-			m.notifyPoller.RebuildSources(a.ID, a.NotifySources)
-		}
-	}
+		m.schedulersStarted = true
+	})
+}
 
-	return m
+// Close releases manager-owned resources (the kojo.db connection).
+// Safe to call on a nil receiver and idempotent.
+func (m *Manager) Close() error {
+	if m == nil {
+		return nil
+	}
+	return m.store.Close()
+}
+
+// Store returns the underlying *store.Store so subsystems built on the
+// agent manager (groupdm manager, follow-up cutover slices) can share
+// the connection rather than each opening their own *sql.DB. May be
+// nil in tests that constructed a *Manager via &Manager{}.
+func (m *Manager) Store() *store.Store {
+	if m == nil || m.store == nil {
+		return nil
+	}
+	return m.store.Store()
 }
 
 // SetGroupDMManager sets the group DM manager reference.
@@ -265,7 +462,7 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
 
-	has, hash := avatarMeta(a.ID)
+	has, hash := m.avatarMeta(a.ID)
 	applyAvatarMeta(a, has, hash)
 
 	// Provision the auth token first. A tokenless agent is silently
@@ -286,7 +483,24 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 
 	m.save()
 
-	if expr := intervalToCron(a.IntervalMinutes, a.ID); expr != "" {
+	// Sync the freshly-minted MEMORY.md / memory/ tree into the DB.
+	// ensureAgentDir already wrote the initial MEMORY.md, but the
+	// inline sync there was a no-op because the parent agent row
+	// didn't exist yet (m.save above is what creates it). Rerun
+	// here so the DB row is populated from the start of the agent's
+	// life — without it, the first cross-device reader would 404.
+	// Best-effort: a sync failure is logged but doesn't abort
+	// Create (the file is canonical regardless; the next sync hook
+	// will reconcile).
+	if st := getGlobalStore(); st != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := SyncAgentMemoryFromDisk(ctx, st, a.ID, m.logger); err != nil {
+			m.logger.Warn("memory sync after create failed", "agent", a.ID, "err", err)
+		}
+		cancel()
+	}
+
+	if expr := a.CronExpr; expr != "" {
 		if err := m.cron.Schedule(a.ID, expr); err != nil {
 			m.logger.Warn("failed to schedule cron", "agent", a.ID, "err", err)
 		}
@@ -302,10 +516,51 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 	return a, nil
 }
 
-// syncPersona reads persona.md and updates Agent.Persona if it has changed.
-// This makes persona.md the single source of truth — the agent can edit it
-// to evolve its personality, and the change is reflected in settings.
+// syncPersona reconciles the on-disk persona.md with the in-memory
+// Agent.Persona and the DB row. Post-cutover the DB is canonical;
+// disk is a hydrated mirror. The CLI process can edit persona.md and
+// this function picks up that edit on the next chat-done /
+// scheduled-hook tick:
+//   - file present, content differs from in-memory → update memory
+//     and DB (CLI-edit propagation)
+//   - file missing + live DB row → hydrate disk from DB (post-
+//     migration first boot or manual wipe; not a clear)
+//   - file missing + no DB row → no-op
+//
+// CLI users that genuinely want to clear persona must round-trip
+// through Manager.Update (PATCH) or PutAgentPersona (Web UI / API
+// PUT) — both of those write through to the DB row, so the next
+// sync sees DB body="" and the hydrate guard `prev.Body != ""`
+// correctly skips re-hydration.
+//
+// Locking: holds personaSyncMu(agentID) for the entire disk-read
+// → DB-upsert critical section so a concurrent PutAgentPersona /
+// Manager.Update can't sneak its write in between. The lock is
+// released BEFORE SaveAgentRowOnly (which takes store.mu) to
+// preserve a single canonical lock order: store.mu is NEVER
+// acquired while personaSyncMu is held, eliminating the
+// inversion-deadlock against m.save() callers (which take store.mu
+// → personaSyncMu via upsertAgent).
 func (m *Manager) syncPersona(agentID string) {
+	// §3.7 device-switch gate via AcquireMutation. Two
+	// invariants this gives us at once:
+	//   1. If switching is set, AcquireMutation refuses — sync
+	//      bails out before any disk read / DB write that
+	//      could land post-snapshot.
+	//   2. While sync runs, mutating[agentID] is incremented
+	//      so WaitChatIdle observes this work as non-idle.
+	//      Without that drain point a sync that passed the
+	//      check microseconds before SetSwitching could still
+	//      write under m.mu after the snapshot.
+	// Best-effort: callers (Get/List/Directory) ignore the
+	// skip silently; the in-memory cache is the most-recent
+	// pre-switch state, which is what those read paths want.
+	releaseMut, mutErr := m.AcquireMutation(agentID)
+	if mutErr != nil {
+		return
+	}
+	defer releaseMut()
+
 	// Check existence under lock, then release for file I/O
 	m.mu.Lock()
 	_, exists := m.agents[agentID]
@@ -314,10 +569,60 @@ func (m *Manager) syncPersona(agentID string) {
 		return
 	}
 
-	// Read file outside lock to avoid blocking other operations
-	content, ok := readPersonaFile(agentID)
-	if !ok {
+	releasePersonaSync := lockPersonaSync(agentID)
+
+	// Read file under personaSyncMu (atomic w.r.t. concurrent writers).
+	// readPersonaForSync distinguishes (body, exists, real-error):
+	//   - exists  → use body (may be empty for an intentionally-empty file)
+	//   - !exists → ENOENT, hydrate-trigger candidate
+	//   - err     → real I/O failure, bail
+	//
+	// readPersonaFile (which collapses ENOENT to ("", true)) cannot be
+	// used here because the empty/missing distinction is the whole
+	// point: post-cutover, missing-disk is hydrate intent and
+	// empty-file is clear intent. The two callsites in this file
+	// previously both used readPersonaFile and TOCTOU'd on the
+	// follow-up readPersonaForSync — collapsed into one atomic read.
+	content, fileExists, readErr := readPersonaForSync(agentID)
+	if readErr != nil {
+		m.logger.Warn("syncPersona: persona.md read failed", "agent", agentID, "err", readErr)
+		releasePersonaSync()
 		return
+	}
+
+	// Missing-disk + live-DB hydrate path. Symmetrical with the
+	// upsertAgent persona path in store.go; see that function's doc
+	// comment for the DB-canonical / disk-mirror rationale.
+	//
+	// DB-error handling: distinguish ErrNotFound (no row, fall
+	// through and treat missing-disk as clear) from real I/O
+	// errors (transient lock contention, corruption, etc.) — for
+	// the latter we MUST NOT proceed to "treat as clear" which
+	// would upsert body="" and silently clobber the live DB row
+	// once the transient error resolved. Bail out with a warn
+	// instead; the next sync retries.
+	if !fileExists {
+		if st := getGlobalStore(); st != nil {
+			ctx, cancel := dbContextWithCancel(nil, 5*time.Second)
+			prev, perr := st.GetAgentPersona(ctx, agentID)
+			cancel()
+			switch {
+			case perr == nil && prev != nil && prev.DeletedAt == nil && prev.Body != "":
+				if werr := writePersonaFile(agentID, prev.Body); werr != nil {
+					m.logger.Warn("syncPersona: hydrate persona disk from DB failed",
+						"agent", agentID, "err", werr)
+				}
+				releasePersonaSync()
+				return
+			case perr != nil && !errors.Is(perr, store.ErrNotFound):
+				m.logger.Warn("syncPersona: persona DB read failed; skipping sync to avoid clobber",
+					"agent", agentID, "err", perr)
+				releasePersonaSync()
+				return
+			}
+		}
+		// No live DB row to hydrate from; treat missing as clear.
+		// content is "" already from readPersonaForSync.
 	}
 
 	// Re-acquire lock to compare and update
@@ -325,6 +630,7 @@ func (m *Manager) syncPersona(agentID string) {
 	a, exists := m.agents[agentID]
 	if !exists {
 		m.mu.Unlock()
+		releasePersonaSync()
 		return
 	}
 	if a.Persona == content {
@@ -332,9 +638,11 @@ func (m *Manager) syncPersona(agentID string) {
 		if content != "" && a.PublicProfile == "" && !a.PublicProfileOverride {
 			persona := content
 			m.mu.Unlock()
+			releasePersonaSync()
 			go m.regeneratePublicProfile(agentID, persona)
 		} else {
 			m.mu.Unlock()
+			releasePersonaSync()
 		}
 		return
 	}
@@ -343,7 +651,40 @@ func (m *Manager) syncPersona(agentID string) {
 	override := a.PublicProfileOverride
 	a.UpdatedAt = time.Now().Format(time.RFC3339)
 	m.mu.Unlock()
-	m.save()
+
+	// Persona DB row update inline, while still holding
+	// personaSyncMu(agentID): the disk read above + this DB
+	// write together form the atomic "disk → DB" sync that the
+	// lock guarantees against concurrent PutAgentPersona.
+	if st := getGlobalStore(); st != nil {
+		ctx, cancel := dbContextWithCancel(nil, 5*time.Second)
+		if _, err := st.UpsertAgentPersona(ctx, agentID, content, "", store.AgentInsertOptions{
+			AllowOverwrite: true,
+		}); err != nil {
+			m.logger.Warn("syncPersona: persona DB upsert failed", "agent", agentID, "err", err)
+		}
+		cancel()
+	}
+
+	// Release personaSyncMu BEFORE crossing into store.mu via
+	// SaveAgentRowOnly. m.save() and friends take store.mu first
+	// and personaSyncMu second (via upsertAgent); a path that
+	// holds personaSyncMu and waits for store.mu would invert
+	// that order and deadlock.
+	releasePersonaSync()
+
+	// Flush the agents-row metadata via the single-agent helper.
+	m.mu.Lock()
+	var snapshot *Agent
+	if cur, ok := m.agents[agentID]; ok {
+		snapshot = copyAgent(cur)
+	}
+	m.mu.Unlock()
+	if snapshot != nil {
+		if err := m.store.SaveAgentRowOnly(snapshot); err != nil {
+			m.logger.Warn("syncPersona: agents-row update failed", "agent", agentID, "err", err)
+		}
+	}
 
 	// Pre-generate persona summary in background so it's cached for next chat
 	if len([]rune(content)) > maxPersonaSummaryRunes {
@@ -359,8 +700,21 @@ func (m *Manager) syncPersona(agentID string) {
 			if a, ok := m.agents[agentID]; ok {
 				a.PublicProfile = ""
 			}
+			var snap *Agent
+			if cur, ok := m.agents[agentID]; ok {
+				snap = copyAgent(cur)
+			}
 			m.mu.Unlock()
-			m.save()
+			// Single-agent save. personaSyncMu has already been
+			// released above (before the agents-row flush) so
+			// this call doesn't risk the personaSyncMu →
+			// store.mu inversion against m.save callers.
+			if snap != nil {
+				if err := m.store.SaveAgentRowOnly(snap); err != nil {
+					m.logger.Warn("syncPersona: clear publicProfile save failed",
+						"agent", agentID, "err", err)
+				}
+			}
 		}
 	}
 }
@@ -377,7 +731,7 @@ func (m *Manager) Get(id string) (*Agent, bool) {
 	if !archived {
 		m.syncPersona(id)
 	}
-	has, hash := avatarMeta(id)
+	has, hash := m.avatarMeta(id)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok = m.agents[id]
@@ -386,6 +740,45 @@ func (m *Manager) Get(id string) (*Agent, bool) {
 	}
 	applyAvatarMeta(a, has, hash)
 	return copyAgent(a), true
+}
+
+// GetRemote returns an agent whose runtime was released from the
+// local manager via §3.7 device-switch but whose DB row still
+// exists. HolderPeer is populated from agent_locks. Returns nil
+// when the agent is either in-memory (use Get) or not in the DB.
+func (m *Manager) GetRemote(id string) *Agent {
+	if m == nil || m.store == nil || id == "" {
+		return nil
+	}
+	// If it's in the in-memory map, it's not remote.
+	m.mu.Lock()
+	_, inMem := m.agents[id]
+	m.mu.Unlock()
+	if inMem {
+		return nil
+	}
+	a, err := m.store.LoadByID(id)
+	if err != nil {
+		return nil
+	}
+	// Populate runtime-cached fields that LoadByID doesn't cover.
+	if msgs, merr := loadMessages(id, 1); merr == nil && len(msgs) > 0 {
+		last := msgs[len(msgs)-1]
+		a.LastMessage = &MessagePreview{
+			Content:   truncatePreview(last.Content, 100),
+			Role:      last.Role,
+			Timestamp: last.Timestamp,
+		}
+	}
+	has, hash := m.avatarMeta(id)
+	applyAvatarMeta(a, has, hash)
+	st := m.Store()
+	if st != nil {
+		if lock, err := st.GetAgentLock(context.Background(), a.ID); err == nil && lock.HolderPeer != "" {
+			a.HolderPeer = lock.HolderPeer
+		}
+	}
+	return a
 }
 
 // List returns deep copies of all agents.
@@ -413,7 +806,7 @@ func (m *Manager) List() []*Agent {
 	}
 	avMap := make(map[string]avInfo, len(ids))
 	for _, id := range ids {
-		has, hash := avatarMeta(id)
+		has, hash := m.avatarMeta(id)
 		avMap[id] = avInfo{has, hash}
 	}
 
@@ -427,6 +820,69 @@ func (m *Manager) List() []*Agent {
 		list = append(list, copyAgent(a))
 	}
 	return list
+}
+
+// ListRemote returns agents that exist in the store but are NOT in
+// the in-memory manager (i.e. their runtime was released via §3.7
+// device-switch). Each returned Agent has HolderPeer populated from
+// agent_locks so the UI knows which peer hosts them. Returns nil
+// when no remote agents exist or the store is unavailable.
+func (m *Manager) ListRemote() []*Agent {
+	if m == nil || m.store == nil {
+		return nil
+	}
+	st := m.Store()
+	if st == nil {
+		return nil
+	}
+
+	// Snapshot local IDs under the lock.
+	m.mu.Lock()
+	local := make(map[string]struct{}, len(m.agents))
+	for id := range m.agents {
+		local[id] = struct{}{}
+	}
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	dbRecs, err := st.ListAgents(ctx)
+	if err != nil {
+		if m.logger != nil {
+			m.logger.Warn("ListRemote: store.ListAgents failed", "err", err)
+		}
+		return nil
+	}
+
+	var remote []*Agent
+	for _, rec := range dbRecs {
+		if _, ok := local[rec.ID]; ok {
+			continue
+		}
+		a, err := m.store.LoadByID(rec.ID)
+		if err != nil {
+			continue
+		}
+		// Populate runtime-cached fields that LoadByID doesn't cover.
+		if msgs, merr := loadMessages(rec.ID, 1); merr == nil && len(msgs) > 0 {
+			last := msgs[len(msgs)-1]
+			a.LastMessage = &MessagePreview{
+				Content:   truncatePreview(last.Content, 100),
+				Role:      last.Role,
+				Timestamp: last.Timestamp,
+			}
+		}
+		has, hash := m.avatarMeta(rec.ID)
+		applyAvatarMeta(a, has, hash)
+		// Look up the holder from agent_locks.
+		lock, err := st.GetAgentLock(ctx, rec.ID)
+		if err == nil && lock.HolderPeer != "" {
+			a.HolderPeer = lock.HolderPeer
+		}
+		remote = append(remote, a)
+	}
+	return remote
 }
 
 // Directory returns minimal public info for all agents (for agent-to-agent discovery).
@@ -469,7 +925,24 @@ func (m *Manager) Directory() []DirectoryEntry {
 // regeneratePublicProfile generates a public profile from persona in the background.
 // Only writes the result if the agent's persona hasn't changed since generation started.
 // Uses profileGen map to prevent duplicate concurrent generations for the same agent.
+//
+// §3.7 device-switch race: this runs as a goroutine spawned from
+// Update / CreateAgent / SetPersona paths AFTER those return. If a
+// switch begins while the LLM round-trip is in flight, naively
+// writing the result would land PublicProfile on the source AFTER
+// the snapshot — stranding the new profile on the wrong peer. We
+// gate both ends: refuse to start if switching is set on entry,
+// and re-check switching under busyMu before the write.
 func (m *Manager) regeneratePublicProfile(agentID, persona string) {
+	// Refuse to even start if a switch is mid-flight. The target
+	// peer will run its own regen after finalize if needed.
+	m.busyMu.Lock()
+	if m.switching != nil && m.switching[agentID] {
+		m.busyMu.Unlock()
+		return
+	}
+	m.busyMu.Unlock()
+
 	// Dedupe: skip if generation is already in flight for this agent
 	m.mu.Lock()
 	if m.profileGen[agentID] {
@@ -490,7 +963,24 @@ func (m *Manager) regeneratePublicProfile(agentID, persona string) {
 		m.logger.Warn("failed to generate public profile", "agent", agentID, "err", err)
 		return
 	}
+	// Re-check switching under m.mu + busyMu, atomically with
+	// the assignment. An LLM round-trip can take many seconds;
+	// a switch may have landed mid-flight. Acquiring m.mu first
+	// then busyMu inside it matches the lock order used
+	// elsewhere (AcquireMutation / WaitChatIdle take busyMu
+	// without m.mu, so m.mu → busyMu is the established
+	// direction). Discarding under both locks closes the
+	// previous gap where SetSwitching could land between the
+	// switching check and the m.mu acquire.
 	m.mu.Lock()
+	m.busyMu.Lock()
+	switching := m.switching != nil && m.switching[agentID]
+	m.busyMu.Unlock()
+	if switching {
+		m.mu.Unlock()
+		m.logger.Info("public profile regen aborted: switch in progress", "agent", agentID)
+		return
+	}
 	a, ok := m.agents[agentID]
 	if ok && a.Persona == persona && !a.PublicProfileOverride {
 		a.PublicProfile = profile
@@ -505,7 +995,33 @@ func (m *Manager) regeneratePublicProfile(agentID, persona string) {
 }
 
 // Update updates an agent's configuration. Only non-nil fields are applied.
+//
+// Validation order (codex review): every cfg field with a Valid*
+// predicate is checked BEFORE any side-effecting write — disk
+// writes (persona.md), avatar fetches, in-memory mutations. A
+// malformed PATCH payload (effort, model+effort combo, workDir,
+// intervalMinutes, timeoutMinutes, silentHours, etc.) returns its
+// error with zero side effects. Without this barrier, a payload
+// that set Persona="..." plus an invalid Effort would land the
+// persona write to disk + DB, then fail on Effort, leaving the
+// caller with a half-applied PATCH whose visible state diverges
+// from the response code.
 func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
+	// Reject pre-CronExpr clients up front (parallel with newAgent) so an
+	// old mobile build can't accidentally clobber a freshly-set cronExpr by
+	// re-PATCHing an intervalMinutes value the server now ignores.
+	if cfg.LegacyIntervalMinutes != nil {
+		return nil, fmt.Errorf("%w: intervalMinutes is no longer supported; use cronExpr",
+			ErrInvalidCronExpr)
+	}
+	// §3.7 device switch gate. AcquireMutation refuses when
+	// switching is set AND bumps the mutating counter so
+	// WaitChatIdle observes this write in flight.
+	releaseMut, err := m.AcquireMutation(id)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseMut()
 	// Pure-input validations that don't depend on existing state run first so
 	// a malformed payload can't trigger any I/O (persona.md write, avatar
 	// fetch) or partial in-memory mutations below.
@@ -519,12 +1035,33 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		nextCronMessage = v
 		cronMessageDirty = true
 	}
-	// Reject invalid resume-idle presets up front so a malformed PATCH cannot
-	// land partial mutations (Persona / Name / Model are applied before the
-	// later validation block, so deferring this check would let a bad value
-	// still corrupt sibling fields on the in-memory Agent).
 	if cfg.ResumeIdleMinutes != nil && !ValidResumeIdle(*cfg.ResumeIdleMinutes) {
 		return nil, fmt.Errorf("unsupported resumeIdle: %d minutes", *cfg.ResumeIdleMinutes)
+	}
+	// Empty CronExpr is a valid value (= disable scheduling); only non-empty
+	// values are run through the parser. Validated up-front like the other
+	// pure-input fields so a malformed expression can't land partial mutations.
+	if cfg.CronExpr != nil && *cfg.CronExpr != "" {
+		if err := ValidateCronExpr(*cfg.CronExpr); err != nil {
+			return nil, err
+		}
+	}
+	if cfg.TimeoutMinutes != nil && !ValidTimeout(*cfg.TimeoutMinutes) {
+		return nil, fmt.Errorf("%w: %d minutes", ErrUnsupportedTimeout, *cfg.TimeoutMinutes)
+	}
+	if cfg.Effort != nil && !ValidEffort(*cfg.Effort) {
+		return nil, fmt.Errorf("unsupported effort level: %q", *cfg.Effort)
+	}
+	if cfg.WorkDir != nil && *cfg.WorkDir != "" {
+		if !filepath.IsAbs(*cfg.WorkDir) {
+			return nil, fmt.Errorf("workDir must be an absolute path: %s", *cfg.WorkDir)
+		}
+		if info, err := os.Stat(*cfg.WorkDir); err != nil || !info.IsDir() {
+			return nil, fmt.Errorf("workDir does not exist or is not a directory: %s", *cfg.WorkDir)
+		}
+	}
+	if cfg.ThinkingMode != nil && !ValidThinkingMode(*cfg.ThinkingMode) {
+		return nil, fmt.Errorf("unsupported thinkingMode: %q", *cfg.ThinkingMode)
 	}
 	// Same reasoning for TTS — checked here so a bad model/voice can't
 	// trigger persona.md write or partial sibling-field mutations below.
@@ -541,17 +1078,125 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 	}
+	// Cross-field checks against the live agent state run under m.mu
+	// since Effort / Model can also be patched in this PATCH; we
+	// compute the prospective values and validate the combination
+	// before releasing the lock to the persona-write path.
+	prospEffort := a.Effort
+	if cfg.Effort != nil {
+		prospEffort = *cfg.Effort
+	}
+	prospModel := a.Model
+	if cfg.Model != nil {
+		prospModel = *cfg.Model
+	}
+	if !ValidModelEffort(prospModel, prospEffort) {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("unsupported effort level %q for model %q", prospEffort, prospModel)
+	}
+	prospSilentS, prospSilentE := a.SilentStart, a.SilentEnd
+	if cfg.SilentStart != nil {
+		prospSilentS = *cfg.SilentStart
+	}
+	if cfg.SilentEnd != nil {
+		prospSilentE = *cfg.SilentEnd
+	}
+	if err := ValidSilentHours(prospSilentS, prospSilentE); err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
+	// Prospective Tool + CustomBaseURL: tool=custom / llama.cpp
+	// require a non-empty CustomBaseURL. Both can be patched in
+	// the same PATCH so we have to compute the post-PATCH pair
+	// and validate the combination here, not at the per-field
+	// site below where a.Tool may already be the new value.
+	prospTool := a.Tool
+	if cfg.Tool != nil {
+		prospTool = *cfg.Tool
+	}
+	prospBaseURL := a.CustomBaseURL
+	if cfg.CustomBaseURL != nil {
+		prospBaseURL = *cfg.CustomBaseURL
+	}
+	if (prospTool == "custom" || prospTool == "llama.cpp") && prospBaseURL == "" {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("customBaseURL is required for %s tool", prospTool)
+	}
 	m.mu.Unlock()
 
-	// Write persona.md outside lock — if it fails, no in-memory state is modified
+	// Persona write: disk + DB row in one personaSyncMu critical section.
+	//
+	// Post-cutover the DB is canonical; disk is a hydrated mirror. PATCH
+	// semantics require the caller's intent (including clear via "") to
+	// take effect, but the hydrate-from-DB recovery path in upsertAgent
+	// / syncPersona would silently reverse a clear (writePersonaFile("")
+	// removes disk → next sync sees missing disk + live DB and
+	// re-hydrates the prior body). Compensating moves:
+	//   1. Hold personaSyncMu across BOTH the disk write and the DB
+	//      upsert so a concurrent syncPersona / upsertAgent (which take
+	//      the same mutex) cannot interleave between the two writes.
+	//   2. Snapshot disk state before the write so a DB-upsert failure
+	//      can roll the disk back. Disk-success + DB-failure was
+	//      previously documented as "unsalvageable, the next sync
+	//      hydrates disk back" — but that path only runs if the prior
+	//      DB body is non-empty, so a "set persona='' on a never-set
+	//      agent + DB transient error" combo would land disk-empty
+	//      + DB-missing, exposing PATCH-success while the body is in
+	//      fact the operator's intended new value. Snapshot + rollback
+	//      is the only failure mode that preserves the pre-PATCH state
+	//      across all combinations.
+	//
+	// CRITICAL ordering: personaSyncMu must be released BEFORE we cross
+	// into store.mu via SaveAgentRowOnly / m.save() further below.
+	// agentStore-internal paths take store.mu THEN personaSyncMu via
+	// upsertAgent; a path holding personaSyncMu and waiting for store.mu
+	// would invert that order and deadlock.
 	if cfg.Persona != nil {
+		releasePersonaSync := lockPersonaSync(id)
+
+		// Snapshot pre-PATCH disk state for rollback.
+		priorBody, priorExisted, readErr := readPersonaForSync(id)
+		if readErr != nil {
+			releasePersonaSync()
+			return nil, fmt.Errorf("read persona.md (pre-PATCH): %w", readErr)
+		}
+
 		if err := writePersonaFile(id, *cfg.Persona); err != nil {
+			releasePersonaSync()
 			return nil, fmt.Errorf("write persona.md: %w", err)
 		}
+		if st := getGlobalStore(); st != nil {
+			ctx, cancel := dbContextWithCancel(nil, 5*time.Second)
+			_, err := st.UpsertAgentPersona(ctx, id, *cfg.Persona, "", store.AgentInsertOptions{
+				AllowOverwrite: true,
+			})
+			cancel()
+			if err != nil {
+				// Rollback disk to the pre-PATCH state. Three cases:
+				//   priorExisted=true, priorBody!=""  → restore body
+				//   priorExisted=true, priorBody==""  → restore as
+				//                                        an EMPTY FILE
+				//                                        (writePersonaFile("")
+				//                                        deletes; we use
+				//                                        atomicfile.WriteBytes
+				//                                        directly to preserve
+				//                                        the file's existence)
+				//   priorExisted=false                → ensure no file
+				//                                        (writePersonaFile("")
+				//                                        deletes which is OK)
+				if rbErr := rollbackPersonaDisk(id, priorBody, priorExisted); rbErr != nil {
+					m.logger.Warn("Manager.Update: persona disk rollback failed",
+						"agent", id, "priorExisted", priorExisted, "err", rbErr)
+				}
+				releasePersonaSync()
+				return nil, fmt.Errorf("upsert persona DB row: %w", err)
+			}
+		}
+		releasePersonaSync()
 	}
 
 	// Pre-fetch avatar info outside lock (disk I/O)
-	avHas, avHash := avatarMeta(id)
+	avHas, avHash := m.avatarMeta(id)
 
 	m.mu.Lock()
 	// Re-check: agent may have been deleted concurrently
@@ -579,42 +1224,18 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		a.Model = *cfg.Model
 	}
 	if cfg.Effort != nil {
-		if !ValidEffort(*cfg.Effort) {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("unsupported effort level: %q", *cfg.Effort)
-		}
+		// Already validated upstream (single + Model+Effort combo).
 		a.Effort = *cfg.Effort
-	}
-	if !ValidModelEffort(a.Model, a.Effort) {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("unsupported effort level %q for model %q", a.Effort, a.Model)
 	}
 	if cfg.Tool != nil {
 		a.Tool = *cfg.Tool
 	}
 	if cfg.WorkDir != nil {
-		if *cfg.WorkDir != "" {
-			if !filepath.IsAbs(*cfg.WorkDir) {
-				m.mu.Unlock()
-				return nil, fmt.Errorf("workDir must be an absolute path: %s", *cfg.WorkDir)
-			}
-			if info, err := os.Stat(*cfg.WorkDir); err != nil || !info.IsDir() {
-				m.mu.Unlock()
-				return nil, fmt.Errorf("workDir does not exist or is not a directory: %s", *cfg.WorkDir)
-			}
-		}
+		// Already validated upstream (abs path + IsDir).
 		a.WorkDir = *cfg.WorkDir
 	}
-	// Validate before mutating
-	if cfg.IntervalMinutes != nil && !ValidInterval(*cfg.IntervalMinutes) {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %d minutes", ErrUnsupportedInterval, *cfg.IntervalMinutes)
-	}
-	if cfg.TimeoutMinutes != nil && !ValidTimeout(*cfg.TimeoutMinutes) {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %d minutes", ErrUnsupportedTimeout, *cfg.TimeoutMinutes)
-	}
-	// ResumeIdleMinutes is validated up-front (before any I/O / mutation).
+	// CronExpr / TimeoutMinutes / ResumeIdleMinutes / SilentHours
+	// validated up-front (before any I/O / mutation).
 	{
 		s, e := a.SilentStart, a.SilentEnd
 		if cfg.SilentStart != nil {
@@ -623,14 +1244,18 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		if cfg.SilentEnd != nil {
 			e = *cfg.SilentEnd
 		}
-		if err := ValidSilentHours(s, e); err != nil {
-			m.mu.Unlock()
-			return nil, err
-		}
+		_ = s
+		_ = e
+		// SilentHours combo validated upstream against the prospective
+		// (s, e) computed there.
 	}
-	oldInterval := a.IntervalMinutes
-	if cfg.IntervalMinutes != nil {
-		a.IntervalMinutes = *cfg.IntervalMinutes
+	oldExpr := a.CronExpr
+	if cfg.CronExpr != nil {
+		// Resolve "@preset:N" sentinels here so the persisted CronExpr is
+		// always a real 5-field string with the per-agent offset baked in.
+		// Same expansion as newAgent — the runtime cron scheduler never
+		// sees the sentinel.
+		a.CronExpr = ResolveCronPreset(*cfg.CronExpr, a.ID)
 	}
 	if cfg.TimeoutMinutes != nil {
 		a.TimeoutMinutes = *cfg.TimeoutMinutes
@@ -647,16 +1272,12 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.NotifyDuringSilent != nil {
 		a.NotifyDuringSilent = cfg.NotifyDuringSilent
 	}
-	{
-		finalBaseURL := a.CustomBaseURL
-		if cfg.CustomBaseURL != nil {
-			finalBaseURL = *cfg.CustomBaseURL
-		}
-		if (a.Tool == "custom" || a.Tool == "llama.cpp") && finalBaseURL == "" {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("customBaseURL is required for %s tool", a.Tool)
-		}
-		a.CustomBaseURL = finalBaseURL
+	if cfg.DeviceSwitchEnabled != nil {
+		a.DeviceSwitchEnabled = cfg.DeviceSwitchEnabled
+	}
+	if cfg.CustomBaseURL != nil {
+		// Validated upstream against the prospective (Tool, CustomBaseURL) combo.
+		a.CustomBaseURL = *cfg.CustomBaseURL
 	}
 	if cfg.AllowedTools != nil {
 		a.AllowedTools = cfg.AllowedTools
@@ -665,10 +1286,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		a.AllowProtectedPaths = normalizeAllowProtectedPaths(*cfg.AllowProtectedPaths)
 	}
 	if cfg.ThinkingMode != nil {
-		if !ValidThinkingMode(*cfg.ThinkingMode) {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("unsupported thinkingMode: %q", *cfg.ThinkingMode)
-		}
+		// Validated upstream.
 		a.ThinkingMode = NormalizeThinkingMode(*cfg.ThinkingMode)
 	}
 	if cronMessageDirty {
@@ -680,7 +1298,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		t := *cfg.TTS
 		a.TTS = &t
 	}
-	newInterval := a.IntervalMinutes
+	newExpr := a.CronExpr
 	a.UpdatedAt = time.Now().Format(time.RFC3339)
 	applyAvatarMeta(a, avHas, avHash)
 
@@ -691,7 +1309,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	currentPersona := a.Persona
 	m.mu.Unlock()
 
-	if oldInterval != newInterval {
+	if oldExpr != newExpr {
 		// Pre-check + post-check pattern (mirrors UpdateNotifySources).
 		// We must NOT hold m.mu across cron.Schedule because cron callbacks
 		// reach back into the manager (runCronJob → Manager.Get) and would
@@ -705,7 +1323,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		m.mu.Unlock()
 
 		if !archived {
-			expr := intervalToCron(newInterval, id)
+			expr := newExpr
 			if err := m.cron.Schedule(id, expr); err != nil {
 				m.logger.Warn("failed to update cron", "agent", id, "err", err)
 			}
@@ -730,12 +1348,40 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 
 	m.save()
+
+	// §3.7 device-switch skill: if the toggle was touched, re-sync
+	// the SKILL.md on disk now so a flip-off cleans up promptly
+	// without waiting for the next prepareChat. claude/custom only
+	// — other backends never had a .claude/ tree to begin with.
+	if cfg.DeviceSwitchEnabled != nil && (cp.Tool == "claude" || cp.Tool == "custom") {
+		SyncDeviceSwitchSkill(id, cp.IsDeviceSwitchEnabled(), m.logger)
+	}
+
 	return cp, nil
 }
 
 // UpdateNotifySources updates the notification source configs for an agent
 // and rebuilds the poller's source instances.
 func (m *Manager) UpdateNotifySources(id string, sources []notifysource.Config) error {
+	releaseMut, err := m.AcquireMutation(id)
+	if err != nil {
+		return err
+	}
+	defer releaseMut()
+	return m.updateNotifySourcesUnguarded(id, sources)
+}
+
+// UpdateNotifySourcesAlreadyGuarded is the no-guard variant for
+// callers that already hold AcquireMutation for the agent
+// (e.g. handleDeleteNotifySource, which needs to wrap both
+// UpdateNotifySources + DeleteTokensBySource in one mutation
+// hold so a switching flip between them can't escape §3.7
+// quiesce). MUST NOT be called without an outer AcquireMutation.
+func (m *Manager) UpdateNotifySourcesAlreadyGuarded(id string, sources []notifysource.Config) error {
+	return m.updateNotifySourcesUnguarded(id, sources)
+}
+
+func (m *Manager) updateNotifySourcesUnguarded(id string, sources []notifysource.Config) error {
 	m.mu.Lock()
 	a, ok := m.agents[id]
 	if !ok {
@@ -776,6 +1422,32 @@ func (m *Manager) UpdateNotifySources(id string, sources []notifysource.Config) 
 // UpdateSlackBot updates the Slack bot configuration for an agent.
 // Pass nil to remove the configuration.
 func (m *Manager) UpdateSlackBot(id string, cfg *SlackBotConfig) error {
+	releaseMut, err := m.AcquireMutation(id)
+	if err != nil {
+		return err
+	}
+	defer releaseMut()
+	return m.updateSlackBotUnguarded(id, cfg)
+}
+
+// UpdateSlackBotAlreadyGuarded is the no-guard variant of
+// UpdateSlackBot for callers that already hold AcquireMutation
+// for the agent (e.g. handleSetSlackBot / handleDeleteSlackBot,
+// which wrap token Save + UpdateSlackBot + hub Reconfigure in
+// one outer mutation hold). Calling UpdateSlackBot from inside
+// the outer hold races with SetSwitching: switching can flip
+// to true between the outer Acquire and the inner Acquire,
+// leaving the token saved but the config row unwritten. This
+// variant skips the inner guard so the whole handler is one
+// transactional unit under the outer mutation.
+//
+// MUST NOT be called from any path that does NOT already hold
+// AcquireMutation for this agent.
+func (m *Manager) UpdateSlackBotAlreadyGuarded(id string, cfg *SlackBotConfig) error {
+	return m.updateSlackBotUnguarded(id, cfg)
+}
+
+func (m *Manager) updateSlackBotUnguarded(id string, cfg *SlackBotConfig) error {
 	m.mu.Lock()
 	a, ok := m.agents[id]
 	if !ok {
@@ -836,7 +1508,7 @@ type chatPrep struct {
 // skipMemoryContext disables query-based memory hints. Use when the transcript
 // is about to be truncated (e.g. regenerate), since the index would still
 // contain entries from messages that are being removed.
-func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool, skipMemoryContext bool) (*chatPrep, error) {
+func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexNewMessages bool, skipMemoryContext bool) (*chatPrep, error) {
 	// Cheap pre-check: refuse archived agents (and unknown ones) before any
 	// disk I/O like syncPersona, so dormant agents don't leak side effects
 	// into persona files / publicProfile regeneration.
@@ -852,7 +1524,47 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool, skip
 	}
 	m.mu.Unlock()
 
+	// Refuse mid-reset agents BEFORE the persona / memory sync side
+	// effects fire. Without this, a chat that's about to be rejected
+	// for ErrAgentResetting would still trigger a syncPersona and a
+	// memory DB sync — the latter would either race with ResetData's
+	// own post-reset sync (potentially resurrecting a tombstoned row
+	// from a stale FS view) or just waste work. Chat / ChatOneShot /
+	// Regenerate all funnel through prepareChat, so one guard here
+	// covers every entry.
+	m.busyMu.Lock()
+	resetting := m.resetting[agentID]
+	m.busyMu.Unlock()
+	if resetting {
+		return nil, ErrAgentResetting
+	}
+
 	m.syncPersona(agentID)
+
+	// Mirror the persona sync for MEMORY.md and memory/*.md so a CLI
+	// edit that landed during the previous conversation is reflected
+	// in the DB before we touch the next message. The disk file is
+	// canonical for the CLI; the DB row is the read path for Web UI
+	// / multi-device — without this hook a cross-device read between
+	// turns would observe stale memory.
+	//
+	// Use the best-effort variant: if a long-running sync (Load,
+	// fork) is already holding the per-agent gate, we skip this turn
+	// rather than block. The system-prompt build below still reads
+	// MEMORY.md from disk so the CLI prompt itself is fresh; the
+	// next prepareChat / scheduled hook will retry the DB sync. A 5s
+	// ctx caps the wait when the lock IS available but the sync's
+	// own DB writes are slow.
+	if st := getGlobalStore(); st != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ran, err := SyncAgentMemoryFromDiskBestEffort(ctx, st, agentID, m.logger)
+		cancel()
+		if !ran {
+			m.logger.Debug("memory sync at prepareChat skipped (busy)", "agent", agentID)
+		} else if err != nil {
+			m.logger.Debug("memory sync at prepareChat failed", "agent", agentID, "err", err)
+		}
+	}
 
 	m.mu.Lock()
 	a, ok := m.agents[agentID]
@@ -880,6 +1592,13 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool, skip
 	}
 	if agentCopy.Tool == "claude" || agentCopy.Tool == "custom" {
 		PrepareClaudeSettings(agentID, apiBase, agentCopy.AllowProtectedPaths, m.logger)
+		// §3.7 device-switch skill. Toggle defaults to true via
+		// IsDeviceSwitchEnabled; SyncDeviceSwitchSkill internally
+		// gates installation on LookupPeerCount() > 0 so a single-
+		// node install never sees the skill. Removes any stale
+		// SKILL.md when the toggle is off or the last peer was
+		// dropped.
+		SyncDeviceSwitchSkill(agentID, agentCopy.IsDeviceSwitchEnabled(), m.logger)
 	}
 
 	// Build MCP server list (backend-agnostic, URL-based).
@@ -909,7 +1628,7 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool, skip
 			queryContext = idx.BuildContextFromQuery(query)
 		}
 	}
-	volatileContext := BuildVolatileContext(agentID, queryContext)
+	volatileContext := m.BuildVolatileContext(ctx, agentID, queryContext)
 
 	return &chatPrep{
 		agentCopy:       agentCopy,
@@ -926,12 +1645,27 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool, skip
 // An optional BusySource may be passed to tag the busy entry; defaults to
 // BusySourceUser when omitted.
 func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, role string, attachments []MessageAttachment, source ...BusySource) (<-chan ChatEvent, error) {
-	prep, err := m.prepareChat(agentID, userMessage, true, false)
+	// acquirePreparing checks switching AND increments the
+	// preparing counter under one busyMu lock — Step -1's
+	// WaitChatIdle observes the counter so a race between
+	// "switching pre-check passed" and "prepareChat finished"
+	// can't slip a disk write past the snapshot.
+	if err := m.acquirePreparing(agentID); err != nil {
+		return nil, err
+	}
+	prepReleased := false
+	defer func() {
+		if !prepReleased {
+			m.releasePreparing(agentID)
+		}
+	}()
+
+	prep, err := m.prepareChat(ctx, agentID, userMessage, true, false)
 	if err != nil {
 		return nil, err
 	}
 
-	// Check if agent is busy, editing, or being reset
+	// Check if agent is busy, editing, being reset, or switching
 	m.busyMu.Lock()
 	if m.resetting[agentID] {
 		m.busyMu.Unlock()
@@ -940,6 +1674,13 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	if m.editing[agentID] {
 		m.busyMu.Unlock()
 		return nil, ErrAgentBusy
+	}
+	if m.switching[agentID] {
+		// Re-check post-prepare: a SetSwitching(true) could
+		// have landed between the first check and now. Refuse
+		// rather than push the chat through.
+		m.busyMu.Unlock()
+		return nil, fmt.Errorf("%w: device switch in progress", ErrAgentBusy)
 	}
 	if _, busy := m.busy[agentID]; busy {
 		m.busyMu.Unlock()
@@ -956,6 +1697,16 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		src = source[0]
 	}
 	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, source: src}
+	// Hand off the preparing counter to the busy entry under
+	// the same lock so WaitChatIdle never observes a window
+	// where neither preparing nor busy is set for this chat.
+	if m.preparing != nil && m.preparing[agentID] > 0 {
+		m.preparing[agentID]--
+		if m.preparing[agentID] == 0 {
+			delete(m.preparing, agentID)
+		}
+	}
+	prepReleased = true
 	m.busyMu.Unlock()
 
 	// Notify any WebSocket clients watching this agent.
@@ -1024,12 +1775,21 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	return callerCh, nil
 }
 
-// ChatOneShot runs a one-shot chat that does not save to transcript
-// (messages.jsonl) and does not resume the CLI session. Used for external
-// platform conversations (Slack, Discord) that carry their own context.
-// Memory (MEMORY.md, diary) access is still available via system prompt.
+// ChatOneShot runs a one-shot chat that does not save to the agent's
+// transcript (agent_messages) and does not resume the CLI session. Used
+// for external platform conversations (Slack, Discord) that carry their
+// own context. Memory (MEMORY.md, diary) access is still available via
+// system prompt.
 func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string) (<-chan ChatEvent, error) {
-	prep, err := m.prepareChat(agentID, userMessage, false, false)
+	// acquirePreparing: see Chat() for the contract — gates
+	// switching AND increments the preparing counter so Step
+	// -1's WaitChatIdle observes the in-flight prepareChat.
+	if err := m.acquirePreparing(agentID); err != nil {
+		return nil, err
+	}
+	defer m.releasePreparing(agentID)
+
+	prep, err := m.prepareChat(ctx, agentID, userMessage, false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1038,6 +1798,10 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	if m.resetting[agentID] {
 		m.busyMu.Unlock()
 		return nil, ErrAgentResetting
+	}
+	if m.switching[agentID] {
+		m.busyMu.Unlock()
+		return nil, fmt.Errorf("%w: device switch in progress", ErrAgentBusy)
 	}
 	m.busyMu.Unlock()
 
@@ -1128,6 +1892,20 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 	receivedDone := false
 
 	defer func() {
+		// §3.7 release guard: a source-release that ran while
+		// this goroutine was mid-flight (post-complete drain
+		// failure) evicted the agent from m.agents. Every
+		// downstream write (persistDoneEvent / appendMessage)
+		// uses agentID to compute file paths, so they would
+		// land on source's disk despite target now owning the
+		// agent. Skip the entire defer body if the agent is
+		// no longer here.
+		m.mu.Lock()
+		_, stillHere := m.agents[agentID]
+		m.mu.Unlock()
+		if !stillHere {
+			return
+		}
 		if receivedDone {
 			if ctx.Err() == context.DeadlineExceeded {
 				errMsg := newSystemMessage("⚠️ この応答は制限時間超過により中断されました。")
@@ -1177,20 +1955,53 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 		}
 		if event.Type == "done" && event.Message != nil {
 			receivedDone = true
+			// §3.7 release guard: if a source-release evicted
+			// the agent while this goroutine was mid-process
+			// (drain failed at switch), skip every downstream
+			// write so we don't strand transcript / JSONL
+			// state on the released peer. Target's chat
+			// goroutine (re-started after handoff) owns the
+			// canonical state from here on.
+			m.mu.Lock()
+			_, stillHere := m.agents[agentID]
+			m.mu.Unlock()
+			if !stillHere {
+				return
+			}
 			m.persistDoneEvent(agentID, event.Message)
 
 			if m.OnChatDone != nil && event.ErrorMessage == "" {
+				// §3.7 race: a source-release that ran while
+				// this chat goroutine was still processing
+				// (post-complete drain failure path) evicted
+				// the agent from m.agents. Dereferencing a
+				// missing entry would panic; skip the
+				// OnChatDone callback so post-release writes
+				// don't fire for an agent target now owns.
 				m.mu.Lock()
-				agCopy := *m.agents[agentID]
+				ag, ok := m.agents[agentID]
+				var agCopy Agent
+				if ok {
+					agCopy = *ag
+				}
 				m.mu.Unlock()
-				msgCopy := *event.Message
-				go m.OnChatDone(&agCopy, &msgCopy)
+				if ok {
+					msgCopy := *event.Message
+					go m.OnChatDone(&agCopy, &msgCopy)
+				}
 			}
 		}
 		if event.ErrorMessage != "" {
-			errMsg := newSystemMessage("⚠️ Error: " + event.ErrorMessage)
-			if err := appendMessage(agentID, errMsg); err != nil {
-				m.logger.Warn("failed to save error message", "err", err)
+			// §3.7 release guard: skip if evicted (see done-event
+			// guard above for rationale).
+			m.mu.Lock()
+			_, stillHere := m.agents[agentID]
+			m.mu.Unlock()
+			if stillHere {
+				errMsg := newSystemMessage("⚠️ Error: " + event.ErrorMessage)
+				if err := appendMessage(agentID, errMsg); err != nil {
+					m.logger.Warn("failed to save error message", "err", err)
+				}
 			}
 		}
 	}
@@ -1283,19 +2094,23 @@ func (m *Manager) updatePostChatIndex(agentID string) {
 	}
 }
 
-// NextCronRun returns the next scheduled run time for an agent, adjusted
-// for silent hours. Returns the zero Time when there is no run to predict
-// because the agent has no schedule, is archived, doesn't exist, or all
-// cron is globally paused — anything that would make the displayed time
-// misleading.
+// NextCronRun returns the next *configured* run time for an agent,
+// adjusted for silent hours. Returns the zero Time when the agent has no
+// schedule, is archived, or doesn't exist.
+//
+// Semantics: this is the schedule the cron entry would fire AT, NOT a
+// guarantee the run will actually happen. Global cron-paused state is
+// deliberately ignored here so the UI can render "what would be next"
+// (suffixed with "(paused)" via the cronPausedGlobal indicator on the
+// agent response). Callers that need "will-actually-fire" semantics
+// must AND the return with !Manager.CronPaused() — the only such caller
+// today is the runtime scheduler itself, which gates via runCronJob's
+// CronPaused check before invoking Chat. The HTTP layer uses this for
+// display only.
 func (m *Manager) NextCronRun(agentID string) time.Time {
 	m.mu.Lock()
-	if m.cronPaused {
-		m.mu.Unlock()
-		return time.Time{}
-	}
 	a, ok := m.agents[agentID]
-	if !ok || a.Archived || a.IntervalMinutes <= 0 {
+	if !ok || a.Archived || a.CronExpr == "" {
 		m.mu.Unlock()
 		return time.Time{}
 	}
@@ -1361,13 +2176,61 @@ func (m *Manager) CronPaused() bool {
 	return m.cronPaused
 }
 
-// SetCronPaused sets the global cron pause state and persists it.
-func (m *Manager) SetCronPaused(paused bool) {
-	m.mu.Lock()
-	m.cronPaused = paused
-	m.mu.Unlock()
-	m.store.SaveCronPaused(paused)
+// SetCronPaused persists the global cron pause state and, on success,
+// updates the in-memory flag. Returns an error if the store rejected the
+// write so the HTTP handler can surface it as 5xx — acknowledging a
+// toggle that hasn't been persisted would let a transient kv-write
+// failure desync the UI from the truth across a restart.
+//
+// Concurrency: cronToggleMu serializes the (memory ↔ kv) update so two
+// concurrent toggles can't interleave their kv-writes and memory-writes
+// in opposite orders and leave the two stores disagreeing.
+//
+// Ordering policy is asymmetric — biased toward "fail closed" in flight:
+//
+//   - paused == true (operator pausing): set memory FIRST so any cron
+//     tick happening during the kv write sees the pause immediately.
+//     If the kv write fails we revert memory back to false and surface
+//     the error; the operator's request didn't land but at most one
+//     in-flight tick saw the pause briefly (harmless: paused never
+//     starts work, only blocks new work).
+//
+//   - paused == false (operator resuming): persist FIRST so we never
+//     advertise "running" until the kv row actually says so. A kv
+//     write failure leaves both memory and kv at "paused" — the
+//     operator's request fails closed.
+//
+// In both branches the post-condition on success is (memory == kv ==
+// requested value). On failure: (memory == kv == previous value).
+func (m *Manager) SetCronPaused(paused bool) error {
+	m.cronToggleMu.Lock()
+	defer m.cronToggleMu.Unlock()
+
+	if paused {
+		// Pause: memory first.
+		m.mu.Lock()
+		prev := m.cronPaused
+		m.cronPaused = true
+		m.mu.Unlock()
+
+		if err := m.store.SaveCronPaused(true); err != nil {
+			m.mu.Lock()
+			m.cronPaused = prev
+			m.mu.Unlock()
+			return err
+		}
+	} else {
+		// Resume: kv first.
+		if err := m.store.SaveCronPaused(false); err != nil {
+			return err
+		}
+		m.mu.Lock()
+		m.cronPaused = false
+		m.mu.Unlock()
+	}
+
 	m.logger.Info("cron pause toggled", "paused", paused)
+	return nil
 }
 
 // IsAgentActive reports whether an agent is currently "active":
@@ -1527,30 +2390,46 @@ func (m *Manager) MessagesPaginated(agentID string, limit int, before string) ([
 // UpdateMessageContent replaces the content of a single message in the transcript.
 // Only supported for the llama.cpp backend. Rejected with ErrAgentBusy while the
 // agent has an active chat.
-func (m *Manager) UpdateMessageContent(agentID, msgID, content string) (*Message, error) {
+//
+// ifMatchETag is forwarded to the store layer so the optimistic-
+// concurrency check is atomic with the UPDATE. Empty value skips the
+// check (used by daemon-internal callers — currently none, but keeps
+// the door open for tools that mutate transcripts without a client
+// etag).
+//
+// Returns (msg, newETag, err). The etag is the value computed inside
+// the same transaction as the UPDATE, so handlers can echo it as an
+// HTTP ETag without a follow-up read that would race against any
+// edit landing after acquireTranscriptEdit's release.
+func (m *Manager) UpdateMessageContent(agentID, msgID, content, ifMatchETag string) (*Message, string, error) {
 	release, err := m.acquireTranscriptEdit(agentID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer release()
-	msg, err := updateMessageContent(agentID, msgID, content)
+	msg, etag, err := updateMessageContent(agentID, msgID, content, ifMatchETag)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	m.refreshLastMessage(agentID)
-	return msg, nil
+	return msg, etag, nil
 }
 
 // DeleteMessage removes a single message from the transcript.
 // Only supported for the llama.cpp backend. Rejected with ErrAgentBusy while the
 // agent has an active chat.
-func (m *Manager) DeleteMessage(agentID, msgID string) error {
+//
+// ifMatchETag forwards an optimistic-lock precondition to the store.
+// Empty disables the check (back-compat for daemon-internal callers and
+// the legacy unconditional UI path); HTTP handlers always pass through
+// the value parsed from the If-Match header.
+func (m *Manager) DeleteMessage(agentID, msgID, ifMatchETag string) error {
 	release, err := m.acquireTranscriptEdit(agentID)
 	if err != nil {
 		return err
 	}
 	defer release()
-	if err := deleteMessage(agentID, msgID); err != nil {
+	if err := deleteMessage(agentID, msgID, ifMatchETag); err != nil {
 		return err
 	}
 	m.refreshLastMessage(agentID)
@@ -1567,7 +2446,11 @@ func (m *Manager) DeleteMessage(agentID, msgID string) error {
 // can immediately see the in-progress chat. The backend request and event
 // streaming run in the background; any backend.Chat failure is surfaced as
 // an error event on the broadcaster (and persisted as a system message).
-func (m *Manager) Regenerate(agentID, msgID string) error {
+// Regenerate truncates and re-runs from msgID. ifMatchETag, when non-empty,
+// preconditions on the clicked message's current etag inside the editing
+// mutex (so a racing edit between the click and the truncate is caught
+// before any rows are tombstoned). Empty disables the check (back-compat).
+func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag string) error {
 	release, err := m.acquireTranscriptEdit(agentID)
 	if err != nil {
 		return err
@@ -1579,31 +2462,74 @@ func (m *Manager) Regenerate(agentID, msgID string) error {
 		}
 	}()
 
-	target, keepCount, err := findRegenerateTarget(agentID, msgID)
+	rt, err := findRegenerateTarget(ctx, agentID, msgID, ifMatchETag)
 	if err != nil {
 		return err
 	}
+	// findRegenerateTarget's etag check is a fast-fail UX optimisation
+	// against an in-memory snapshot. The authoritative pivot etag
+	// re-check happens inside truncateForRegenerate's transaction, and
+	// afterSeq is derived from the pivot's *immutable* seq there too —
+	// so a cross-device prefix mutation between the click and the
+	// truncate cannot shift the boundary onto the wrong row.
+
+	// Re-read the source content right before prepareChat so the chat
+	// we re-run reflects the currently-committed source. Capture the
+	// source row's etag too so truncateForRegenerate can re-validate
+	// inside its transaction — without that, an edit / tombstone on
+	// the source between this read and the truncate would silently
+	// commit a regen against a stale snapshot. The pre-tx GetMessage
+	// is still needed (the truncate itself doesn't return content)
+	// but the etag round-trip turns the window from "stale-content
+	// regen committed" into "ErrMessageETagMismatch and the UI can
+	// refetch", which matches the rest of the If-Match story.
+	st := getGlobalStore()
+	if st == nil {
+		return errStoreNotReady
+	}
+	// Bound the pre-busy DB read by the request ctx — if the HTTP
+	// caller disconnected, there's no point completing the read. The
+	// 30s ceiling defends against a stuck DB on a request stream
+	// that's still alive but slow.
+	srcCtx, srcCancel := boundedCtx(ctx)
+	srcRec, err := st.GetMessage(srcCtx, rt.SourceID)
+	srcCancel()
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ErrMessageNotFound
+		}
+		return err
+	}
+	srcMsg, err := recordToMessage(srcRec)
+	if err != nil {
+		return err
+	}
+	sourceETagSnapshot := srcRec.ETag
 
 	// Prepare chat (system prompt, backend resolution) before touching the
 	// transcript so a setup failure leaves history intact. Memory context
 	// injection is skipped — the index still contains entries for messages
 	// about to be truncated, which would otherwise leak into the prompt.
-	prep, err := m.prepareChat(agentID, target.Content, true, true)
+	prep, err := m.prepareChat(ctx, agentID, srcMsg.Content, true, true)
 	if err != nil {
 		return err
 	}
 
-	effectiveMessage := target.Content
-	if len(target.Attachments) > 0 {
-		effectiveMessage = formatMessageWithAttachments(target.Content, target.Attachments)
+	effectiveMessage := srcMsg.Content
+	if len(srcMsg.Attachments) > 0 {
+		effectiveMessage = formatMessageWithAttachments(srcMsg.Content, srcMsg.Attachments)
 	}
 	if prep.volatileContext != "" {
 		effectiveMessage = prep.volatileContext + effectiveMessage
 	}
 
-	// Truncate synchronously so that any client reloading during the
-	// regeneration reads a consistent transcript via GET /messages.
-	if err := truncateMessagesTo(agentID, keepCount); err != nil {
+	// Truncate atomically with the pivot AND source etag re-checks.
+	// If a racing edit landed between findRegenerateTarget's snapshot
+	// and now (on either the pivot or the source row), this returns
+	// ErrMessageETagMismatch (or ErrMessageNotFound for a vanished
+	// row) and prepareChat's setup work is wasted — but we never
+	// tombstone, and never re-run the chat, against a stale view.
+	if err := truncateForRegenerate(ctx, agentID, rt.PivotID, ifMatchETag, rt.SourceID, sourceETagSnapshot, rt.KillPivot); err != nil {
 		return err
 	}
 	m.refreshLastMessage(agentID)
@@ -1681,6 +2607,15 @@ func (m *Manager) acquireTranscriptEdit(agentID string) (func(), error) {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w, try again later", ErrAgentBusy)
 	}
+	if m.switching[agentID] {
+		// §3.7 device switch is mid-flight: refuse transcript
+		// edits (which trigger prepareChat side effects via
+		// Regenerate) so the snapshot-on-source remains the
+		// authoritative state target receives.
+		m.busyMu.Unlock()
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: device switch in progress", ErrAgentBusy)
+	}
 	if _, busy := m.busy[agentID]; busy {
 		m.busyMu.Unlock()
 		m.mu.Unlock()
@@ -1737,7 +2672,16 @@ func (m *Manager) BackendAvailability() map[string]bool {
 }
 
 // Shutdown stops all cron jobs, notify polling, and cancels active chats.
+//
+// Short-circuits when StartSchedulers never ran (e.g. an early-exit
+// CLI subcommand path that built a Manager but didn't reach the
+// post-hydrate scheduler boot). Without this guard, notifyPoller.
+// Stop would block on a never-launched poller goroutine and hang
+// the shutdown sequence.
 func (m *Manager) Shutdown() {
+	if !m.schedulersStarted {
+		return
+	}
 	m.cron.Stop()
 	m.notifyPoller.Stop()
 
@@ -1769,6 +2713,38 @@ func (m *Manager) save() {
 	m.store.Save(agents)
 }
 
+// LockPatch returns a per-agent mutex acquired for the duration of an
+// If-Match-gated mutation (currently only HTTP PATCH /api/v1/agents/{id}).
+//
+// The returned function MUST be called to release the lock; callers
+// should use `defer release()` immediately after acquiring. Holding
+// this lock across a precondition-check + Update + ETag-echo trio
+// closes the TOCTOU window inherent in reading the store etag outside
+// m.mu (m.mu is released between Update's in-memory mutation and
+// m.save()'s store write, so two concurrent same-etag PATCHes would
+// otherwise both pass the precheck).
+//
+// Cross-process / cross-device write coordination is the store-level
+// optimistic-concurrency layer's job; LockPatch only serializes within
+// one daemon process.
+//
+// We never delete entries from patchMus: agent IDs are bounded
+// (effectively low-tens to low-thousands per daemon) and a freed
+// *sync.Mutex would be just as small, so the GC saving isn't worth
+// the bookkeeping complexity of "which mutex is currently unheld and
+// safe to drop".
+func (m *Manager) LockPatch(id string) (release func()) {
+	m.patchMusMu.Lock()
+	mu, ok := m.patchMus[id]
+	if !ok {
+		mu = &sync.Mutex{}
+		m.patchMus[id] = mu
+	}
+	m.patchMusMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
 // copyAgent returns a deep copy of an Agent, including pointer fields.
 func copyAgent(a *Agent) *Agent {
 	cp := *a
@@ -1779,6 +2755,10 @@ func copyAgent(a *Agent) *Agent {
 	if a.NotifyDuringSilent != nil {
 		v := *a.NotifyDuringSilent
 		cp.NotifyDuringSilent = &v
+	}
+	if a.DeviceSwitchEnabled != nil {
+		v := *a.DeviceSwitchEnabled
+		cp.DeviceSwitchEnabled = &v
 	}
 	if a.SlackBot != nil {
 		sb := *a.SlackBot
