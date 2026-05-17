@@ -946,16 +946,21 @@ func (s *Server) handleUploadAvatar(w http.ResponseWriter, r *http.Request) {
 	}
 	defer releaseMut()
 
-	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10MB max
-	if err := r.ParseMultipartForm(10 << 20); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, 128<<20) // 128 MiB max
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "file too large (max 10MB)")
+			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "file too large (max 128MiB)")
 		} else {
 			writeError(w, http.StatusBadRequest, "bad_request", "invalid multipart form")
 		}
 		return
 	}
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
 
 	file, header, err := r.FormFile("avatar")
 	if err != nil {
@@ -1798,11 +1803,20 @@ func (s *Server) handleParseQR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10MB max
+	// QR images are tiny; the inner DecodeQRImage hard-caps the
+	// reader at 10 MiB, so accepting more than that just wastes
+	// bandwidth before failing inside the decoder. Keep the
+	// outer cap aligned with the decoder's budget.
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10 MiB max
 	if err := r.ParseMultipartForm(10 << 20); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid multipart form")
 		return
 	}
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
 
 	file, _, err := r.FormFile("qr")
 	if err != nil {

@@ -346,7 +346,7 @@ diff を返す。
 ```
 
 - 保存先: `/tmp/kojo/upload/` 以下に `{ULIDv7}_{元ファイル名}` のユニーク名で保存
-- サイズ制限: 20MB
+- サイズ制限: 10GiB (cross-peer 経由は upstream proxy / signed-body の事実上の上限あり)
 - サーバー graceful shutdown 時に自動クリーンアップ
 
 ---

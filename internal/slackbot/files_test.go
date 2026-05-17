@@ -38,6 +38,17 @@ func withTempUploadDir(t *testing.T) string {
 	return dir
 }
 
+// withSmallMaxFileSize lowers maxFileSize for the duration of a test
+// so the oversize / server-lies paths can be exercised without
+// allocating ~1 GiB of data on disk + in flight. Restores the
+// production value on cleanup.
+func withSmallMaxFileSize(t *testing.T, size int64) {
+	t.Helper()
+	orig := maxFileSize
+	maxFileSize = size
+	t.Cleanup(func() { maxFileSize = orig })
+}
+
 func TestAppendFileInfo(t *testing.T) {
 	t.Run("no files and no errors returns original text", func(t *testing.T) {
 		got := appendFileInfo("hello", nil, nil)
@@ -73,7 +84,7 @@ func TestAppendFileInfo(t *testing.T) {
 
 func TestPreflightSlackFile(t *testing.T) {
 	t.Run("oversize rejected", func(t *testing.T) {
-		err := preflightSlackFile(slack.File{Size: maxFileSize + 1, URLPrivateDownload: "https://x"})
+		err := preflightSlackFile(slack.File{Size: int(maxFileSize) + 1, URLPrivateDownload: "https://x"})
 		if err == nil || !strings.Contains(err.Error(), "too large") {
 			t.Errorf("got err=%v, want too-large error", err)
 		}
@@ -193,7 +204,7 @@ func TestDownloadSlackFilesTooLarge(t *testing.T) {
 	files := []slack.File{{
 		ID:                 "F2",
 		Name:               "huge.bin",
-		Size:               maxFileSize + 1,
+		Size:               int(maxFileSize) + 1,
 		URLPrivateDownload: srv.URL + "/huge.bin",
 	}}
 
@@ -211,6 +222,8 @@ func TestDownloadSlackFilesTooLarge(t *testing.T) {
 
 func TestDownloadSlackFilesServerLies(t *testing.T) {
 	dir := withTempUploadDir(t)
+	// Lower the cap so we don't have to stream gigabytes per test run.
+	withSmallMaxFileSize(t, 4<<20)
 
 	// Slack claims the file is small, but the server streams more than the
 	// cap. The hard cap should reject the download and delete the partial
@@ -219,13 +232,13 @@ func TestDownloadSlackFilesServerLies(t *testing.T) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		// Write 2× the cap, one chunk at a time.
 		chunk := bytes.Repeat([]byte("A"), 64*1024)
-		written := 0
+		written := int64(0)
 		for written < 2*maxFileSize {
 			n, err := w.Write(chunk)
 			if err != nil {
 				return
 			}
-			written += n
+			written += int64(n)
 		}
 	}))
 	t.Cleanup(srv.Close)

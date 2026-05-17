@@ -11,13 +11,14 @@ import (
 
 // defaultBlobMaxPutBytes caps the bytes a single PUT can stream by
 // default. Blobs cover avatars (~few KB), books (~MB), and attachments
-// (sometimes >20MB). 256MB is the upper bound so a misbehaving client
-// can't fill the disk in a single request; legitimate larger artefacts
-// move through the migration / snapshot path, not this handler.
+// (videos / datasets / model files, occasionally multi-GB). kojo is a
+// local/Tailscale-only tool so we set the ceiling at 10 GiB rather
+// than the prior 256 MiB — disk fills are the operator's problem, not
+// a public-endpoint DoS vector.
 // Tests override the per-Server cap (Config.MaxBlobPutBytes) so the
-// limit-exceeded path can be exercised without allocating 256MB in
-// memory just to trip MaxBytesReader.
-const defaultBlobMaxPutBytes int64 = 256 << 20
+// limit-exceeded path can be exercised without allocating the full
+// cap in memory just to trip MaxBytesReader.
+const defaultBlobMaxPutBytes int64 = 10 << 30
 
 // listResponseItem mirrors blob.Object in JSON form. Fields are
 // lower-camel to match the rest of the kojo API surface.
