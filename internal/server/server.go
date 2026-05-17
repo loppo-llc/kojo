@@ -103,6 +103,13 @@ type Server struct {
 	// expiry doesn't trigger a re-Acquire from here. Set by
 	// cmd/kojo/main.go via SetOnAgentReleasedAsSource.
 	onAgentReleasedAsSource func(ctx context.Context, agentID string)
+	// onAgentForceReclaimed fires after the operator-driven
+	// force-reclaim path rewrites agent_locks back to this host.
+	// cmd/kojo wires it to AgentLockGuard.AddAgent +
+	// agentMgr.ActivateAgentRuntime so the chat surface comes
+	// back up without a daemon restart. Set via
+	// SetOnAgentForceReclaimed.
+	onAgentForceReclaimed func(ctx context.Context, agentID string)
 	// pendingAgentSyncs holds the per-op state delivered by
 	// /api/v1/peers/agent-sync until the matching finalize or
 	// drop call arrives. Keyed by (agent_id, op_id) so a
@@ -575,6 +582,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		mux.HandleFunc("POST /api/v1/agents/{id}/handoff/begin", s.handleAgentHandoffBegin)
 		mux.HandleFunc("POST /api/v1/agents/{id}/handoff/complete", s.handleAgentHandoffComplete)
 		mux.HandleFunc("POST /api/v1/agents/{id}/handoff/abort", s.handleAgentHandoffAbort)
+		mux.HandleFunc("POST /api/v1/agents/{id}/handoff/force-reclaim", s.handleAgentHandoffForceReclaim)
 		// Agent-self orchestrated switch (begin → pull → complete).
 		// Owner OR self-agent; the policy layer enforces the
 		// caller-matches-{id} invariant for non-owner principals.
@@ -1137,6 +1145,12 @@ func (s *Server) SetOnAgentSyncFinalized(fn func(ctx context.Context, agentID, r
 // Set via SetOnAgentReleasedAsSource.
 func (s *Server) SetOnAgentReleasedAsSource(fn func(ctx context.Context, agentID string)) {
 	s.onAgentReleasedAsSource = fn
+}
+
+// SetOnAgentForceReclaimed installs the operator-driven force-
+// reclaim hook. See onAgentForceReclaimed for the contract.
+func (s *Server) SetOnAgentForceReclaimed(fn func(ctx context.Context, agentID string)) {
+	s.onAgentForceReclaimed = fn
 }
 
 func (s *Server) Handler() http.Handler {

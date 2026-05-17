@@ -333,6 +333,32 @@ export function Dashboard() {
                         <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
                       </svg>
                     </button>
+                    {agent.holderPeer && (
+                      <button
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          if (!window.confirm(
+                            `Force-reclaim "${agent.name}" to this host?\n` +
+                            `現在のholder (${agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)}) との通信を放棄し、` +
+                            `この端末でランタイムを再起動する。`,
+                          )) return;
+                          try {
+                            await agentApi.forceReclaim(agent.id);
+                            // List poll picks the new state up on the
+                            // next 5s tick; force a refresh for snappy UX.
+                            const fresh = await agentApi.list();
+                            setAgents(fresh);
+                          } catch (err) {
+                            console.error("force-reclaim failed", err);
+                            window.alert(`Force-reclaim failed: ${(err as Error).message}`);
+                          }
+                        }}
+                        className="px-2 py-1 mr-1 bg-amber-900/60 hover:bg-amber-900 text-amber-200 rounded text-[10px] shrink-0"
+                        title="Force-reclaim: rewrite agent_locks back to this host and restart the runtime. Use when device-switch left the agent stuck on an unreachable peer."
+                      >
+                        強制復帰
+                      </button>
+                    )}
                     <button
                       onClick={() => navigate(`/agents/${agent.id}`)}
                       className={`flex-1 flex items-center gap-3 text-left min-w-0 ${isCollapsed ? "py-1.5 pr-3 pl-1" : "p-3 pl-1"}`}

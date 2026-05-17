@@ -317,6 +317,17 @@ export const agentApi = {
   setCronPaused: (paused: boolean) =>
     put<{ paused: boolean }>("/api/v1/agents/cron-paused", { paused }),
 
+  // forceReclaim rewrites agent_locks back to this host and
+  // restarts the local runtime. Owner-only recovery path for
+  // agents whose post-device-switch lock points at an
+  // unreachable / dead peer. Response carries the new fencing
+  // token; UI just needs to await it and refresh the list.
+  forceReclaim: (agentId: string) =>
+    post<{ agentId: string; holderPeer: string; fencingToken: number; leaseExpiresAt: number }>(
+      `/api/v1/agents/${encodeURIComponent(agentId)}/handoff/force-reclaim`,
+      {},
+    ),
+
   // GET /api/v1/agents/{id}. The server emits the row's strong ETag
   // both in the HTTP header and in the JSON body's `etag` field. We
   // prefer the body (it's threaded through React state alongside

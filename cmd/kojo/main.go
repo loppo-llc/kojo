@@ -935,6 +935,22 @@ func main() {
 				hub.StopBot(agentID)
 			}
 		})
+		// Operator-driven force-reclaim path. After
+		// handleAgentHandoffForceReclaim rewrites agent_locks
+		// back to this host, the chat surface only comes back if
+		// the in-memory AgentLockGuard.desired set knows about
+		// the agent (so its refresh loop keeps the lease alive)
+		// and the runtime side-channels (cron, notify) are
+		// re-activated. Both live outside the store, so the hook
+		// runs them here.
+		srv.SetOnAgentForceReclaimed(func(hookCtx context.Context, agentID string) {
+			if capturedGuard != nil {
+				capturedGuard.AddAgent(hookCtx, agentID)
+			}
+			if agentMgr != nil {
+				agentMgr.ActivateAgentRuntime(agentID)
+			}
+		})
 	}
 
 	// graceful shutdown

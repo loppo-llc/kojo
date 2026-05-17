@@ -311,6 +311,65 @@ UPDATE agent_locks
 	return rec, nil
 }
 
+// ForceReclaimAgentLock unconditionally rewrites the lock to point
+// at `peer` with a fresh fencing token, regardless of the current
+// holder or lease state. Owner-driven recovery path for agents
+// stuck pointing at an unreachable / dead peer after a botched
+// device-switch — the regular Acquire path refuses a live lease,
+// and a peer that's unreachable can't co-operate on a Release.
+//
+// Token bump is REQUIRED: any in-flight write from the previous
+// holder must fail CheckFencing on the new value rather than land
+// silently on a row the operator has reclaimed. Insert path covers
+// the rare case where the row was already deleted but the agent
+// still exists.
+func (s *Store) ForceReclaimAgentLock(ctx context.Context, agentID, peer string, now, leaseDurationMs int64) (*AgentLockRecord, error) {
+	if agentID == "" {
+		return nil, errors.New("store.ForceReclaimAgentLock: agent_id required")
+	}
+	if peer == "" {
+		return nil, errors.New("store.ForceReclaimAgentLock: peer required")
+	}
+	if leaseDurationMs <= 0 {
+		return nil, errors.New("store.ForceReclaimAgentLock: lease duration must be > 0")
+	}
+	if now == 0 {
+		now = NowMillis()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("store.ForceReclaimAgentLock: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	token, err := nextFencingToken(ctx, tx, agentID)
+	if err != nil {
+		return nil, fmt.Errorf("store.ForceReclaimAgentLock: %w", err)
+	}
+	expires := now + leaseDurationMs
+	const upsert = `
+INSERT INTO agent_locks (agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(agent_id) DO UPDATE SET
+  holder_peer      = excluded.holder_peer,
+  fencing_token    = excluded.fencing_token,
+  lease_expires_at = excluded.lease_expires_at,
+  acquired_at      = excluded.acquired_at`
+	if _, err := tx.ExecContext(ctx, upsert, agentID, peer, token, expires, now); err != nil {
+		return nil, fmt.Errorf("store.ForceReclaimAgentLock: upsert: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("store.ForceReclaimAgentLock: commit: %w", err)
+	}
+	return &AgentLockRecord{
+		AgentID:        agentID,
+		HolderPeer:     peer,
+		FencingToken:   token,
+		LeaseExpiresAt: expires,
+		AcquiredAt:     now,
+	}, nil
+}
+
 // TransferAgentLock atomically moves the lock from currentPeer to
 // newPeer, bumping the fencing_token via the per-agent counter so
 // a delayed write from currentPeer with the prior token fails
