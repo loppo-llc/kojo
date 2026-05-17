@@ -108,10 +108,62 @@ func (s *Server) handlePeerBlobIngest(w http.ResponseWriter, r *http.Request) {
 			"peer blob ingest is limited to scope=global")
 		return
 	}
-	if !peerBlobIngestPath.MatchString(blobPath) {
+	matches := peerBlobIngestPath.FindStringSubmatch(blobPath)
+	if matches == nil {
 		writeError(w, http.StatusBadRequest, "path_not_allowed",
 			"peer blob ingest path must be agents/<agentID>/attach/<messageID>/<filename>")
 		return
+	}
+	pathAgentID := matches[1]
+
+	// Agent-ownership gate. The trust-bit gate in policy.go was
+	// intentionally bypassed for this surface (paired-but-untrusted
+	// peers — the common case for `--peer-add` without
+	// `--peer-add-trusted` — need to push attachments for their own
+	// agents). The handler-side guarantee that replaces it: the
+	// RolePeer signer MUST currently hold the agent_lock for the
+	// agent the URI references. That ties an arbitrary-blob-write
+	// vector to "you are the running runtime for this agent", which
+	// is the only legitimate caller of this surface anyway.
+	//
+	// Operator (RoleOwner) bypasses the lock check because a manual
+	// `kojo` CLI run that pushes blobs is a recovery / migration
+	// path that should not depend on agent_locks state. `p` was
+	// fetched at the top of the handler for the principal-role
+	// check; reuse the same value here.
+	if p.IsPeer() && s.agents != nil && s.agents.Store() != nil {
+		lock, lockErr := s.agents.Store().GetAgentLock(r.Context(), pathAgentID)
+		switch {
+		case lockErr == nil:
+			if lock.HolderPeer != p.PeerID {
+				writeError(w, http.StatusForbidden, "not_lock_holder",
+					"signer is not the current agent_lock holder for "+pathAgentID)
+				return
+			}
+			// Lease-expiry check. holder_peer alone is the row
+			// snapshot, but an expired lease means the prior
+			// holder has effectively yielded — refuse rather
+			// than accept a stale-lease write. The agent guard
+			// re-acquires expired locks promptly so a healthy
+			// runtime never trips this branch.
+			if lock.LeaseExpiresAt > 0 && lock.LeaseExpiresAt < store.NowMillis() {
+				writeError(w, http.StatusForbidden, "lease_expired",
+					"signer holds an expired lease for "+pathAgentID)
+				return
+			}
+		case errors.Is(lockErr, store.ErrNotFound):
+			// No lock row at all means no peer can legitimately
+			// claim to be running this agent. Refuse — opening
+			// the surface to a no-lock state would let any
+			// paired peer publish into any agent's namespace.
+			writeError(w, http.StatusForbidden, "no_agent_lock",
+				"no agent_lock row exists for "+pathAgentID+"; refuse peer ingest")
+			return
+		default:
+			writeError(w, http.StatusInternalServerError, "internal",
+				"agent_locks lookup: "+lockErr.Error())
+			return
+		}
 	}
 
 	// Mandatory digest header. A peer push without a pre-declared
@@ -156,12 +208,13 @@ func (s *Server) handlePeerBlobIngest(w http.ResponseWriter, r *http.Request) {
 					"target row is mid-handoff; refuse peer ingest")
 				return
 			}
-			p := auth.FromContext(r.Context())
 			// Owner can always re-PUT (operator override). For
 			// RolePeer, the home_peer must be either the signer
 			// (peer pushed it earlier, retrying) OR the hub's
 			// own DeviceID (the standard case where a prior
-			// ingest stamped home_peer = hub).
+			// ingest stamped home_peer = hub). `p` is the
+			// Principal already fetched above for the
+			// agent-ownership gate.
 			if p.IsPeer() && p.PeerID != "" {
 				hubOK := s.peerID != nil && ref.HomePeer == s.peerID.DeviceID
 				signerOK := ref.HomePeer == p.PeerID

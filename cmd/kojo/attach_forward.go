@@ -56,30 +56,65 @@ func wireAttachForwarder(mgr *agent.Manager, st *store.Store, self *peer.Identit
 		if err != nil {
 			return fmt.Errorf("attach forward: list peers: %w", err)
 		}
-		// Candidate set: every non-self peer with a dialable URL.
-		// last_seen DESC ordering means the most-recently-active
-		// hub (typical single-hub deploy) is tried first.
-		candidates := make([]*store.PeerRecord, 0, len(peers))
+		// Candidate ordering: trusted-only when any trusted row
+		// exists; untrusted-fallback only when the registry has
+		// zero trusted candidates. auto-discovery stamps the
+		// legitimate hub row with trusted=true (see
+		// peer.Discovery.upsertHubIntoRegistry), so under typical
+		// deploys the trusted bucket holds exactly the hub.
+		//
+		// The "fall back to untrusted" branch covers setups where
+		// the operator paired peers via plain `--peer-add` (no
+		// `--peer-add-trusted`) and the trusted bucket is empty.
+		// We deliberately do NOT mix trusted + untrusted in one
+		// candidate list: returning "success" from a non-hub
+		// untrusted peer when the real hub is down would leave
+		// the hub UI without bytes and no forward error to
+		// surface. If trusted candidates exist, they are the
+		// authoritative target — failure to reach them is a
+		// failure, not a reason to try someone else.
+		//
+		// Within each bucket we keep last_seen DESC (the order
+		// ListPeers already returned) so the most-recently-
+		// active row is tried first.
+		var trusted, untrusted []*store.PeerRecord
 		for _, p := range peers {
 			if p.DeviceID == selfID || p.URL == "" {
 				continue
 			}
-			candidates = append(candidates, p)
+			if p.Trusted {
+				trusted = append(trusted, p)
+			} else {
+				untrusted = append(untrusted, p)
+			}
+		}
+		candidates := trusted
+		if len(candidates) == 0 {
+			candidates = untrusted
 		}
 		if len(candidates) == 0 {
 			return errors.New("attach forward: no candidate hub peers in registry (need at least one paired peer with a URL)")
 		}
 
 		// body is a fresh io.Reader the caller opened just for this
-		// invocation; if multiple candidates need to be tried, the
-		// per-candidate retry inside pushWithRetry handles its own
-		// Seek-to-start. Reset once up front so the very first
-		// attempt is also from offset 0.
+		// invocation. seeker presence determines whether we can
+		// try more than one candidate (or more than one retry per
+		// candidate); a non-seekable body is one-shot.
 		seeker, _ := body.(io.Seeker)
 
 		var lastErr error
 		for i, hub := range candidates {
-			if seeker != nil && i > 0 {
+			if i > 0 {
+				if seeker == nil {
+					// Non-seekable body was consumed by the
+					// first attempt; we cannot rewind, so the
+					// remaining candidates would receive an
+					// empty payload (or a partial one, worse).
+					// Stop and surface the last error.
+					logger.Warn("attach forward: non-seekable body consumed; skipping remaining candidates",
+						"remaining", len(candidates)-i)
+					break
+				}
 				if _, err := seeker.Seek(0, io.SeekStart); err != nil {
 					return fmt.Errorf("attach forward: seek 0 before candidate %s: %w", hub.DeviceID, err)
 				}
@@ -89,6 +124,7 @@ func wireAttachForwarder(mgr *agent.Manager, st *store.Store, self *peer.Identit
 				if len(candidates) > 1 {
 					logger.Info("attach forward: hub push succeeded",
 						"hub", hub.DeviceID, "url", hub.URL,
+						"trusted", hub.Trusted,
 						"candidates_total", len(candidates), "candidate_index", i)
 				}
 				return nil
