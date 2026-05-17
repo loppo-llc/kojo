@@ -51,6 +51,12 @@ type Principal struct {
 	Role    Role
 	AgentID string // populated for RoleAgent / RolePrivAgent
 	PeerID  string // populated for RolePeer (device_id from peer_registry)
+	// PeerTrusted mirrors peer_registry.trusted for RolePeer
+	// requests. Gates the privileged cross-peer surface (sessions,
+	// ws, info, dirs, files, git, upload). The bare RolePeer
+	// (PeerTrusted=false) is limited to the inter-peer-only
+	// endpoints (status events, blob pull, agent-sync, register-push).
+	PeerTrusted bool
 }
 
 // IsOwner returns true if the principal is the kojo user.

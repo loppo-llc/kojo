@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,7 +13,6 @@ import (
 
 	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/store"
-	"github.com/loppo-llc/kojo/internal/store/secretcrypto"
 )
 
 // runPeerListCommand prints the peer_registry rows to stdout in a
@@ -58,7 +55,7 @@ func runPeerListCommand(logger *slog.Logger, configDir string) int {
 	selfID := readSelfDeviceID(ctx, st)
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "DEVICE_ID\tNAME\tSTATUS\tLAST_SEEN\tSELF")
+	fmt.Fprintln(w, "DEVICE_ID\tNAME\tURL\tSTATUS\tLAST_SEEN\tTRUST\tSELF")
 	now := store.NowMillis()
 	for _, p := range peers {
 		idShort := p.DeviceID
@@ -75,8 +72,16 @@ func runPeerListCommand(logger *slog.Logger, configDir string) int {
 		if selfID != "" && p.DeviceID == selfID {
 			self = "*"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-			idShort, p.Name, p.Status, lastSeen, self)
+		urlCol := p.URL
+		if urlCol == "" {
+			urlCol = "—"
+		}
+		trust := "—"
+		if p.Trusted {
+			trust = "trusted"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			idShort, p.Name, urlCol, p.Status, lastSeen, trust, self)
 	}
 	if err := w.Flush(); err != nil {
 		fmt.Fprintf(os.Stderr, "peer-list: flush: %v\n", err)
@@ -155,20 +160,20 @@ func relativeTime(deltaMillis int64) string {
 // the local binary can address it by device_id. Format of the spec
 // argument:
 //
-//	<device_id>:<name>:<base64-public-key>
+//	<device_id>|<name>|<url>|<base64-public-key>
 //
-// All three components are required. The public key is the remote
-// peer's Ed25519 public key, base64-encoded the same way the
-// remote's --peer-list output reports it. Passing a key that doesn't
-// round-trip through base64 → 32 bytes returns an error and the row
-// is NOT inserted (mismatched key size would later fail the
-// signature verification path with a confusing low-level error).
+// All four components are required. `name` is the human-friendly
+// device label; `url` is the dial address other peers reach it on
+// (`host:port` for tsnet/HTTPS or `http://host:port` for peer-mode).
+// The public key is the remote peer's Ed25519 public key, base64-
+// encoded — passing a key that doesn't round-trip through base64 →
+// 32 bytes returns an error and the row is NOT inserted.
 //
 // Status defaults to "offline" — the operator only asserted the
 // peer's identity, not its current reachability. The Hub flips it
 // to "online" on the first successful inbound heartbeat from that
-// peer (Phase G slice 2+).
-func runPeerAddCommand(logger *slog.Logger, configDir, spec string) int {
+// peer.
+func runPeerAddCommand(logger *slog.Logger, configDir, spec string, trusted bool) int {
 	st, closeFn, err := openStoreReadOnly(logger, configDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "peer-add: %v\n", err)
@@ -176,16 +181,16 @@ func runPeerAddCommand(logger *slog.Logger, configDir, spec string) int {
 	}
 	defer closeFn()
 
-	// Pipe separator (not colon) so <name> can hold a
+	// Pipe separator (not colon) so <url> can hold a
 	// `host:port` form. The base64 alphabet doesn't include `|`
 	// and peer name validation refuses control chars, so `|`
-	// is safe as a delimiter against both fields' contents.
-	parts := strings.SplitN(spec, "|", 3)
-	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-		fmt.Fprintf(os.Stderr, "peer-add: spec must be <device_id>|<name>|<base64-public-key>\n")
+	// is safe as a delimiter against every field's contents.
+	parts := strings.SplitN(spec, "|", 4)
+	if len(parts) != 4 || parts[0] == "" || parts[1] == "" || parts[2] == "" || parts[3] == "" {
+		fmt.Fprintf(os.Stderr, "peer-add: spec must be <device_id>|<name>|<url>|<base64-public-key>\n")
 		return 1
 	}
-	deviceID, name, pubB64 := parts[0], parts[1], parts[2]
+	deviceID, name, peerURL, pubB64 := parts[0], parts[1], parts[2], parts[3]
 
 	// Shape gates shared with the HTTP handler so a typo doesn't
 	// reach UpsertPeer (which would store a junk row that later
@@ -196,6 +201,10 @@ func runPeerAddCommand(logger *slog.Logger, configDir, spec string) int {
 	}
 	if err := peer.ValidateName(name); err != nil {
 		fmt.Fprintf(os.Stderr, "peer-add: %v\n", err)
+		return 1
+	}
+	if !peer.IsDialAddress(peerURL) {
+		fmt.Fprintf(os.Stderr, "peer-add: url must look like host:port or http(s)://host:port (got %q)\n", peerURL)
 		return 1
 	}
 	if err := peer.ValidatePublicKey(pubB64); err != nil {
@@ -213,12 +222,69 @@ func runPeerAddCommand(logger *slog.Logger, configDir, spec string) int {
 	if _, err := st.RegisterPeerMetadata(ctx, &store.PeerRecord{
 		DeviceID:  deviceID,
 		Name:      name,
+		URL:       peerURL,
 		PublicKey: pubB64,
+		Trusted:   trusted,
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "peer-add: register: %v\n", err)
 		return 1
 	}
-	fmt.Printf("peer added: %s (%s)\n", deviceID, name)
+	// RegisterPeerMetadata's preserve-on-conflict contract leaves
+	// trusted alone on re-add. Apply the flip explicitly so the
+	// CLI argument is authoritative for both insert AND update.
+	if err := st.UpdatePeerTrust(ctx, deviceID, trusted); err != nil {
+		fmt.Fprintf(os.Stderr, "peer-add: set trust: %v\n", err)
+		return 1
+	}
+	trustLabel := ""
+	if trusted {
+		trustLabel = " [trusted]"
+	}
+	fmt.Printf("peer added: %s (%s, %s)%s\n", deviceID, name, peerURL, trustLabel)
+	return 0
+}
+
+// runPeerTrustCommand flips the trusted bit on an existing
+// peer_registry row. Decoupled from peer-add so the operator can
+// promote / demote a previously-paired peer without re-typing the
+// full spec. Refuses self (same reasoning as peer-remove —
+// flipping the local trust state would be a meaningless self-write
+// because the principal never authenticates against its own
+// trusted column).
+func runPeerTrustCommand(logger *slog.Logger, configDir, deviceID string, trusted bool) int {
+	st, closeFn, err := openStoreReadOnly(logger, configDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "peer-trust: %v\n", err)
+		return 1
+	}
+	defer closeFn()
+	if deviceID == "" {
+		fmt.Fprintf(os.Stderr, "peer-trust: device_id required\n")
+		return 1
+	}
+	if err := peer.ValidateDeviceID(deviceID); err != nil {
+		fmt.Fprintf(os.Stderr, "peer-trust: %v\n", err)
+		return 1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if self := readSelfDeviceID(ctx, st); self != "" && self == deviceID {
+		fmt.Fprintf(os.Stderr, "peer-trust: refusing to flip self (%s)\n", deviceID)
+		return 1
+	}
+	if err := st.UpdatePeerTrust(ctx, deviceID, trusted); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			fmt.Fprintf(os.Stderr, "peer-trust: %s not in peer_registry\n", deviceID)
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "peer-trust: %v\n", err)
+		return 1
+	}
+	state := "trusted"
+	if !trusted {
+		state = "untrusted"
+	}
+	fmt.Printf("peer %s: %s\n", deviceID, state)
 	return 0
 }
 
@@ -261,139 +327,51 @@ func runPeerRemoveCommand(logger *slog.Logger, configDir, deviceID string) int {
 	return 0
 }
 
-// isPeerRegistryDialAddress is the shape gate peer-self uses to
-// decide whether a peer_registry self-row's Name field looks like a
-// dial address other peers can actually reach. The runtime stamps
-// exactly two shapes:
+// printPairingSpec prints the pairing triple (device_id|name|url|pubkey)
+// to stderr at startup so the operator can paste it into the OTHER
+// host's `kojo --peer-add` flag. Pairing is bidirectional: each
+// host stores the other's row so signed inter-peer requests pass
+// the receiver's PeerAuth middleware.
 //
-//   - Hub (tsnet): "<fqdn>:<port>" — no scheme; the historical
-//     Tailscale TLS form. peerSubscriberTargetsLoop's
-//     normalizeSubscriberAddress fills in "https://" for these.
-//   - Peer (`--peer`): "http://<ts-ipv4-or-host>:<port>" — explicit
-//     scheme so the Subscriber dials plain HTTP. Set in main.go's
-//     peer-mode SetPublicName path.
+// The pipe `|` separator is shell-active in bash/zsh/cmd/PowerShell,
+// so paste-without-quotes turns the spec into two phantom commands —
+// exactly the failure mode the operator hits when they copy the
+// printed line and run it verbatim. Spell out the single-quote form,
+// with paths for every shell we expect operators to use.
 //
-// Anything else — bare hostname (`TVT-DEV-0000`), path/query/
-// fragment, unsupported scheme — would silently land in a Hub
-// operator's peer-add and produce an unreachable row the
-// Subscriber loops over forever. Refuse and force the operator
-// to start the daemon once so the row gets the canonical form.
-//
-// `https://host[:port]` is allowed too for an operator who hand-
-// stamps a non-default explicit scheme into the row; we just won't
-// generate it ourselves.
-func isPeerRegistryDialAddress(name string) bool {
-	if name == "" {
-		return false
+// role is "Hub" or "peer" — wording in the banner shifts so the
+// operator knows which side they are sitting on and which side to
+// run --peer-add on.
+func printPairingSpec(id *peer.Identity, peerURL, role string) {
+	if id == nil {
+		return
 	}
-	// Scheme branch: anything with "://" must parse cleanly as
-	// http/https, expose a host with a port, and carry no path /
-	// query / fragment cruft.
-	if strings.Contains(name, "://") {
-		u, err := url.Parse(name)
-		if err != nil {
-			return false
-		}
-		scheme := strings.ToLower(u.Scheme)
-		if scheme != "http" && scheme != "https" {
-			return false
-		}
-		if u.Host == "" {
-			return false
-		}
-		if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
-			return false
-		}
-		if _, _, err := net.SplitHostPort(u.Host); err != nil {
-			return false
-		}
-		return true
+	spec := fmt.Sprintf("%s|%s|%s|%s", id.DeviceID, id.Name, peerURL, id.PublicKeyBase64())
+	// Hub-side pairing must combine `--peer-add <spec>` with the
+	// bool flag `--peer-add-trusted` so the peer admits the Hub
+	// on the privileged surface (session create, files, git, ...).
+	// A plain `--peer-add` leaves the row as trusted=0 and every
+	// Hub→peer proxy call would 403. Peer-side pairing on the Hub
+	// uses plain `--peer-add` because the Hub should NOT trust an
+	// arbitrary peer to drive its own session / file surface; the
+	// operator can flip `--peer-trust <device_id>` later if they
+	// decide to.
+	var headline, suffix string
+	switch role {
+	case "hub":
+		headline = "Hub pairing spec — run on every peer host so the peer admits Hub-driven session/file/git proxy:"
+		suffix = " --peer-add-trusted"
+	case "peer":
+		headline = "peer pairing spec — run on the Hub to register this peer (Hub stays default-untrusted; use `kojo --peer-trust <device_id>` to promote):"
+		suffix = ""
+	default:
+		headline = "peer pairing spec — run on the other host:"
+		suffix = ""
 	}
-	// Scheme-less branch: must be `host:port`. SplitHostPort is the
-	// authoritative parser for that shape — bare hostnames (no
-	// colon, no port) and "host:" with empty port are rejected.
-	host, port, err := net.SplitHostPort(name)
-	if err != nil || host == "" || port == "" {
-		return false
-	}
-	return true
-}
-
-// runPeerSelfCommand prints the local binary's identity in a form
-// suitable for paste-into-other-peer's `--peer-add` flag:
-//
-//	<device_id>|<name>|<base64-public-key>
-//
-// Pipe separator (not colon) so the middle <name> field can hold
-// a `host:port` Tailscale FQDN without colliding with the
-// delimiter — the base64 alphabet doesn't include `|` and peer
-// name validation refuses control chars.
-//
-// First-ever boot path: if peer.LoadOrCreate hasn't been called yet
-// (kv has no peer/* rows), this command refuses with a hint to start
-// the daemon once. Mirrors --peer-list's degraded behaviour around
-// missing self markers; Phase G's design assumes identity is
-// generated by the daemon's main flow, not by ad-hoc subcommands.
-func runPeerSelfCommand(logger *slog.Logger, configDir string) int {
-	st, closeFn, err := openStoreReadOnly(logger, configDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "peer-self: %v\n", err)
-		return 1
-	}
-	defer closeFn()
-
-	authDir := filepath.Join(configDir, "auth")
-	kek, err := secretcrypto.LoadOrCreateKEK(authDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "peer-self: KEK setup failed: %v\n", err)
-		return 1
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	id, err := peer.LoadOrCreate(ctx, st, kek)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "peer-self: load identity: %v\n", err)
-		return 1
-	}
-	// Prefer the peer_registry self-row's Name: a running daemon
-	// will have called Registrar.RefreshPublicName after tsnet
-	// (Hub) or peerBindAndAdvertise (--peer) populated the dial
-	// address, so the row holds the canonical
-	// `[scheme://]<host>:<port>` form other peers can dial.
-	//
-	// If the row hasn't been written yet, the binary's identity
-	// name (= OS hostname, no port, no scheme) is the only thing
-	// available — and that is exactly the broken paste a remote
-	// operator's --peer-add would silently accept, only for
-	// Subscriber dial to fail later because the address has no
-	// port (and on a peer-mode host, no `http://` either). Refuse
-	// instead so the operator runs the daemon once before pairing.
-	rec, gerr := st.GetPeer(ctx, id.DeviceID)
-	if gerr != nil || rec == nil || !isPeerRegistryDialAddress(rec.Name) {
-		fmt.Fprintf(os.Stderr,
-			"peer-self: this binary has not advertised a dial address yet.\n"+
-				"  Start the daemon once first (so it can stamp the peer_registry\n"+
-				"  self-row with the Tailscale FQDN / Tailscale IPv4 the Hub will\n"+
-				"  reach this host on) and re-run --peer-self:\n"+
-				"    Hub:   kojo            # tsnet → <host>.<tailnet>.ts.net:<port>\n"+
-				"    Peer:  kojo --peer     # plain HTTP on Tailscale IPv4\n")
-		return 1
-	}
-	spec := fmt.Sprintf("%s|%s|%s", id.DeviceID, rec.Name, id.PublicKeyBase64())
-	fmt.Println(spec)
-	// Usage hint on stderr so piping the stdout into another tool
-	// stays clean (machine-readable spec on stdout, human-readable
-	// guidance on stderr). The pipe `|` separator is shell-active
-	// in bash/zsh/cmd/PowerShell, so paste-without-quotes turns the
-	// spec into two phantom commands — exactly the failure mode the
-	// operator hits when they copy the printed line and run it
-	// verbatim. Spell out the single-quote form, with paths for
-	// every shell we expect operators to use.
 	fmt.Fprintf(os.Stderr,
-		"\n  to register this peer on the other host, run (quotes required — `|` is a shell pipe):\n"+
-			"    bash/zsh:    kojo --peer-add '%[1]s'\n"+
-			"    cmd.exe:     kojo --peer-add \"%[1]s\"\n"+
-			"    PowerShell:  kojo --peer-add '%[1]s'\n\n",
-		spec)
-	return 0
+		"  %s\n\n"+
+			"    bash/zsh:    kojo --peer-add '%[3]s'%[2]s\n"+
+			"    cmd.exe:     kojo --peer-add \"%[3]s\"%[2]s\n"+
+			"    PowerShell:  kojo --peer-add '%[3]s'%[2]s\n\n",
+		headline, suffix, spec)
 }

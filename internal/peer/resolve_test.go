@@ -31,7 +31,7 @@ func (f *fakeLookupStore) ListPeers(_ context.Context, _ store.ListPeersOptions)
 func TestResolvePeerTarget_AcceptsUUID(t *testing.T) {
 	id := "11111111-1111-4111-8111-111111111111"
 	st := &fakeLookupStore{rows: map[string]*store.PeerRecord{
-		id: {DeviceID: id, Name: "bravo:8080"},
+		id: {DeviceID: id, Name: "bravo", URL: "bravo:8080"},
 	}}
 	got, err := ResolvePeerTarget(context.Background(), st, id)
 	if err != nil {
@@ -45,7 +45,7 @@ func TestResolvePeerTarget_AcceptsUUID(t *testing.T) {
 func TestResolvePeerTarget_AcceptsShortHostname(t *testing.T) {
 	id := "22222222-2222-4222-8222-222222222222"
 	st := &fakeLookupStore{rows: map[string]*store.PeerRecord{
-		id: {DeviceID: id, Name: "http://bravo:8080"},
+		id: {DeviceID: id, Name: "labelled-host", URL: "http://bravo:8080"},
 	}}
 	got, err := ResolvePeerTarget(context.Background(), st, "bravo")
 	if err != nil {
@@ -59,7 +59,7 @@ func TestResolvePeerTarget_AcceptsShortHostname(t *testing.T) {
 func TestResolvePeerTarget_AcceptsFQDN(t *testing.T) {
 	id := "33333333-3333-4333-8333-333333333333"
 	st := &fakeLookupStore{rows: map[string]*store.PeerRecord{
-		id: {DeviceID: id, Name: "bravo.tailnet.ts.net:8080"},
+		id: {DeviceID: id, Name: "device-3", URL: "bravo.tailnet.ts.net:8080"},
 	}}
 	// Full FQDN match.
 	got, err := ResolvePeerTarget(context.Background(), st, "bravo.tailnet.ts.net")
@@ -93,11 +93,13 @@ func TestResolvePeerTarget_Ambiguous(t *testing.T) {
 	st := &fakeLookupStore{rows: map[string]*store.PeerRecord{
 		"44444444-4444-4444-8444-444444444444": {
 			DeviceID: "44444444-4444-4444-8444-444444444444",
-			Name:     "bravo.east.ts.net:8080",
+			Name:     "east-host",
+			URL:      "bravo.east.ts.net:8080",
 		},
 		"55555555-5555-4555-8555-555555555555": {
 			DeviceID: "55555555-5555-4555-8555-555555555555",
-			Name:     "bravo.west.ts.net:8080",
+			Name:     "west-host",
+			URL:      "bravo.west.ts.net:8080",
 		},
 	}}
 	_, err := ResolvePeerTarget(context.Background(), st, "bravo")

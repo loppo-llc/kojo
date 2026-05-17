@@ -57,11 +57,13 @@ func main() {
 	migrateForceRecentMtime := flag.Bool("migrate-force-recent-mtime", false, "with --migrate: bypass the v0 mtime safety window (5min). Use when v0 is confirmed dead but a recent `ls`/backup-extract bumped a file's timestamp; mid-import data races silently corrupt if v0 is actually live")
 	rollbackExternal := flag.Bool("rollback-external-cli", false, "revert --migrate-external-cli changes; required before booting a v0 binary again")
 
-	peerMode := flag.Bool("peer", false, "run as a daemon-only peer: bind plain HTTP to 0.0.0.0:<port>, expose ONLY /api/v1/peers/events + /api/v1/peers/blobs/* (Ed25519-signed inter-peer requests), skip the web UI / dev proxy / Hub-side routes / tsnet. The tailnet identity is borrowed from the OS tailscaled (no --hostname). Mutually exclusive with --dev / --local / --no-auth.")
+	peerMode := flag.Bool("peer", false, "run as a daemon-only peer: bind plain HTTP to 0.0.0.0:<port> + a loopback agent-auth listener on <port>+1. Exposes the full peer API (session lifecycle, agents, files, git, /api/v1/peers/* inter-peer routes) but skips the Web UI / dev proxy / Hub-side mutation routes / tsnet. Owner Bearer is unavailable; non-Owner access is gated by Ed25519 inter-peer auth (RolePeer) plus the per-row `trusted` bit. The tailnet identity is borrowed from the OS tailscaled (no --hostname). Mutually exclusive with --dev / --local / --no-auth.")
 	peerList := flag.Bool("peer-list", false, "list peer_registry rows and exit (read-only; coexists with running kojo)")
-	peerAdd := flag.String("peer-add", "", "register a remote peer in peer_registry; spec = <device_id>|<name>|<base64-public-key>; run `kojo --peer-self` on the other host to obtain its triple. The pipe `|` separator lets <name> hold `host:port` for Tailscale FQDNs.")
+	peerAdd := flag.String("peer-add", "", "register a remote peer in peer_registry; spec = <device_id>|<name>|<url>|<base64-public-key>. The other host prints this spec on startup (`kojo --peer`).")
+	peerAddTrusted := flag.Bool("peer-add-trusted", false, "with --peer-add: mark the peer as trusted (allowed to create sessions, browse files, run git on this host). Without this flag the paired peer is restricted to inter-peer endpoints only.")
 	peerRemove := flag.String("peer-remove", "", "delete a peer_registry row by device_id; refuses to remove self")
-	peerSelf := flag.Bool("peer-self", false, "print this binary's identity triple (for paste into another host's --peer-add)")
+	peerTrust := flag.String("peer-trust", "", "flip a paired peer's trusted bit on (allowed to drive sessions/files/git on this host); pass <device_id>")
+	peerUntrust := flag.String("peer-untrust", "", "flip a paired peer's trusted bit off; pass <device_id>")
 	doSnapshot := flag.Bool("snapshot", false, "take a point-in-time snapshot of kojo.db + blobs/global into <configdir>/snapshots/<ts>/ and exit")
 	doRestore := flag.String("restore", "", "restore a snapshot (verified sha256) into <configdir>. The configdir must not be in use by a running kojo. KEK and per-peer credentials are NOT restored — supply them out-of-band before booting.")
 	restoreForce := flag.Bool("restore-force", false, "with --restore: overwrite an existing kojo.db in the target. Required when the target is a previously-used Hub being re-seeded.")
@@ -84,7 +86,7 @@ func main() {
 	// daemon and don't waste cycles on init when the user just wants
 	// to query the registry. Each opens its own short-lived
 	// *store.Store and exits.
-	if *peerList || *peerAdd != "" || *peerRemove != "" || *peerSelf {
+	if *peerList || *peerAdd != "" || *peerRemove != "" || *peerTrust != "" || *peerUntrust != "" {
 		if *configDir != "" {
 			configdir.Set(*configDir)
 		}
@@ -92,12 +94,14 @@ func main() {
 		switch {
 		case *peerList:
 			os.Exit(runPeerListCommand(logger, configdir.Path()))
-		case *peerSelf:
-			os.Exit(runPeerSelfCommand(logger, configdir.Path()))
 		case *peerAdd != "":
-			os.Exit(runPeerAddCommand(logger, configdir.Path(), *peerAdd))
+			os.Exit(runPeerAddCommand(logger, configdir.Path(), *peerAdd, *peerAddTrusted))
 		case *peerRemove != "":
 			os.Exit(runPeerRemoveCommand(logger, configdir.Path(), *peerRemove))
+		case *peerTrust != "":
+			os.Exit(runPeerTrustCommand(logger, configdir.Path(), *peerTrust, true))
+		case *peerUntrust != "":
+			os.Exit(runPeerTrustCommand(logger, configdir.Path(), *peerUntrust, false))
 		}
 	}
 
@@ -1016,14 +1020,20 @@ func main() {
 			// scheme to match the historical Tailscale TLS shape
 			// (peerSubscriberTargetsLoop defaults scheme-less
 			// names to https://).
-			publicName := fmt.Sprintf("http://%s:%d", addr, listenPort)
-			peerRegistrar.SetPublicName(publicName)
+			publicURL := fmt.Sprintf("http://%s:%d", addr, listenPort)
+			peerRegistrar.SetPublicURL(publicURL)
 			refreshCtx, refreshCancel := context.WithTimeout(ctx, 5*time.Second)
 			if rerr := peerRegistrar.RefreshPublicName(refreshCtx); rerr != nil {
 				logger.Warn("peer self-row refresh failed; relying on heartbeat-loop retry",
 					"err", rerr)
 			}
 			refreshCancel()
+
+			// Print the pairing triple to stderr so the operator can
+			// paste it into the Hub's `kojo --peer-add` (replacing
+			// the old `kojo --peer-self` subcommand). Format matches
+			// the --peer-add spec exactly.
+			printPairingSpec(peerIdentity, publicURL, "peer")
 		}
 
 		go func() {
@@ -1149,6 +1159,15 @@ func main() {
 			// when Status() was momentarily not ready.
 			if peerRegistrar != nil {
 				go refreshPublicNameFromTailscale(ctx, lc, peerRegistrar, *port, logger)
+				// Print the Hub's own pairing spec once the tsnet
+				// listener has reported a stable FQDN so the
+				// operator can run `kojo --peer-add` on every peer
+				// host. Pairing is bidirectional: the Hub stores
+				// the peer via the operator's UI / CLI, and each
+				// peer must in turn store the Hub so the Hub's
+				// signed register-push / session-proxy requests
+				// pass the peer's PeerAuth middleware.
+				go printHubPairingSpecOnce(ctx, lc, peerIdentity, *port, logger)
 			}
 		}
 
@@ -1265,6 +1284,49 @@ func printTailscaleAddrs(status *ipnstate.Status, port int) {
 	}
 }
 
+// printHubPairingSpecOnce waits for tsnet to report a stable
+// DNSName, then prints the Hub's pairing spec (deviceID|name|url|
+// publicKey) to stderr exactly once. Mirrors the `--peer` mode's
+// stderr banner so the operator can run `kojo --peer-add` on every
+// peer host. Pairing is bidirectional — without the Hub's row on a
+// peer's registry, the Hub's signed register-push and Hub→peer
+// session-proxy requests fail at the peer's PeerAuth middleware
+// with 401.
+func printHubPairingSpecOnce(ctx context.Context, lc tailscaleLocalClient, id *peer.Identity, port int, logger *slog.Logger) {
+	if id == nil {
+		return
+	}
+	const maxAttempts = 60
+	backoff := 1 * time.Second
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		st, err := lc.Status(ctx)
+		if err == nil && st != nil && st.Self != nil {
+			dnsName := strings.TrimSuffix(st.Self.DNSName, ".")
+			if dnsName != "" {
+				printPairingSpec(id, fmt.Sprintf("%s:%d", dnsName, port), "hub")
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
+	if logger != nil {
+		logger.Warn("hub pairing spec: tsnet FQDN not available after retries; skipping --peer-add banner",
+			"attempts", maxAttempts)
+	}
+}
+
 // refreshPublicNameFromTailscale polls LocalClient.Status() until
 // a DNSName comes back (or the context is cancelled), then calls
 // SetPublicName + RefreshPublicName on the registrar. Without
@@ -1294,7 +1356,7 @@ func refreshPublicNameFromTailscale(ctx context.Context, lc tailscaleLocalClient
 				// HTTPS default; the row is consumed by code, not
 				// rendered to users.
 				addr := fmt.Sprintf("%s:%d", dnsName, port)
-				reg.SetPublicName(addr)
+				reg.SetPublicURL(addr)
 				rCtx, rCancel := context.WithTimeout(context.Background(), 10*time.Second)
 				if rerr := reg.RefreshPublicName(rCtx); rerr != nil && logger != nil {
 					logger.Warn("peer self-row refresh failed", "err", rerr)
@@ -1360,19 +1422,19 @@ func peerSubscriberTargetsLoop(ctx context.Context, st *store.Store, self *peer.
 			if r.DeviceID == self.DeviceID {
 				continue // never self-subscribe
 			}
-			// Convention: peer_registry.name is the Tailscale
+			// Convention: peer_registry.url is the Tailscale
 			// FQDN, optionally suffixed with ":port" when the
 			// peer listens on a non-443 port (kojo default
-			// 8080). Operator stamps this via `--peer-add
-			// <id>|<host:port>|<pubkey>`; the pipe separator
+			// 8080). Operator stamps this via the pairing spec
+			// `<id>|<name>|<url>|<pubkey>`; the pipe separator
 			// keeps the colon in `host:port` from colliding
 			// with the field delimiter.
-			if r.Name == "" {
+			if r.URL == "" {
 				continue
 			}
-			// Name MAY carry an explicit scheme prefix
+			// URL MAY carry an explicit scheme prefix
 			// ("http://host:port" / "https://host:port"). A
-			// scheme-less name is treated as https (the historical
+			// scheme-less URL is treated as https (the historical
 			// Hub-side Tailscale TLS shape). Daemon-only peers
 			// (`kojo --peer`) publish "http://host:port" so the
 			// Subscriber dials plain HTTP over the tailnet — the
@@ -1385,10 +1447,10 @@ func peerSubscriberTargetsLoop(ctx context.Context, st *store.Store, self *peer.
 			// is skipped. We do NOT want to silently splice
 			// "https://" in front of "ws://..." and produce a
 			// nonsense URL the Subscriber will mis-dial.
-			addr, err := peer.NormalizeAddress(r.Name)
+			addr, err := peer.NormalizeAddress(r.URL)
 			if err != nil {
-				logger.Warn("peer subscriber: dropping unusable peer_registry.name",
-					"name", r.Name, "err", err)
+				logger.Warn("peer subscriber: dropping unusable peer_registry.url",
+					"url", r.URL, "err", err)
 				continue
 			}
 			targets = append(targets, peer.SubscriberTarget{

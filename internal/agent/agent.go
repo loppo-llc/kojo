@@ -366,6 +366,13 @@ type Agent struct {
 	// locally-managed agents. The UI uses it to show a "remote"
 	// indicator and route chat traffic through the WS proxy.
 	HolderPeer string `json:"holderPeer,omitempty"`
+	// HolderPeerName is the human-friendly name of HolderPeer,
+	// resolved from peer_registry at list time so the dashboard
+	// doesn't have to do its own lookup. Empty when HolderPeer is
+	// empty or the registry has no row for the holder (a race
+	// against decommission, or a freshly switched-to peer that
+	// hasn't broadcast its registration yet).
+	HolderPeerName string `json:"holderPeerName,omitempty"`
 }
 
 // ShouldNotifyDuringSilent returns whether the agent should receive DM

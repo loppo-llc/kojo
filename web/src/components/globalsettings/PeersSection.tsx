@@ -61,11 +61,14 @@ export function PeersSection({ setError, flashSuccess }: Props) {
   const [unavailable, setUnavailable] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
   const [rotateFor, setRotateFor] = useState<string>(""); // deviceId
-  // Form state for add.
-  const [deviceId, setDeviceId] = useState("");
-  const [name, setName] = useState("");
-  const [publicKey, setPublicKey] = useState("");
-  const [capabilities, setCapabilities] = useState("");
+  // Form state for add: a single textarea matching the --peer-add
+  // pipe-separated spec the daemon prints at startup.
+  const [pairingSpec, setPairingSpec] = useState("");
+  const [parseError, setParseError] = useState("");
+  // Trust checkbox: opt the new peer into the privileged surface
+  // (sessions / files / git on this host). Defaults to false so
+  // an unmodified paste lands as a safe restricted peer.
+  const [trustOnAdd, setTrustOnAdd] = useState(false);
   // Form state for rotate.
   const [newKey, setNewKey] = useState("");
   const [busy, setBusy] = useState(false);
@@ -144,23 +147,45 @@ export function PeersSection({ setError, flashSuccess }: Props) {
   }, [refresh]);
 
   const resetAddForm = () => {
-    setDeviceId("");
-    setName("");
-    setPublicKey("");
-    setCapabilities("");
+    setPairingSpec("");
+    setParseError("");
+    setTrustOnAdd(false);
     setShowAdd(false);
   };
 
+  // parsePairingSpec splits the pipe-separated spec the `--peer-add`
+  // flag accepts. Same shape the daemon prints on startup so the
+  // operator pastes it verbatim. Strips a surrounding pair of single
+  // or double quotes so a copy that included the shell-escape
+  // delimiters still parses.
+  const parsePairingSpec = (raw: string) => {
+    let s = raw.trim();
+    if ((s.startsWith("'") && s.endsWith("'")) || (s.startsWith('"') && s.endsWith('"'))) {
+      s = s.slice(1, -1).trim();
+    }
+    const parts = s.split("|");
+    if (parts.length !== 4) {
+      throw new Error(`expected 4 pipe-separated fields, got ${parts.length}`);
+    }
+    const [deviceId, name, url, publicKey] = parts.map((p) => p.trim());
+    if (!deviceId || !name || !url || !publicKey) {
+      throw new Error("every field (deviceId | name | url | publicKey) must be non-empty");
+    }
+    return { deviceId, name, url, publicKey };
+  };
+
   const submitAdd = async () => {
-    if (!deviceId.trim() || !name.trim() || !publicKey.trim()) return;
+    setParseError("");
+    let parsed: { deviceId: string; name: string; url: string; publicKey: string };
+    try {
+      parsed = parsePairingSpec(pairingSpec);
+    } catch (e) {
+      setParseError((e as Error).message);
+      return;
+    }
     setBusy(true);
     try {
-      await peersApi.register({
-        deviceId: deviceId.trim(),
-        name: name.trim(),
-        publicKey: publicKey.trim(),
-        capabilities: capabilities.trim() || undefined,
-      });
+      await peersApi.register({ ...parsed, trusted: trustOnAdd });
       resetAddForm();
       flashSuccess();
       await refresh();
@@ -182,6 +207,19 @@ export function PeersSection({ setError, flashSuccess }: Props) {
       await refresh();
     } catch (e) {
       setError(`Rotate failed: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleTrust = async (p: PeerInfo) => {
+    setBusy(true);
+    try {
+      await peersApi.setTrust(p.deviceId, !p.trusted);
+      flashSuccess();
+      await refresh();
+    } catch (e) {
+      setError(`Trust toggle failed: ${(e as Error).message}`);
     } finally {
       setBusy(false);
     }
@@ -235,37 +273,42 @@ export function PeersSection({ setError, flashSuccess }: Props) {
 
       {showAdd && (
         <div className="p-3 bg-neutral-900 border border-neutral-800 rounded-lg mb-2 space-y-2">
-          <input
-            type="text"
-            value={deviceId}
-            onChange={(e) => setDeviceId(e.target.value)}
-            placeholder="Device ID (UUID)"
-            className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-xs font-mono focus:outline-none focus:border-neutral-500"
-          />
-          <input
-            type="text"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="Name"
-            className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-xs focus:outline-none focus:border-neutral-500"
-          />
-          <input
-            type="text"
-            value={publicKey}
-            onChange={(e) => setPublicKey(e.target.value)}
-            placeholder="Public key (base64-std, 32-byte Ed25519)"
-            className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-xs font-mono focus:outline-none focus:border-neutral-500"
-          />
+          <p className="text-[11px] text-neutral-500 leading-snug">
+            Paste the pairing spec the other peer prints on startup
+            (<code className="font-mono">kojo --peer-add</code> argument).
+            Format: <code className="font-mono">deviceId | name | url | publicKey</code>
+          </p>
           <textarea
-            value={capabilities}
-            onChange={(e) => setCapabilities(e.target.value)}
-            placeholder='Capabilities (optional JSON object, e.g. {"os":"macos"})'
-            rows={2}
+            value={pairingSpec}
+            onChange={(e) => {
+              setPairingSpec(e.target.value);
+              if (parseError) setParseError("");
+            }}
+            placeholder="00000000-0000-4000-8000-000000000000|laptop|http://100.64.0.5:8080|AAAA…"
+            rows={3}
             className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-xs font-mono focus:outline-none focus:border-neutral-500"
           />
+          {parseError && (
+            <div className="text-xs text-red-400">Parse: {parseError}</div>
+          )}
+          <label className="flex items-start gap-2 text-xs text-neutral-300 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={trustOnAdd}
+              onChange={(e) => setTrustOnAdd(e.target.checked)}
+              className="mt-0.5 accent-amber-500"
+            />
+            <span>
+              Trust this peer
+              <span className="block text-[10px] text-neutral-500 mt-0.5">
+                Required for the peer to create sessions, browse files, or run git on this host.
+                Leave unchecked unless you operate both sides.
+              </span>
+            </span>
+          </label>
           <button
             onClick={submitAdd}
-            disabled={busy || !deviceId.trim() || !name.trim() || !publicKey.trim()}
+            disabled={busy || !pairingSpec.trim()}
             className="w-full py-2 bg-neutral-700 hover:bg-neutral-600 rounded text-xs font-medium disabled:opacity-40"
           >
             {busy ? "Registering..." : "Register peer"}
@@ -298,6 +341,11 @@ export function PeersSection({ setError, flashSuccess }: Props) {
                   <div className="text-[11px] font-mono text-neutral-600 truncate mt-0.5">
                     {p.deviceId}
                   </div>
+                  {p.url && (
+                    <div className="text-[11px] font-mono text-neutral-500 truncate">
+                      {p.url}
+                    </div>
+                  )}
                   <div className="text-xs mt-1 flex items-center gap-3">
                     <span className={STATUS_COLOR[p.status] ?? "text-neutral-500"}>
                       {p.status}
@@ -305,10 +353,26 @@ export function PeersSection({ setError, flashSuccess }: Props) {
                     <span className="text-neutral-600">
                       seen {formatLastSeen(p.lastSeen)}
                     </span>
+                    {p.trusted && (
+                      <span className="text-[10px] px-1.5 py-0.5 bg-amber-900/60 text-amber-300 rounded">
+                        trusted
+                      </span>
+                    )}
                   </div>
                 </div>
                 {!isSelf && (
                   <div className="flex flex-col gap-1 shrink-0">
+                    <button
+                      onClick={() => toggleTrust(p)}
+                      disabled={busy}
+                      className={`px-2 py-1 rounded text-xs ${
+                        p.trusted
+                          ? "bg-amber-900/60 text-amber-200 hover:bg-amber-900"
+                          : "bg-neutral-800 hover:bg-neutral-700"
+                      }`}
+                    >
+                      {p.trusted ? "Untrust" : "Trust"}
+                    </button>
                     <button
                       onClick={() => {
                         setRotateFor(rotateFor === p.deviceId ? "" : p.deviceId);

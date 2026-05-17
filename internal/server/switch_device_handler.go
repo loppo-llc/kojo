@@ -254,7 +254,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// (runHandoffOp, dispatchPeerPull). The user-typed string
 	// only got us this far.
 	req.TargetPeerID = targetRec.DeviceID
-	targetAddr, err := peer.NormalizeAddress(targetRec.Name)
+	targetAddr, err := peer.NormalizeAddress(targetRec.URL)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"target peer has no usable dial name in peer_registry: "+err.Error())
@@ -312,7 +312,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 			"self peer_registry row missing: "+err.Error())
 		return
 	}
-	if _, err := peer.NormalizeAddress(selfRec.Name); err != nil {
+	if _, err := peer.NormalizeAddress(selfRec.URL); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "unavailable",
 			"self peer_registry row has no usable name: "+err.Error())
 		return

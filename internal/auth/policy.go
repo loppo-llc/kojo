@@ -5,6 +5,56 @@ import (
 	"strings"
 )
 
+// allowPeerSessionPath returns true when (method, path) names a
+// known RolePeer-callable session route. Explicit list — additions
+// require a deliberate edit here. Covers every endpoint registered
+// by registerRoutes under /api/v1/sessions; /api/v1/ws is handled
+// by the caller because its query semantics differ.
+//
+// Routes:
+//
+//	GET    /api/v1/sessions                           list
+//	POST   /api/v1/sessions                           create
+//	GET    /api/v1/sessions/{id}                      info
+//	DELETE /api/v1/sessions/{id}                      stop
+//	PATCH  /api/v1/sessions/{id}                      yolo toggle / patch
+//	POST   /api/v1/sessions/{id}/restart
+//	POST   /api/v1/sessions/{id}/tmux
+//	GET    /api/v1/sessions/{id}/terminal
+//	GET    /api/v1/sessions/{id}/attachments
+//	DELETE /api/v1/sessions/{id}/attachments          ?path=
+func allowPeerSessionPath(method, path string) bool {
+	if path == "/api/v1/sessions" {
+		return method == http.MethodGet || method == http.MethodPost
+	}
+	const prefix = "/api/v1/sessions/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	rest := path[len(prefix):]
+	// Strip the {id} segment.
+	slash := strings.IndexByte(rest, '/')
+	var sub string
+	if slash >= 0 {
+		sub = rest[slash:] // e.g. "/restart", "/attachments"
+	}
+	switch sub {
+	case "":
+		// /api/v1/sessions/{id}
+		switch method {
+		case http.MethodGet, http.MethodPatch, http.MethodDelete:
+			return true
+		}
+	case "/restart", "/tmux":
+		return method == http.MethodPost
+	case "/terminal":
+		return method == http.MethodGet
+	case "/attachments":
+		return method == http.MethodGet || method == http.MethodDelete
+	}
+	return false
+}
+
 // EnforceMiddleware gates /api/v1/* requests by Principal/method/path
 // using AllowNonOwner. It runs after AuthMiddleware (which set the
 // Principal in ctx). Static files and non-API paths pass through.
@@ -113,6 +163,13 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			// successful complete; drop rolls back on abort.
 			return true
 		}
+		if method == http.MethodPost && path == "/api/v1/peers/register-push" {
+			// Hub fan-out of its own self-row to a paired peer so
+			// the peer's registry learns the Hub's url/name. The
+			// handler enforces signer == req.DeviceID, so even a
+			// leaked peer signing key can only update its own row.
+			return true
+		}
 		if method == http.MethodPost && path == "/api/v1/peers/agent-sync/state" {
 			// Incremental device-switch preflight (§3.7): source
 			// peer asks target for its high-water marks so the
@@ -121,6 +178,20 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			// signer-equals-source and agent_lock holder check
 			// run inside the handler.
 			return true
+		}
+		// Trust gate. Every privileged peer surface — sessions,
+		// ws, info, dirs, files, git, upload, AND the §3.7
+		// agent proxy paths — is admitted only when the operator
+		// flipped peer_registry.trusted (--peer-add --trusted /
+		// `--peer-trust` / UI checkbox). Pairing alone is shape
+		// validation, not authorisation: any paired RolePeer
+		// signer that bypassed this gate could create sessions,
+		// read other agents' personas, or run git commands on
+		// this host. Inter-peer-only routes (events / blobs /
+		// pull / agent-sync) were handled above; everything
+		// below requires trusted=1.
+		if !p.PeerTrusted {
+			return false
 		}
 		// Blanket agent-path proxy surface (§3.7 device-switch):
 		// Hub's remoteAgentProxyMiddleware forwards any agent-
@@ -132,6 +203,38 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		// never re-proxy a peer-signed request. Subsumes the
 		// earlier per-endpoint entries (WS, messages).
 		if strings.HasPrefix(path, "/api/v1/agents/") {
+			return true
+		}
+		if allowPeerSessionPath(method, path) {
+			return true
+		}
+		if method == http.MethodGet && path == "/api/v1/ws" {
+			return true
+		}
+		if method == http.MethodGet && path == "/api/v1/info" {
+			return true
+		}
+		if method == http.MethodGet && path == "/api/v1/dirs" {
+			return true
+		}
+		// File browser + raw fetch + upload. Mirrors the routes the
+		// Hub UI hits when it has selected a remote peer in the
+		// session screen's File/Attachments tabs.
+		if method == http.MethodGet && (path == "/api/v1/files" ||
+			path == "/api/v1/files/view" || path == "/api/v1/files/raw") {
+			return true
+		}
+		if method == http.MethodPost && path == "/api/v1/upload" {
+			return true
+		}
+		// Git surface used by the Git tab. Read-only routes admit
+		// GET; the exec endpoint runs whitelisted operations
+		// inside handler-side guards.
+		if method == http.MethodGet && (path == "/api/v1/git/status" ||
+			path == "/api/v1/git/log" || path == "/api/v1/git/diff") {
+			return true
+		}
+		if method == http.MethodPost && path == "/api/v1/git/exec" {
 			return true
 		}
 		return false

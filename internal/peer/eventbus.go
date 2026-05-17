@@ -14,7 +14,8 @@ import (
 type StatusEvent struct {
 	DeviceID string `json:"device_id"`
 	Name     string `json:"name,omitempty"`
-	Status   string `json:"status"`             // "online" | "offline" | "degraded"
+	URL      string `json:"url,omitempty"`
+	Status   string `json:"status"`              // "online" | "offline" | "degraded"
 	LastSeen int64  `json:"last_seen,omitempty"` // unix millis
 	// Op is "upsert" for register / first-touch, "touch" for
 	// heartbeat status refreshes, "expire" for sweeper-driven

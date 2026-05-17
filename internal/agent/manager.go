@@ -776,6 +776,9 @@ func (m *Manager) GetRemote(id string) *Agent {
 	if st != nil {
 		if lock, err := st.GetAgentLock(context.Background(), a.ID); err == nil && lock.HolderPeer != "" {
 			a.HolderPeer = lock.HolderPeer
+			if rec, err := st.GetPeer(context.Background(), lock.HolderPeer); err == nil && rec != nil {
+				a.HolderPeerName = rec.Name
+			}
 		}
 	}
 	return a
@@ -879,6 +882,9 @@ func (m *Manager) ListRemote() []*Agent {
 		lock, err := st.GetAgentLock(ctx, rec.ID)
 		if err == nil && lock.HolderPeer != "" {
 			a.HolderPeer = lock.HolderPeer
+			if peerRec, err := st.GetPeer(ctx, lock.HolderPeer); err == nil && peerRec != nil {
+				a.HolderPeerName = peerRec.Name
+			}
 		}
 		remote = append(remote, a)
 	}

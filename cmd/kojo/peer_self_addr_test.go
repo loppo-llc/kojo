@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/loppo-llc/kojo/internal/peer"
+)
 
 func TestIsPeerRegistryDialAddress(t *testing.T) {
 	cases := []struct {
@@ -38,8 +42,8 @@ func TestIsPeerRegistryDialAddress(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isPeerRegistryDialAddress(tc.in); got != tc.want {
-				t.Errorf("isPeerRegistryDialAddress(%q) = %v, want %v", tc.in, got, tc.want)
+			if got := peer.IsDialAddress(tc.in); got != tc.want {
+				t.Errorf("peer.IsDialAddress(%q) = %v, want %v", tc.in, got, tc.want)
 			}
 		})
 	}

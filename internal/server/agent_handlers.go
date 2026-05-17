@@ -1064,7 +1064,7 @@ func (s *Server) proxyPeerGetMessages(w http.ResponseWriter, r *http.Request, ag
 	if err != nil || peerRec == nil || peerRec.Status != store.PeerStatusOnline {
 		return false
 	}
-	addr, err := peer.NormalizeAddress(peerRec.Name)
+	addr, err := peer.NormalizeAddress(peerRec.URL)
 	if err != nil {
 		return false
 	}
@@ -1200,7 +1200,7 @@ func (s *Server) fetchRemoteLatestMessage(ctx context.Context, agentID, holderDe
 	if err != nil || peerRec == nil || peerRec.Status != store.PeerStatusOnline {
 		return "", "", "", false
 	}
-	addr, err := peer.NormalizeAddress(peerRec.Name)
+	addr, err := peer.NormalizeAddress(peerRec.URL)
 	if err != nil {
 		return "", "", "", false
 	}

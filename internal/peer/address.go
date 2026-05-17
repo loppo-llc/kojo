@@ -94,6 +94,58 @@ func NameMatches(rowName, input string) bool {
 	return false
 }
 
+// IsDialAddress is the strict shape gate the operator-facing
+// surfaces (CLI `--peer-add`, HTTP /api/v1/peers POST/PATCH, GUI
+// register form) use to decide whether the supplied URL is a
+// dial-form other peers can actually reach. The runtime stamps
+// exactly two shapes:
+//
+//   - Hub (tsnet): "<fqdn>:<port>" — no scheme; the historical
+//     Tailscale TLS form. peerSubscriberTargetsLoop's
+//     NormalizeAddress fills in "https://" for these.
+//   - Peer (`--peer`): "http://<ts-ipv4-or-host>:<port>" — explicit
+//     scheme so the Subscriber dials plain HTTP.
+//
+// Anything else — bare hostname (`TVT-DEV-0000`), path/query/
+// fragment, unsupported scheme — would silently land in a registry
+// row and produce an unreachable target the Subscriber / proxy
+// loops over forever. Refuse so the bug surfaces at registration
+// time.
+//
+// `https://host[:port]` is allowed too for an operator who hand-
+// stamps a non-default explicit scheme into the row; we just won't
+// generate it ourselves.
+func IsDialAddress(name string) bool {
+	if name == "" {
+		return false
+	}
+	if strings.Contains(name, "://") {
+		u, err := url.Parse(name)
+		if err != nil {
+			return false
+		}
+		scheme := strings.ToLower(u.Scheme)
+		if scheme != "http" && scheme != "https" {
+			return false
+		}
+		if u.Host == "" {
+			return false
+		}
+		if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+			return false
+		}
+		if _, _, err := net.SplitHostPort(u.Host); err != nil {
+			return false
+		}
+		return true
+	}
+	host, port, err := net.SplitHostPort(name)
+	if err != nil || host == "" || port == "" {
+		return false
+	}
+	return true
+}
+
 // NormalizeAddress turns a peer_registry.name value into a base URL
 // that can be dialed (Subscriber WS, blob-pull GET, switch-device
 // POST, ...). Accepted forms:

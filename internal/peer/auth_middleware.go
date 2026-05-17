@@ -256,10 +256,16 @@ func (m *AuthMiddleware) Wrap(next http.Handler) http.Handler {
 		_ = m.store.TouchPeer(touchCtx, dev, store.PeerStatusOnline, time.Now().UnixMilli())
 		touchCancel()
 		// All checks passed. Stamp the principal and forward.
+		// PeerTrusted is read from the peer_registry row so the
+		// policy layer can admit /sessions, /ws, /files, /git
+		// only when the operator explicitly marked this peer as
+		// trusted. Untrusted RolePeer principals stay scoped to
+		// the minimal inter-peer endpoints.
 		next.ServeHTTP(w, r.WithContext(
 			auth.WithPrincipal(r.Context(), auth.Principal{
-				Role:   auth.RolePeer,
-				PeerID: dev,
+				Role:        auth.RolePeer,
+				PeerID:      dev,
+				PeerTrusted: rec.Trusted,
 			}),
 		))
 	})

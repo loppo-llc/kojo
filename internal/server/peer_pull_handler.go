@@ -171,7 +171,7 @@ func (s *Server) handlePeerPull(w http.ResponseWriter, r *http.Request) {
 			"peer_registry lookup: "+err.Error())
 		return
 	}
-	srcAddr, err := peer.NormalizeAddress(srcRec.Name)
+	srcAddr, err := peer.NormalizeAddress(srcRec.URL)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"source peer has no usable dial name in peer_registry: "+err.Error())

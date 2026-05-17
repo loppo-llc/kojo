@@ -356,6 +356,18 @@ func New(cfg Config) *Server {
 	// (which the handlers refuse).
 	publicHandler := s.idempotencyMiddleware(mux)
 	publicHandler = s.remoteAgentProxyMiddleware(publicHandler)
+	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
+		publicHandler = s.sessionPeerProxyMiddleware(publicHandler)
+	}
+	// EnforceMiddleware gates non-Owner principals (RolePeer, future
+	// guest tokens) on the public listener too. Without it a peer-
+	// signed request bypasses AllowNonOwner entirely and lands on
+	// the mux with no route-level allowlist — the handler-side
+	// IsPeer() check is the last line of defence rather than the
+	// first. OwnerOnlyMiddleware below this line still promotes
+	// Tailscale-trusted Guest → Owner, so legitimate UI traffic is
+	// unaffected.
+	publicHandler = auth.EnforceMiddleware(publicHandler)
 	if !cfg.PeerOnly {
 		publicHandler = auth.OwnerOnlyMiddleware(publicHandler)
 	}
@@ -519,7 +531,15 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 			mux.HandleFunc("POST /api/v1/peers", s.handleRegisterPeer)
 			mux.HandleFunc("DELETE /api/v1/peers/{id}", s.handleDeletePeer)
 			mux.HandleFunc("POST /api/v1/peers/{id}/rotate-key", s.handleRotatePeerKey)
+			mux.HandleFunc("PATCH /api/v1/peers/{id}/trust", s.handlePatchPeerTrust)
 		}
+		// Inter-peer registration push (Hub fans out a newly-paired
+		// peer's row to every online peer; receivers RegisterPeerMetadata
+		// the row locally so the cluster's registries converge without
+		// manual --peer-add on every host). Auth: RolePeer (Ed25519
+		// signed). Available on every host so a peer can both receive
+		// and forward the broadcast.
+		mux.HandleFunc("POST /api/v1/peers/register-push", s.handlePeerRegisterPush)
 		// Cross-peer status push (§3.10). Auth: RolePeer (Ed25519-
 		// signed inter-peer request) OR RoleOwner. Wired only when
 		// the bus is supplied — nil leaves the route unregistered
@@ -840,6 +860,9 @@ func (s *Server) ensureAuthServer(resolver *auth.Resolver) *http.Server {
 	}
 	handler = s.idempotencyMiddleware(handler)
 	handler = s.remoteAgentProxyMiddleware(handler)
+	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
+		handler = s.sessionPeerProxyMiddleware(handler)
+	}
 	handler = auth.EnforceMiddleware(handler)
 	handler = auth.AuthMiddleware(resolver)(handler)
 	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {

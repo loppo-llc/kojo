@@ -5,9 +5,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/session"
 )
 
@@ -59,6 +62,18 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if sessionID == "" {
 		writeError(w, http.StatusBadRequest, "bad_request", "missing session parameter")
 		return
+	}
+
+	// Peer-routed attach: the UI carries the session's home peer
+	// in `?peer=` so the Hub knows where to forward the WS.
+	// Self / empty falls through to the local handler. Loop
+	// prevention: a RolePeer-signed inbound WS upgrade must NOT
+	// re-proxy.
+	if pid := r.URL.Query().Get("peer"); pid != "" && s.peerID != nil && pid != s.peerID.DeviceID {
+		if !isPeerWS(r) {
+			s.proxySessionWebSocket(w, r, sessionID, pid)
+			return
+		}
 	}
 
 	sess, ok := s.sessions.Get(sessionID)
@@ -278,5 +293,107 @@ func writeJSON(ctx context.Context, conn *websocket.Conn, v any) error {
 		return err
 	}
 	return conn.Write(ctx, websocket.MessageText, data)
+}
+
+// isPeerWS sniffs the inbound WS upgrade for a peer-auth signature
+// header so the proxy router doesn't re-proxy a peer-signed
+// request. We can't use auth.FromContext for the principal because
+// AuthMiddleware may not have run on the WS upgrade path on every
+// listener configuration; checking the header directly is the
+// minimal, correct loop guard.
+func isPeerWS(r *http.Request) bool {
+	return r.Header.Get("X-Kojo-Peer-Sig") != ""
+}
+
+// proxySessionWebSocket dials the target peer's
+// `/api/v1/ws?session=<id>` with peer-auth headers and pipes
+// frames between the inbound (UI) and outbound (peer) sockets
+// until either side closes. Mirrors proxyAgentWebSocket — same
+// trust model, same nonce-replay defence.
+func (s *Server) proxySessionWebSocket(w http.ResponseWriter, r *http.Request, sessionID, targetDeviceID string) {
+	if s.agents == nil || s.agents.Store() == nil || s.peerID == nil {
+		writeError(w, http.StatusServiceUnavailable, "unavailable",
+			"peer routing not available on this host")
+		return
+	}
+	targetRec, err := s.agents.Store().GetPeer(r.Context(), targetDeviceID)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway",
+			"target peer not in registry: "+err.Error())
+		return
+	}
+	addr, err := peer.NormalizeAddress(targetRec.URL)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway",
+			"target peer has no usable dial address: "+err.Error())
+		return
+	}
+	targetURL, err := url.Parse(addr)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway",
+			"target address unparseable: "+err.Error())
+		return
+	}
+	switch targetURL.Scheme {
+	case "http":
+		targetURL.Scheme = "ws"
+	case "https":
+		targetURL.Scheme = "wss"
+	default:
+		writeError(w, http.StatusBadGateway, "bad_gateway",
+			"target scheme not http(s): "+targetURL.Scheme)
+		return
+	}
+	targetURL.Path = "/api/v1/ws"
+	q := targetURL.Query()
+	q.Set("session", sessionID)
+	targetURL.RawQuery = q.Encode()
+
+	upgrade, err := http.NewRequestWithContext(r.Context(),
+		http.MethodGet, targetURL.String(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	nonce, err := peer.MakeNonce()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "nonce: "+err.Error())
+		return
+	}
+	if err := peer.SignRequest(upgrade,
+		s.peerID.DeviceID, s.peerID.PrivateKey, nonce, targetDeviceID); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "sign: "+err.Error())
+		return
+	}
+	targetConn, _, err := websocket.Dial(r.Context(), targetURL.String(),
+		&websocket.DialOptions{
+			HTTPHeader: upgrade.Header,
+			HTTPClient: peer.NoKeepAliveHTTPClient(10 * time.Second),
+		})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway",
+			"connect to peer: "+err.Error())
+		return
+	}
+	defer targetConn.CloseNow()
+
+	clientConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		OriginPatterns: wsOriginPatterns,
+	})
+	if err != nil {
+		s.logger.Error("session ws proxy: accept inbound failed", "session", sessionID, "err", err)
+		return
+	}
+	defer clientConn.CloseNow()
+	clientConn.SetReadLimit(256 * 1024)
+	targetConn.SetReadLimit(256 * 1024)
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); defer cancel(); copyWS(ctx, clientConn, targetConn) }()
+	go func() { defer wg.Done(); defer cancel(); copyWS(ctx, targetConn, clientConn) }()
+	wg.Wait()
 }
 

@@ -127,6 +127,10 @@ export interface AgentInfo {
   // owns the runtime. The dashboard surfaces this as a "転移中" badge and
   // hides the (necessarily stale) lastMessage preview.
   holderPeer?: string;
+  // holderPeerName is the human-friendly label resolved server-side
+  // from peer_registry. Falls back to holderPeer (deviceID) when the
+  // registry lookup miss races a decommission.
+  holderPeerName?: string;
 }
 
 // TTSConfig mirrors internal/agent.TTSConfig in the Go backend.

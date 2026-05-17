@@ -17,12 +17,31 @@ import (
 // threshold (3.7); 'degraded' is reserved for "reachable but with
 // errors" cases (sha256 scrub failures, slow disk, etc.).
 type PeerRecord struct {
-	DeviceID     string
-	Name         string
+	DeviceID string
+	// Name is the human-readable device label (OS hostname by default).
+	// Operator-overridable from the UI; agents address peers by Name
+	// rather than URL because the dial address (`<host>:<port>` or
+	// `http://...`) is meaningless to a human and changes when the
+	// network topology shifts.
+	Name string
+	// URL is the dial address other peers reach this row on. The
+	// registrar stamps it from tsnet's FQDN (Hub) or the Tailscale
+	// IPv4 (--peer). Empty until the daemon has been started at least
+	// once so the listener bound its port.
+	URL          string
 	PublicKey    string
 	Capabilities string // raw JSON, empty = NULL
 	LastSeen     int64  // unix millis, 0 = NULL
 	Status       string
+	// Trusted gates the privileged cross-peer surface: when set,
+	// requests signed by this row's public_key are admitted on
+	// /api/v1/sessions, /api/v1/ws, /api/v1/info, /api/v1/dirs,
+	// /api/v1/files, /api/v1/git, /api/v1/upload. Without it the
+	// signer can only reach the minimal inter-peer endpoints
+	// (peers/events, peers/blobs, peers/pull, peers/agent-sync,
+	// peers/register-push). Operator-controlled at pairing time
+	// (--peer-add --trusted, or the UI checkbox).
+	Trusted bool
 }
 
 // PeerStatus values accepted by the schema's CHECK constraint.
@@ -83,26 +102,37 @@ func (s *Store) UpsertPeer(ctx context.Context, rec *PeerRecord) (*PeerRecord, e
 	// public_key column blocks a silent identity-key rotation (a
 	// hostile or buggy peer can re-register but cannot also swap its
 	// long-lived key without a separate RotatePeerKey path that
-	// audits the swap). Status / capabilities / last_seen / name are
-	// expected to drift over time and overwrite cleanly.
+	// audits the swap). The `trusted` column is operator-controlled
+	// and likewise preserved on conflict: a heartbeat / register-push
+	// must never silently flip a peer's trust state.
+	// Status / capabilities / last_seen / name / url are expected
+	// to drift over time and overwrite cleanly.
 	const q = `
-INSERT INTO peer_registry (device_id, name, public_key, capabilities, last_seen, status)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO peer_registry (device_id, name, url, public_key, capabilities, last_seen, status, trusted)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(device_id) DO UPDATE SET
   name         = excluded.name,
+  url          = excluded.url,
   capabilities = excluded.capabilities,
   last_seen    = excluded.last_seen,
   status       = excluded.status
 `
 	if _, err := s.db.ExecContext(ctx, q,
-		rec.DeviceID, rec.Name, rec.PublicKey,
+		rec.DeviceID, rec.Name, rec.URL, rec.PublicKey,
 		nullableText(rec.Capabilities),
 		nullableInt64(rec.LastSeen),
-		rec.Status,
+		rec.Status, boolToInt(rec.Trusted),
 	); err != nil {
 		return nil, fmt.Errorf("store.UpsertPeer: %w", err)
 	}
 	return s.GetPeer(ctx, rec.DeviceID)
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // RegisterPeerMetadata is the operator-driven peer registration path:
@@ -137,22 +167,62 @@ func (s *Store) RegisterPeerMetadata(ctx context.Context, rec *PeerRecord) (*Pee
 	if rec.PublicKey == "" {
 		return nil, errors.New("store.RegisterPeerMetadata: public_key required")
 	}
+	// On conflict, treat empty url as "no change" instead of
+	// blanking the existing column. A startup-time register-push
+	// from a peer that hasn't bound its listener yet would
+	// otherwise wipe the Hub's known URL for that peer and break
+	// every subsequent Hub→peer dial. The same applies to name —
+	// the operator-supplied label on the Hub is more authoritative
+	// than the bare hostname a fresh peer emits.
+	//
+	// `trusted` mirrors UpsertPeer's preserve-on-conflict semantics:
+	// register-push from a peer is operator-paired metadata, not an
+	// operator authorization decision, so the receiver's existing
+	// trust state stays canonical. Promotion / demotion of trust
+	// flows through the explicit UI / CLI path (see UpdatePeerTrust).
 	const q = `
-INSERT INTO peer_registry (device_id, name, public_key, capabilities, last_seen, status)
-VALUES (?, ?, ?, ?, NULL, ?)
+INSERT INTO peer_registry (device_id, name, url, public_key, capabilities, last_seen, status, trusted)
+VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
 ON CONFLICT(device_id) DO UPDATE SET
-  name         = excluded.name,
+  name         = CASE WHEN excluded.name = '' THEN peer_registry.name ELSE excluded.name END,
+  url          = CASE WHEN excluded.url  = '' THEN peer_registry.url  ELSE excluded.url  END,
   capabilities = excluded.capabilities
-  -- public_key, last_seen, status intentionally NOT touched on conflict
+  -- public_key, last_seen, status, trusted intentionally NOT touched on conflict
 `
 	if _, err := s.db.ExecContext(ctx, q,
-		rec.DeviceID, rec.Name, rec.PublicKey,
+		rec.DeviceID, rec.Name, rec.URL, rec.PublicKey,
 		nullableText(rec.Capabilities),
-		PeerStatusOffline,
+		PeerStatusOffline, boolToInt(rec.Trusted),
 	); err != nil {
 		return nil, fmt.Errorf("store.RegisterPeerMetadata: %w", err)
 	}
 	return s.GetPeer(ctx, rec.DeviceID)
+}
+
+// UpdatePeerTrust flips the trusted bit on a paired peer row.
+// Operator-driven only; the cross-peer register-push path
+// preserves the existing trust state (any cluster member with a
+// signing key would otherwise self-promote to trusted). Returns
+// ErrNotFound when no row matches the device_id.
+func (s *Store) UpdatePeerTrust(ctx context.Context, deviceID string, trusted bool) error {
+	if deviceID == "" {
+		return errors.New("store.UpdatePeerTrust: device_id required")
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE peer_registry SET trusted = ? WHERE device_id = ?`,
+		boolToInt(trusted), deviceID,
+	)
+	if err != nil {
+		return fmt.Errorf("store.UpdatePeerTrust: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store.UpdatePeerTrust: rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // RotatePeerKey swaps public_key for the row keyed by device_id and
@@ -224,8 +294,8 @@ func (s *Store) RotatePeerKey(ctx context.Context, deviceID, newPublicKey string
 	// with the UPDATE we just issued, so the returned record is
 	// guaranteed to carry our newPublicKey.
 	rec, err := scanPeerRow(tx.QueryRowContext(ctx, `
-SELECT device_id, name, public_key,
-       COALESCE(capabilities,''), COALESCE(last_seen,0), status
+SELECT device_id, name, url, public_key,
+       COALESCE(capabilities,''), COALESCE(last_seen,0), status, trusted
   FROM peer_registry WHERE device_id = ?`, deviceID))
 	if err != nil {
 		return "", nil, fmt.Errorf("store.RotatePeerKey: re-read: %w", err)
@@ -239,8 +309,8 @@ SELECT device_id, name, public_key,
 // GetPeer returns the row keyed by device_id or ErrNotFound.
 func (s *Store) GetPeer(ctx context.Context, deviceID string) (*PeerRecord, error) {
 	const q = `
-SELECT device_id, name, public_key,
-       COALESCE(capabilities,''), COALESCE(last_seen,0), status
+SELECT device_id, name, url, public_key,
+       COALESCE(capabilities,''), COALESCE(last_seen,0), status, trusted
   FROM peer_registry WHERE device_id = ?`
 	rec, err := scanPeerRow(s.db.QueryRowContext(ctx, q, deviceID))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -262,8 +332,8 @@ type ListPeersOptions struct {
 // recently-active peers float to the top.
 func (s *Store) ListPeers(ctx context.Context, opts ListPeersOptions) ([]*PeerRecord, error) {
 	q := `
-SELECT device_id, name, public_key,
-       COALESCE(capabilities,''), COALESCE(last_seen,0), status
+SELECT device_id, name, url, public_key,
+       COALESCE(capabilities,''), COALESCE(last_seen,0), status, trusted
   FROM peer_registry
  WHERE 1=1`
 	args := []any{}
@@ -464,11 +534,13 @@ func (s *Store) DeletePeer(ctx context.Context, deviceID string) error {
 
 func scanPeerRow(r rowScanner) (*PeerRecord, error) {
 	var rec PeerRecord
+	var trustedInt int
 	if err := r.Scan(
-		&rec.DeviceID, &rec.Name, &rec.PublicKey,
-		&rec.Capabilities, &rec.LastSeen, &rec.Status,
+		&rec.DeviceID, &rec.Name, &rec.URL, &rec.PublicKey,
+		&rec.Capabilities, &rec.LastSeen, &rec.Status, &trustedInt,
 	); err != nil {
 		return nil, err
 	}
+	rec.Trusted = trustedInt != 0
 	return &rec, nil
 }

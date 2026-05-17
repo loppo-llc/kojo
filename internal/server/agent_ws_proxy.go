@@ -101,7 +101,7 @@ func (s *Server) proxyAgentWebSocket(w http.ResponseWriter, r *http.Request, age
 			"agent lock points at unknown peer "+targetDeviceID)
 		return
 	}
-	addr, err := peer.NormalizeAddress(targetRec.Name)
+	addr, err := peer.NormalizeAddress(targetRec.URL)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "bad_gateway",
 			"target peer has no usable dial address: "+err.Error())

@@ -13,16 +13,22 @@
 // site. Empty string = "no caps reported" (distinct from "{}" =
 // "empty caps object").
 
-import { get, post, del } from "./httpClient";
+import { get, post, del, patch } from "./httpClient";
 
 export interface PeerInfo {
   deviceId: string;
   name: string;
+  url?: string;
   publicKey: string;
   capabilities?: string;
   lastSeen?: number; // unix millis
   status: "online" | "offline" | "degraded";
   isSelf: boolean;
+  // trusted gates the privileged cross-peer surface on this host
+  // (sessions, ws, info, dirs, files, git, upload). Untrusted
+  // peers can still pair but only the inter-peer endpoints
+  // (events, blobs, agent-sync, register-push) admit them.
+  trusted: boolean;
 }
 
 export interface PeerListResponse {
@@ -33,8 +39,10 @@ export interface PeerListResponse {
 export interface PeerRegisterRequest {
   deviceId: string;
   name: string;
+  url: string;
   publicKey: string;
   capabilities?: string;
+  trusted?: boolean;
 }
 
 export interface PeerRotateKeyResponse {
@@ -52,4 +60,6 @@ export const peersApi = {
       `/api/v1/peers/${encodeURIComponent(deviceId)}/rotate-key`,
       { publicKey },
     ),
+  setTrust: (deviceId: string, trusted: boolean) =>
+    patch<PeerInfo>(`/api/v1/peers/${encodeURIComponent(deviceId)}/trust`, { trusted }),
 };

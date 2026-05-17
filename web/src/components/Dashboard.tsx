@@ -3,6 +3,7 @@ import { Link, useNavigate } from "react-router";
 import { api, type SessionInfo } from "../lib/api";
 import { agentApi, type AgentInfo } from "../lib/agentApi";
 import { groupdmApi, type GroupDMInfo } from "../lib/groupdmApi";
+import { peersApi } from "../lib/peerApi";
 import { AgentAvatar } from "./agent/AgentAvatar";
 import { usePushNotifications } from "../hooks/usePushNotifications";
 import { timeAgo } from "../lib/utils";
@@ -26,7 +27,11 @@ function groupSessions(sessions: SessionInfo[]): SessionGroup[] {
 
   const map = new Map<string, SessionInfo[]>();
   for (const s of sorted) {
-    const key = `${s.tool}:${s.workDir}`;
+    // Bucket by (peer, tool, workDir) so a remote-peer claude
+    // session in /home/me doesn't merge with a local Hub claude
+    // session in the same path — different hosts, different
+    // filesystem semantics. Empty peer is the local Hub.
+    const key = `${s.peer ?? ""}:${s.tool}:${s.workDir}`;
     const list = map.get(key);
     if (list) list.push(s);
     else map.set(key, [s]);
@@ -80,9 +85,65 @@ export function Dashboard() {
   const { state: pushState, loading: pushLoading, subscribe: pushSubscribe } = usePushNotifications();
 
   useEffect(() => {
-    const loadSessions = () => api.sessions.list().then(setSessions).catch(console.error);
-    loadSessions();
-    const interval = setInterval(loadSessions, 3000);
+    // loadSessions concurrently queries every trusted peer in
+    // addition to the local Hub. A session created on peer X with
+    // NewSession's peer selector lives in X's manager; Dashboard
+    // would otherwise look empty until the user navigated directly.
+    // Stamp `peer` on the wire response so subsequent REST + WS
+    // calls (delete, restart, terminal, ws) route through the
+    // Hub→peer proxy. Failures per peer are swallowed so one
+    // unreachable host can't blank the whole list.
+    //
+    // In-flight guard: peer-routed list calls inherit the 30s
+    // proxy timeout. Without the guard a 3s poll would stack up
+    // overlapping outbound requests against a slow / offline peer
+    // and eventually exhaust the browser's per-host connection
+    // pool. The ref skips ticks while one is still resolving;
+    // the next interval just runs again.
+    let inflight = false;
+    const loadSessions = async () => {
+      if (inflight) return;
+      inflight = true;
+      try {
+        const local = await api.sessions.list();
+        let remote: SessionInfo[] = [];
+        try {
+          const peers = (await peersApi.list()).items ?? [];
+          // Trust direction asymmetry: the local row's `trusted`
+          // bit means "this peer may drive privileged ops on THIS
+          // host", not "this host may drive ops on the peer".
+          // For session-list we need the OTHER direction, which
+          // the Hub registry can't observe directly — try every
+          // online non-self peer and silently drop 403s / network
+          // errors. allSettled keeps one unreachable host from
+          // blanking the whole dashboard.
+          const remotes = peers.filter((p) => !p.isSelf && p.status === "online");
+          const settled = await Promise.allSettled(
+            remotes.map((p) =>
+              api.sessions.list(p.deviceId).then((rows) =>
+                rows.map((r) => ({ ...r, peer: r.peer || p.deviceId })),
+              ),
+            ),
+          );
+          remote = settled.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
+        } catch {
+          /* peer registry unavailable — keep local-only */
+        }
+        // Dedup by (peer, id) so a Hub-self entry can't collide
+        // with a peer-side entry that happens to share an id.
+        const merged = new Map<string, SessionInfo>();
+        for (const s of [...local, ...remote]) {
+          merged.set(`${s.peer ?? ""}::${s.id}`, s);
+        }
+        setSessions(Array.from(merged.values()));
+      } catch (err) {
+        console.error(err);
+      } finally {
+        inflight = false;
+      }
+    };
+    void loadSessions();
+    const interval = setInterval(() => void loadSessions(), 3000);
     return () => clearInterval(interval);
   }, []);
 
@@ -157,14 +218,21 @@ export function Dashboard() {
     });
   };
 
+  // sessionHref preserves the session's home peer so a click on a
+  // peer-routed entry lands on the right host. Empty peer → local.
+  const sessionHref = (s: SessionInfo) =>
+    s.peer ? `/session/${s.id}?peer=${encodeURIComponent(s.peer)}` : `/session/${s.id}`;
+
   const deleteGroup = async (g: SessionGroup, e: React.MouseEvent) => {
     e.stopPropagation();
     const all = [g.primary, ...g.others];
-    const results = await Promise.allSettled(all.map((s) => api.sessions.delete(s.id)));
-    const deletedIds = new Set<string>();
-    results.forEach((r, i) => { if (r.status === "fulfilled") deletedIds.add(all[i].id); });
-    if (deletedIds.size > 0) {
-      setSessions((prev) => prev.filter((s) => !deletedIds.has(s.id)));
+    const results = await Promise.allSettled(all.map((s) => api.sessions.delete(s.id, s.peer)));
+    const deletedKeys = new Set<string>();
+    results.forEach((r, i) => {
+      if (r.status === "fulfilled") deletedKeys.add(`${all[i].peer ?? ""}::${all[i].id}`);
+    });
+    if (deletedKeys.size > 0) {
+      setSessions((prev) => prev.filter((s) => !deletedKeys.has(`${s.peer ?? ""}::${s.id}`)));
     }
   };
 
@@ -276,7 +344,9 @@ export function Dashboard() {
                         <div className="flex items-center gap-2 flex-1 min-w-0">
                           <span className="font-medium text-sm truncate">{agent.name}</span>
                           {agent.holderPeer && (
-                            <span className="text-[10px] text-amber-400/80 shrink-0">転移中</span>
+                            <span className="text-[10px] text-amber-400/80 shrink-0" title={agent.holderPeer}>
+                              転移中 @ {agent.holderPeerName || agent.holderPeer.slice(0, 8)}
+                            </span>
                           )}
                           <span className="text-[10px] text-neutral-600 font-mono">{agent.tool}</span>
                           <span className="text-[10px] text-neutral-600 shrink-0 ml-auto">
@@ -297,7 +367,7 @@ export function Dashboard() {
                           </div>
                           <div className="text-xs text-neutral-500 truncate mt-0.5">
                             {agent.holderPeer
-                              ? "転移中 — 最新発言はこの端末では未反映"
+                              ? `転移中 @ ${agent.holderPeerName || agent.holderPeer.slice(0, 8)} — 最新発言はこの端末では未反映`
                               : agent.lastMessage
                                 ? `${agent.lastMessage.role === "user" ? "You: " : ""}${agent.lastMessage.content}`
                                 : agent.persona
@@ -415,7 +485,7 @@ export function Dashboard() {
               return (
                 <div key={g.key} className="bg-neutral-900 rounded-lg border border-neutral-800 relative">
                   <button
-                    onClick={() => navigate(`/session/${g.primary.id}`)}
+                    onClick={() => navigate(sessionHref(g.primary))}
                     className="w-full text-left p-4 hover:bg-neutral-800 rounded-lg"
                   >
                     <div className="flex items-center gap-2 mb-1">
@@ -463,7 +533,7 @@ export function Dashboard() {
                   {runningOthers.map((s) => (
                     <button
                       key={s.id}
-                      onClick={() => navigate(`/session/${s.id}`)}
+                      onClick={() => navigate(sessionHref(s))}
                       className="w-full text-left px-4 py-2.5 hover:bg-neutral-800 border-t border-neutral-800 flex items-center gap-2 text-xs text-neutral-500"
                     >
                       <span className="inline-block w-1.5 h-1.5 rounded-full shrink-0 bg-green-500" />
@@ -483,7 +553,7 @@ export function Dashboard() {
                       {expanded.has(g.key) && stoppedOthers.map((s) => (
                         <button
                           key={s.id}
-                          onClick={() => navigate(`/session/${s.id}`)}
+                          onClick={() => navigate(sessionHref(s))}
                           className="w-full text-left px-4 py-2.5 hover:bg-neutral-800 border-t border-neutral-800 flex items-center gap-2 text-xs text-neutral-500"
                         >
                           <span className="inline-block w-1.5 h-1.5 rounded-full shrink-0 bg-neutral-600" />

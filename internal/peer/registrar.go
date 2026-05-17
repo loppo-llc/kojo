@@ -37,19 +37,19 @@ type Registrar struct {
 	logger *slog.Logger
 	events *EventBus // optional pub/sub for cross-peer status push
 
-	// publicName overrides id.Name on the peer_registry self-row.
-	// Writers: SetPublicName (called from cmd/kojo after tsnet
-	// reports its FQDN). Readers: selfName called from
-	// heartbeatLoop / Stop / RefreshPublicName. Mutex-protected
-	// because the Status() call that drives SetPublicName runs
-	// concurrently with the heartbeat goroutine. The `stopped`
-	// flag closes the race where a slow retry goroutine still
-	// calls RefreshPublicName after Stop has emitted the final
-	// offline-touch — without it the post-Stop refresh would
-	// flip the row back to online.
-	publicMu   sync.RWMutex
-	publicName string
-	stopped    bool
+	// publicURL is the dial address other peers reach this row on.
+	// Writers: SetPublicURL (called from cmd/kojo after tsnet reports
+	// its FQDN, or after peer-mode binds its Tailscale IPv4).
+	// Readers: selfURL / selfURLLocked, called from heartbeatLoop /
+	// Stop / RefreshPublicName. Mutex-protected because the
+	// Status() poll that drives SetPublicURL runs concurrently with
+	// the heartbeat goroutine. The `stopped` flag closes the race
+	// where a slow retry goroutine still calls RefreshPublicName
+	// after Stop has emitted the final offline-touch — without it
+	// the post-Stop refresh would flip the row back to online.
+	publicMu  sync.RWMutex
+	publicURL string
+	stopped   bool
 
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -79,27 +79,27 @@ func (r *Registrar) SetEventBus(bus *EventBus) {
 	r.events = bus
 }
 
-// SetPublicName overrides the name written to the peer_registry
-// self-row. The default (id.Name = os.Hostname()) is wrong for a
-// multi-peer cluster: other peers' Subscriber dials
-// `https://<row.Name>` and expects DNS-resolvable. cmd/kojo passes
-// the Tailscale FQDN + port (e.g. "bravo.<tailnet>.ts.net:8080")
-// here once tsnet has reported its assigned name. Safe to call
-// once before Start; empty name falls back to id.Name.
-func (r *Registrar) SetPublicName(name string) {
+// SetPublicURL stamps the dial address other peers reach this row
+// on. Other peers' Subscriber dials `https://<row.url>` and expects
+// DNS-resolvable. cmd/kojo passes the Tailscale FQDN + port (e.g.
+// "bravo.<tailnet>.ts.net:8080") here once tsnet has reported its
+// assigned name; --peer hosts pass "http://<ts-ipv4>:<port>". Safe
+// to call once before Start; empty leaves the column blank until a
+// later call lands.
+func (r *Registrar) SetPublicURL(url string) {
 	if r == nil {
 		return
 	}
 	r.publicMu.Lock()
-	r.publicName = name
+	r.publicURL = url
 	r.publicMu.Unlock()
 }
 
 // RefreshPublicName re-upserts the self-row with the current
-// publicName. Called by cmd/kojo AFTER tsnet has reported its
+// publicURL. Called by cmd/kojo AFTER tsnet has reported its
 // assigned FQDN — Start runs before tsnet is up, so the initial
-// upsert lands with id.Name (the OS hostname) and this method
-// corrects it. Idempotent; safe to call repeatedly.
+// upsert lands with an empty URL and this method fills it in.
+// Idempotent; safe to call repeatedly.
 //
 // Refuses to run after Stop has been called — without that
 // gate, a slow retry goroutine could fire the refresh AFTER
@@ -120,11 +120,12 @@ func (r *Registrar) RefreshPublicName(ctx context.Context) error {
 	if r.stopped {
 		return errors.New("peer.Registrar.RefreshPublicName: registrar stopped")
 	}
-	name := r.selfNameLocked()
+	url := r.selfURLLocked()
 	nowMs := store.NowMillis()
 	rec, err := r.st.UpsertPeer(ctx, &store.PeerRecord{
 		DeviceID:  r.id.DeviceID,
-		Name:      name,
+		Name:      r.id.Name,
+		URL:       url,
 		PublicKey: r.id.PublicKeyBase64(),
 		LastSeen:  nowMs,
 		Status:    store.PeerStatusOnline,
@@ -133,40 +134,33 @@ func (r *Registrar) RefreshPublicName(ctx context.Context) error {
 		return fmt.Errorf("peer.Registrar.RefreshPublicName: upsert: %w", err)
 	}
 	r.publishStatus(StatusEvent{
-		DeviceID: r.id.DeviceID, Name: name,
+		DeviceID: r.id.DeviceID, Name: r.id.Name, URL: url,
 		Status: store.PeerStatusOnline, LastSeen: nowMs,
 		Op: StatusOpUpsert,
 	})
 	if r.logger != nil {
-		r.logger.Info("peer self-row refreshed with public name",
-			"device_id", r.id.DeviceID, "name", rec.Name)
+		r.logger.Info("peer self-row refreshed with public URL",
+			"device_id", r.id.DeviceID, "name", rec.Name, "url", rec.URL)
 	}
 	return nil
 }
 
-// selfNameLocked returns the row Name to write. Caller MUST
-// hold r.publicMu (read or write). Used by RefreshPublicName +
-// Stop which hold the write lock for the full DB-write scope.
-func (r *Registrar) selfNameLocked() string {
-	if r.publicName != "" {
-		return r.publicName
-	}
-	return r.id.Name
+// selfURLLocked returns the URL column value to write. Caller
+// MUST hold r.publicMu (read or write). Empty when SetPublicURL
+// has not been called — the row's url column lands blank until
+// the listener finishes binding.
+func (r *Registrar) selfURLLocked() string {
+	return r.publicURL
 }
 
-// selfName returns the row Name to write — publicName when set,
-// id.Name otherwise.
-func (r *Registrar) selfName() string {
+// selfURL returns the URL column value to write.
+func (r *Registrar) selfURL() string {
 	if r == nil {
 		return ""
 	}
 	r.publicMu.RLock()
-	pn := r.publicName
-	r.publicMu.RUnlock()
-	if pn != "" {
-		return pn
-	}
-	return r.id.Name
+	defer r.publicMu.RUnlock()
+	return r.publicURL
 }
 
 // Start performs the initial peer_registry upsert (online + last_seen
@@ -181,7 +175,8 @@ func (r *Registrar) Start(ctx context.Context) error {
 	nowMs := store.NowMillis()
 	if _, err := r.st.UpsertPeer(ctx, &store.PeerRecord{
 		DeviceID:  r.id.DeviceID,
-		Name:      r.selfName(),
+		Name:      r.id.Name,
+		URL:       r.selfURL(),
 		PublicKey: r.id.PublicKeyBase64(),
 		LastSeen:  nowMs,
 		Status:    store.PeerStatusOnline,
@@ -189,7 +184,7 @@ func (r *Registrar) Start(ctx context.Context) error {
 		return fmt.Errorf("peer.Registrar.Start: upsert: %w", err)
 	}
 	r.publishStatus(StatusEvent{
-		DeviceID: r.id.DeviceID, Name: r.selfName(),
+		DeviceID: r.id.DeviceID, Name: r.id.Name, URL: r.selfURL(),
 		Status: store.PeerStatusOnline, LastSeen: nowMs,
 		Op: StatusOpUpsert,
 	})
@@ -246,7 +241,7 @@ func (r *Registrar) Stop() {
 			return
 		}
 		r.publishStatus(StatusEvent{
-			DeviceID: r.id.DeviceID, Name: r.selfNameLocked(),
+			DeviceID: r.id.DeviceID, Name: r.id.Name, URL: r.selfURLLocked(),
 			Status: store.PeerStatusOffline, LastSeen: nowMs,
 			Op: StatusOpTouch,
 		})
@@ -298,7 +293,7 @@ func (r *Registrar) tickOnce() {
 	err := r.st.TouchPeer(ctx, r.id.DeviceID, store.PeerStatusOnline, nowMs)
 	if err == nil {
 		r.publishStatus(StatusEvent{
-			DeviceID: r.id.DeviceID, Name: r.selfName(),
+			DeviceID: r.id.DeviceID, Name: r.id.Name, URL: r.selfURL(),
 			Status: store.PeerStatusOnline, LastSeen: nowMs,
 			Op: StatusOpTouch,
 		})
@@ -314,11 +309,12 @@ func (r *Registrar) tickOnce() {
 		return
 	}
 	// Row vanished. Reseed via the same path Start uses so the row
-	// reappears at full identity (public_key + name + caps) instead
-	// of a header-only stub.
+	// reappears at full identity (public_key + name + url + caps)
+	// instead of a header-only stub.
 	if _, upErr := r.st.UpsertPeer(ctx, &store.PeerRecord{
 		DeviceID:  r.id.DeviceID,
-		Name:      r.selfName(),
+		Name:      r.id.Name,
+		URL:       r.selfURL(),
 		PublicKey: r.id.PublicKeyBase64(),
 		LastSeen:  nowMs,
 		Status:    store.PeerStatusOnline,
@@ -330,7 +326,7 @@ func (r *Registrar) tickOnce() {
 		return
 	}
 	r.publishStatus(StatusEvent{
-		DeviceID: r.id.DeviceID, Name: r.selfName(),
+		DeviceID: r.id.DeviceID, Name: r.id.Name, URL: r.selfURL(),
 		Status: store.PeerStatusOnline, LastSeen: nowMs,
 		Op: StatusOpUpsert,
 	})

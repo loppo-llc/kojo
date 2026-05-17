@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/loppo-llc/kojo/internal/store"
 )
@@ -52,7 +53,16 @@ func ResolvePeerTarget(ctx context.Context, st PeerLookupStore, idOrName string)
 	}
 	var hits []*store.PeerRecord
 	for _, rec := range rows {
-		if NameMatches(rec.Name, idOrName) {
+		// 1) Exact (case-insensitive) match on the human-friendly
+		//    Name column — that's the primary identifier the operator
+		//    sees in the UI / CLI.
+		if rec.Name != "" && strings.EqualFold(strings.TrimSpace(rec.Name), strings.TrimSpace(idOrName)) {
+			hits = append(hits, rec)
+			continue
+		}
+		// 2) Fall back to URL-host matching so the historical
+		//    "I typed the Tailscale FQDN" workflow keeps working.
+		if NameMatches(rec.URL, idOrName) {
 			hits = append(hits, rec)
 		}
 	}

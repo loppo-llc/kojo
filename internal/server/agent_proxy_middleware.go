@@ -111,6 +111,19 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// isRawAgentSubpath reports whether the agent sub-path streams
+// bulk body data (file raw / view) and therefore needs the
+// long-proxy timeout. Mirrors session_proxy_middleware's
+// isRawProxyPath; kept local so the agent-routing module owns
+// its own decision.
+func isRawAgentSubpath(sub string) bool {
+	switch sub {
+	case "/files/raw", "/files/view":
+		return true
+	}
+	return false
+}
+
 // proxyToHolderPeer forwards the HTTP request to the peer that
 // holds the agent's runtime lock, signing it with this peer's
 // Ed25519 identity. The target peer's policy layer admits the
@@ -138,17 +151,26 @@ func (s *Server) proxyToHolderPeer(w http.ResponseWriter, r *http.Request, agent
 		return
 	}
 
-	addr, err := peer.NormalizeAddress(peerRec.Name)
+	addr, err := peer.NormalizeAddress(peerRec.URL)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "peer_address",
 			"holder peer has no usable address: "+err.Error())
 		return
 	}
 
-	// Reconstruct the target URL preserving path + query.
+	// Reconstruct the target URL preserving path + query. Strip
+	// `?token=`: extractBearer admits it as an Owner-token fallback
+	// on GET/HEAD so attachment / image-src URLs work, but it must
+	// NOT cross the trust boundary into the holder peer's access
+	// logs. The Ed25519 signature is the only auth that needs to
+	// survive this hop.
 	targetURL := addr + r.URL.Path
-	if r.URL.RawQuery != "" {
-		targetURL += "?" + r.URL.RawQuery
+	q := r.URL.Query()
+	if q.Get("token") != "" {
+		q.Del("token")
+	}
+	if encoded := q.Encode(); encoded != "" {
+		targetURL += "?" + encoded
 	}
 
 	// Buffer the request body (capped at 10 MB — covers avatar
@@ -196,11 +218,16 @@ func (s *Server) proxyToHolderPeer(w http.ResponseWriter, r *http.Request, agent
 		return
 	}
 
-	// Proxy timeout is shorter than switchDeviceOpTimeout (5 min)
-	// because individual API calls should be fast. Avatar upload
-	// and heavy mutations are the outliers; 60s covers those with
-	// margin.
-	const proxyTimeout = 60 * time.Second
+	// Proxy timeout split: API calls are fast (60s covers avatar
+	// uploads + heavy mutations); raw / view fetches stream
+	// multi-MB bodies and would clip mid-transfer on a 60s
+	// budget. Match session_proxy_middleware's 5-minute raw
+	// ceiling so the two surfaces behave the same.
+	_, sub, _ := auth.SplitAgentIDPath(r.URL.Path)
+	proxyTimeout := 60 * time.Second
+	if isRawAgentSubpath(sub) {
+		proxyTimeout = 5 * time.Minute
+	}
 	client := peer.NoKeepAliveHTTPClient(proxyTimeout)
 	resp, err := client.Do(proxyReq)
 	if err != nil {
@@ -214,16 +241,23 @@ func (s *Server) proxyToHolderPeer(w http.ResponseWriter, r *http.Request, agent
 	}
 	defer resp.Body.Close()
 
-	// Stream the upstream response back to the caller.
-	// Preserve headers the UI/client cares about.
+	// Stream the upstream response back to the caller. Preserve
+	// every header a browser keys off — raw file downloads under
+	// /api/v1/agents/{id}/files/raw need Content-Disposition +
+	// Content-Length to land as proper saves, and the existing
+	// JSON / WS surfaces use Content-Type / ETag. Body is copied
+	// unbounded; a 32 MiB silent truncate would mangle big
+	// agent-side downloads.
 	for _, k := range []string{
 		"Content-Type", "ETag",
 		"X-Kojo-No-Idempotency-Cache",
+		"Content-Disposition", "Content-Length",
+		"Last-Modified", "Cache-Control",
 	} {
 		if v := resp.Header.Get(k); v != "" {
 			w.Header().Set(k, v)
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, io.LimitReader(resp.Body, 32<<20))
+	_, _ = io.Copy(w, resp.Body)
 }
