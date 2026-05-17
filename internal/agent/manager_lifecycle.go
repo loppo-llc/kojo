@@ -634,6 +634,27 @@ func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string
 	if _, dup := arrivalNotified.LoadOrStore(key, struct{}{}); dup {
 		return
 	}
+	// Build the cancel context BEFORE the goroutine spawns and
+	// register it synchronously so a teardown that fires between
+	// here and the goroutine's first instruction can still find
+	// our cancel and stop the chat. Wrap in a uniquely-
+	// addressable wrapper so CompareAndDelete on defer compares
+	// pointers (CancelFunc itself isn't comparable in Go).
+	//
+	// Replacement semantics: a SECOND arrival for the same agent
+	// (different op_id) supersedes the prior one — fire the old
+	// cancel and reuse the key. This keeps the registry tracking
+	// the LATEST in-flight arrival, never letting an orphan run
+	// to completion if a fresh switch lands while it's still
+	// drafting the recap. The displaced goroutine's m.Chat will
+	// return ctx.Err() and exit cleanly.
+	ctx, cancel := context.WithCancel(context.Background())
+	myEntry := &cancel
+	if prev, loaded := arrivalCancels.Swap(agentID, myEntry); loaded {
+		if pf, ok := prev.(*context.CancelFunc); ok && pf != nil && *pf != nil {
+			(*pf)()
+		}
+	}
 	go func() {
 		// No artificial timeout: the arrival prompt asks the
 		// agent to resume mid-thought after a device switch, and
@@ -643,21 +664,6 @@ func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string
 		// system message in the transcript — visible to the user
 		// as "timeouts are firing on every switch". A plain
 		// Background context drops the deadline.
-		ctx, cancel := context.WithCancel(context.Background())
-		// Register the cancel func so a target-side teardown
-		// (TeardownAgentRuntime when state-probe purge fires,
-		// or source-release when the switch flips back) can
-		// stop this chat instead of letting it keep writing to
-		// a transcript the agent no longer owns. The defer
-		// clears the entry on normal completion so a stale
-		// cancel doesn't fire for a later, unrelated arrival.
-		// Wrap cancel in a uniquely-addressable value so a stale
-		// goroutine's defer can CompareAndDelete its OWN entry
-		// without blowing away a fresh arrival's cancel that
-		// overwrote ours. Comparing the bare CancelFunc would
-		// fall back to func-value == which panics in Go.
-		myEntry := &cancel
-		arrivalCancels.Store(agentID, myEntry)
 		defer arrivalCancels.CompareAndDelete(agentID, myEntry)
 		defer cancel()
 
