@@ -368,6 +368,16 @@ func New(cfg Config) *Server {
 	// Tailscale-trusted Guest → Owner, so legitimate UI traffic is
 	// unaffected.
 	publicHandler = auth.EnforceMiddleware(publicHandler)
+	// agentHolderAdmitMiddleware sits between OwnerOnly (which
+	// stamps Guest → Owner for the LAN UX) and Enforce (which
+	// runs the route-level allowlist). For RolePeer signers it
+	// looks up agent_locks.holder_peer and request-scope-promotes
+	// the Principal when the signer holds the targeted agent's
+	// lock, so a post-device-switch Hub→peer chat proxy lands
+	// without the operator having to flip persistent trust.
+	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
+		publicHandler = s.agentHolderAdmitMiddleware(publicHandler)
+	}
 	if !cfg.PeerOnly {
 		publicHandler = auth.OwnerOnlyMiddleware(publicHandler)
 	}
@@ -865,6 +875,9 @@ func (s *Server) ensureAuthServer(resolver *auth.Resolver) *http.Server {
 		handler = s.sessionPeerProxyMiddleware(handler)
 	}
 	handler = auth.EnforceMiddleware(handler)
+	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
+		handler = s.agentHolderAdmitMiddleware(handler)
+	}
 	handler = auth.AuthMiddleware(resolver)(handler)
 	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
 		peerAuth := peer.NewAuthMiddleware(s.agents.Store(), s.peerNonces, s.peerID.DeviceID)

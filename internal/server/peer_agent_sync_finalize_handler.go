@@ -142,26 +142,20 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			"commit kv delete: "+err.Error())
 		return
 	}
-	// Trust auto-promote on device-switch landing. The source peer
-	// just handed an agent's runtime to this host; every chat
-	// frame, message read, persona edit and avatar fetch the
-	// operator drives from the Hub UI is going to arrive here as
-	// a Hub→peer signed proxy. The agents/* policy gate requires
-	// the signer's peer_registry.trusted bit on THIS side to be
-	// set, otherwise every post-switch interaction 403s. The
-	// operator already authorised the switch (an Owner-only flow
-	// upstream); flipping trusted=1 for the source row mirrors
-	// that consent and keeps the post-switch UX working without a
-	// separate manual `--peer-trust` step. Best-effort: a failure
-	// here is logged but does NOT roll back the finalize — the
-	// agent has already been adopted; manual trust flip remains
-	// the operator's recovery path.
-	if s.agents != nil && s.agents.Store() != nil {
-		if err := s.agents.Store().UpdatePeerTrust(r.Context(), req.SourceDeviceID, true); err != nil {
-			s.logger.Warn("peer agent-sync finalize: auto-trust promote failed",
-				"source", req.SourceDeviceID, "err", err)
-		}
-	}
+	// Cross-peer access for the post-switch agent traffic is NOT
+	// granted by promoting peer_registry.trusted here. Doing so
+	// would let any paired peer self-escalate by orchestrating a
+	// no-op agent-sync against itself — agent-sync + finalize
+	// admit RolePeer at the policy layer before the trust gate,
+	// so the unprivileged signer could flip its own bit and then
+	// reach the entire sessions/files/git surface as a bonus.
+	//
+	// Instead, the policy layer admits agents/* on a NARROWER
+	// signal: the signer must equal agent_locks.holder_peer for
+	// the targeted agent. That gate is computed at request time
+	// by agentHolderAdmitMiddleware; the lock row this finalize
+	// path adopts is what makes the Hub→peer proxy land green
+	// without any persistent trust flip.
 	writeJSONResponse(w, http.StatusOK,
 		peerAgentSyncFinalizeResponse{AgentID: req.AgentID})
 }
