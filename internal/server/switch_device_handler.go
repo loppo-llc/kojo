@@ -386,6 +386,49 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// Step 0-pre: flush source's disk-side memory writes into the
+	// DB BEFORE building the sync payload. The agent's own chat
+	// turn (which is what called this handler on the self-call
+	// path) may have just used the Write tool to create
+	// memory/daily/<date>.md or any other memory_entries body
+	// that hasn't been picked up by the next prepareChat's
+	// SyncAgentMemoryFromDiskBestEffort yet. Without this flush
+	// buildAgentSyncRequest's ListMemoryEntries reads stale rows
+	// and target ships back missing the freshly-written diary —
+	// visible to the user as "日記が反映されない" on return.
+	//
+	// Same fix applies to MEMORY.md (syncAgentMemoryToDB inside)
+	// so an edit during the closing turn doesn't get dropped.
+	//
+	// Hard fail: a failed flush leaves source's DB stale, and the
+	// switch would silently ship a sync payload missing the newest
+	// diary entry / MEMORY.md edit. The source would also be
+	// released afterwards, so the operator has no path back to
+	// recover the missing rows. Bail BEFORE begin so handoff_pending
+	// stays clear and the operator can retry the switch.
+	//
+	// NOTE: SyncAgentMemoryFromDisk does NOT respect the caller's
+	// ctx — both the per-agent memorySyncMu acquisition and the
+	// internal DB ctx are rooted at context.Background() (see
+	// dbContextWithCancel). switchDeviceOpTimeout above ONLY caps
+	// the parent ctx; the sync itself can outlast it. In practice
+	// the call returns in milliseconds because Step -1's
+	// WaitChatIdle just drained every concurrent writer that could
+	// be holding memorySyncMu; the DB sync runs against a quiet
+	// agent. The honest bound is "as long as a single memory
+	// sync takes," which is dominated by FS scan size and SQLite
+	// write throughput. Adding a ctx-aware lock acquire is a
+	// separate refactor.
+	if s.agents != nil && s.agents.Store() != nil {
+		if err := agent.SyncAgentMemoryFromDisk(ctx, s.agents.Store(), agentID, s.logger); err != nil {
+			s.logger.Error("switch-device: pre-sync disk→DB flush failed; refusing switch to avoid shipping stale memory state",
+				"agent", agentID, "err", err)
+			writeError(w, http.StatusInternalServerError, "memory_flush_failed",
+				"disk→DB memory flush failed; switch aborted to avoid shipping stale state: "+err.Error())
+			return
+		}
+	}
+
 	// Step 0a: probe target's existing state for this agent so
 	// we ship only the delta. Error handling distinguishes two
 	// cases:
@@ -452,7 +495,17 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 			// message so the target's syncMessagesTx accepts it
 			// (seq <= 0 is rejected). Version=1 is the initial
 			// value AppendMessage uses for new rows.
+			//
+			// Seed maxSeq with targetState.MaxMessageSeq when
+			// known: incremental sync can ship an EMPTY
+			// syncReq.Messages slice (no rows past target's
+			// max), and a maxSeq=0 would push inflight.Seq=1
+			// straight into a UNIQUE(agent_id, seq) collision
+			// with target's existing seq=1 row.
 			var maxSeq int64
+			if targetState != nil && targetState.Known {
+				maxSeq = targetState.MaxMessageSeq
+			}
 			for _, m := range syncReq.Messages {
 				if m.Seq > maxSeq {
 					maxSeq = m.Seq

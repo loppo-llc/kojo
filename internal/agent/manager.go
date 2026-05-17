@@ -35,6 +35,12 @@ type busyEntry struct {
 	startedAt   time.Time
 	broadcaster *chatBroadcaster // fan-out for reconnecting clients
 	source      BusySource
+	// accumulator captures the in-flight assistant turn as it
+	// streams. processChatEvents updates it inline (not through
+	// outCh) so SnapshotAccumulatedMessageRecord sees every event
+	// regardless of broadcaster back-pressure. nil for legacy /
+	// hand-rolled busy entries; callers must nil-check.
+	accumulator *chatAccumulator
 }
 
 // Manager manages agent CRUD, chat orchestration, and lifecycle.
@@ -1726,7 +1732,8 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	if len(source) > 0 {
 		src = source[0]
 	}
-	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, source: src}
+	acc := newChatAccumulator()
+	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, source: src, accumulator: acc}
 	// Hand off the preparing counter to the busy entry under
 	// the same lock so WaitChatIdle never observes a window
 	// where neither preparing nor busy is set for this chat.
@@ -1921,6 +1928,18 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 	var accToolUses []ToolUse
 	receivedDone := false
 
+	// Shared accumulator on the busy entry: SnapshotAccumulatedMessageRecord
+	// reads from this struct (NOT the broadcaster's log) so the §3.7
+	// self-call snapshot reflects every event the chat goroutine saw,
+	// including events that outCh dropped under back-pressure. Nil-safe
+	// for hand-rolled test fixtures.
+	m.busyMu.Lock()
+	var sharedAcc *chatAccumulator
+	if entry, ok := m.busy[agentID]; ok {
+		sharedAcc = entry.accumulator
+	}
+	m.busyMu.Unlock()
+
 	defer func() {
 		// §3.7 release guard: a source-release that ran while
 		// this goroutine was mid-flight (post-complete drain
@@ -1960,7 +1979,9 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 		}
 	}()
 
-	// accumulate records streaming data for abort recovery.
+	// accumulate records streaming data for abort recovery AND
+	// mirrors every event into the busy entry's shared accumulator
+	// so the §3.7 self-call snapshot path sees the same data.
 	accumulate := func(event *ChatEvent) {
 		switch event.Type {
 		case "text":
@@ -1976,6 +1997,7 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 		case "tool_result":
 			matchToolOutput(accToolUses, event.ToolUseID, event.ToolName, event.ToolOutput)
 		}
+		sharedAcc.OnEvent(event)
 	}
 
 	// handleTerminal persists terminal events (done/error) to the transcript.
@@ -2574,7 +2596,7 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 	m.busyMu.Lock()
 	delete(m.editing, agentID)
 	editingReleased = true
-	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc}
+	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, accumulator: newChatAccumulator()}
 	m.busyMu.Unlock()
 	m.notifyChatStart(agentID)
 

@@ -668,7 +668,7 @@ func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string
 		defer cancel()
 
 		prompt := "デバイス転移完了。転移元: " + sourcePeerName + "。このデバイスで作業を継続してください。直前の会話の流れを確認し、中断された作業があれば再開してください。"
-		events, err := m.Chat(ctx, agentID, prompt, "system", nil, BusySourceNotification)
+		events, err := chatWithArrivalRetry(ctx, m, agentID, prompt, opID)
 		if err != nil {
 			// Clear dedup so a finalize retry for the SAME op can
 			// fire — the chat never landed, retry is benign.
@@ -690,6 +690,117 @@ func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string
 			m.logger.Info("device-switch arrival chat completed", "agent", agentID, "op_id", opID)
 		}
 	}()
+}
+
+// arrivalChatRetryAttempts × arrivalChatRetryBackoff bounds the total
+// wait the arrival prompt accepts before giving up. ActivateAgentRuntime
+// schedules cron / notify side channels right before the arrival fires;
+// if a cron tick or a notify poll grabs the busy slot first, m.Chat
+// returns ErrAgentBusy and the arrival would otherwise be lost — visible
+// to the user as "auto-continue didn't fire on return."
+//
+// Codex flagged that a 3s budget can't outlast a real cron-triggered
+// chat (which can run for minutes). The compromise: bump the budget to
+// roughly the longest plausible competing one-shot — claude turns
+// typically wrap within a minute or two — and rely on the budget being
+// dominated by the COMPLETION of the competing chat, not by polling
+// overhead. If a wedged sibling chat truly blocks longer than that,
+// the arrival is permanently lost (see LIMITATION on
+// chatWithArrivalRetry — /handoff/finalize retry does NOT re-fire
+// the hook because pending was already consumed). Recovery in that
+// case is manual: the operator drafts a system message via the UI
+// to wake the agent, or a future durable arrival queue (kv-backed,
+// follow-up work) sweeps it on the next daemon tick.
+//
+// ReloadAgentFromStore racing with the lookup similarly surfaces as
+// ErrAgentNotFound for a brief window; the same retry covers that.
+const arrivalChatRetryAttempts = 60
+
+// arrivalChatRetryBackoff is the inter-attempt sleep. 2s × 60 = 120s of
+// total wait, far enough to outlast the typical cron/notify-triggered
+// claude turn that might transiently hold busy.
+const arrivalChatRetryBackoff = 2 * time.Second
+
+// chatWithArrivalRetry wraps m.Chat with a bounded retry loop for the
+// arrival prompt. Retries on ErrAgentBusy / ErrAgentNotFound (both
+// race-driven and self-clearing). Other errors bail immediately —
+// they signal a genuine misconfiguration (no backend, archived
+// agent, switching flag pinned by a buggy caller) that a retry
+// wouldn't fix.
+//
+// Returns the same (events, err) shape as m.Chat so the caller's
+// drain loop is unchanged.
+//
+// Cheap busy-wait before each m.Chat attempt: a full m.Chat call
+// runs prepareChat (FS sync + memory-context build + system-prompt
+// assembly + AppendMessage + backend init), which is expensive to
+// repeat 60 times when the only blocker is a competing busy entry.
+// Polling IsBusy / Get is just a map lookup under a mutex, so a
+// short pre-check skips the wasted prepareChat work on every retry
+// while the competing chat finishes.
+//
+// LIMITATION: this retry only covers ~120s. If a sibling chat truly
+// holds busy past arrivalChatRetryAttempts × arrivalChatRetryBackoff,
+// the goroutine gives up and arrivalNotified.Delete(key) runs — but
+// the finalize HTTP handler has already returned 200 to source by
+// then, source's onAgentReleasedAsSource has run, and the pending
+// agent-sync entry on target has been consumed. The arrival is
+// effectively LOST and the operator must drive a fresh switch (or
+// manually trigger a system message on target) to resume claude.
+// A durable arrival queue (kv row written before m.Chat, swept at
+// daemon startup) is the correct fix; tracked as follow-up.
+func chatWithArrivalRetry(ctx context.Context, m *Manager, agentID, prompt, opID string) (<-chan ChatEvent, error) {
+	var lastErr error
+	for attempt := 0; attempt < arrivalChatRetryAttempts; attempt++ {
+		// Cheap pre-check: skip the expensive m.Chat → prepareChat
+		// path while the agent is observably busy. The check races
+		// with concurrent state changes but at worst we issue one
+		// m.Chat call that returns ErrAgentBusy (idempotent, no
+		// side effects) — strictly better than burning prepareChat
+		// every attempt. ErrAgentNotFound also self-clears via
+		// the m.Chat path; we only poll IsBusy here, not Get(),
+		// to keep the pre-check single-purpose.
+		if attempt > 0 && m.IsBusy(agentID) {
+			if m.logger != nil {
+				m.logger.Debug("device-switch arrival chat: agent still busy, skipping retry attempt",
+					"agent", agentID, "op_id", opID, "attempt", attempt+1)
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(arrivalChatRetryBackoff):
+			}
+			continue
+		}
+		events, err := m.Chat(ctx, agentID, prompt, "system", nil, BusySourceNotification)
+		if err == nil {
+			if attempt > 0 && m.logger != nil {
+				m.logger.Info("device-switch arrival chat: succeeded after retry",
+					"agent", agentID, "op_id", opID, "attempts", attempt+1)
+			}
+			return events, nil
+		}
+		lastErr = err
+		// Non-retryable: backend init failures, archived agent,
+		// fenced-out by switching, etc. Bail immediately so the
+		// caller logs the genuine cause instead of masking it
+		// with retry timing noise.
+		if !errors.Is(err, ErrAgentBusy) && !errors.Is(err, ErrAgentNotFound) {
+			return nil, err
+		}
+		if m.logger != nil {
+			m.logger.Debug("device-switch arrival chat: transient reject, retrying",
+				"agent", agentID, "op_id", opID, "attempt", attempt+1, "err", err)
+		}
+		if attempt+1 < arrivalChatRetryAttempts {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(arrivalChatRetryBackoff):
+			}
+		}
+	}
+	return nil, lastErr
 }
 
 // kvReleasedNamespace + kvReleasedKey: machine-scoped kv row that

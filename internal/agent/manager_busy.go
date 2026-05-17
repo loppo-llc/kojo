@@ -391,9 +391,9 @@ func (m *Manager) acquireResetGuard(agentID string) (func(), error) {
 }
 
 // SnapshotAccumulatedMessageRecord reconstructs the in-flight
-// assistant message from the chat broadcaster's event log for the
-// agent and returns it as a store.MessageRecord ready for inclusion
-// in the §3.7 agent-sync payload.
+// assistant message from the busy entry's shared accumulator and
+// returns it as a store.MessageRecord ready for inclusion in the
+// §3.7 agent-sync payload.
 //
 // Used by the device-switch self-call path: the assistant turn
 // containing the kojo-switch-device tool_use is still mid-flight
@@ -403,48 +403,75 @@ func (m *Manager) acquireResetGuard(agentID string) (func(), error) {
 // release guard would prevent the processChatEvents defer from ever
 // persisting it.
 //
-// Returns nil if the agent is not busy, has no broadcaster, or no
-// streaming data has accumulated. The caller appends the returned
-// record to the sync payload WITHOUT persisting it to the source's
-// DB — on abort the chat continues normally and the done event
-// persists the full message; on success the source is released and
-// persistence is moot.
+// Reads the shared chatAccumulator (NOT the chat broadcaster's
+// log) because outCh's non-blocking send drops non-terminal events
+// under back-pressure — so the broadcaster's log silently misses
+// streaming text / tool_use rows on long claude turns and the
+// snapshot would migrate a partial message. The accumulator is fed
+// inline by processChatEvents on every event, regardless of outCh
+// pressure, so a Snapshot read here matches the chat goroutine's
+// own view of the turn.
+//
+// Falls back to the broadcaster's log when the busy entry has no
+// accumulator (legacy / hand-rolled test fixtures); the legacy path
+// retains the original behavior so existing tests don't regress.
+//
+// Returns nil if the agent is not busy or no streaming data has
+// accumulated. The caller appends the returned record to the sync
+// payload WITHOUT persisting it to the source's DB — on abort the
+// chat continues normally and the done event persists the full
+// message; on success the source is released and persistence is moot.
 func (m *Manager) SnapshotAccumulatedMessageRecord(agentID string) *store.MessageRecord {
 	m.busyMu.Lock()
 	entry, ok := m.busy[agentID]
 	m.busyMu.Unlock()
-	if !ok || entry.broadcaster == nil {
+	if !ok {
 		return nil
 	}
 
-	past, _, unsub := entry.broadcaster.Subscribe()
-	unsub()
-
-	var text, thinking strings.Builder
+	var text, thinking string
 	var toolUses []ToolUse
-	for _, ev := range past {
-		switch ev.Type {
-		case "text":
-			text.WriteString(ev.Delta)
-		case "thinking":
-			thinking.WriteString(ev.Delta)
-		case "tool_use":
-			toolUses = append(toolUses, ToolUse{
-				ID:    ev.ToolUseID,
-				Name:  ev.ToolName,
-				Input: ev.ToolInput,
-			})
-		case "tool_result":
-			matchToolOutput(toolUses, ev.ToolUseID, ev.ToolName, ev.ToolOutput)
+	if entry.accumulator != nil {
+		text, thinking, toolUses = entry.accumulator.Snapshot()
+	} else if entry.broadcaster != nil {
+		// Fallback for legacy busy entries that predate the
+		// accumulator. Same shape as the original implementation —
+		// reads the broadcaster's past log and folds it into a
+		// MessageRecord. Drops events if outCh ever back-pressured;
+		// acceptable here because the only callers without an
+		// accumulator are test fixtures whose chats run too short
+		// to back-pressure outCh.
+		past, _, unsub := entry.broadcaster.Subscribe()
+		unsub()
+		var tBuf, thBuf strings.Builder
+		for _, ev := range past {
+			switch ev.Type {
+			case "text":
+				tBuf.WriteString(ev.Delta)
+			case "thinking":
+				thBuf.WriteString(ev.Delta)
+			case "tool_use":
+				toolUses = append(toolUses, ToolUse{
+					ID:    ev.ToolUseID,
+					Name:  ev.ToolName,
+					Input: ev.ToolInput,
+				})
+			case "tool_result":
+				matchToolOutput(toolUses, ev.ToolUseID, ev.ToolName, ev.ToolOutput)
+			}
 		}
+		text = tBuf.String()
+		thinking = thBuf.String()
+	} else {
+		return nil
 	}
 
-	if text.Len() == 0 && thinking.Len() == 0 && len(toolUses) == 0 {
+	if text == "" && thinking == "" && len(toolUses) == 0 {
 		return nil
 	}
 	msg := newAssistantMessage()
-	msg.Content = text.String()
-	msg.Thinking = thinking.String()
+	msg.Content = text
+	msg.Thinking = thinking
 	msg.ToolUses = toolUses
 	rec, err := messageToRecord(agentID, msg)
 	if err != nil {
