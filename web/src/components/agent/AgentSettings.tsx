@@ -136,7 +136,9 @@ export function AgentSettings() {
   const [forkError, setForkError] = useState("");
   const [userContext, setUserContext] = useState("");
   const [userContextDirty, setUserContextDirty] = useState(false);
-  const [savingUserContext, setSavingUserContext] = useState(false);
+  // user.md persistence rides on handleSave's `saving` flag — it disables
+  // the Save button and the inputs together with the rest of the form. A
+  // dedicated savingUserContext flag would be dead state.
   const [cronMessage, setCronMessage] = useState("");
   // Track whether cronMessage diverges from what's persisted in checkin.md.
   // Manual check-in runs against the persisted file, so editing the textarea

@@ -180,7 +180,9 @@ func truncateBootstrapFile(content string, filePath string) string {
 	markerRunes := []rune(marker)
 	budget := maxBootstrapRunes - len(markerRunes)
 	if budget < 100 {
-		return string(runes[:maxBootstrapRunes]) + "…"
+		// Reserve 1 rune for the ellipsis so the result stays within
+		// maxBootstrapRunes (the hard cap callers rely on).
+		return string(runes[:maxBootstrapRunes-1]) + "…"
 	}
 	headSize := int(float64(budget) * 0.75)
 	tailSize := budget - headSize

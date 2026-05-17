@@ -360,7 +360,11 @@ function FilePathChip({
 function CollapsibleSystemPill({ message }: { message: AgentMessage }) {
   const [expanded, setExpanded] = useState(false);
   const firstLine = message.content.split("\n", 1)[0];
-  const hasMore = message.content.length > firstLine.length;
+  // Expandable when there's content past the first line, or when the first
+  // line is long enough that `truncate` on the pill will hide some of it.
+  // 80 is a safe heuristic — narrower than every pill width we ship — so long
+  // single-line system messages stay inspectable.
+  const hasMore = message.content.length > firstLine.length || firstLine.length > 80;
   return (
     <div className="flex justify-center my-1.5">
       <div className="flex flex-col items-center max-w-[90%] w-full">

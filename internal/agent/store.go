@@ -120,19 +120,28 @@ func (st *store) Load() ([]*Agent, error) {
 		a.LegacyActiveEnd = ""
 
 		// Migrate CronMessage → checkin.md file.
-		// If the agent has a non-empty CronMessage and no checkin.md exists,
-		// write the content to checkin.md and clear the JSON field.
+		// Only clear the legacy JSON field once we know the content survives
+		// somewhere on disk — either checkin.md already exists, or this run
+		// just wrote it. If the write (or stat) fails we keep CronMessage so
+		// the agent's check-in instructions aren't silently dropped.
 		if a.CronMessage != "" {
 			checkinPath := filepath.Join(agentDir(a.ID), "checkin.md")
-			if _, err := os.Stat(checkinPath); os.IsNotExist(err) {
+			switch _, statErr := os.Stat(checkinPath); {
+			case statErr == nil:
+				// checkin.md already exists — legacy field is redundant.
+				a.CronMessage = ""
+				needsSave = true
+			case os.IsNotExist(statErr):
 				if err := os.WriteFile(checkinPath, []byte(a.CronMessage), 0o644); err != nil {
-					st.logger.Warn("failed to migrate cronMessage to checkin.md", "agent", a.ID, "err", err)
+					st.logger.Warn("failed to migrate cronMessage to checkin.md, keeping legacy field for retry", "agent", a.ID, "err", err)
 				} else {
 					st.logger.Info("migrated cronMessage → checkin.md", "agent", a.ID)
+					a.CronMessage = ""
+					needsSave = true
 				}
+			default:
+				st.logger.Warn("stat checkin.md failed during cronMessage migration, keeping legacy field", "agent", a.ID, "err", statErr)
 			}
-			a.CronMessage = ""
-			needsSave = true
 		}
 
 		// Validate loaded silent hours — clear invalid values

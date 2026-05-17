@@ -1228,7 +1228,11 @@ func (s *Server) handleSetUserContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := agent.WriteUserFile(id, body.Content); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		// Don't surface the raw filesystem error to the client — it can leak
+		// internal paths / OS details. Log server-side and return a stable
+		// message (matches the checkin-file handler pattern).
+		s.logger.Warn("failed to write user.md", "agent", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to write user.md")
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]string{"content": body.Content})
