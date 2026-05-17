@@ -61,14 +61,22 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusInternalServerError, "internal", "agent lookup: "+err.Error())
 		return
 	}
-	rec, err := s.agents.Store().ForceReclaimAgentLock(
+	// One-shot atomic restore of every device-switch artefact
+	// (agent_locks, blob_refs, kv handoff markers) back to "local
+	// owns the runtime". Without this all-in-one tx the operator
+	// has to chase down state row-by-row whenever a switch
+	// half-fails — see the recurring force-reclaim breakage where
+	// agent_locks was rewritten but blob_refs.home_peer kept
+	// pointing at the dead peer and the next device-switch
+	// surfaced wrong_source.
+	rec, err := s.agents.Store().ForceReclaimAgentToLocal(
 		r.Context(), id, s.peerID.DeviceID,
 		store.NowMillis(), forceReclaimLeaseDuration.Milliseconds(),
 	)
 	if err != nil {
-		s.logger.Error("force-reclaim: lock rewrite failed", "agent", id, "err", err)
+		s.logger.Error("force-reclaim: atomic state restore failed", "agent", id, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal",
-			"lock reclaim: "+err.Error())
+			"force-reclaim: "+err.Error())
 		return
 	}
 	if s.onAgentForceReclaimed != nil {
