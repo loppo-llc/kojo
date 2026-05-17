@@ -149,14 +149,17 @@ func TestAgentFencing_ReturnsServiceUnavailableOnStoreError(t *testing.T) {
 }
 
 func TestAgentFencing_PassesNonAgentPrincipals(t *testing.T) {
-	// Owner must pass without the middleware consulting the lock
-	// at all — they're admin. fakeLockStore with failErr ensures
-	// a hypothetical GetAgentLock call would error, proving the
-	// middleware short-circuited before reaching it.
+	// Owner / WebDAV / Guest must pass without the middleware
+	// consulting the lock at all. RolePeer is intentionally NOT
+	// in this list: a Hub→peer proxy write needs to be refused
+	// when the holder has moved (covered by
+	// TestAgentFencing_FencesPeerWrongHolder). fakeLockStore
+	// with failErr ensures a hypothetical GetAgentLock call would
+	// error, proving the middleware short-circuited before
+	// reaching it.
 	st := &fakeLockStore{failErr: errors.New("should not be called")}
 	for _, p := range []Principal{
 		{Role: RoleOwner},
-		{Role: RolePeer, PeerID: "some-peer"},
 		{Role: RoleWebDAV},
 		{Role: RoleGuest},
 	} {
@@ -168,6 +171,54 @@ func TestAgentFencing_PassesNonAgentPrincipals(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Errorf("role=%v: status=%d, want 200 (body=%s)", p.Role, w.Code, w.Body.String())
 		}
+	}
+}
+
+func TestAgentFencing_PassesPeerWhenHolderMatches(t *testing.T) {
+	// RolePeer proxy write lands on the host whose lock holder
+	// matches selfPeerID — the typical post-device-switch chat
+	// flow. The fence must let it through.
+	st := &fakeLockStore{holderByID: map[string]string{"ag_x": "peer-self"}}
+	h := newFencingHandler(t, st, "peer-self",
+		Principal{Role: RolePeer, PeerID: "hub-id"})
+	r := httptest.NewRequest(http.MethodPost,
+		"/api/v1/agents/ag_x/messages", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+}
+
+func TestAgentFencing_FencesPeerWrongHolder(t *testing.T) {
+	// RolePeer proxy write against an agent whose lock has moved
+	// elsewhere must 409 — the post-switch invariant. Without
+	// this gate a stale Hub→source proxy would mutate state on
+	// the source after the target adopted the agent.
+	st := &fakeLockStore{holderByID: map[string]string{"ag_x": "peer-tgt"}}
+	h := newFencingHandler(t, st, "peer-self",
+		Principal{Role: RolePeer, PeerID: "hub-id"})
+	r := httptest.NewRequest(http.MethodPost,
+		"/api/v1/agents/ag_x/messages", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", w.Code, w.Body.String())
+	}
+}
+
+func TestAgentFencing_PassesPeerOnHandoffRoute(t *testing.T) {
+	// /handoff/* sub-paths are the orchestrator's move-the-lock
+	// machinery and must skip fencing even from a RolePeer signer.
+	st := &fakeLockStore{holderByID: map[string]string{"ag_x": "peer-tgt"}}
+	h := newFencingHandler(t, st, "peer-self",
+		Principal{Role: RolePeer, PeerID: "hub-id"})
+	r := httptest.NewRequest(http.MethodPost,
+		"/api/v1/agents/ag_x/handoff/complete", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
 	}
 }
 

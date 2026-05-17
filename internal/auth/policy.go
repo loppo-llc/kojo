@@ -180,28 +180,27 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			return true
 		}
 		// Trust gate. Every privileged peer surface — sessions,
-		// ws, info, dirs, files, git, upload, AND the §3.7
-		// agent proxy paths — is admitted only when the operator
-		// flipped peer_registry.trusted (--peer-add --trusted /
-		// `--peer-trust` / UI checkbox). Pairing alone is shape
-		// validation, not authorisation: any paired RolePeer
-		// signer that bypassed this gate could create sessions,
-		// read other agents' personas, or run git commands on
-		// this host. Inter-peer-only routes (events / blobs /
-		// pull / agent-sync) were handled above; everything
-		// below requires trusted=1.
+		// ws, info, dirs, files, git, upload, AND the §3.7 agent
+		// proxy paths — is admitted only when the operator
+		// flipped peer_registry.trusted on the receiving side
+		// (--peer-add --trusted / `--peer-trust` / UI checkbox).
+		// Pairing alone is shape validation, not authorisation:
+		// any paired RolePeer signer that bypassed this gate could
+		// reach credentials/persona/memory/export and the rest of
+		// the agent admin surface. AgentFencingMiddleware does NOT
+		// currently distinguish RolePeer signers at the holder-
+		// fencing check, so the policy layer is the load-bearing
+		// authorisation boundary here.
+		//
+		// device-switch / chat-proxy interplay: when the Hub moves
+		// an agent to a peer via §3.7, the peer's agent-sync
+		// finalize handler auto-promotes the source (= Hub) to
+		// trusted=1 on the local registry. That keeps the post-
+		// switch Hub→peer chat / WS / messages traffic admitted
+		// without forcing the operator to flip trust manually.
 		if !p.PeerTrusted {
 			return false
 		}
-		// Blanket agent-path proxy surface (§3.7 device-switch):
-		// Hub's remoteAgentProxyMiddleware forwards any agent-
-		// scoped request from an authorised caller (Owner /
-		// Agent) to the holder peer, signing it with the Hub's
-		// Ed25519 identity. The target's handler still runs
-		// its own guards (If-Match, busy checks, lock holder,
-		// etc.). Loop prevention in the middleware ensures we
-		// never re-proxy a peer-signed request. Subsumes the
-		// earlier per-endpoint entries (WS, messages).
 		if strings.HasPrefix(path, "/api/v1/agents/") {
 			return true
 		}

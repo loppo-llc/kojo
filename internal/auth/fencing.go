@@ -25,18 +25,23 @@ type AgentFencingStore interface {
 }
 
 // AgentFencingMiddleware refuses mutating requests from
-// RoleAgent / RolePrivAgent principals when agent_locks.holder_peer
-// does NOT match the local peer. Closes the §3.7 device-switch
-// invariant the previous slice left open: once the orchestrator
-// transfers the lock to a target peer, the source peer's agent
-// runtime MUST stop writing to the agent's tables.
+// RoleAgent / RolePrivAgent / RolePeer principals when
+// agent_locks.holder_peer does NOT match the local peer. Closes
+// the §3.7 device-switch invariant the previous slice left open:
+// once the orchestrator transfers the lock to a target peer, the
+// source peer's agent runtime — and any stale Hub→source proxy
+// write — MUST stop writing to the agent's tables.
 //
 // Scope:
 //
-//   - Only RoleAgent / RolePrivAgent are gated. RoleOwner /
-//     RolePeer / RoleWebDAV / RoleGuest pass through untouched
-//     (owner is admin; peers run their own auth surface; webdav /
-//     guest don't write to agent state).
+//   - RoleAgent / RolePrivAgent gated as before.
+//   - RolePeer also gated: a Hub→peer agent proxy that lands on a
+//     host that no longer holds the lock must 409 rather than
+//     mutate state out from under the real holder. The fence is
+//     the load-bearing safeguard here because EnforceMiddleware
+//     admits /api/v1/agents/* for trusted RolePeer.
+//   - RoleOwner / RoleWebDAV / RoleGuest pass through (owner is
+//     admin; webdav / guest don't write to agent state).
 //   - Read methods (GET / HEAD / OPTIONS) pass through. Lock
 //     holders rotate via complete; readers should still observe
 //     transient state without 409s.
@@ -71,32 +76,47 @@ func AgentFencingMiddleware(st AgentFencingStore, selfPeerID string, logger *slo
 				return
 			}
 			p := FromContext(r.Context())
-			if !p.IsAgent() {
+			if !p.IsAgent() && !p.IsPeer() {
 				next.ServeHTTP(w, r)
 				return
 			}
-			fenceID, ok := agentIDForFencing(r.URL.Path, p.AgentID)
-			if !ok {
-				// Not an agent-write route the fence covers.
-				// EnforceMiddleware's allowlist already binds
-				// non-owner mutations to the caller's own
-				// agent_id; the fence trusts that gate and
-				// only kicks in for routes where a mutation
-				// actually targets agent-scoped state on this
-				// peer.
+			// Handoff orchestration is the very mechanism that
+			// moves the lock — fencing it would deadlock. Exempt
+			// every /handoff/* sub-path regardless of principal
+			// (Agent self-switch, Hub-driven orchestrator dispatch,
+			// peer-side agent-sync flow).
+			id, sub, sok := SplitAgentIDPath(r.URL.Path)
+			if sok && strings.HasPrefix(sub, "/handoff/") {
 				next.ServeHTTP(w, r)
 				return
 			}
-			if id, sub, sok := SplitAgentIDPath(r.URL.Path); sok {
-				// Exempt the orchestrated-switch route on the
-				// per-agent path — it's the very mechanism
-				// that moves the lock away. fenceID may differ
-				// from id if the request is cross-agent, but
-				// EnforceMiddleware already 403s that case.
-				if id == p.AgentID && sub == "/handoff/switch" {
+			var fenceID string
+			switch {
+			case p.IsAgent():
+				f, ok := agentIDForFencing(r.URL.Path, p.AgentID)
+				if !ok {
+					// Not an agent-write route the fence covers.
+					// EnforceMiddleware's allowlist already binds
+					// non-owner mutations to the caller's own
+					// agent_id; the fence trusts that gate and
+					// only kicks in for routes where a mutation
+					// actually targets agent-scoped state on this
+					// peer.
 					next.ServeHTTP(w, r)
 					return
 				}
+				fenceID = f
+			case p.IsPeer():
+				// Path-only resolution: the RolePeer signer has no
+				// AgentID. Agent routes outside /agents/{id}/...
+				// (e.g. /agents/directory) aren't write paths and
+				// pass through; everything else is gated on the
+				// path-derived agent_id.
+				if !sok || id == "" {
+					next.ServeHTTP(w, r)
+					return
+				}
+				fenceID = id
 			}
 			if st == nil || selfPeerID == "" {
 				// Misconfigured pipeline. Refuse rather than
