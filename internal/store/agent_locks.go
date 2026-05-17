@@ -773,7 +773,7 @@ func (s *Store) ListAgentLocksByHolder(ctx context.Context, peer string) ([]Agen
 		return nil, errors.New("store.ListAgentLocksByHolder: peer required")
 	}
 	const q = `
-SELECT agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at
+SELECT agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at, allowed_proxy_peer
   FROM agent_locks WHERE holder_peer = ?`
 	rows, err := s.db.QueryContext(ctx, q, peer)
 	if err != nil {
@@ -792,6 +792,39 @@ SELECT agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at
 		return nil, fmt.Errorf("store.ListAgentLocksByHolder: rows: %w", err)
 	}
 	return out, nil
+}
+
+// UpdateAgentLockAllowedProxy stamps the allowed_proxy_peer column
+// on an existing lock row without disturbing holder / fencing_token /
+// lease. Used by the §3.7 device-switch finalize path: target's
+// AgentLockGuard.AddAgent (called inside the finalize hook) ran
+// AcquireAgentLock which inserted with allowed_proxy_peer = self.
+// That default would refuse the post-switch Hub→target proxy whose
+// signer is the source. This call rewrites allowed_proxy_peer to
+// the source so admit-by-orchestrator works without re-issuing the
+// lock row (which would bump the fencing_token and invalidate the
+// agent's just-adopted runtime tokens).
+//
+// Returns ErrNotFound when no row matches the agent_id.
+func (s *Store) UpdateAgentLockAllowedProxy(ctx context.Context, agentID, allowedProxyPeer string) error {
+	if agentID == "" {
+		return errors.New("store.UpdateAgentLockAllowedProxy: agent_id required")
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE agent_locks SET allowed_proxy_peer = ? WHERE agent_id = ?`,
+		allowedProxyPeer, agentID,
+	)
+	if err != nil {
+		return fmt.Errorf("store.UpdateAgentLockAllowedProxy: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store.UpdateAgentLockAllowedProxy: rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // GetAgentLock returns the row for agent_id or ErrNotFound.

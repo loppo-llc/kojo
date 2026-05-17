@@ -17,10 +17,15 @@
 --   ForceReclaimAgentLock: allowed = peer (= self が orchestrator)
 --   RefreshAgentLock: 既存値 preserve
 --
--- 既存行 backfill: AllowedProxyPeer = holder_peer。device-switch を
--- 経た既存行は次の transfer / refresh で正しい値に上書きされる。
+-- 既存行は backfill しない (空のまま)。理由:
+--   - 既存 deployed の post-device-switch 行は holder=target で
+--     source 情報を store に保持していない。holder_peer で機械的に
+--     backfill すると target=target=allowed となり、Hub からの
+--     proxy が誤って middleware にrejectされる (source ≠ target)。
+--   - allowed_proxy_peer = '' のままなら middleware は admit せず、
+--     operator が「強制復帰」ボタン (force-reclaim) で復活させる
+--     経路だけが有効になる。これは migration 跨ぎの安全な fallback。
+--   - 新規 acquire / transfer / force-reclaim / finalize 経由の
+--     row には正しい値が入る (各 path で stamp 済み)。
 ALTER TABLE agent_locks
   ADD COLUMN allowed_proxy_peer TEXT NOT NULL DEFAULT '';
-
-UPDATE agent_locks SET allowed_proxy_peer = holder_peer
- WHERE allowed_proxy_peer = '';

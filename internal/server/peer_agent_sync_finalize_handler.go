@@ -3,10 +3,12 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 
 	"github.com/loppo-llc/kojo/internal/auth"
+	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // docs/multi-device-storage.md §3.7 — agent-sync finalize.
@@ -142,20 +144,26 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			"commit kv delete: "+err.Error())
 		return
 	}
-	// Cross-peer access for the post-switch agent traffic is NOT
-	// granted by promoting peer_registry.trusted here. Doing so
-	// would let any paired peer self-escalate by orchestrating a
-	// no-op agent-sync against itself — agent-sync + finalize
-	// admit RolePeer at the policy layer before the trust gate,
-	// so the unprivileged signer could flip its own bit and then
-	// reach the entire sessions/files/git surface as a bonus.
+	// agentHolderAdmitMiddleware gates the agents/* surface on
+	// `holder_peer == self AND allowed_proxy_peer == signer`.
+	// The lock row the AgentLockGuard.AddAgent path inside the
+	// hook just minted (or refreshed) carries
+	// allowed_proxy_peer = self by default; the Hub→target proxy
+	// whose signer IS the source would 403 against that. Stamp
+	// the source as the authorised orchestrator for THIS agent
+	// so post-switch chat / messages / persona writes admit.
 	//
-	// Instead, the policy layer admits agents/* on a NARROWER
-	// signal: the signer must equal agent_locks.holder_peer for
-	// the targeted agent. That gate is computed at request time
-	// by agentHolderAdmitMiddleware; the lock row this finalize
-	// path adopts is what makes the Hub→peer proxy land green
-	// without any persistent trust flip.
+	// Scoped to a single agent (no peer_registry.trusted flip),
+	// so paired-but-untrusted source can NOT use this as a
+	// stepping-stone to sessions/files/git.
+	if s.agents != nil && s.agents.Store() != nil {
+		if err := s.agents.Store().UpdateAgentLockAllowedProxy(
+			r.Context(), req.AgentID, req.SourceDeviceID,
+		); err != nil && !errors.Is(err, store.ErrNotFound) {
+			s.logger.Warn("peer agent-sync finalize: allowed-proxy stamp failed",
+				"agent", req.AgentID, "source", req.SourceDeviceID, "err", err)
+		}
+	}
 	writeJSONResponse(w, http.StatusOK,
 		peerAgentSyncFinalizeResponse{AgentID: req.AgentID})
 }
