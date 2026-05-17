@@ -38,7 +38,7 @@ func TestCronPromptAt_CustomReplacesDefault(t *testing.T) {
 	if !strings.Contains(got, "本日(2026-04-25)の予定を確認して。") {
 		t.Errorf("{date} not substituted: %q", got)
 	}
-	if !strings.Contains(got, "--- 指示 ---") {
+	if !strings.Contains(got, "--- Instructions ---") {
 		t.Errorf("custom section header missing (visual separator): %q", got)
 	}
 }

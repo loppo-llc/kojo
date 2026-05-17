@@ -23,11 +23,13 @@ func cronPrompt(nextRun time.Time, timeoutMinutes int, customMessage string) str
 }
 
 // cronPromptAt is the time-injectable form of cronPrompt for unit testing.
-// If customMessage is non-empty it replaces the default trailing instruction;
-// the literal "{date}" inside customMessage is replaced with today's date in
-// YYYY-MM-DD form. The custom section is separated from the meta header by a
-// blank line so an injected "[system message]" prefix cannot blend in with the
-// surrounding meta text.
+// customMessage is the body of the agent's checkin.md (empty when the file
+// doesn't exist). When empty, DefaultCheckinContent is used so the prompt
+// that actually fires matches the template the settings UI shows. Either
+// way, the body is rendered under a blank-line "--- Instructions ---" heading so an
+// injected "[system message]" prefix in the content cannot blend in with the
+// surrounding meta text. The literal "{date}" inside the body is replaced
+// with today's date in YYYY-MM-DD form.
 func cronPromptAt(now, nextRun time.Time, timeoutMinutes int, customMessage string) string {
 	today := now.Format("2006-01-02")
 	msg := "[system message] " + now.Format("2006年1月2日 15:04") + "の定期チェックインです。"
@@ -43,30 +45,29 @@ func cronPromptAt(now, nextRun time.Time, timeoutMinutes int, customMessage stri
 		msg += "。完了後の次回のチェックインは最短" + formatUntil(nextRun, now) + "後 (" + nextFmt + ")"
 	}
 	msg += "）"
-	if trimmed := strings.TrimSpace(customMessage); trimmed != "" {
-		// Blank line + heading make the user-supplied section visually
-		// distinguishable from the meta header even if the value contains
-		// "[system message]" or similar prompt-bracketing.
-		msg += "\n\n--- 指示 ---\n" + strings.ReplaceAll(trimmed, "{date}", today)
-	} else {
-		msg += "最近の出来事や気づきがあれば memory/" + today + ".md に記録し、必要なタスクを実行してください。"
+	body := strings.TrimSpace(customMessage)
+	if body == "" {
+		body = DefaultCheckinContent
 	}
+	msg += "\n\n--- Instructions ---\n" + strings.ReplaceAll(body, "{date}", today)
 	return msg
 }
 
 // checkinPrompt builds the manual check-in prompt. Unlike cronPromptAt this
 // is fired on demand from the UI and has no scheduled successor, so it omits
 // the "次回のチェックイン" footer and uses the wording "チェックイン" (not
-// "定期チェックイン") to make the source visible in the transcript.
+// "定期チェックイン") to make the source visible in the transcript. Empty
+// customMessage falls back to DefaultCheckinContent — see cronPromptAt for the
+// rationale.
 func checkinPrompt(now time.Time, timeoutMinutes int, customMessage string) string {
 	today := now.Format("2006-01-02")
 	msg := "[system message] " + now.Format("2006年1月2日 15:04") + "のチェックインです。"
 	msg += fmt.Sprintf("（今回のタイムアウトは%d分）", timeoutMinutes)
-	if trimmed := strings.TrimSpace(customMessage); trimmed != "" {
-		msg += "\n\n--- 指示 ---\n" + strings.ReplaceAll(trimmed, "{date}", today)
-	} else {
-		msg += "最近の出来事や気づきがあれば memory/" + today + ".md に記録し、必要なタスクを実行してください。"
+	body := strings.TrimSpace(customMessage)
+	if body == "" {
+		body = DefaultCheckinContent
 	}
+	msg += "\n\n--- Instructions ---\n" + strings.ReplaceAll(body, "{date}", today)
 	return msg
 }
 

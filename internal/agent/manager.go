@@ -1074,11 +1074,20 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	// with the agent's normal WebUI context — or with a different Slack
 	// thread's session. For those backends we force OneShot=true so the
 	// chat stays ephemeral, mirroring the no-SessionKey path.
+	// ChatOneShot's only current SessionKey caller is the Slack bot, where
+	// every fire is a human reply in a thread. AutomatedTrigger=true would
+	// disable the idle-window guard in sessionFileUsable and let a session
+	// be reset mid-conversation while the user is actively typing — exactly
+	// the case the guard exists to prevent. Treat SessionKey one-shots as
+	// interactive (AutomatedTrigger=false) so the idle window protects them
+	// the same way it protects the WebUI chat path. If a non-interactive
+	// caller is added later, surface AutomatedTrigger through OneShotOpts
+	// rather than re-defaulting it to true here.
 	var chatOpts ChatOptions
 	if cfg.SessionKey != "" && backendSupportsSessionKey(prep.backend) {
 		chatOpts = ChatOptions{
 			MCPServers:       prep.mcpServers,
-			AutomatedTrigger: true,
+			AutomatedTrigger: false,
 			SessionKey:       cfg.SessionKey,
 		}
 	} else {

@@ -178,6 +178,13 @@ func isSelfScopedRoute(method, sub string) bool {
 	case "/pre-compact":
 		// PreCompact hook fired by claude-code on the agent's own session.
 		return method == http.MethodPost
+	case "/user-context":
+		// Agent edits its own user.md (people-it-works-with notes).
+		// Read is handled separately by /files; this gate covers writes.
+		return method == http.MethodGet || method == http.MethodPut
+	case "/checkin-file":
+		// Agent edits its own checkin.md (recurring check-in instructions).
+		return method == http.MethodGet || method == http.MethodPut
 	}
 
 	// Sub-resources with their own {id} segments (messages, tasks,

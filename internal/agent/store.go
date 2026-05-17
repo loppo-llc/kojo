@@ -120,10 +120,15 @@ func (st *store) Load() ([]*Agent, error) {
 		a.LegacyActiveEnd = ""
 
 		// Migrate CronMessage → checkin.md file.
-		// Only clear the legacy JSON field once we know the content survives
-		// somewhere on disk — either checkin.md already exists, or this run
-		// just wrote it. If the write (or stat) fails we keep CronMessage so
-		// the agent's check-in instructions aren't silently dropped.
+		//
+		// Runtime (cron.go, manager.Checkin) reads only checkin.md and never
+		// CronMessage, so the legacy field has no effect on actual check-in
+		// behavior between startup attempts. The "keep the legacy field"
+		// branches below exist purely so a write-or-stat failure now is
+		// retried on the next process start — they do NOT preserve check-in
+		// behavior in the meantime. While the legacy field is retained, the
+		// agent's check-in prompt falls back to DefaultCheckinContent, the
+		// same path used by agents that have never customised it.
 		if a.CronMessage != "" {
 			checkinPath := filepath.Join(agentDir(a.ID), "checkin.md")
 			switch _, statErr := os.Stat(checkinPath); {
@@ -133,14 +138,14 @@ func (st *store) Load() ([]*Agent, error) {
 				needsSave = true
 			case os.IsNotExist(statErr):
 				if err := os.WriteFile(checkinPath, []byte(a.CronMessage), 0o644); err != nil {
-					st.logger.Warn("failed to migrate cronMessage to checkin.md, keeping legacy field for retry", "agent", a.ID, "err", err)
+					st.logger.Warn("failed to migrate cronMessage to checkin.md; runtime falls back to default until next startup retries", "agent", a.ID, "err", err)
 				} else {
 					st.logger.Info("migrated cronMessage → checkin.md", "agent", a.ID)
 					a.CronMessage = ""
 					needsSave = true
 				}
 			default:
-				st.logger.Warn("stat checkin.md failed during cronMessage migration, keeping legacy field", "agent", a.ID, "err", statErr)
+				st.logger.Warn("stat checkin.md failed during cronMessage migration; runtime falls back to default until next startup retries", "agent", a.ID, "err", statErr)
 			}
 		}
 

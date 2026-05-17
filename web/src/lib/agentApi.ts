@@ -323,7 +323,7 @@ export const agentApi = {
     get<{ content: string; isDefault: boolean }>(`/api/v1/agents/${id}/checkin-file`),
 
   putCheckinFile: (id: string, content: string) =>
-    put<{ content: string; isDefault: boolean }>(`/api/v1/agents/${id}/checkin-file`, { content }).then((r) => r.content),
+    put<{ content: string; isDefault: boolean }>(`/api/v1/agents/${id}/checkin-file`, { content }),
 
   fork: (id: string, params: { name: string; includeTranscript: boolean }) =>
     post<AgentInfo>(`/api/v1/agents/${id}/fork`, params),
@@ -520,11 +520,14 @@ export const agentApi = {
 
   userContext: {
     get: (agentId: string) =>
-      get<{ content: string }>(`/api/v1/agents/${agentId}/user-context`).then(
-        (r) => r.content ?? "",
+      get<{ content: string; isDefault: boolean }>(
+        `/api/v1/agents/${agentId}/user-context`,
       ),
     set: (agentId: string, content: string) =>
-      put<{ content: string }>(`/api/v1/agents/${agentId}/user-context`, { content }),
+      put<{ content: string; isDefault: boolean }>(
+        `/api/v1/agents/${agentId}/user-context`,
+        { content },
+      ),
   },
 
   embeddingModel: {

@@ -135,20 +135,44 @@ export function AgentSettings() {
   const [forking, setForking] = useState(false);
   const [forkError, setForkError] = useState("");
   const [userContext, setUserContext] = useState("");
-  // user.md persistence rides on handleSave's `saving` flag — it disables
-  // the Save button and the inputs together with the rest of the form. A
-  // dedicated savingUserContext flag would be dead state. We also intentionally
-  // do not track a `userContextDirty` flag: unlike cronMessage (which manual
-  // check-in reads from disk, so editing without saving would silently fire
-  // stale instructions), user.md is only consumed by the next system-prompt
-  // build, and handleSave persists it alongside everything else.
+  // userContext mirrors cronMessage's three-state model: the textarea content,
+  // the last value the server confirmed it has, and whether what's currently
+  // shown is the in-memory default template (no user.md on disk).
+  //
+  // Without these guards an unconditional PUT on every Save would write
+  // DefaultUserContent back as a real user.md the first time the user edits
+  // any *other* field, flipping isDefault to false and pinning the agent to
+  // a frozen copy of whatever default existed at that save time. Future
+  // template updates would then never reach that agent.
+  const [savedUserContext, setSavedUserContext] = useState("");
+  const [userContextIsDefault, setUserContextIsDefault] = useState(false);
   const [cronMessage, setCronMessage] = useState("");
   // Track whether cronMessage diverges from what's persisted in checkin.md.
   // Manual check-in runs against the persisted file, so editing the textarea
   // without saving would silently fire with stale instructions. We block the
   // button when this is true (see handleCheckin).
   const [savedCronMessage, setSavedCronMessage] = useState("");
-  const cronMessageDirty = cronMessage !== savedCronMessage;
+  // cronIsDefault is true when the textarea is currently showing the server-
+  // supplied DefaultCheckinContent template (no checkin.md exists yet). In
+  // that state a Save click must NOT write the template back as a real
+  // checkin.md — that would erase the "uses default" distinction and pin
+  // whatever the default happens to be at this moment, freezing the agent on
+  // an old template if we update the default later. We only PUT when the
+  // textarea is dirty (user actually edited something). When the user has a
+  // real checkin.md already, isDefault is false and every save persists.
+  const [cronIsDefault, setCronIsDefault] = useState(false);
+  // Compare trimmed values so pure-whitespace edits (e.g. accidentally
+  // hitting Enter at the end while reading the default template) don't
+  // count as a real change. The server-side WriteCheckinFile trims before
+  // persisting, so an untrimmed-equal comparison would flag the textarea
+  // as dirty, then a Save would PUT, the server would trim, and the
+  // resulting checkin.md would be byte-identical to the previous default —
+  // except isDefault would now be false, silently pinning the agent to a
+  // frozen copy of whatever default existed at that save time.
+  const cronMessageDirty = cronMessage.trim() !== savedCronMessage.trim();
+  // Same trim-compare reasoning as cronMessageDirty: keep pure-whitespace
+  // edits from triggering a no-op PUT that would pin the default template.
+  const userContextDirty = userContext.trim() !== savedUserContext.trim();
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -182,9 +206,16 @@ export function AgentSettings() {
       setTTSModel(a.tts?.model ?? "");
       setTTSVoice(a.tts?.voice ?? "");
       setTTSStylePrompt(a.tts?.stylePrompt ?? "");
-      setUserContext(uc);
+      setUserContext(uc.content);
+      setSavedUserContext(uc.content);
+      setUserContextIsDefault(uc.isDefault);
       setCronMessage(checkin.content);
+      // When the server reports isDefault=true the textarea is showing the
+      // template, not the persisted file. Mark savedCronMessage with the
+      // same value so cronMessageDirty stays false until the user actually
+      // types — and remember isDefault so handleSave can skip the no-op PUT.
       setSavedCronMessage(checkin.content);
+      setCronIsDefault(checkin.isDefault);
     }).catch(() => navigate("/"));
   }, [id, navigate]);
 
@@ -210,44 +241,69 @@ export function AgentSettings() {
     setError("");
     setSuccess(false);
     try {
-      const [updated, , savedCheckin] = await Promise.all([
-        agentApi.update(id!, {
-          name: name.trim(),
-          persona: persona.trim(),
-          ...(publicProfileOverride ? { publicProfile: publicProfile.trim() } : {}),
-          publicProfileOverride,
-          model: model.trim(),
-          effort: supportsEffort(tool) ? effort : undefined,
-          tool: tool.trim(),
-          customBaseURL: needsCustomURL ? customBaseURL.trim() : undefined,
-          thinkingMode: tool === "llama.cpp" ? thinkingMode : undefined,
-          workDir: workDir.trim(),
-          intervalMinutes,
-          timeoutMinutes,
-          resumeIdleMinutes,
-          silentStart,
-          silentEnd,
-          notifyDuringSilent,
-          allowedTools: (tool === "custom") ? allowedTools : undefined,
-          allowProtectedPaths: (tool === "claude" || tool === "custom") ? allowProtectedPaths : undefined,
-          tts: {
-            enabled: ttsEnabled,
-            model: ttsModel || undefined,
-            voice: ttsVoice || undefined,
-            stylePrompt: ttsStylePrompt.trim() || undefined,
-          },
-        }),
-        agentApi.userContext.set(id!, userContext),
-        agentApi.putCheckinFile(id!, cronMessage),
-      ]);
+      // Save sequentially rather than via Promise.all so a failure in any
+      // earlier write surfaces before later writes fire. Promise.all races
+      // them in parallel, which would leave partially-applied state on the
+      // server when one write fails and the others succeed (e.g. user
+      // context lands but agent.update rejects), and the user has to figure
+      // out from the error message alone what actually persisted.
+      const updated = await agentApi.update(id!, {
+        name: name.trim(),
+        persona: persona.trim(),
+        ...(publicProfileOverride ? { publicProfile: publicProfile.trim() } : {}),
+        publicProfileOverride,
+        model: model.trim(),
+        effort: supportsEffort(tool) ? effort : undefined,
+        tool: tool.trim(),
+        customBaseURL: needsCustomURL ? customBaseURL.trim() : undefined,
+        thinkingMode: tool === "llama.cpp" ? thinkingMode : undefined,
+        workDir: workDir.trim(),
+        intervalMinutes,
+        timeoutMinutes,
+        resumeIdleMinutes,
+        silentStart,
+        silentEnd,
+        notifyDuringSilent,
+        allowedTools: (tool === "custom") ? allowedTools : undefined,
+        allowProtectedPaths: (tool === "claude" || tool === "custom") ? allowProtectedPaths : undefined,
+        tts: {
+          enabled: ttsEnabled,
+          model: ttsModel || undefined,
+          voice: ttsVoice || undefined,
+          stylePrompt: ttsStylePrompt.trim() || undefined,
+        },
+      });
+      // Same conditional-PUT story as checkin.md (see comment below): when
+      // the textarea is still showing the in-memory default template AND
+      // the user hasn't edited it, an unconditional PUT would write the
+      // template to disk — flipping isDefault to false and pinning whatever
+      // text happens to be the default at this moment, so future template
+      // updates would never reach this agent.
+      if (userContextDirty || !userContextIsDefault) {
+        const savedUC = await agentApi.userContext.set(id!, userContext);
+        setUserContext(savedUC.content);
+        setSavedUserContext(savedUC.content);
+        setUserContextIsDefault(savedUC.isDefault);
+      }
+      // Only persist checkin.md when the user actually changed it. When the
+      // textarea is still showing the server-supplied default template AND
+      // the user hasn't edited it, an unconditional PUT would write the
+      // template to disk — flipping isDefault to false and pinning whatever
+      // text happens to be the default at this moment. Skipping the PUT
+      // keeps the "uses default" state intact so future template updates
+      // continue to apply.
+      if (cronMessageDirty || !cronIsDefault) {
+        const savedCheckin = await agentApi.putCheckinFile(id!, cronMessage);
+        // Sync the textarea to the server-normalized value (WriteCheckinFile
+        // trims whitespace) so the UI matches what was actually persisted,
+        // and reset the dirty flag so manual check-in unblocks.
+        setCronMessage(savedCheckin.content);
+        setSavedCronMessage(savedCheckin.content);
+        setCronIsDefault(savedCheckin.isDefault);
+      }
       setAgent(updated);
       setPublicProfile(updated.publicProfile ?? "");
       setPublicProfileOverride(updated.publicProfileOverride ?? false);
-      // Sync the textarea to the server-normalized value (WriteCheckinFile
-      // trims whitespace) so the UI matches what was actually persisted, and
-      // reset the dirty flag so manual check-in unblocks.
-      setCronMessage(savedCheckin);
-      setSavedCronMessage(savedCheckin);
       setSuccess(true);
       setTimeout(() => setSuccess(false), 2000);
     } catch (err) {

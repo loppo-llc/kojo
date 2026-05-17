@@ -640,16 +640,22 @@ const sessionResetThresholdTokens = 150_000
 const sessionTailReadBytes = 1 * 1024 * 1024
 
 // preResetSummarize is the summarization hook invoked by sessionFileUsable
-// right before it deletes a session file. Defaults to PreCompactSummarize,
-// which writes a diary entry from the live session JSONL. Exposed as a
-// package variable so tests can substitute a deterministic fake instead of
-// spawning a real claude CLI process.
-var preResetSummarize = func(agentID, tool string, logger *slog.Logger) error {
-	// Reset path doesn't have the PreCompact-hook stdin payload (claude
-	// isn't telling us about a compaction here — kojo is initiating a
-	// session wipe), so transcriptPath is left empty and the function
-	// falls back to discovery.
-	return PreCompactSummarize(agentID, tool, "", logger)
+// right before it deletes a session file. Defaults to runAutoSummary in
+// strict mode, which writes a diary entry from the named session JSONL.
+// Exposed as a package variable so tests can substitute a deterministic
+// fake instead of spawning a real claude CLI process.
+//
+// sessionPath is the absolute path of the JSONL we're about to delete.
+// Forwarding it eliminates a cross-session contamination risk: when a Slack
+// agent has multiple thread-keyed sessions, mtime-based discovery would
+// otherwise pick the most recently modified JSONL — which may be a different
+// thread's session that is NOT being reset — and summarise THAT into today's
+// diary. Strict mode pins the summary to the session about to be wiped: if
+// the path fails validation or yields no messages, the summary returns an
+// error, which sessionFileUsable treats as "abort the reset" so we don't
+// lose context to a misleading delete.
+var preResetSummarize = func(agentID, tool, sessionPath string, logger *slog.Logger) error {
+	return runAutoSummary(agentID, tool, sessionPath, true, logger)
 }
 
 // sessionResetMinIdleDuration is the package-default idle window used when
@@ -745,7 +751,7 @@ func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool,
 	// abort the reset — losing context silently would be worse than
 	// carrying a slightly-over-threshold session for one more turn.
 	if agentID != "" {
-		if err := preResetSummarize(agentID, "claude", logger); err != nil {
+		if err := preResetSummarize(agentID, "claude", path, logger); err != nil {
 			slog.Warn("pre-reset summary failed, keeping session to avoid context loss",
 				"path", path, "agent", agentID, "err", err)
 			return true

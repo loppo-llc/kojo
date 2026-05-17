@@ -645,11 +645,12 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		old := time.Now().Add(-2 * sessionResetMinIdleDuration)
 		os.Chtimes(sessionFile, old, old)
 
-		var calledAgent, calledTool string
+		var calledAgent, calledTool, calledPath string
 		orig := preResetSummarize
-		preResetSummarize = func(agentID, tool string, _ *slog.Logger) error {
+		preResetSummarize = func(agentID, tool, sessionPath string, _ *slog.Logger) error {
 			calledAgent = agentID
 			calledTool = tool
+			calledPath = sessionPath
 			return nil
 		}
 		t.Cleanup(func() { preResetSummarize = orig })
@@ -662,6 +663,9 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		}
 		if calledTool != "claude" {
 			t.Errorf("summary hook called with tool=%q, want claude", calledTool)
+		}
+		if calledPath != sessionFile {
+			t.Errorf("summary hook called with sessionPath=%q, want %q", calledPath, sessionFile)
 		}
 		if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
 			t.Error("expected session file removed after successful summary")
@@ -679,7 +683,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		os.Chtimes(sessionFile, old, old)
 
 		orig := preResetSummarize
-		preResetSummarize = func(_, _ string, _ *slog.Logger) error {
+		preResetSummarize = func(_, _, _ string, _ *slog.Logger) error {
 			return fmt.Errorf("simulated summary failure")
 		}
 		t.Cleanup(func() { preResetSummarize = orig })
@@ -725,7 +729,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		// Stub the summary hook so the reset path can complete without
 		// spawning a real claude subprocess.
 		orig := preResetSummarize
-		preResetSummarize = func(_, _ string, _ *slog.Logger) error { return nil }
+		preResetSummarize = func(_, _, _ string, _ *slog.Logger) error { return nil }
 		t.Cleanup(func() { preResetSummarize = orig })
 
 		if sessionFileUsable(aDir, sessionID, false, "ag_per_agent_idle", 1*time.Minute, nil) {

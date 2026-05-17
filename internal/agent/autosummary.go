@@ -253,6 +253,21 @@ func messagesFingerprint(msgs []*Message) string {
 // per-agent lock to prevent concurrent fires from racing on the marker
 // or the recent.md tempfile.
 func PreCompactSummarize(agentID string, tool string, transcriptPath string, logger *slog.Logger) error {
+	return runAutoSummary(agentID, tool, transcriptPath, false, logger)
+}
+
+// runAutoSummary is the shared implementation behind PreCompactSummarize
+// (hook-driven, lenient) and the pre-reset summary path in backend_claude
+// (caller-supplied exact path, strict).
+//
+// When strict=true the caller has an authoritative session path that is
+// about to be deleted, so falling back to mtime-based discovery or the kojo
+// transcript would silently summarize the wrong conversation (e.g. another
+// Slack thread's JSONL that happens to be newest in the project dir).
+// strict=true therefore returns an error on path-validation failure and on
+// "no session messages found", letting the caller abort the reset/delete
+// rather than proceed with a misleading summary.
+func runAutoSummary(agentID string, tool string, transcriptPath string, strict bool, logger *slog.Logger) error {
 	mu := agentPreCompactLock(agentID)
 	mu.Lock()
 	defer mu.Unlock()
@@ -265,6 +280,12 @@ func PreCompactSummarize(agentID string, tool string, transcriptPath string, log
 		if v, err := validateTranscriptPath(agentID, transcriptPath); err == nil {
 			resolvedTranscript = v
 		} else {
+			if strict {
+				// Pre-reset path: the caller is about to delete this exact
+				// file. Falling back to discovery could pick another Slack
+				// thread's JSONL and summarise that into this agent's diary.
+				return fmt.Errorf("validate transcript path: %w", err)
+			}
 			logger.Warn("autosummary: invalid transcript_path, falling back",
 				"agent", agentID, "err", err)
 		}
@@ -272,6 +293,13 @@ func PreCompactSummarize(agentID string, tool string, transcriptPath string, log
 
 	msgs := loadSessionMessages(agentID, tool, resolvedTranscript, preCompactMaxMessages, logger)
 	if len(msgs) == 0 {
+		if strict {
+			// Don't fall back to kojo transcript when the caller named a
+			// specific session — that transcript belongs to whichever
+			// thread last wrote to messages.jsonl, not necessarily this
+			// one. Abort the reset instead of summarising the wrong data.
+			return fmt.Errorf("no messages found in session %q", resolvedTranscript)
+		}
 		// Fallback to kojo transcript
 		var err error
 		msgs, err = loadMessages(agentID, preCompactMaxMessages)
@@ -312,6 +340,14 @@ func PreCompactSummarize(agentID string, tool string, transcriptPath string, log
 
 	summary = strings.TrimSpace(summary)
 	if summary == "" {
+		if strict {
+			// Pre-reset path: the caller will delete the session JSONL after
+			// this returns nil. An empty summary means we have nothing to
+			// write to the diary, so going ahead with the delete would lose
+			// the conversation outright. Surface the failure so the caller
+			// keeps the session for the next attempt.
+			return fmt.Errorf("summary generator returned empty output")
+		}
 		return nil
 	}
 

@@ -1200,12 +1200,16 @@ func (s *Server) handleGetUserContext(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden", "not allowed to read this agent's user context")
 		return
 	}
-	content, ok := agent.ReadUserFileOrDefault(id)
-	if !ok {
+	content, isDefault, err := agent.ReadUserFileOrDefault(id)
+	if err != nil {
+		s.logger.Warn("failed to read user.md", "agent", id, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "failed to read user.md")
 		return
 	}
-	writeJSONResponse(w, http.StatusOK, map[string]string{"content": content})
+	writeJSONResponse(w, http.StatusOK, map[string]any{
+		"content":   content,
+		"isDefault": isDefault,
+	})
 }
 
 func (s *Server) handleSetUserContext(w http.ResponseWriter, r *http.Request) {
@@ -1235,7 +1239,13 @@ func (s *Server) handleSetUserContext(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "failed to write user.md")
 		return
 	}
-	writeJSONResponse(w, http.StatusOK, map[string]string{"content": body.Content})
+	// After a PUT user.md exists on disk, so the UI is no longer viewing the
+	// in-memory default template. Echo isDefault=false so the form can clear
+	// the dirty/default guards and skip future no-op PUTs on this session.
+	writeJSONResponse(w, http.StatusOK, map[string]any{
+		"content":   body.Content,
+		"isDefault": false,
+	})
 }
 
 // --- Pre-Compact Handler ---

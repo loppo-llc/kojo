@@ -34,11 +34,12 @@ interface Props {
   onCronMessageChange?: (v: string) => void;
 }
 
-// Hint shown when the textarea is empty. Mirrors the language of the
-// server-side DefaultCheckinContent template (internal/agent/memory.go) so the
-// placeholder and the actual fallback stay consistent.
+// Hint shown when the textarea is empty. Kept verbatim in sync with
+// DefaultCheckinContent in internal/agent/memory.go — when the textarea is
+// empty (user cleared it) the server falls back to that same string, so the
+// placeholder must show what will actually run.
 const DEFAULT_CRON_MESSAGE_HINT =
-  "Record recent events in memory/{date}.md and run any pending tasks.";
+  "If there are recent events or observations, record them in memory/{date}.md, and execute any necessary tasks.";
 
 /** Parse "HH:MM" to minutes since midnight. */
 function toMinutes(hhmm: string): number {
