@@ -199,6 +199,49 @@ ON CONFLICT(device_id) DO UPDATE SET
 	return s.GetPeer(ctx, rec.DeviceID)
 }
 
+// UpdatePeerMetadata mutates the human-editable name + url of an
+// existing peer row without touching public_key, trusted,
+// capabilities, last_seen, or status. Operator-driven path for
+// the GUI's inline edit form.
+//
+// Why capabilities is out: the UI never edits it, so sending the
+// current value alongside an edit would race a concurrent peer-
+// reported capabilities refresh and silently roll it back. The
+// other preserved columns are owned by separate code paths
+// (identity rotation, trust flip, heartbeat) and likewise must
+// not be overwritten by a metadata edit. `name` and `url` empty
+// values are rejected because the operator-facing UI has no
+// legitimate path to wipe them.
+//
+// Returns ErrNotFound when no row matches the device_id.
+func (s *Store) UpdatePeerMetadata(ctx context.Context, deviceID, name, url string) error {
+	if deviceID == "" {
+		return errors.New("store.UpdatePeerMetadata: device_id required")
+	}
+	if name == "" {
+		return errors.New("store.UpdatePeerMetadata: name required")
+	}
+	if url == "" {
+		return errors.New("store.UpdatePeerMetadata: url required")
+	}
+	const q = `
+UPDATE peer_registry
+   SET name = ?, url = ?
+ WHERE device_id = ?`
+	res, err := s.db.ExecContext(ctx, q, name, url, deviceID)
+	if err != nil {
+		return fmt.Errorf("store.UpdatePeerMetadata: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store.UpdatePeerMetadata: rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // UpdatePeerTrust flips the trusted bit on a paired peer row.
 // Operator-driven only; the cross-peer register-push path
 // preserves the existing trust state (any cluster member with a

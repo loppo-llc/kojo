@@ -529,6 +529,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		mux.HandleFunc("GET /api/v1/peers/self", s.handleGetSelfPeer)
 		if !cfg.PeerOnly {
 			mux.HandleFunc("POST /api/v1/peers", s.handleRegisterPeer)
+			mux.HandleFunc("PATCH /api/v1/peers/{id}", s.handlePatchPeerMetadata)
 			mux.HandleFunc("DELETE /api/v1/peers/{id}", s.handleDeletePeer)
 			mux.HandleFunc("POST /api/v1/peers/{id}/rotate-key", s.handleRotatePeerKey)
 			mux.HandleFunc("PATCH /api/v1/peers/{id}/trust", s.handlePatchPeerTrust)

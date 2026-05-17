@@ -235,19 +235,11 @@ export function PeersSection({ setError, flashSuccess }: Props) {
     }
     setBusy(true);
     try {
-      // Re-register with the new metadata. The server's
-      // register-push path preserves public_key on conflict, so
-      // identity stays put; only name / url change. Carry the
-      // existing trusted bit so this edit doesn't accidentally
-      // demote or promote the peer.
-      await peersApi.register({
-        deviceId: p.deviceId,
-        name,
-        url,
-        publicKey: p.publicKey,
-        capabilities: p.capabilities,
-        trusted: p.trusted,
-      });
+      // Narrow PATCH: only name + url reach the server. trusted,
+      // publicKey, capabilities, last_seen, status are NOT sent,
+      // so a stale browser tab can't roll back a flip / refresh
+      // that landed in another window or another surface.
+      await peersApi.updateMetadata(p.deviceId, { name, url });
       setEditFor("");
       flashSuccess();
       await refresh();
@@ -438,6 +430,11 @@ export function PeersSection({ setError, flashSuccess }: Props) {
                       onClick={() => {
                         setRotateFor(rotateFor === p.deviceId ? "" : p.deviceId);
                         setNewKey("");
+                        // Close the edit form when opening rotate
+                        // so the row never shows both panels at
+                        // once — they reuse the same horizontal
+                        // strip below the row header.
+                        setEditFor("");
                       }}
                       className="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-xs"
                       title="Replace this peer's long-lived Ed25519 identity key (audited)"

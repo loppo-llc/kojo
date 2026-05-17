@@ -54,6 +54,13 @@ export const peersApi = {
   list: () => get<PeerListResponse>("/api/v1/peers"),
   self: () => get<PeerInfo>("/api/v1/peers/self"),
   register: (req: PeerRegisterRequest) => post<PeerInfo>("/api/v1/peers", req),
+  // updateMetadata patches name + url only. publicKey rotates
+  // through rotateKey; trusted flips through setTrust;
+  // capabilities is owned by the peer's own self-report. Narrow
+  // patch shape so the inline Edit form can't accidentally
+  // clobber fields another surface owns.
+  updateMetadata: (deviceId: string, req: { name: string; url: string }) =>
+    patch<PeerInfo>(`/api/v1/peers/${encodeURIComponent(deviceId)}`, req),
   remove: (deviceId: string) => del<void>(`/api/v1/peers/${encodeURIComponent(deviceId)}`),
   rotateKey: (deviceId: string, publicKey: string) =>
     post<PeerRotateKeyResponse>(

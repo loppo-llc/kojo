@@ -552,6 +552,89 @@ func peerKeyFingerprint(b64 string) string {
 	return b64[:16] + "…"
 }
 
+// peerMetadataPatchRequest is the wire shape for PATCH
+// /api/v1/peers/{id}. Only the operator-editable name + url
+// are accepted here; identity rotation flows through
+// /rotate-key, trust flip through /trust, and capabilities
+// are owned by the peer's own self-report (so the GUI must
+// not clobber them). Limiting the patch shape keeps a stale
+// browser tab from accidentally rolling back fields another
+// surface just changed.
+type peerMetadataPatchRequest struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
+// handlePatchPeerMetadata updates a peer's name + url in place.
+// Owner-only. Refuses self because the local registrar owns the
+// self-row's url/name (operator must use the daemon's hostname /
+// pairing spec to rename this host).
+//
+// Successful edits fan out via broadcastPeerRegistration so other
+// paired peers learn the new url/name without waiting for the
+// next register-push roundtrip. fan-out is best-effort; the row
+// is already committed locally so an unreachable peer just keeps
+// the stale view until its next inbound heartbeat / re-broadcast.
+func (s *Server) handlePatchPeerMetadata(w http.ResponseWriter, r *http.Request) {
+	if !s.requireOwnerForPeers(w, r) {
+		return
+	}
+	id := r.PathValue("id")
+	if err := validateDeviceID(id); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if s.peerID != nil && id == s.peerID.DeviceID {
+		writeError(w, http.StatusConflict, "conflict",
+			"cannot edit the local peer's row; rename via the daemon's hostname / pairing spec instead")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, peerRequestCap)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	var req peerMetadataPatchRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON")
+		return
+	}
+	if err := validatePeerName(req.Name); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if req.URL == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "url required")
+		return
+	}
+	if err := validatePeerURL(req.URL); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if err := s.agents.Store().UpdatePeerMetadata(r.Context(), id, req.Name, req.URL); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "peer not registered")
+			return
+		}
+		s.logger.Error("peer handler: metadata update failed", "device_id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+	rec, err := s.agents.Store().GetPeer(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "post-update lookup failed")
+		return
+	}
+	// Propagate the edit to other paired peers so their registry
+	// converges. broadcastPeerRegistration ships the local self-
+	// row + the edited row; receivers admit the third-party row
+	// because the local host signs as trusted from their side
+	// (operator pairing prerequisite for this edit to matter).
+	s.broadcastPeerRegistration(rec)
+	writeJSONResponse(w, http.StatusOK, s.toPeerResponse(rec))
+}
+
 // peerTrustRequest is the wire shape for PATCH
 // /api/v1/peers/{id}/trust.
 type peerTrustRequest struct {
