@@ -140,17 +140,16 @@ func (s *Server) handlePeerBlobIngest(w http.ResponseWriter, r *http.Request) {
 					"signer is not the current agent_lock holder for "+pathAgentID)
 				return
 			}
-			// Lease-expiry check. holder_peer alone is the row
-			// snapshot, but an expired lease means the prior
-			// holder has effectively yielded — refuse rather
-			// than accept a stale-lease write. The agent guard
-			// re-acquires expired locks promptly so a healthy
-			// runtime never trips this branch.
-			if lock.LeaseExpiresAt > 0 && lock.LeaseExpiresAt < store.NowMillis() {
-				writeError(w, http.StatusForbidden, "lease_expired",
-					"signer holds an expired lease for "+pathAgentID)
-				return
-			}
+			// NOTE: deliberately no wall-clock lease_expires_at
+			// check here. Each peer refreshes its OWN local
+			// agent_locks row; hub's row is only re-stamped on
+			// §3.7 device-switch sync. Enforcing lease expiry
+			// against the hub row would 403 every legitimate
+			// remote attachment once the snapshotted lease aged
+			// past hub's clock (typically ~1 minute), even
+			// though the holder peer's own row is still being
+			// refreshed normally. The holder_peer signature
+			// match above remains the authoritative gate.
 		case errors.Is(lockErr, store.ErrNotFound):
 			// No lock row at all means no peer can legitimately
 			// claim to be running this agent. Refuse — opening
