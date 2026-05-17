@@ -71,6 +71,12 @@ export function PeersSection({ setError, flashSuccess }: Props) {
   const [trustOnAdd, setTrustOnAdd] = useState(false);
   // Form state for rotate.
   const [newKey, setNewKey] = useState("");
+  // Inline edit form per row. Only the human-friendly Name and the
+  // dial URL are editable here — public_key rotates through the
+  // separate rotate-key flow and device_id is immutable.
+  const [editFor, setEditFor] = useState<string>("");
+  const [editName, setEditName] = useState("");
+  const [editURL, setEditURL] = useState("");
   const [busy, setBusy] = useState(false);
   // requestSeq is monotonically incremented before every list() call;
   // a response is only allowed to update state when its captured seq
@@ -212,6 +218,46 @@ export function PeersSection({ setError, flashSuccess }: Props) {
     }
   };
 
+  const openEdit = (p: PeerInfo) => {
+    setEditFor(editFor === p.deviceId ? "" : p.deviceId);
+    setEditName(p.name);
+    setEditURL(p.url ?? "");
+    setRotateFor("");
+    setNewKey("");
+  };
+
+  const submitEdit = async (p: PeerInfo) => {
+    const name = editName.trim();
+    const url = editURL.trim();
+    if (!name || !url) {
+      setError("Edit: name と url を両方入力する必要がある");
+      return;
+    }
+    setBusy(true);
+    try {
+      // Re-register with the new metadata. The server's
+      // register-push path preserves public_key on conflict, so
+      // identity stays put; only name / url change. Carry the
+      // existing trusted bit so this edit doesn't accidentally
+      // demote or promote the peer.
+      await peersApi.register({
+        deviceId: p.deviceId,
+        name,
+        url,
+        publicKey: p.publicKey,
+        capabilities: p.capabilities,
+        trusted: p.trusted,
+      });
+      setEditFor("");
+      flashSuccess();
+      await refresh();
+    } catch (e) {
+      setError(`Edit failed: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const toggleTrust = async (p: PeerInfo) => {
     setBusy(true);
     try {
@@ -268,7 +314,10 @@ export function PeersSection({ setError, flashSuccess }: Props) {
       </div>
       <p className="text-xs text-neutral-600 mb-3">
         Known cluster members. Register a peer after pairing it off-band; the local device
-        cannot be added or removed from this UI.
+        cannot be added or removed from this UI. <span className="text-neutral-500">Trust</span>{" "}
+        controls whether this peer can create sessions / browse files / run git on{" "}
+        <em>this</em> host — pairing alone does not grant that, and the flip is per-direction
+        (you also need to be marked trusted on the peer to drive its surface).
       </p>
 
       {showAdd && (
@@ -363,6 +412,13 @@ export function PeersSection({ setError, flashSuccess }: Props) {
                 {!isSelf && (
                   <div className="flex flex-col gap-1 shrink-0">
                     <button
+                      onClick={() => openEdit(p)}
+                      className="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-xs"
+                      title="Edit this peer's display name and dial URL"
+                    >
+                      {editFor === p.deviceId ? "Cancel" : "Edit"}
+                    </button>
+                    <button
                       onClick={() => toggleTrust(p)}
                       disabled={busy}
                       className={`px-2 py-1 rounded text-xs ${
@@ -370,6 +426,11 @@ export function PeersSection({ setError, flashSuccess }: Props) {
                           ? "bg-amber-900/60 text-amber-200 hover:bg-amber-900"
                           : "bg-neutral-800 hover:bg-neutral-700"
                       }`}
+                      title={
+                        p.trusted
+                          ? "Trusted: this peer may create sessions, browse files, and run git on this host. Click to revoke."
+                          : "Not trusted: this peer is paired but cannot create sessions or read files on this host. Click to grant."
+                      }
                     >
                       {p.trusted ? "Untrust" : "Trust"}
                     </button>
@@ -379,18 +440,52 @@ export function PeersSection({ setError, flashSuccess }: Props) {
                         setNewKey("");
                       }}
                       className="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-xs"
+                      title="Replace this peer's long-lived Ed25519 identity key (audited)"
                     >
                       {rotateFor === p.deviceId ? "Cancel" : "Rotate key"}
                     </button>
                     <button
                       onClick={() => remove(p.deviceId, p.name)}
                       className="px-2 py-1 text-neutral-600 hover:text-red-400 rounded text-xs"
+                      title="Remove this peer from the registry"
                     >
                       Delete
                     </button>
                   </div>
                 )}
               </div>
+
+              {!isSelf && editFor === p.deviceId && (
+                <div className="mt-3 space-y-2 border-t border-neutral-800 pt-3">
+                  <div className="text-[11px] text-neutral-500">
+                    Display name (free-form label; agents reference this peer by name):
+                  </div>
+                  <input
+                    type="text"
+                    value={editName}
+                    onChange={(e) => setEditName(e.target.value)}
+                    placeholder="laptop"
+                    className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-xs focus:outline-none focus:border-neutral-500"
+                  />
+                  <div className="text-[11px] text-neutral-500">
+                    Dial URL (host:port or http(s)://host:port):
+                  </div>
+                  <input
+                    type="text"
+                    value={editURL}
+                    onChange={(e) => setEditURL(e.target.value)}
+                    placeholder="http://100.64.0.5:8080"
+                    className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-xs font-mono focus:outline-none focus:border-neutral-500"
+                  />
+                  <button
+                    onClick={() => submitEdit(p)}
+                    disabled={busy || !editName.trim() || !editURL.trim()}
+                    className="w-full py-2 bg-neutral-700 hover:bg-neutral-600 rounded text-xs font-medium disabled:opacity-40"
+                  >
+                    {busy ? "Saving..." : "Save changes"}
+                  </button>
+                </div>
+              )}
 
               {!isSelf && rotateFor === p.deviceId && (
                 <div className="mt-3 space-y-2 border-t border-neutral-800 pt-3">
