@@ -14,11 +14,19 @@ import (
 // its op so a delayed write from an old holder is rejected after lease
 // expiry — see docs §3.7 fencing.
 type AgentLockRecord struct {
-	AgentID         string
-	HolderPeer      string
-	FencingToken    int64
-	LeaseExpiresAt  int64
-	AcquiredAt      int64
+	AgentID        string
+	HolderPeer     string
+	FencingToken   int64
+	LeaseExpiresAt int64
+	AcquiredAt     int64
+	// AllowedProxyPeer names the signer that may drive proxied
+	// requests on /api/v1/agents/{id}/* against this host while
+	// the lock is live. Mirrors the §3.7 device-switch model: the
+	// host that handed the runtime here is the only legitimate
+	// orchestrator. Holder == self acquires set this to holder
+	// itself; device-switch transfer sets it to the source peer;
+	// force-reclaim sets it to whoever is reclaiming (self).
+	AllowedProxyPeer string
 }
 
 // ErrLockHeld signals that AcquireAgentLock found a live lock held by
@@ -146,12 +154,12 @@ func (s *Store) AcquireAgentLock(ctx context.Context, agentID, peer string, now,
 	defer func() { _ = tx.Rollback() }()
 
 	const sel = `
-SELECT agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at
+SELECT agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at, allowed_proxy_peer
   FROM agent_locks WHERE agent_id = ?`
 	var cur AgentLockRecord
 	switch err := tx.QueryRowContext(ctx, sel, agentID).Scan(
 		&cur.AgentID, &cur.HolderPeer, &cur.FencingToken,
-		&cur.LeaseExpiresAt, &cur.AcquiredAt,
+		&cur.LeaseExpiresAt, &cur.AcquiredAt, &cur.AllowedProxyPeer,
 	); {
 	case errors.Is(err, sql.ErrNoRows):
 		// First acquisition for this agent (or first since the prior
@@ -161,21 +169,25 @@ SELECT agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at
 		if err != nil {
 			return nil, err
 		}
+		// allowed_proxy_peer = holder for a fresh local acquire:
+		// the host that owns the lock IS the orchestrator until a
+		// device-switch transfers the role elsewhere.
 		const ins = `
-INSERT INTO agent_locks (agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at)
-VALUES (?, ?, ?, ?, ?)`
-		if _, err := tx.ExecContext(ctx, ins, agentID, peer, token, now+leaseDuration, now); err != nil {
+INSERT INTO agent_locks (agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at, allowed_proxy_peer)
+VALUES (?, ?, ?, ?, ?, ?)`
+		if _, err := tx.ExecContext(ctx, ins, agentID, peer, token, now+leaseDuration, now, peer); err != nil {
 			return nil, fmt.Errorf("store.AcquireAgentLock: insert: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
 			return nil, fmt.Errorf("store.AcquireAgentLock: commit: %w", err)
 		}
 		return &AgentLockRecord{
-			AgentID:        agentID,
-			HolderPeer:     peer,
-			FencingToken:   token,
-			LeaseExpiresAt: now + leaseDuration,
-			AcquiredAt:     now,
+			AgentID:          agentID,
+			HolderPeer:       peer,
+			FencingToken:     token,
+			LeaseExpiresAt:   now + leaseDuration,
+			AcquiredAt:       now,
+			AllowedProxyPeer: peer,
 		}, nil
 
 	case err != nil:
@@ -211,28 +223,32 @@ VALUES (?, ?, ?, ?, ?)`
 	default:
 		// Lease expired — steal. Bump the counter so the prior
 		// holder's delayed writes get rejected with
-		// ErrFencingMismatch.
+		// ErrFencingMismatch. allowed_proxy_peer follows the new
+		// holder: a steal means the prior orchestrator no longer
+		// has authority to drive proxied writes here.
 		token, err := nextFencingToken(ctx, tx, agentID)
 		if err != nil {
 			return nil, err
 		}
 		const upd = `
 UPDATE agent_locks
-   SET holder_peer      = ?,
-       fencing_token    = ?,
-       lease_expires_at = ?,
-       acquired_at      = ?
+   SET holder_peer        = ?,
+       fencing_token      = ?,
+       lease_expires_at   = ?,
+       acquired_at        = ?,
+       allowed_proxy_peer = ?
  WHERE agent_id = ?`
-		if _, err := tx.ExecContext(ctx, upd, peer, token, now+leaseDuration, now, agentID); err != nil {
+		if _, err := tx.ExecContext(ctx, upd, peer, token, now+leaseDuration, now, peer, agentID); err != nil {
 			return nil, fmt.Errorf("store.AcquireAgentLock: steal: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
 			return nil, fmt.Errorf("store.AcquireAgentLock: commit: %w", err)
 		}
 		return &AgentLockRecord{
-			AgentID:        agentID,
-			HolderPeer:     peer,
-			FencingToken:   token,
+			AgentID:          agentID,
+			HolderPeer:       peer,
+			FencingToken:     token,
+			AllowedProxyPeer: peer,
 			LeaseExpiresAt: now + leaseDuration,
 			AcquiredAt:     now,
 		}, nil
@@ -347,26 +363,31 @@ func (s *Store) ForceReclaimAgentLock(ctx context.Context, agentID, peer string,
 		return nil, fmt.Errorf("store.ForceReclaimAgentLock: %w", err)
 	}
 	expires := now + leaseDurationMs
+	// allowed_proxy_peer = peer: a force-reclaim makes THIS host the
+	// new orchestrator. Any prior allowed_proxy_peer (the dead
+	// source's deviceID) loses authority along with the holder swap.
 	const upsert = `
-INSERT INTO agent_locks (agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at)
-VALUES (?, ?, ?, ?, ?)
+INSERT INTO agent_locks (agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at, allowed_proxy_peer)
+VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(agent_id) DO UPDATE SET
-  holder_peer      = excluded.holder_peer,
-  fencing_token    = excluded.fencing_token,
-  lease_expires_at = excluded.lease_expires_at,
-  acquired_at      = excluded.acquired_at`
-	if _, err := tx.ExecContext(ctx, upsert, agentID, peer, token, expires, now); err != nil {
+  holder_peer        = excluded.holder_peer,
+  fencing_token      = excluded.fencing_token,
+  lease_expires_at   = excluded.lease_expires_at,
+  acquired_at        = excluded.acquired_at,
+  allowed_proxy_peer = excluded.allowed_proxy_peer`
+	if _, err := tx.ExecContext(ctx, upsert, agentID, peer, token, expires, now, peer); err != nil {
 		return nil, fmt.Errorf("store.ForceReclaimAgentLock: upsert: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("store.ForceReclaimAgentLock: commit: %w", err)
 	}
 	return &AgentLockRecord{
-		AgentID:        agentID,
-		HolderPeer:     peer,
-		FencingToken:   token,
-		LeaseExpiresAt: expires,
-		AcquiredAt:     now,
+		AgentID:          agentID,
+		HolderPeer:       peer,
+		FencingToken:     token,
+		LeaseExpiresAt:   expires,
+		AcquiredAt:       now,
+		AllowedProxyPeer: peer,
 	}, nil
 }
 
@@ -414,11 +435,17 @@ func (s *Store) TransferAgentLock(ctx context.Context, agentID, currentPeer stri
 		return nil, fmt.Errorf("store.TransferAgentLock: %w", err)
 	}
 	expires := now + leaseDurationMs
+	// allowed_proxy_peer = currentPeer: the device-switch source is
+	// the orchestrator that's about to start proxying user-driven
+	// chat / files / persona writes against the new holder. Without
+	// this, the target's middleware would refuse the Hub→target
+	// proxy because the post-transfer holder_peer == target, not
+	// the Hub.
 	const upd = `
 UPDATE agent_locks
-   SET holder_peer = ?, fencing_token = ?, lease_expires_at = ?, acquired_at = ?
+   SET holder_peer = ?, fencing_token = ?, lease_expires_at = ?, acquired_at = ?, allowed_proxy_peer = ?
  WHERE agent_id = ?`
-	res, err := tx.ExecContext(ctx, upd, newPeer, newToken, expires, now, agentID)
+	res, err := tx.ExecContext(ctx, upd, newPeer, newToken, expires, now, currentPeer, agentID)
 	if err != nil {
 		return nil, fmt.Errorf("store.TransferAgentLock: update: %w", err)
 	}
@@ -770,7 +797,7 @@ SELECT agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at
 // GetAgentLock returns the row for agent_id or ErrNotFound.
 func (s *Store) GetAgentLock(ctx context.Context, agentID string) (*AgentLockRecord, error) {
 	const q = `
-SELECT agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at
+SELECT agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at, allowed_proxy_peer
   FROM agent_locks WHERE agent_id = ?`
 	rec, err := scanAgentLockRow(s.db.QueryRowContext(ctx, q, agentID))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -854,7 +881,7 @@ func scanAgentLockRow(r rowScanner) (*AgentLockRecord, error) {
 	var rec AgentLockRecord
 	if err := r.Scan(
 		&rec.AgentID, &rec.HolderPeer, &rec.FencingToken,
-		&rec.LeaseExpiresAt, &rec.AcquiredAt,
+		&rec.LeaseExpiresAt, &rec.AcquiredAt, &rec.AllowedProxyPeer,
 	); err != nil {
 		return nil, err
 	}
@@ -866,7 +893,7 @@ func scanAgentLockRow(r rowScanner) (*AgentLockRecord, error) {
 // post-update state without a second non-tx round-trip.
 func scanAgentLockTx(ctx context.Context, tx *sql.Tx, agentID string) (*AgentLockRecord, error) {
 	const q = `
-SELECT agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at
+SELECT agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at, allowed_proxy_peer
   FROM agent_locks WHERE agent_id = ?`
 	rec, err := scanAgentLockRow(tx.QueryRowContext(ctx, q, agentID))
 	if errors.Is(err, sql.ErrNoRows) {
