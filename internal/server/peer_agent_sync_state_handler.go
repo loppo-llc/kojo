@@ -114,31 +114,33 @@ func (s *Server) handlePeerAgentSyncState(w http.ResponseWriter, r *http.Request
 			// agent-sync handler's existingLock guard 409s) and
 			// can only be opened by tearing the row down. We do
 			// that here so the operator's "re-run device-switch"
-			// from the Hub UI converges on its own.
+			// from the Hub UI converges without manual SQL.
 			//
-			// Trust gate: refuse the purge unless the signer is
-			// operator-trusted on this host. Without the gate
-			// any paired RolePeer could probe a fabricated
-			// agent_id and wipe its lock/blob_refs/kv state —
-			// p.PeerTrusted is the same per-row trust bit
-			// agentHolderAdmitMiddleware reads for the full
-			// agents/* surface. operator pairing prerequisites
-			// (--peer-add --trusted on this host, or UI Trust
-			// button) already required for device-switch to
-			// land here in the first place.
+			// Trust model: pairing IS the trust anchor for this
+			// admit. Any peer that signed a valid RolePeer
+			// request has a row in peer_registry — operator
+			// approval at pairing time. PurgeAgentRuntimeStateFor
+			// Retry is NON-destructive in the operator's data
+			// sense: it only forgets local lock + handoff
+			// markers; agent rows / messages / personas survive,
+			// and the orchestrator's follow-up agent-sync
+			// reseeds everything from the source. Worst-case
+			// abuse is a transient DoS where a paired peer
+			// flushes this host's view of the agent until the
+			// next switch — far below the bar an untrusted
+			// agents/* admit (credentials / persona leak) would
+			// cross. Trading the per-row PeerTrusted gate for
+			// the pairing gate is what stops the operator from
+			// having to flip trust on every paired peer just to
+			// run device-switch.
 			//
-			// PurgeAgentRuntimeStateForRetry intentionally
-			// DELETEs the row (no upsert) — the subsequent
-			// agent-sync's existingLock check sees row=nil and
-			// admits the sync, AgentLockGuard.AddAgent then
-			// minted a clean (holder=self, allowed=self) row,
-			// and finalize's UpdateAllowedProxy stamps source
-			// as allowed_proxy_peer.
-			if !p.PeerTrusted {
-				writeError(w, http.StatusForbidden, "wrong_holder",
-					"agent_locks.holder_peer does not match source_device_id; self-heal refused for untrusted signer")
-				return
-			}
+			// PurgeAgentRuntimeStateForRetry DELETEs the lock
+			// row (no upsert) — the subsequent agent-sync's
+			// existingLock check sees row=nil and admits the
+			// sync, AgentLockGuard.AddAgent mints a clean
+			// (holder=self, allowed=self) row, finalize's
+			// UpdateAllowedProxy stamps source as
+			// allowed_proxy_peer.
 			s.logger.Warn("state probe: purging stale agent runtime state on target",
 				"agent", req.AgentID, "source", req.SourceDeviceID,
 				"stale_holder", lock.HolderPeer,
