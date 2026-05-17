@@ -34,8 +34,11 @@ interface Props {
   onCronMessageChange?: (v: string) => void;
 }
 
+// Hint shown when the textarea is empty. Mirrors the language of the
+// server-side DefaultCheckinContent template (internal/agent/memory.go) so the
+// placeholder and the actual fallback stay consistent.
 const DEFAULT_CRON_MESSAGE_HINT =
-  "最近の出来事や気づきがあれば memory/{date}.md に記録し、必要なタスクを実行してください。";
+  "Record recent events in memory/{date}.md and run any pending tasks.";
 
 /** Parse "HH:MM" to minutes since midnight. */
 function toMinutes(hhmm: string): number {
@@ -379,6 +382,12 @@ export function ScheduleEditor({
             value={cronMessage}
             onChange={(e) => onCronMessageChange(e.target.value)}
             rows={5}
+            // Backend caps the PUT body at 1 MiB (http.MaxBytesReader in
+            // handlePutCheckinFile). Match it client-side using the most
+            // pessimistic UTF-8 footprint (4 bytes/char) so confusingly
+            // large pastes get blocked at the input instead of failing on
+            // save.
+            maxLength={Math.floor((1 << 20) / 4)}
             placeholder={DEFAULT_CRON_MESSAGE_HINT}
             className="w-full px-2.5 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 resize-none focus:outline-none focus:border-amber-700/60"
           />

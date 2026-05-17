@@ -135,10 +135,13 @@ export function AgentSettings() {
   const [forking, setForking] = useState(false);
   const [forkError, setForkError] = useState("");
   const [userContext, setUserContext] = useState("");
-  const [userContextDirty, setUserContextDirty] = useState(false);
   // user.md persistence rides on handleSave's `saving` flag — it disables
   // the Save button and the inputs together with the rest of the form. A
-  // dedicated savingUserContext flag would be dead state.
+  // dedicated savingUserContext flag would be dead state. We also intentionally
+  // do not track a `userContextDirty` flag: unlike cronMessage (which manual
+  // check-in reads from disk, so editing without saving would silently fire
+  // stale instructions), user.md is only consumed by the next system-prompt
+  // build, and handleSave persists it alongside everything else.
   const [cronMessage, setCronMessage] = useState("");
   // Track whether cronMessage diverges from what's persisted in checkin.md.
   // Manual check-in runs against the persisted file, so editing the textarea
@@ -240,7 +243,6 @@ export function AgentSettings() {
       setAgent(updated);
       setPublicProfile(updated.publicProfile ?? "");
       setPublicProfileOverride(updated.publicProfileOverride ?? false);
-      setUserContextDirty(false);
       // Sync the textarea to the server-normalized value (WriteCheckinFile
       // trims whitespace) so the UI matches what was actually persisted, and
       // reset the dirty flag so manual check-in unblocks.
@@ -610,8 +612,14 @@ export function AgentSettings() {
           </label>
           <textarea
             value={userContext}
-            onChange={(e) => { setUserContext(e.target.value); setUserContextDirty(true); }}
+            onChange={(e) => setUserContext(e.target.value)}
             rows={6}
+            // Backend caps the PUT body at 1 MiB (http.MaxBytesReader in
+            // handleSetUserContext). Match it client-side using the most
+            // pessimistic UTF-8 footprint (4 bytes/char) so confusingly
+            // large pastes get blocked at the input instead of failing on
+            // save.
+            maxLength={Math.floor((1 << 20) / 4)}
             placeholder="Record information about users and collaborators (agents also update this through conversation)"
             className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm resize-none focus:outline-none focus:border-neutral-500"
           />
