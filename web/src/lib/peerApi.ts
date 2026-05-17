@@ -50,10 +50,38 @@ export interface PeerRotateKeyResponse {
   previousPublicKey: string;
 }
 
+// PeerPendingInfo mirrors one row of `peer_pending` — a peer that
+// auto-discovered the Hub and POSTed a join-request, awaiting Owner
+// Approve from the Settings UI. See docs/peer-onboarding-plan.md.
+export interface PeerPendingInfo {
+  deviceId: string;
+  name: string;
+  url: string;
+  publicKey: string;
+  firstSeen: number;
+  lastSeen: number;
+}
+
+export interface PeerPendingListResponse {
+  items: PeerPendingInfo[];
+}
+
 export const peersApi = {
   list: () => get<PeerListResponse>("/api/v1/peers"),
   self: () => get<PeerInfo>("/api/v1/peers/self"),
   register: (req: PeerRegisterRequest) => post<PeerInfo>("/api/v1/peers", req),
+  // Pending join requests (docs/peer-onboarding-plan.md).
+  pending: () => get<PeerPendingListResponse>("/api/v1/peers/pending"),
+  approvePending: (deviceId: string) =>
+    post<PeerInfo>(
+      `/api/v1/peers/pending/${encodeURIComponent(deviceId)}/approve`,
+      {},
+    ),
+  rejectPending: (deviceId: string) =>
+    post<void>(
+      `/api/v1/peers/pending/${encodeURIComponent(deviceId)}/reject`,
+      {},
+    ),
   // updateMetadata patches name + url only. publicKey rotates
   // through rotateKey; trusted flips through setTrust;
   // capabilities is owned by the peer's own self-report. Narrow

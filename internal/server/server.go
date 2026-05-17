@@ -562,6 +562,17 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 			mux.HandleFunc("DELETE /api/v1/peers/{id}", s.handleDeletePeer)
 			mux.HandleFunc("POST /api/v1/peers/{id}/rotate-key", s.handleRotatePeerKey)
 			mux.HandleFunc("PATCH /api/v1/peers/{id}/trust", s.handlePatchPeerTrust)
+			// Peer onboarding (docs/peer-onboarding-plan.md).
+			// hub-info + join-request are unauthenticated: the
+			// peer has no credential on the Hub yet. Pending
+			// management is Owner-only — Settings UI Approve /
+			// Reject buttons.
+			mux.HandleFunc("GET /api/v1/peers/hub-info", s.handleHubInfo)
+			mux.HandleFunc("POST /api/v1/peers/join-request", s.handleJoinRequest)
+			mux.HandleFunc("GET /api/v1/peers/join-request/{deviceId}", s.handleJoinRequestPoll)
+			mux.HandleFunc("GET /api/v1/peers/pending", s.handleListPeerPending)
+			mux.HandleFunc("POST /api/v1/peers/pending/{deviceId}/approve", s.handleApprovePeerPending)
+			mux.HandleFunc("POST /api/v1/peers/pending/{deviceId}/reject", s.handleRejectPeerPending)
 		}
 		// Inter-peer registration push (Hub fans out a newly-paired
 		// peer's row to every online peer; receivers RegisterPeerMetadata

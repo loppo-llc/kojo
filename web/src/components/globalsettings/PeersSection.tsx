@@ -17,7 +17,11 @@
 // this form, not replace it.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { peersApi, type PeerInfo } from "../../lib/peerApi";
+import {
+  peersApi,
+  type PeerInfo,
+  type PeerPendingInfo,
+} from "../../lib/peerApi";
 
 interface Props {
   setError: (msg: string) => void;
@@ -51,6 +55,7 @@ const REFRESH_INTERVAL_MS = 30_000;
 
 export function PeersSection({ setError, flashSuccess }: Props) {
   const [items, setItems] = useState<PeerInfo[]>([]);
+  const [pending, setPending] = useState<PeerPendingInfo[]>([]);
   const [selfId, setSelfId] = useState<string>("");
   const [loading, setLoading] = useState(true);
   // unavailable=true means the server returned 404 / 503 for the
@@ -102,11 +107,26 @@ export function PeersSection({ setError, flashSuccess }: Props) {
       if (!silent) setLoading(true);
       const myseq = ++requestSeq.current;
       try {
-        const resp = await peersApi.list();
+        const [resp, pendResp] = await Promise.all([
+          peersApi.list(),
+          // pending API: swallow 404/503 (route not registered /
+          // registry not initialized — same soft states the main
+          // list handles via setUnavailable). Surface anything
+          // else as an error banner so the Approve / Reject UI
+          // doesn't silently disappear on a real failure.
+          peersApi.pending().catch((e: unknown) => {
+            const msg = (e as Error).message ?? "";
+            if (!/^404:|^503:/.test(msg) && !silent) {
+              setError(`Failed to load pending peers: ${msg}`);
+            }
+            return { items: [] };
+          }),
+        ]);
         if (!mounted.current) return;
         if (myseq === requestSeq.current) {
           setItems(resp.items ?? []);
           setSelfId(resp.selfDeviceId ?? "");
+          setPending(pendResp.items ?? []);
           setUnavailable(false);
         }
       } catch (e) {
@@ -263,6 +283,33 @@ export function PeersSection({ setError, flashSuccess }: Props) {
     }
   };
 
+  const approvePending = async (p: PeerPendingInfo) => {
+    setBusy(true);
+    try {
+      await peersApi.approvePending(p.deviceId);
+      flashSuccess();
+      await refresh();
+    } catch (e) {
+      setError(`Approve failed: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const rejectPending = async (p: PeerPendingInfo) => {
+    if (!window.confirm(`Reject join request from "${p.name}"?`)) return;
+    setBusy(true);
+    try {
+      await peersApi.rejectPending(p.deviceId);
+      flashSuccess();
+      await refresh();
+    } catch (e) {
+      setError(`Reject failed: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const remove = async (id: string, peerName: string) => {
     if (!window.confirm(`Decommission peer "${peerName}"? This cannot be undone.`)) return;
     setBusy(true);
@@ -354,6 +401,57 @@ export function PeersSection({ setError, flashSuccess }: Props) {
           >
             {busy ? "Registering..." : "Register peer"}
           </button>
+        </div>
+      )}
+
+      {pending.length > 0 && (
+        <div className="mb-3">
+          <h3 className="text-[11px] font-semibold text-amber-400 uppercase tracking-wider mb-2">
+            Pending join requests
+          </h3>
+          <p className="text-[11px] text-neutral-500 mb-2 leading-snug">
+            Peers that auto-discovered this Hub via{" "}
+            <code className="font-mono">kojo --peer</code> and are waiting for
+            approval. Approve grants the privileged surface (trusted=true);
+            Reject drops the request — the peer may retry.
+          </p>
+          {pending.map((p) => (
+            <div
+              key={p.deviceId}
+              className="p-3 bg-amber-950/30 border border-amber-900/60 rounded-lg mb-2"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm font-medium truncate">{p.name}</div>
+                  <div className="text-[11px] font-mono text-neutral-500 truncate mt-0.5">
+                    {p.deviceId}
+                  </div>
+                  <div className="text-[11px] font-mono text-neutral-500 truncate">
+                    {p.url}
+                  </div>
+                  <div className="text-xs text-neutral-500 mt-1">
+                    seen {formatLastSeen(p.lastSeen)}
+                  </div>
+                </div>
+                <div className="flex flex-col gap-1 shrink-0">
+                  <button
+                    onClick={() => approvePending(p)}
+                    disabled={busy}
+                    className="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 rounded text-xs font-medium disabled:opacity-40"
+                  >
+                    {busy ? "..." : "Approve"}
+                  </button>
+                  <button
+                    onClick={() => rejectPending(p)}
+                    disabled={busy}
+                    className="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-xs text-neutral-400 hover:text-red-400 disabled:opacity-40"
+                  >
+                    Reject
+                  </button>
+                </div>
+              </div>
+            </div>
+          ))}
         </div>
       )}
 

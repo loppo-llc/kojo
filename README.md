@@ -85,6 +85,40 @@ kojo --port 9090
 By default, kojo listens on the Tailscale network via tsnet with HTTPS.
 Use `--local` or `--dev` to bind to localhost only.
 
+### Multi-device cluster (peer mode)
+
+A second machine joins the Hub as a peer with a single command:
+
+```bash
+# On the peer host
+kojo --peer
+```
+
+The peer auto-discovers the Hub via Tailscale MagicDNS
+(`https://kojo.<tailnet>.ts.net:8080`), writes the Hub into its local peer
+registry, and POSTs a join request. The Hub parks the request in
+`peer_pending` and surfaces it in Settings → Peers → "Pending join
+requests". Click **Approve** to grant the peer the privileged surface
+(sessions, files, git). Reject drops the request; the peer is free to
+retry.
+
+Override the discovery target when needed:
+
+```bash
+kojo --peer --hub https://hub.example.ts.net:8080
+KOJO_HUB_URL=https://hub.example.ts.net:8080 kojo --peer
+```
+
+Bind the peer listener to the Tailscale interface only (refuse to fall
+back to `0.0.0.0`):
+
+```bash
+kojo --peer --tailnet-only
+```
+
+The legacy manual pairing path (`--peer-add` / `--peer-trust` /
+`--peer-remove`) still works as an escape hatch.
+
 ## Tailscale HTTPS Setup
 
 kojo uses [tsnet](https://tailscale.com/kb/1244/tsnet) to join your Tailscale network directly as a node named `kojo`. All traffic is encrypted with WireGuard — no ports to open, no certificates to manage.

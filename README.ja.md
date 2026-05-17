@@ -85,6 +85,39 @@ kojo --port 9090
 デフォルトでは kojo は tsnet 経由で Tailscale ネットワーク上に HTTPS でリッスンします。
 `--local` または `--dev` で localhost のみにバインドします。
 
+### マルチデバイス構成 (peer モード)
+
+2 台目のマシンを Hub に参加させる手順は 1 コマンド。
+
+```bash
+# peer 側ホストで
+kojo --peer
+```
+
+peer は Tailscale MagicDNS (`https://kojo.<tailnet>.ts.net:8080`) で
+Hub を自動発見し、Hub の identity を自分の peer_registry に書き込んで
+join request を POST する。Hub 側は `peer_pending` に保留し、
+Settings → Peers → 「Pending join requests」に表示する。Owner が
+**Approve** を押すと peer に privileged surface (sessions / files /
+git) を許可する。Reject なら request 削除のみ、peer は再要求できる。
+
+発見先を明示する場合:
+
+```bash
+kojo --peer --hub https://hub.example.ts.net:8080
+KOJO_HUB_URL=https://hub.example.ts.net:8080 kojo --peer
+```
+
+peer の listener を Tailscale interface IP のみに bind する
+(`0.0.0.0` fallback を禁止する):
+
+```bash
+kojo --peer --tailnet-only
+```
+
+従来の手動 pairing 路 (`--peer-add` / `--peer-trust` /
+`--peer-remove`) は escape hatch として残してある。
+
 ## Tailscale HTTPS セットアップ
 
 kojo は [tsnet](https://tailscale.com/kb/1244/tsnet) を使って、`kojo` という名前のノードとして Tailscale ネットワークに直接参加します。すべての通信は WireGuard で暗号化されます。ポートの開放や証明書の管理は不要です。

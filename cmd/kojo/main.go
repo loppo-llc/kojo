@@ -64,6 +64,9 @@ func main() {
 	peerRemove := flag.String("peer-remove", "", "delete a peer_registry row by device_id; refuses to remove self")
 	peerTrust := flag.String("peer-trust", "", "flip a paired peer's trusted bit on (allowed to drive sessions/files/git on this host); pass <device_id>")
 	peerUntrust := flag.String("peer-untrust", "", "flip a paired peer's trusted bit off; pass <device_id>")
+	// Auto-onboarding flags (docs/peer-onboarding-plan.md).
+	hubURL := flag.String("hub", "", "with --peer: override Hub auto-discovery. Accepts host:port or scheme://host:port. Falls back to $KOJO_HUB_URL then MagicDNS default `https://kojo.<tailnet>.ts.net:<KOJO_HUB_PORT or 8080>`.")
+	tailnetOnly := flag.Bool("tailnet-only", false, "with --peer: bind the listener to the Tailscale interface IP only. Refuses to start if Tailscale is not running. Without this flag, peer mode falls back to 0.0.0.0 when Tailscale is unavailable.")
 	doSnapshot := flag.Bool("snapshot", false, "take a point-in-time snapshot of kojo.db + blobs/global into <configdir>/snapshots/<ts>/ and exit")
 	doRestore := flag.String("restore", "", "restore a snapshot (verified sha256) into <configdir>. The configdir must not be in use by a running kojo. KEK and per-peer credentials are NOT restored — supply them out-of-band before booting.")
 	restoreForce := flag.Bool("restore-force", false, "with --restore: overwrite an existing kojo.db in the target. Required when the target is a previously-used Hub being re-seeded.")
@@ -200,6 +203,18 @@ func main() {
 		}
 		if strings.TrimSpace(*hostname) != "kojo" {
 			logger.Warn("--hostname is ignored in --peer mode; the tailnet identity is borrowed from the OS daemon")
+		}
+	} else {
+		// --hub / --tailnet-only are peer-mode-only flags. Refuse
+		// up front so an operator who forgot --peer doesn't end up
+		// with a Hub-mode boot that silently ignored their intent.
+		if strings.TrimSpace(*hubURL) != "" {
+			fmt.Fprintln(os.Stderr, "kojo: --hub requires --peer")
+			os.Exit(1)
+		}
+		if *tailnetOnly {
+			fmt.Fprintln(os.Stderr, "kojo: --tailnet-only requires --peer")
+			os.Exit(1)
 		}
 	}
 
@@ -1121,6 +1136,16 @@ func main() {
 		// reach the API without traversing the Tailscale
 		// interface — same pattern Hub mode uses.
 		bindHost, tsAddr := peerBindAndAdvertise(ctx, logger)
+		if *tailnetOnly && tsAddr == "" {
+			// --tailnet-only is the explicit opt-in for "do NOT
+			// fall back to 0.0.0.0 when Tailscale is unreachable".
+			// peerBindAndAdvertise returned "" for tsAddr and
+			// "0.0.0.0" for bindHost; refuse to bind so the
+			// operator notices the misconfig rather than silently
+			// listening on every interface.
+			fmt.Fprintln(os.Stderr, "kojo: --tailnet-only set but Tailscale interface is unavailable; refusing to bind to 0.0.0.0")
+			os.Exit(1)
+		}
 		ln, err := listenWithFallback(bindHost, *port, 10, logger)
 		if err != nil {
 			logger.Error("failed to listen", "err", err)
@@ -1196,6 +1221,44 @@ func main() {
 				stop()
 			}
 		}()
+
+		// Auto-onboarding (docs/peer-onboarding-plan.md). Spawn a
+		// long-running Discovery goroutine that resolves the Hub
+		// URL (--hub / KOJO_HUB_URL / MagicDNS), writes the Hub row
+		// into our local peer_registry (trusted=true), and POSTs
+		// /api/v1/peers/join-request every 60s until Owner Approve.
+		// Best-effort: nil identity or nil store skips silently —
+		// the existing pairing-spec banner above gives the operator
+		// the fallback path.
+		if peerIdentity != nil && agentMgr != nil && agentMgr.Store() != nil {
+			peerPublicURL := fmt.Sprintf("http://%s:%d", func() string {
+				if tsAddr != "" {
+					return tsAddr
+				}
+				if h := os.Getenv("HOSTNAME"); h != "" {
+					return h
+				}
+				if h, herr := os.Hostname(); herr == nil && h != "" {
+					return h
+				}
+				return peerIdentity.Name
+			}(), listenPort)
+			// DefaultHubPort is the plan-mandated 8080 default for
+			// the MagicDNS form. Peer's own --port is unrelated —
+			// peer + Hub run independent listeners. KOJO_HUB_PORT
+			// env still overrides inside Discovery.
+			disco, derr := peer.NewDiscovery(peer.DiscoveryConfig{
+				HubURLOverride: *hubURL,
+				DefaultHubPort: 8080,
+				PeerPublicURL:  peerPublicURL,
+			}, peerIdentity, agentMgr.Store(), logger)
+			if derr != nil {
+				logger.Warn("peer discovery: init failed; auto-onboarding disabled",
+					"err", derr)
+			} else {
+				go disco.Run(ctx)
+			}
+		}
 
 		// Second listener on 127.0.0.1:<port+1> so agent CLIs on
 		// this host can reach the API without going out and back
