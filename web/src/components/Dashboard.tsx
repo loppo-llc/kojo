@@ -101,23 +101,31 @@ export function Dashboard() {
     // pool. The ref skips ticks while one is still resolving;
     // the next interval just runs again.
     let inflight = false;
+    let firstLoad = true;
     const loadSessions = async () => {
       if (inflight) return;
       inflight = true;
       try {
         const local = await api.sessions.list();
+        // Paint the local Hub list immediately on the very first
+        // tick. Without this, if any peer is offline the Promise
+        // below blocks on the 30s peer-proxy timeout and the user
+        // stares at an empty dashboard for half a minute even
+        // though local sessions are already in hand. Subsequent
+        // polls skip the early paint so remote rows don't blink
+        // out and back in on every tick.
+        if (firstLoad) setSessions(local);
         let remote: SessionInfo[] = [];
         try {
           const peers = (await peersApi.list()).items ?? [];
-          // Trust direction asymmetry: the local row's `trusted`
-          // bit means "this peer may drive privileged ops on THIS
-          // host", not "this host may drive ops on the peer".
-          // For session-list we need the OTHER direction, which
-          // the Hub registry can't observe directly — try every
-          // online non-self peer and silently drop 403s / network
-          // errors. allSettled keeps one unreachable host from
-          // blanking the whole dashboard.
-          const remotes = peers.filter((p) => !p.isSelf && p.status === "online");
+          // Don't pre-filter by p.status: a peer marked "offline"
+          // in the hub registry might still answer (heartbeat
+          // lag, or it just came back). Dropping it here would
+          // silently hide its sessions until the next sweep
+          // re-marks it online. allSettled below absorbs peers
+          // that are truly unreachable, so one offline peer never
+          // blanks the whole dashboard.
+          const remotes = peers.filter((p) => !p.isSelf);
           const settled = await Promise.allSettled(
             remotes.map((p) =>
               api.sessions.list(p.deviceId).then((rows) =>
@@ -136,6 +144,7 @@ export function Dashboard() {
           merged.set(`${s.peer ?? ""}::${s.id}`, s);
         }
         setSessions(Array.from(merged.values()));
+        firstLoad = false;
       } catch (err) {
         console.error(err);
       } finally {

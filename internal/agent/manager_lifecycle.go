@@ -1049,6 +1049,22 @@ func (m *Manager) ReleaseAgentLocally(agentID string) {
 	m.releaseAgentLocallyCore(agentID, true /*withDBCleanup*/, true /*markReleased*/)
 }
 
+// TeardownAgentRuntime stops every in-memory runtime side channel
+// (cron, notify, slack, in-flight one-shots, agents map entry)
+// WITHOUT writing the §3.7 source-release marker and WITHOUT
+// touching DB rows the orchestrator is about to overwrite (notify
+// cursors, group-DM members). Used by the inter-peer state-probe
+// self-heal path: the orchestrator is retrying a device-switch
+// against this host, so this peer has to stop driving the agent
+// before the new agent-sync lands, but the released marker would
+// flag the row for startup eviction on the next boot and undo
+// the retry.
+//
+// Idempotent. Threadsafe.
+func (m *Manager) TeardownAgentRuntime(agentID string) {
+	m.releaseAgentLocallyCore(agentID, false /*withDBCleanup*/, false /*markReleased*/)
+}
+
 // detachAgentInMemory is the no-DB-cleanup variant used by
 // EvictNonLocalAgentsAtStartup. The marker that triggered eviction
 // implies a prior ReleaseAgentLocally already ran (with full

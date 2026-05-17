@@ -968,6 +968,24 @@ func main() {
 		// and the runtime side-channels (cron, notify) are
 		// re-activated. Both live outside the store, so the hook
 		// runs them here.
+		// Target-side state-probe self-heal: peer purged the
+		// agent's DB state because the orchestrator's retry
+		// found stale lock pointing elsewhere. Strip every
+		// in-memory side channel so the guard's refresh loop
+		// doesn't immediately re-Acquire what we just deleted
+		// and cron / notify / slack stop driving the agent
+		// until the orchestrator's agent-sync re-adopts it.
+		srv.SetOnAgentRuntimePurged(func(hookCtx context.Context, agentID string) {
+			if capturedGuard != nil {
+				capturedGuard.RemoveAgent(hookCtx, agentID)
+			}
+			if agentMgr != nil {
+				agentMgr.TeardownAgentRuntime(agentID)
+			}
+			if hub := srv.SlackHub(); hub != nil {
+				hub.StopBot(agentID)
+			}
+		})
 		srv.SetOnAgentForceReclaimed(func(hookCtx context.Context, agentID string) {
 			// Re-hydrate the in-memory cache FIRST. Without this
 			// ActivateAgentRuntime's Manager.Get returns ok=false

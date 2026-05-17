@@ -110,6 +110,18 @@ type Server struct {
 	// back up without a daemon restart. Set via
 	// SetOnAgentForceReclaimed.
 	onAgentForceReclaimed func(ctx context.Context, agentID string)
+	// onAgentRuntimePurged fires after the inter-peer state
+	// probe self-heal path (PurgeAgentRuntimeStateForRetry)
+	// deletes the local agent_locks row + handoff markers. The
+	// DB is clean, but the in-memory AgentLockGuard.desired set
+	// and runtime side channels (cron / notify / slack) still
+	// reference the agent — leaving them attached would let the
+	// guard's refresh loop re-Acquire the just-deleted lock
+	// with a stale view. cmd/kojo wires this to
+	// AgentLockGuard.RemoveAgent + Manager.TeardownAgentRuntime.
+	// DOES NOT write the handoff/released marker (that's the
+	// source-release path's job; purge is target-side cleanup).
+	onAgentRuntimePurged func(ctx context.Context, agentID string)
 	// pendingAgentSyncs holds the per-op state delivered by
 	// /api/v1/peers/agent-sync until the matching finalize or
 	// drop call arrives. Keyed by (agent_id, op_id) so a
@@ -1151,6 +1163,12 @@ func (s *Server) SetOnAgentReleasedAsSource(fn func(ctx context.Context, agentID
 // reclaim hook. See onAgentForceReclaimed for the contract.
 func (s *Server) SetOnAgentForceReclaimed(fn func(ctx context.Context, agentID string)) {
 	s.onAgentForceReclaimed = fn
+}
+
+// SetOnAgentRuntimePurged installs the inter-peer state-probe
+// self-heal hook. See onAgentRuntimePurged for the contract.
+func (s *Server) SetOnAgentRuntimePurged(fn func(ctx context.Context, agentID string)) {
+	s.onAgentRuntimePurged = fn
 }
 
 func (s *Server) Handler() http.Handler {

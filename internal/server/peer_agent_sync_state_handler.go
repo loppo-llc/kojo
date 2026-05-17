@@ -152,6 +152,25 @@ func (s *Server) handlePeerAgentSyncState(w http.ResponseWriter, r *http.Request
 					"stale state purge: "+err.Error())
 				return
 			}
+			// Tear down in-memory runtime side channels so the
+			// guard's refresh loop doesn't immediately re-Acquire
+			// the lock we just deleted, and cron / notify / slack
+			// stop driving the now-purged agent until the
+			// orchestrator's agent-sync re-adopts it.
+			if s.onAgentRuntimePurged != nil {
+				s.onAgentRuntimePurged(r.Context(), req.AgentID)
+			}
+			// Force full sync. Without this the orchestrator
+			// would consult GetAgentSyncState below, find stale
+			// max(seq) on messages / memory_entries left over
+			// from the prior switch, and ship only the delta —
+			// any rows the source generated AFTER the prior
+			// sync but BEFORE the purge would be missing from
+			// the response and never replayed on target.
+			// Empty state ≡ Known=false, which triggers full
+			// sync on the source.
+			writeJSONResponse(w, http.StatusOK, store.AgentSyncState{})
+			return
 		}
 	}
 
