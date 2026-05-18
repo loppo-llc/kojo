@@ -119,7 +119,30 @@ func (s *Server) handlePeerBlobGet(w http.ResponseWriter, r *http.Request) {
 			"blob_refs read: "+err.Error())
 		return
 	}
-	if peerBlobReadHandoffPendingOnly && !ref.HandoffPending {
+	// `?live_read=1` is the kojo-attach hub-fallback path: hub asks
+	// the holder peer for an attach blob whose forwarder push never
+	// landed on hub (network blip, hub offline at push time, etc.).
+	// Bypasses handoff_pending because attach reads are NOT part of
+	// the §3.7 switch state machine — they happen during normal
+	// operation, when no handoff is in flight.
+	//
+	// Strictly scope-limited:
+	//   - scope MUST be `global` (the only scope the kojo-attach
+	//     contract publishes into; mirrors peerBlobIngestHandler)
+	//   - path MUST match peerBlobIngestPath
+	//     (agents/<id>/attach/<msgID>/<file>)
+	//
+	// Together these guarantee live_read can only ever surface a
+	// row this peer published via the kojo-attach skill — never an
+	// avatar / book / arbitrary other blob_refs row in the same
+	// agent's tree. The downstream `wrong_home` check (the row's
+	// home_peer must equal this peer's DeviceID) means a paired
+	// peer cannot relay-read OTHER peers' attach blobs through us
+	// either.
+	liveRead := r.URL.Query().Get("live_read") == "1" &&
+		scope == blob.ScopeGlobal &&
+		peerBlobIngestPath.MatchString(blobPath)
+	if peerBlobReadHandoffPendingOnly && !ref.HandoffPending && !liveRead {
 		writeError(w, http.StatusConflict, "not_in_handoff",
 			"blob_refs row is not marked handoff_pending; refusing peer fetch")
 		return
@@ -160,6 +183,15 @@ func (s *Server) handlePeerBlobGet(w http.ResponseWriter, r *http.Request) {
 	// it, but a streaming Copy is simpler and avoids reading the
 	// whole body into memory. We accept that range requests aren't
 	// honoured for peer-fetch (the target reads the full body).
+	//
+	// HEAD short-circuit: http.ResponseWriter auto-discards body
+	// writes for HEAD requests, but io.Copy would still drain the
+	// on-disk fd before discovering nothing landed on the wire.
+	// Skip the read entirely so HEAD probes don't pay the disk-I/O
+	// cost of a multi-GiB blob.
+	if r.Method == http.MethodHead {
+		return
+	}
 	_, _ = io.Copy(w, f)
 }
 

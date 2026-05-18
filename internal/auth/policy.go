@@ -138,6 +138,15 @@ func AllowNonOwner(p Principal, method, path string) bool {
 				return true
 			}
 		}
+		if method == http.MethodHead &&
+			strings.HasPrefix(path, "/api/v1/peers/blobs/") {
+			// HEAD is the metadata-only twin of the GET above —
+			// hub's kojo-attach live-read fallback uses it to
+			// probe size / ETag before deciding whether to relay
+			// the body. Admit alongside GET so HEAD doesn't 403
+			// while GET succeeds.
+			return true
+		}
 		if method == http.MethodPost && path == "/api/v1/peers/pull" {
 			// Device-switch orchestration (§3.7 step 4): the
 			// Hub signs the pull dispatch as its own peer

@@ -570,6 +570,13 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		// to serve.
 		if s.blob != nil {
 			mux.HandleFunc("GET /api/v1/peers/blobs/", s.handlePeerBlobGet)
+			// HEAD is registered alongside GET so the hub's
+			// kojo-attach live-read fallback can probe metadata
+			// (Content-Length / ETag) without pulling the body.
+			// http.ResponseWriter auto-discards body writes for
+			// HEAD, so the same handler implementation works
+			// unmodified for both methods.
+			mux.HandleFunc("HEAD /api/v1/peers/blobs/", s.handlePeerBlobGet)
 			// kojo-attach hub ingest: peer-mode daemons PUT
 			// agent-generated attachment bodies here so the
 			// hub UI can serve them via the regular
@@ -654,6 +661,7 @@ func (s *Server) registerPeerOnlyRoutes(mux *http.ServeMux) {
 	}
 	if s.blob != nil {
 		mux.HandleFunc("GET /api/v1/peers/blobs/", s.handlePeerBlobGet)
+		mux.HandleFunc("HEAD /api/v1/peers/blobs/", s.handlePeerBlobGet)
 		mux.HandleFunc("POST /api/v1/peers/pull", s.handlePeerPull)
 	}
 }
