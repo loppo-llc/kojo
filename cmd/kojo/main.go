@@ -526,14 +526,12 @@ func main() {
 	// register / heartbeat / expire / shutdown events. Nil
 	// peerIdentity falls through (no bus, no route registered).
 	var peerEvents *peer.EventBus
-	var peerNonces *peer.NonceCache
 	var peerSubscriber *peer.Subscriber
 	var peerSubscriberTargetsCtx context.Context
 	var peerSubscriberTargetsCancel context.CancelFunc
 	if peerIdentity != nil && agentMgr != nil {
 		if st := agentMgr.Store(); st != nil {
 			peerEvents = peer.NewEventBus()
-			peerNonces = peer.NewNonceCache(peer.AuthMaxClockSkew)
 			peerRegistrar = peer.NewRegistrar(st, peerIdentity, logger)
 			peerRegistrar.SetEventBus(peerEvents)
 			startCtx, startCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -887,7 +885,6 @@ func main() {
 		Store:          agentMgr.Store(),
 		PeerIdentity:   peerIdentity,
 		PeerEvents:     peerEvents,
-		PeerNonces:     peerNonces,
 		// docs §3.5 transition: when KOJO_REQUIRE_IF_MATCH=1, every
 		// optimistic-concurrency-aware write rejects a missing
 		// If-Match header with 428 Precondition Required. Off by

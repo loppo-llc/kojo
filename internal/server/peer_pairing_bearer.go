@@ -54,17 +54,17 @@ type stashedPairingBearers struct {
 // mintAndStashPairingBearers is called from handleApprovePeerPending right
 // after the registry promotion. It:
 //
-//   1. Mints Token A and inserts its hash into peer_tokens with role
-//      peer_to_hub. The raw value goes into the kv stash for the peer to
-//      pick up on its next poll. Hub-side BearerPeerMiddleware will hash
-//      the inbound Authorization header and look it up.
-//   2. Mints Token B (raw only) and stores it in the Hub-side
-//      pairingHubOutNS kv keyed by peer device_id; this is the Bearer
-//      this Hub presents when calling THIS peer. The peer side stamps
-//      the hash via StorePeerTokenHash when it receives raw_B.
-//   3. Writes both raw values to the pairing-bearer stash so the next
-//      /join-request poll hands them over once and then deletes the
-//      stash.
+//  1. Mints Token A and inserts its hash into peer_tokens with role
+//     peer_to_hub. The raw value goes into the kv stash for the peer to
+//     pick up on its next poll. Hub-side BearerPeerMiddleware will hash
+//     the inbound Authorization header and look it up.
+//  2. Mints Token B (raw only) and stores it in the Hub-side
+//     pairingHubOutNS kv keyed by peer device_id; this is the Bearer
+//     this Hub presents when calling THIS peer. The peer side stamps
+//     the hash via StorePeerTokenHash when it receives raw_B.
+//  3. Writes both raw values to the pairing-bearer stash so the next
+//     /join-request poll hands them over once and then deletes the
+//     stash.
 //
 // Errors at any step roll back the whole sequence — partial state would
 // leave the Hub thinking it had a working Bearer pair when the peer

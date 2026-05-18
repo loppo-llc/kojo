@@ -65,31 +65,17 @@ func AttachOutboundBearer(ctx context.Context, st *store.Store, req *http.Reques
 	return nil
 }
 
-// AuthorizeOutbound is the single migration entry point used by the
-// SignRequest callers in internal/server / internal/peer during the
-// docs/peer-simplify-plan.md step-5 dual-stack window. The function:
+// AuthorizeOutbound stamps the `Authorization: Bearer …` header on req,
+// loading the raw token from kv via AttachOutboundBearer. Returns
+// ErrNoOutboundBearer when no Bearer is paired for peerDeviceID so the
+// caller can surface a clean failure — there is no longer a signing
+// fallback (the Ed25519 signing path was deleted in step 9 of
+// docs/peer-simplify-plan.md).
 //
-//  1. Tries the Bearer path via AttachOutboundBearer.
-//  2. On ErrNoOutboundBearer (no Bearer paired for this peer yet),
-//     OR when the store handle is nil (test fixtures, daemon
-//     bootstrap before kvstore is wired), falls back to SignRequest
-//     with the supplied identity material.
-//  3. Surfaces any other error verbatim — these signal a genuine
-//     kv failure (transient SQLite BUSY, schema drift), not the
-//     steady-state "no Bearer minted yet".
-//
-// Once step 9 removes SignRequest the fallback branch goes away and
-// the function fails closed when no Bearer is present.
-func AuthorizeOutbound(ctx context.Context, st *store.Store, req *http.Request, selfIdent *Identity, peerDeviceID, nonce string) error {
-	if st != nil {
-		if err := AttachOutboundBearer(ctx, st, req, peerDeviceID); err == nil {
-			return nil
-		} else if !errors.Is(err, ErrNoOutboundBearer) {
-			return err
-		}
+// A nil store handle is treated the same as a missing Bearer.
+func AuthorizeOutbound(ctx context.Context, st *store.Store, req *http.Request, peerDeviceID string) error {
+	if st == nil {
+		return ErrNoOutboundBearer
 	}
-	if selfIdent == nil {
-		return errors.New("peer.AuthorizeOutbound: nil identity for signing fallback")
-	}
-	return SignRequest(req, selfIdent.DeviceID, selfIdent.PrivateKey, nonce, peerDeviceID)
+	return AttachOutboundBearer(ctx, st, req, peerDeviceID)
 }

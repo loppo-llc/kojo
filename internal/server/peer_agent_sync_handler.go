@@ -98,21 +98,21 @@ const peerAgentSyncMaxBody = 128 << 20
 const peerAgentSyncMaxWireBody = 32 << 20
 
 type peerAgentSyncRequest struct {
-	SourceDeviceID string                     `json:"source_device_id"`
+	SourceDeviceID string `json:"source_device_id"`
 	// OpID is the orchestrator-minted UUID identifying this
 	// particular switch attempt. The same id rides along on
 	// the matching finalize / drop call so target's pending
 	// state map can resolve which sync to commit or roll back.
 	// Required for the two-phase protocol to be safe across
 	// concurrent retries.
-	OpID           string                     `json:"op_id"`
-	Agent          *store.AgentRecord         `json:"agent"`
-	Persona        *store.AgentPersonaRecord  `json:"persona,omitempty"`
-	Memory         *store.AgentMemoryRecord   `json:"memory,omitempty"`
-	Messages       []*store.MessageRecord     `json:"messages,omitempty"`
-	MemoryEntries  []*store.MemoryEntryRecord `json:"memory_entries,omitempty"`
-	Tasks          []*store.AgentTaskRecord   `json:"tasks,omitempty"`
-	AgentToken     string                     `json:"agent_token,omitempty"`
+	OpID          string                     `json:"op_id"`
+	Agent         *store.AgentRecord         `json:"agent"`
+	Persona       *store.AgentPersonaRecord  `json:"persona,omitempty"`
+	Memory        *store.AgentMemoryRecord   `json:"memory,omitempty"`
+	Messages      []*store.MessageRecord     `json:"messages,omitempty"`
+	MemoryEntries []*store.MemoryEntryRecord `json:"memory_entries,omitempty"`
+	Tasks         []*store.AgentTaskRecord   `json:"tasks,omitempty"`
+	AgentToken    string                     `json:"agent_token,omitempty"`
 	// ClaudeSessions carry the source peer's
 	// ~/.claude/projects/<encoded-workdir>/*.jsonl files so
 	// `claude --continue` on target finds the same conversation

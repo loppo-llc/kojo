@@ -453,7 +453,6 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, toDirectoryView(a))
 }
 
-
 func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	p := auth.FromContext(r.Context())
@@ -1087,11 +1086,8 @@ func (s *Server) proxyPeerGetMessages(w http.ResponseWriter, r *http.Request, ag
 	if err != nil {
 		return false
 	}
-	nonce, err := peer.MakeNonce()
-	if err != nil {
-		return false
-	}
-	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, s.peerID, holderDeviceID, nonce); err != nil {
+
+	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, holderDeviceID); err != nil {
 		return false
 	}
 	// Forward auth token so the holder's auth middleware can verify
@@ -1215,11 +1211,8 @@ func (s *Server) fetchRemoteLatestMessage(ctx context.Context, agentID, holderDe
 	if err != nil {
 		return "", "", "", false
 	}
-	nonce, err := peer.MakeNonce()
-	if err != nil {
-		return "", "", "", false
-	}
-	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, s.peerID, holderDeviceID, nonce); err != nil {
+
+	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, holderDeviceID); err != nil {
 		return "", "", "", false
 	}
 
@@ -2212,4 +2205,3 @@ func (s *Server) handleResetSession(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
-

@@ -239,4 +239,3 @@ func (s *Server) handlePeerPull(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSONResponse(w, http.StatusOK, peerPullResponse{Results: results})
 }
-

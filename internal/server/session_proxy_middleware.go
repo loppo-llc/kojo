@@ -139,12 +139,8 @@ func (s *Server) proxySessionRequest(w http.ResponseWriter, r *http.Request, pee
 			proxyReq.Header.Set(h, v)
 		}
 	}
-	nonce, err := peer.MakeNonce()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "nonce: "+err.Error())
-		return
-	}
-	if err := peer.AuthorizeOutbound(proxyReq.Context(), s.agents.Store(), proxyReq, s.peerID, peerID, nonce); err != nil {
+
+	if err := peer.AuthorizeOutbound(proxyReq.Context(), s.agents.Store(), proxyReq, peerID); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "authorize: "+err.Error())
 		return
 	}

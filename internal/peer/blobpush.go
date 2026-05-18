@@ -135,13 +135,7 @@ func (c *PushClient) PushOne(
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Kojo-Expected-SHA256", expectedSHA256)
 
-	nonce, err := MakeNonce()
-	if err != nil {
-		return fmt.Errorf("peer.PushOne: nonce: %w", err)
-	}
-	// Bearer first when paired (step 7 dual-stack); SignRequest is
-	// the fallback. See PushClient.store doc for the migration story.
-	if err := AuthorizeOutbound(ctx, c.store, req, c.identity, dst.DeviceID, nonce); err != nil {
+	if err := AuthorizeOutbound(ctx, c.store, req, dst.DeviceID); err != nil {
 		return fmt.Errorf("peer.PushOne: authorize: %w", err)
 	}
 

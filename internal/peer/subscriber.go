@@ -3,7 +3,6 @@ package peer
 import (
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -293,18 +292,12 @@ func (s *Subscriber) connectOnce(ctx context.Context, t SubscriberTarget) error 
 	}
 	target.Path = "/api/v1/peers/events"
 
-	// Build the upgrade request to attach peer-auth headers.
+	// Build the upgrade request to attach the Bearer.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
-	nonce, err := newNonce()
-	if err != nil {
-		return fmt.Errorf("nonce: %w", err)
-	}
-	// Bearer first (docs/peer-simplify-plan.md step 6); SignRequest is
-	// the dual-stack fallback until step 9 removes signing entirely.
-	if err := AuthorizeOutbound(ctx, s.store, req, s.id, t.DeviceID, nonce); err != nil {
+	if err := AuthorizeOutbound(ctx, s.store, req, t.DeviceID); err != nil {
 		return fmt.Errorf("authorize request: %w", err)
 	}
 
@@ -428,18 +421,6 @@ func (s *Subscriber) republish(evt StatusEvent) {
 	_ = evt
 }
 
-// newNonce returns a fresh 32-byte base64 nonce for use in
-// AuthHeaderNonce. The dedicated helper lives here so the
-// subscriber doesn't have to import crypto/rand at every call
-// site.
-func newNonce() (string, error) {
-	var b [AuthNonceLen]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(b[:]), nil
-}
-
 // jitter applies ±25% to d. Helps avoid synchronised reconnect
 // storms when many peers come back at once.
 func jitter(d time.Duration) time.Duration {
@@ -466,4 +447,3 @@ func previewBytes(b []byte, n int) string {
 	}
 	return string(b[:n]) + "...(" + fmt.Sprint(len(b)) + " bytes total)"
 }
-

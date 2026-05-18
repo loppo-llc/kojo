@@ -775,12 +775,12 @@ const (
 // messageInfo is the JSON shape returned by slack_get_channel_history and
 // slack_get_thread_replies.
 type messageInfo struct {
-	User      string `json:"user"`
-	Text      string `json:"text"`
-	Timestamp string `json:"timestamp"`
-	ThreadTS  string `json:"thread_ts,omitempty"`
-	ReplyCount int   `json:"reply_count,omitempty"`
-	SubType   string `json:"subtype,omitempty"`
+	User       string `json:"user"`
+	Text       string `json:"text"`
+	Timestamp  string `json:"timestamp"`
+	ThreadTS   string `json:"thread_ts,omitempty"`
+	ReplyCount int    `json:"reply_count,omitempty"`
+	SubType    string `json:"subtype,omitempty"`
 }
 
 func slackGetChannelHistoryHandler(agents *agent.Manager, logger *slog.Logger) mcpserver.ToolHandlerFunc {
@@ -1154,15 +1154,15 @@ func matchUser(u slack.User, nameFilter string, includeBots bool) (userInfo, boo
 // errors) so they can be safely logged without leaking absolute paths or
 // other host details.
 const (
-	uploadErrEmpty     = "empty"
-	uploadErrInvalid   = "invalid_path"
-	uploadErrNotFound  = "not_found"
-	uploadErrOutside   = "outside_upload_dir"
-	uploadErrIsDir     = "is_directory"
-	uploadErrNotFile   = "not_regular_file"
-	uploadErrOpenFail  = "open_failed"
-	uploadErrStatFail  = "stat_failed"
-	uploadErrSwapped   = "swapped_during_validation"
+	uploadErrEmpty    = "empty"
+	uploadErrInvalid  = "invalid_path"
+	uploadErrNotFound = "not_found"
+	uploadErrOutside  = "outside_upload_dir"
+	uploadErrIsDir    = "is_directory"
+	uploadErrNotFile  = "not_regular_file"
+	uploadErrOpenFail = "open_failed"
+	uploadErrStatFail = "stat_failed"
+	uploadErrSwapped  = "swapped_during_validation"
 )
 
 // uploadPathUserMessage maps an internal error kind to a fixed,

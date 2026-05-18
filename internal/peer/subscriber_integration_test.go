@@ -2,9 +2,6 @@ package peer
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -16,17 +13,18 @@ import (
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
-// docs §3.10 — pin the full subscriber ↔ Hub WS handshake:
-// Subscriber dials a peer-authed endpoint, the AuthMiddleware
-// verifies the Ed25519 signature, the handler streams a snapshot
-// + an event, the Subscriber's live cache reflects both. Mocks
-// the Hub side with httptest + websocket.Accept so the test
-// doesn't depend on internal/server.
+// docs §3.10 — pin the subscriber ↔ Hub WS handshake. Auth at the
+// Hub side has moved off Ed25519 signatures to BearerPeerMiddleware
+// (docs/peer-simplify-plan.md step 9), so the fixture now issues
+// the subscriber a Bearer instead of generating a keypair. The
+// streaming + snapshot/event semantics are unchanged.
 
 // hubFixture builds the minimal Hub side: a kv store with the
-// subscriber's peer_registry row + a WS handler protected by
-// AuthMiddleware. Returns the httptest server URL.
-func hubFixture(t *testing.T) (string, ed25519.PrivateKey, *Identity, *store.Store) {
+// subscriber's peer_registry row + a Bearer-protected WS handler.
+// Returns the httptest URL, the subscriber Identity, and the
+// subscriber-side store handle (which already holds the outbound
+// Bearer the Subscriber will present).
+func hubFixture(t *testing.T) (string, *Identity, *store.Store) {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(context.Background(), store.Options{ConfigDir: dir})
@@ -34,34 +32,43 @@ func hubFixture(t *testing.T) (string, ed25519.PrivateKey, *Identity, *store.Sto
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	// Local identity = the SUBSCRIBER's identity. The peer
-	// dialling US presents its signed request; we look up its
-	// public key in our peer_registry. So the Hub fixture has
-	// the subscriber's identity row.
-	subPub, subPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("ed25519: %v", err)
-	}
 	subID := &Identity{
-		DeviceID:   "subscriber0123456789abcdef012345",
-		Name:       "sub-host",
-		PublicKey:  subPub,
-		PrivateKey: subPriv,
+		DeviceID: "subscriber0123456789abcdef012345",
+		Name:     "sub-host",
 	}
 	if _, err := st.UpsertPeer(context.Background(), &store.PeerRecord{
-		DeviceID:  subID.DeviceID,
-		Name:      subID.Name,
-		PublicKey: base64.StdEncoding.EncodeToString(subPub),
+		DeviceID: subID.DeviceID,
+		Name:     subID.Name,
+		// public_key is still NOT NULL in the schema; step 10
+		// drops the column once the signing layer is fully out.
+		// Use a placeholder to satisfy the constraint.
+		PublicKey: "deadbeef-placeholder-base64==",
 		Status:    store.PeerStatusOnline,
+		Trusted:   true,
 	}); err != nil {
 		t.Fatalf("UpsertPeer: %v", err)
 	}
+	if err := st.UpdatePeerTrust(context.Background(), subID.DeviceID, true); err != nil {
+		t.Fatalf("UpdatePeerTrust: %v", err)
+	}
+	issued, err := st.IssuePeerToken(context.Background(), subID.DeviceID, store.PeerTokenRolePeerToHub)
+	if err != nil {
+		t.Fatalf("IssuePeerToken: %v", err)
+	}
+	// Subscriber-side: stash the raw token as the outbound bearer
+	// for the Hub's device_id. SetTargets uses "hub-device-id" as
+	// the target id, so the stash key matches.
+	if _, err := st.PutKV(context.Background(), &store.KVRecord{
+		Namespace: OutBearerNS,
+		Key:       "hub-device-id",
+		Value:     issued.Raw,
+		Type:      store.KVTypeString,
+		Scope:     store.KVScopeMachine,
+	}, store.KVPutOptions{}); err != nil {
+		t.Fatalf("PutKV outbound bearer: %v", err)
+	}
 	bus := NewEventBus()
-	// hub-self is the device_id we expect the subscriber to name
-	// as audience. The integration tests call SetTargets with
-	// DeviceID="hub-device-id" — match that so the audience
-	// check passes.
-	mw := NewAuthMiddleware(st, NewNonceCache(AuthMaxClockSkew), "hub-device-id")
+	mw := NewBearerPeerMiddleware(st, "hub-device-id")
 	handler := mw.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			OriginPatterns: []string{"*"},
@@ -98,21 +105,15 @@ func hubFixture(t *testing.T) (string, ed25519.PrivateKey, *Identity, *store.Sto
 		srv.Close()
 		bus.Publish(StatusEvent{}) // unblock any pending recv
 	})
-	// Stash the bus on the store via closure: tests will publish
-	// directly using the returned bus pointer through a hook.
-	t.Cleanup(func() {})
-	// Expose the bus via the returned httptest server by attaching
-	// it to a side-channel: simplest is to publish from the test
-	// using the subscriber-observed `peer-y` event below.
-	hubBus := bus // capture for return
+	hubBus := bus
 	_ = hubBus
-	return srv.URL, subPriv, subID, st
+	return srv.URL, subID, st
 }
 
 func TestSubscriber_ReceivesSnapshotFromHub(t *testing.T) {
-	hubURL, _, subID, _ := hubFixture(t)
+	hubURL, subID, st := hubFixture(t)
 	bus := NewEventBus()
-	sub := NewSubscriber(subID, nil, bus, nil)
+	sub := NewSubscriber(subID, st, bus, nil)
 	defer sub.Stop()
 
 	sub.SetTargets([]SubscriberTarget{
@@ -130,8 +131,8 @@ func TestSubscriber_ReceivesSnapshotFromHub(t *testing.T) {
 }
 
 func TestSubscriber_StopUnsubscribesAllTargets(t *testing.T) {
-	hubURL, _, subID, _ := hubFixture(t)
-	sub := NewSubscriber(subID, nil, nil, nil)
+	hubURL, subID, st := hubFixture(t)
+	sub := NewSubscriber(subID, st, nil, nil)
 	sub.SetTargets([]SubscriberTarget{
 		{DeviceID: "hub-device-id", Address: hubURL},
 	})

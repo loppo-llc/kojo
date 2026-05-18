@@ -199,14 +199,14 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	// peer). Empty for local creates — UI treats empty as "self".
 	info := sess.Info()
 	out := map[string]any{
-		"id":         info.ID,
-		"tool":       info.Tool,
-		"workDir":    info.WorkDir,
-		"args":       info.Args,
-		"status":     info.Status,
-		"createdAt":  info.CreatedAt,
-		"yoloMode":   info.YoloMode,
-		"peer":       "",
+		"id":        info.ID,
+		"tool":      info.Tool,
+		"workDir":   info.WorkDir,
+		"args":      info.Args,
+		"status":    info.Status,
+		"createdAt": info.CreatedAt,
+		"yoloMode":  info.YoloMode,
+		"peer":      "",
 	}
 	// Carry the rest of the SessionInfo via a quick re-marshal so we
 	// don't have to maintain a manual mirror of every field. Then
@@ -273,12 +273,8 @@ func (s *Server) proxyCreateSessionToPeer(w http.ResponseWriter, r *http.Request
 			proxyReq.Header.Set(h, v)
 		}
 	}
-	nonce, err := peer.MakeNonce()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "nonce: "+err.Error())
-		return
-	}
-	if err := peer.AuthorizeOutbound(proxyReq.Context(), s.agents.Store(), proxyReq, s.peerID, peerID, nonce); err != nil {
+
+	if err := peer.AuthorizeOutbound(proxyReq.Context(), s.agents.Store(), proxyReq, peerID); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "authorize: "+err.Error())
 		return
 	}

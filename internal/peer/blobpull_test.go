@@ -2,8 +2,6 @@ package peer
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
@@ -12,16 +10,16 @@ import (
 	"testing"
 
 	"github.com/loppo-llc/kojo/internal/blob"
+	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // fixedSourceFixture mounts an httptest server that pretends to
 // be a source peer's /api/v1/peers/blobs/{uri} endpoint. The
 // handler returns a configurable status / body / sha256 header
-// so each subtest can pin one behaviour. It does NOT mount the
-// AuthMiddleware: SignRequest is verified by the existing
-// Sign/Verify roundtrip suite, and bringing the middleware in
-// here would require a store + peer_registry row whose only
-// purpose is to re-prove a check that already has coverage.
+// so each subtest can pin one behaviour. Auth verification lives
+// in bearer_middleware_test.go; here we only sanity-check that an
+// Authorization header was attached so a regression that dropped
+// AttachOutboundBearer surfaces locally.
 func fixedSourceFixture(t *testing.T, status int, body []byte, sha256Hdr string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -29,11 +27,8 @@ func fixedSourceFixture(t *testing.T, status int, body []byte, sha256Hdr string)
 			http.NotFound(w, r)
 			return
 		}
-		// Sanity-check that SignRequest stamped the auth headers
-		// on the outbound request — the source-side middleware
-		// would 401 otherwise.
-		if r.Header.Get(AuthHeaderSig) == "" || r.Header.Get(AuthHeaderID) == "" {
-			http.Error(w, "missing auth headers", http.StatusBadRequest)
+		if !strings.HasPrefix(strings.ToLower(r.Header.Get("Authorization")), "bearer ") {
+			http.Error(w, "missing Authorization Bearer", http.StatusBadRequest)
 			return
 		}
 		if sha256Hdr != "" {
@@ -48,16 +43,33 @@ func fixedSourceFixture(t *testing.T, status int, body []byte, sha256Hdr string)
 
 func newTestIdentity(t *testing.T) *Identity {
 	t.Helper()
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("ed25519: %v", err)
-	}
 	return &Identity{
-		DeviceID:   "client-device-0123456789abcdef0",
-		Name:       "client",
-		PublicKey:  pub,
-		PrivateKey: priv,
+		DeviceID: "client-device-0123456789abcdef0",
+		Name:     "client",
 	}
+}
+
+// newBlobTestStore opens a temp store and provisions an outbound
+// Bearer for the canonical source device used by the blob tests.
+// Returns the store so the caller can pass it to NewPullClient.
+func newBlobTestStore(t *testing.T, sourceDeviceID string) *store.Store {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(context.Background(), store.Options{ConfigDir: dir})
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if _, err := st.PutKV(context.Background(), &store.KVRecord{
+		Namespace: OutBearerNS,
+		Key:       sourceDeviceID,
+		Value:     "test-bearer-raw-token",
+		Type:      store.KVTypeString,
+		Scope:     store.KVScopeMachine,
+	}, store.KVPutOptions{}); err != nil {
+		t.Fatalf("PutKV bearer: %v", err)
+	}
+	return st
 }
 
 func newTestBlobStore(t *testing.T) *blob.Store {
@@ -80,7 +92,8 @@ func TestPullOne_HappyPath(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	client := NewPullClient(id, nil, nil, nil)
+	st := newBlobTestStore(t, "source-device-fedcba9876543210")
+	client := NewPullClient(id, st, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	uri := "kojo://global/agents/ag_x/transcript"
@@ -120,7 +133,8 @@ func TestPullOne_SHA256Mismatch(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	client := NewPullClient(id, nil, nil, nil)
+	st := newBlobTestStore(t, "source-device-fedcba9876543210")
+	client := NewPullClient(id, st, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	// No orchestrator-supplied digest: only the response header
@@ -150,7 +164,8 @@ func TestPullOne_HTTPNon200(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	client := NewPullClient(id, nil, nil, nil)
+	st := newBlobTestStore(t, "source-device-fedcba9876543210")
+	client := NewPullClient(id, st, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	res, err := client.PullOne(context.Background(),
@@ -176,7 +191,8 @@ func TestPullOne_MissingSHAHeader(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	client := NewPullClient(id, nil, nil, nil)
+	st := newBlobTestStore(t, "source-device-fedcba9876543210")
+	client := NewPullClient(id, st, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	// Pass an empty ExpectedSHA256 so the helper has nothing to
@@ -206,7 +222,8 @@ func TestPullOne_OrchestratorDigestOverridesHeader(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	client := NewPullClient(id, nil, nil, nil)
+	st := newBlobTestStore(t, "source-device-fedcba9876543210")
+	client := NewPullClient(id, st, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	res, err := client.PullOne(context.Background(),
@@ -235,7 +252,8 @@ func TestPullMany_StopsOnLocalFatal(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	client := NewPullClient(id, nil, nil, nil)
+	st := newBlobTestStore(t, "source-device-fedcba9876543210")
+	client := NewPullClient(id, st, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	ctx, cancel := context.WithCancel(context.Background())

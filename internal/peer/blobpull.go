@@ -2,8 +2,6 @@ package peer
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -209,15 +207,11 @@ func (c *PullClient) PullOne(ctx context.Context, src PullSource, item PullItem,
 	if err != nil {
 		return res, fmt.Errorf("peer.PullOne: new request: %w", err)
 	}
-	nonce, err := MakeNonce()
-	if err != nil {
-		return res, fmt.Errorf("peer.PullOne: nonce: %w", err)
-	}
 	// Bearer first when paired (step 7 dual-stack); SignRequest is
 	// the fallback for the peer↔peer leg where no Bearer exists yet.
 	// Once a follow-up adds Hub-issued blob capabilities, swap this
 	// for a capability presentation and drop the sign branch.
-	if err := AuthorizeOutbound(ctx, c.store, req, c.identity, src.DeviceID, nonce); err != nil {
+	if err := AuthorizeOutbound(ctx, c.store, req, src.DeviceID); err != nil {
 		return res, fmt.Errorf("peer.PullOne: authorize: %w", err)
 	}
 
@@ -378,14 +372,3 @@ func buildPeerBlobURL(base, blobURI string) (string, error) {
 	return u.String(), nil
 }
 
-// MakeNonce returns a fresh 32-byte base64 nonce for use in
-// AuthHeaderNonce. Same shape as subscriber.newNonce; duplicated
-// here so the pull client can stand alone without coupling to the
-// status-subscribe machinery.
-func MakeNonce() (string, error) {
-	var b [AuthNonceLen]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(b[:]), nil
-}

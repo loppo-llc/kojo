@@ -134,13 +134,7 @@ func (s *Server) proxyAgentWebSocket(w http.ResponseWriter, r *http.Request, age
 			"build upgrade request: "+err.Error())
 		return
 	}
-	nonce, err := peer.MakeNonce()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal",
-			"nonce: "+err.Error())
-		return
-	}
-	if err := peer.AuthorizeOutbound(r.Context(), s.agents.Store(), upgrade, s.peerID, targetDeviceID, nonce); err != nil {
+	if err := peer.AuthorizeOutbound(r.Context(), s.agents.Store(), upgrade, targetDeviceID); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal",
 			"authorize upgrade: "+err.Error())
 		return
