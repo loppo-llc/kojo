@@ -51,7 +51,14 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
 
-	args := b.buildClaudeArgs(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers, opts.AutomatedTrigger)
+	args := b.buildClaudeArgs(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers, opts.AutomatedTrigger, opts.SessionKey)
+
+	// Expected session ID for THIS branch, used as the recovery fallback if
+	// Claude exits before result.streamSessionID is set. Without this anchor,
+	// recoverFromSession would pick the most-recently-modified JSONL in the
+	// project dir — which under concurrent Slack threads can be a different
+	// thread's file, causing cross-thread text contamination.
+	expectedSessionID := expectedClaudeSessionID(agent.ID, opts.SessionKey, opts.OneShot)
 
 	cmd := exec.CommandContext(ctx, claudePath, args...)
 	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
@@ -151,8 +158,19 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		// Last resort: recover from Claude session JSONL when the stream
 		// produced no usable text. Only used as fallback, never overrides
 		// text that was successfully captured from the stream.
-		if finalText == "" {
-			if sessionText := recoverFromSession(agent.ID, result.streamSessionID, b.logger); sessionText != "" {
+		//
+		// Prefer streamSessionID (authoritative — Claude told us which file it
+		// wrote to). When unavailable (e.g. process died before the result
+		// event), fall back to the deterministic UUID we computed for this
+		// branch. Never fall through to "" because findSessionFile then picks
+		// the most-recently-modified JSONL, which under concurrent threads can
+		// be a sibling thread's file.
+		recoverSessionID := result.streamSessionID
+		if recoverSessionID == "" {
+			recoverSessionID = expectedSessionID
+		}
+		if finalText == "" && recoverSessionID != "" {
+			if sessionText := recoverFromSession(agent.ID, recoverSessionID, b.logger); sessionText != "" {
 				b.logger.Info("recovered text from session log",
 					"agent", agent.ID,
 					"sessionLen", len(sessionText))
@@ -193,7 +211,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 }
 
 // buildClaudeArgs constructs the CLI arguments for a Claude chat invocation.
-func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir string, oneShot bool, mcpServers map[string]mcpServerEntry, automatedTrigger bool) []string {
+func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir string, oneShot bool, mcpServers map[string]mcpServerEntry, automatedTrigger bool, sessionKey string) []string {
 	args := []string{
 		"-p",
 		"--output-format", "stream-json",
@@ -252,8 +270,7 @@ func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir s
 	//
 	// OneShot mode (e.g. Slack conversations) skips session resumption entirely,
 	// running a fresh ephemeral session each time.
-	if !oneShot {
-		sessionID := agentIDToUUID(agent.ID)
+	if sessionID := expectedClaudeSessionID(agent.ID, sessionKey, oneShot); sessionID != "" {
 		if sessionFileUsable(dir, sessionID, automatedTrigger, agent.ID, agent.ResumeIdleDuration(), b.logger) {
 			args = append(args, "--resume", sessionID)
 		} else {
@@ -642,16 +659,22 @@ const sessionResetThresholdTokens = 150_000
 const sessionTailReadBytes = 1 * 1024 * 1024
 
 // preResetSummarize is the summarization hook invoked by sessionFileUsable
-// right before it deletes a session file. Defaults to PreCompactSummarize,
-// which writes a diary entry from the live session JSONL. Exposed as a
-// package variable so tests can substitute a deterministic fake instead of
-// spawning a real claude CLI process.
-var preResetSummarize = func(agentID, tool string, logger *slog.Logger) error {
-	// Reset path doesn't have the PreCompact-hook stdin payload (claude
-	// isn't telling us about a compaction here — kojo is initiating a
-	// session wipe), so transcriptPath is left empty and the function
-	// falls back to discovery.
-	return PreCompactSummarize(agentID, tool, "", logger)
+// right before it deletes a session file. Defaults to runAutoSummary in
+// strict mode, which writes a diary entry from the named session JSONL.
+// Exposed as a package variable so tests can substitute a deterministic
+// fake instead of spawning a real claude CLI process.
+//
+// sessionPath is the absolute path of the JSONL we're about to delete.
+// Forwarding it eliminates a cross-session contamination risk: when a Slack
+// agent has multiple thread-keyed sessions, mtime-based discovery would
+// otherwise pick the most recently modified JSONL — which may be a different
+// thread's session that is NOT being reset — and summarise THAT into today's
+// diary. Strict mode pins the summary to the session about to be wiped: if
+// the path fails validation or yields no messages, the summary returns an
+// error, which sessionFileUsable treats as "abort the reset" so we don't
+// lose context to a misleading delete.
+var preResetSummarize = func(agentID, tool, sessionPath string, logger *slog.Logger) error {
+	return runAutoSummary(agentID, tool, sessionPath, true, logger)
 }
 
 // sessionResetMinIdleDuration is the package-default idle window used when
@@ -747,7 +770,7 @@ func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool,
 	// abort the reset — losing context silently would be worse than
 	// carrying a slightly-over-threshold session for one more turn.
 	if agentID != "" {
-		if err := preResetSummarize(agentID, "claude", logger); err != nil {
+		if err := preResetSummarize(agentID, "claude", path, logger); err != nil {
 			slog.Warn("pre-reset summary failed, keeping session to avoid context loss",
 				"path", path, "agent", agentID, "err", err)
 			return true
@@ -858,6 +881,28 @@ func agentIDToUUID(agentID string) string {
 	h[6] = (h[6] & 0x0f) | 0x30 // version 3
 	h[8] = (h[8] & 0x3f) | 0x80 // variant RFC4122
 	return fmt.Sprintf("%x-%x-%x-%x-%x", h[0:4], h[4:6], h[6:8], h[8:10], h[10:16])
+}
+
+// expectedClaudeSessionID returns the deterministic Claude session UUID that
+// this invocation would resume/create, or "" when the caller has opted out of
+// session persistence (oneShot mode).
+//
+// When sessionKey is non-empty (e.g. per-Slack-thread isolation), the UUID is
+// derived from that key so each thread maps to its own JSONL. Otherwise the
+// agent-wide UUID is used.
+//
+// The recovery path uses this value as a fallback so that, if Claude exits
+// before emitting the result event with streamSessionID, we still recover
+// text from THIS branch's JSONL rather than whichever file was most recently
+// modified (which could belong to a concurrent Slack thread).
+func expectedClaudeSessionID(agentID, sessionKey string, oneShot bool) string {
+	if oneShot {
+		return ""
+	}
+	if sessionKey != "" {
+		return agentIDToUUID(sessionKey)
+	}
+	return agentIDToUUID(agentID)
 }
 
 // recoverFromSession reads the Claude session JSONL for the agent and

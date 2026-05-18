@@ -339,16 +339,10 @@ func (m *Manager) syncPersona(agentID string) {
 		return
 	}
 	a.Persona = content
-	tool := a.Tool
 	override := a.PublicProfileOverride
 	a.UpdatedAt = time.Now().Format(time.RFC3339)
 	m.mu.Unlock()
 	m.save()
-
-	// Pre-generate persona summary in background so it's cached for next chat
-	if len([]rune(content)) > maxPersonaSummaryRunes {
-		go getPersonaSummary(agentID, content, tool, m.logger)
-	}
 
 	// Regenerate or clear public profile when persona changes via file edit (unless overridden)
 	if !override {
@@ -506,19 +500,6 @@ func (m *Manager) regeneratePublicProfile(agentID, persona string) {
 
 // Update updates an agent's configuration. Only non-nil fields are applied.
 func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
-	// Pure-input validations that don't depend on existing state run first so
-	// a malformed payload can't trigger any I/O (persona.md write, avatar
-	// fetch) or partial in-memory mutations below.
-	var nextCronMessage string
-	cronMessageDirty := false
-	if cfg.CronMessage != nil {
-		v, err := validateCronMessage(*cfg.CronMessage)
-		if err != nil {
-			return nil, err
-		}
-		nextCronMessage = v
-		cronMessageDirty = true
-	}
 	// Reject invalid resume-idle presets up front so a malformed PATCH cannot
 	// land partial mutations (Persona / Name / Model are applied before the
 	// later validation block, so deferring this check would let a bad value
@@ -670,9 +651,6 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 			return nil, fmt.Errorf("unsupported thinkingMode: %q", *cfg.ThinkingMode)
 		}
 		a.ThinkingMode = NormalizeThinkingMode(*cfg.ThinkingMode)
-	}
-	if cronMessageDirty {
-		a.CronMessage = nextCronMessage
 	}
 	if cfg.TTS != nil {
 		// Already validated up-front before any I/O / mutation.
@@ -1025,10 +1003,34 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 }
 
 // ChatOneShot runs a one-shot chat that does not save to transcript
-// (messages.jsonl) and does not resume the CLI session. Used for external
-// platform conversations (Slack, Discord) that carry their own context.
+// (messages.jsonl). Used for external platform conversations (Slack, Discord)
+// that carry their own context.
 // Memory (MEMORY.md, diary) access is still available via system prompt.
-func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string) (<-chan ChatEvent, error) {
+//
+// OneShotOpts configures a one-shot chat session.
+type OneShotOpts struct {
+	// SessionKey enables session resumption with a deterministic session ID
+	// derived from this key (e.g. per Slack thread). When empty, the chat
+	// runs as a fresh ephemeral session with no resumption.
+	SessionKey string
+
+	// SystemPromptExtra is appended to the system prompt for this session.
+	// Use it to inject platform-specific context (e.g. Slack reply behavior)
+	// without modifying the shared system prompt builder.
+	SystemPromptExtra string
+}
+
+// ChatOneShot runs a non-persistent chat that doesn't save to the transcript.
+//
+// When opts.SessionKey is non-empty, the chat uses session resumption so the
+// agent maintains Claude context across messages in the same conversation
+// (e.g. Slack thread), isolated from the WebUI session and other threads.
+func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string, opts ...OneShotOpts) (<-chan ChatEvent, error) {
+	var cfg OneShotOpts
+	if len(opts) > 0 {
+		cfg = opts[0]
+	}
+
 	prep, err := m.prepareChat(agentID, userMessage, false, false)
 	if err != nil {
 		return nil, err
@@ -1045,16 +1047,6 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	osID := m.trackOneShot(agentID, cancel)
 	outCh := make(chan ChatEvent, 64)
 
-	// Slack messages: instruct the agent to separate thinking from reply.
-	if strings.Contains(userMessage, "[Slack @") {
-		prep.sysPrompt += "\n\n## Slack Response Format\n\n" +
-			"This message is from Slack. Your text output will be posted to Slack.\n" +
-			"Wrap ONLY your final reply in <reply>...</reply> tags.\n" +
-			"Text outside these tags is your internal workspace — use it freely to think, reason, plan, and execute tools.\n" +
-			"Only the content inside <reply> will be shown to the Slack user.\n" +
-			"Always include exactly one <reply> block at the end of your response.\n"
-	}
-
 	// NOTE: No appendMessage — one-shot chats are not saved to transcript.
 
 	// Prepend volatile context for the same reason as the persistent
@@ -1064,7 +1056,49 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	if prep.volatileContext != "" {
 		effectiveMessage = prep.volatileContext + userMessage
 	}
-	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{OneShot: true, MCPServers: prep.mcpServers})
+
+	// Append platform-specific system prompt extra (e.g. Slack context).
+	// This goes at the end of the system prompt so it doesn't break
+	// the prompt cache prefix shared across turns within the same session.
+	sysPrompt := prep.sysPrompt
+	if cfg.SystemPromptExtra != "" {
+		sysPrompt += "\n\n" + cfg.SystemPromptExtra
+	}
+
+	// Build chat options.
+	//
+	// SessionKey-scoped resumption is only honored by backends that read
+	// opts.SessionKey when building their CLI args (see
+	// backendSupportsSessionKey for the canonical allow-list).
+	// Other backends like gemini interpret !OneShot as "resume the agent's
+	// latest session", which would incorrectly mix Slack thread context
+	// with the agent's normal WebUI context — or with a different Slack
+	// thread's session. For those backends we force OneShot=true so the
+	// chat stays ephemeral, mirroring the no-SessionKey path.
+	// ChatOneShot's only current SessionKey caller is the Slack bot, where
+	// every fire is a human reply in a thread. AutomatedTrigger=true would
+	// disable the idle-window guard in sessionFileUsable and let a session
+	// be reset mid-conversation while the user is actively typing — exactly
+	// the case the guard exists to prevent. Treat SessionKey one-shots as
+	// interactive (AutomatedTrigger=false) so the idle window protects them
+	// the same way it protects the WebUI chat path. If a non-interactive
+	// caller is added later, surface AutomatedTrigger through OneShotOpts
+	// rather than re-defaulting it to true here.
+	var chatOpts ChatOptions
+	if cfg.SessionKey != "" && backendSupportsSessionKey(prep.backend) {
+		chatOpts = ChatOptions{
+			MCPServers:       prep.mcpServers,
+			AutomatedTrigger: false,
+			SessionKey:       cfg.SessionKey,
+		}
+	} else {
+		chatOpts = ChatOptions{
+			OneShot:    true,
+			MCPServers: prep.mcpServers,
+		}
+	}
+
+	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, sysPrompt, chatOpts)
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
@@ -1266,6 +1300,78 @@ func (m *Manager) resolveBackend(agentID string, agentCopy *Agent) (ChatBackend,
 	return backend, nil
 }
 
+// CanResumeSession reports whether the next ChatOneShot for this
+// (agentID, sessionKey) pair will actually resume an existing backend
+// session. Three conditions must hold: the configured backend honors
+// ChatOptions.SessionKey for resumption, the on-disk session artifact
+// exists, AND the artifact is non-empty (a zero-byte JSONL is treated
+// as "no session" because sessionFileUsable will delete it and start
+// fresh on the next invocation).
+//
+// Callers that inject conversation history into the user message use
+// this to skip re-injection once the backend has its own resumable
+// session — re-injecting would duplicate every prior message once in
+// the resumed transcript and once in the new payload. When false, the
+// caller should keep injecting history: either the backend runs in
+// OneShot mode (codex, gemini, …) or the session file was removed
+// (claude /clear, upgrade, manual cleanup) and the next run will
+// start fresh.
+//
+// Currently only Claude-family backends have a verifiable on-disk
+// artifact; future resumable backends with sessions elsewhere should
+// be dispatched in the switch below.
+//
+// Edge case not covered: if the existing session is over
+// sessionResetThresholdTokens, sessionFileUsable will preReset-summarize
+// and delete it, and Claude starts a new session with --session-id.
+// History injection was already skipped, so Claude loses the prior
+// Slack context — and once the new session is established,
+// CanResumeSession keeps returning true so subsequent turns also skip
+// injection. Recovery requires the user to re-share context (or a
+// future delta-injection feature). We accept this because reaching
+// sessionResetThresholdTokens within a single Slack thread is rare in
+// practice, and replicating sessionFileUsable's token check here would
+// either duplicate its destructive side effects (preReset summary,
+// file removal) or require splitting it into a read-only probe.
+func (m *Manager) CanResumeSession(agentID, sessionKey string) bool {
+	m.mu.Lock()
+	a, ok := m.agents[agentID]
+	if !ok {
+		m.mu.Unlock()
+		return false
+	}
+	tool := a.Tool
+	m.mu.Unlock()
+	backend, ok := m.backends[tool]
+	if !ok {
+		return false
+	}
+	if !backendSupportsSessionKey(backend) {
+		return false
+	}
+	switch backend.Name() {
+	case "claude", "custom":
+		sessionID := expectedClaudeSessionID(agentID, sessionKey, false)
+		if sessionID == "" {
+			return false
+		}
+		absDir, err := filepath.Abs(agentDir(agentID))
+		if err != nil {
+			return false
+		}
+		path := filepath.Join(claudeProjectDir(absDir), sessionID+".jsonl")
+		info, err := os.Stat(path)
+		if err != nil {
+			return false
+		}
+		// Zero-byte JSONL is unusable: sessionFileUsable would delete it
+		// on the next invocation, so it cannot anchor a resume.
+		return info.Size() > 0
+	default:
+		return false
+	}
+}
+
 // updatePostChatIndex updates the memory index after a chat completes.
 // Skips if the agent was deleted or is being reset to avoid reopening a closed index.
 func (m *Manager) updatePostChatIndex(agentID string) {
@@ -1323,8 +1429,16 @@ func (m *Manager) Checkin(agentID string) error {
 		return fmt.Errorf("%w: %s", ErrAgentArchived, agentID)
 	}
 	timeoutMinutes := a.TimeoutMinutes
-	cronMessage := a.CronMessage
 	m.mu.Unlock()
+
+	cronMessage, err := readCheckinFile(agentID)
+	if err != nil {
+		// Abort the manual check-in instead of running with the default
+		// prompt: if the operator wrote a custom check-in but we can't
+		// read it (permission denied, disk failure, etc.), executing the
+		// default would silently violate the configured rules.
+		return fmt.Errorf("read checkin.md: %w", err)
+	}
 
 	timeout := cronTimeout
 	if timeoutMinutes > 0 {

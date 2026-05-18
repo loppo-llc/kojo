@@ -259,6 +259,10 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/tts/audio/{file}", s.handleTTSAudio)
 	mux.HandleFunc("HEAD /api/v1/tts/audio/{file}", s.handleTTSAudio)
 
+	// User Context
+	mux.HandleFunc("GET /api/v1/agents/{id}/user-context", s.handleGetUserContext)
+	mux.HandleFunc("PUT /api/v1/agents/{id}/user-context", s.handleSetUserContext)
+
 	// Tasks
 	mux.HandleFunc("GET /api/v1/agents/{id}/tasks", s.handleListTasks)
 	mux.HandleFunc("POST /api/v1/agents/{id}/tasks", s.handleCreateTask)
@@ -273,6 +277,10 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 
 	// Manual check-in (fires the periodic check-in prompt on demand)
 	mux.HandleFunc("POST /api/v1/agents/{id}/checkin", s.handleCheckin)
+
+	// Checkin file (file-based check-in instructions)
+	mux.HandleFunc("GET /api/v1/agents/{id}/checkin-file", s.handleGetCheckinFile)
+	mux.HandleFunc("PUT /api/v1/agents/{id}/checkin-file", s.handlePutCheckinFile)
 
 	// Slack bot
 	mux.HandleFunc("GET /api/v1/agents/{id}/slackbot", s.handleGetSlackBot)

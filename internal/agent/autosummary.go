@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"bufio"
 	"crypto/md5"
 	"encoding/json"
 	"fmt"
@@ -12,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/chathistory"
 )
 
 // secretPatterns matches common secret formats for redaction.
@@ -67,8 +68,9 @@ const (
 	// transcriptMaxBytes caps how much of a session JSONL we'll read.
 	// Bounds memory + DoS exposure on the (now-validated) transcript
 	// path coming from the PreCompact hook. Generous compared to
-	// sessionTailReadBytes because PreCompactSummarize uses bufio.Scanner
-	// streaming, not a slurp.
+	// sessionTailReadBytes because PreCompactSummarize streams the file
+	// line-by-line via chathistory.ScanJSONLLines (per-line cap
+	// MaxJSONLLineBytes, no full-file slurp).
 	transcriptMaxBytes = 256 * 1024 * 1024
 )
 
@@ -253,6 +255,21 @@ func messagesFingerprint(msgs []*Message) string {
 // per-agent lock to prevent concurrent fires from racing on the marker
 // or the recent.md tempfile.
 func PreCompactSummarize(agentID string, tool string, transcriptPath string, logger *slog.Logger) error {
+	return runAutoSummary(agentID, tool, transcriptPath, false, logger)
+}
+
+// runAutoSummary is the shared implementation behind PreCompactSummarize
+// (hook-driven, lenient) and the pre-reset summary path in backend_claude
+// (caller-supplied exact path, strict).
+//
+// When strict=true the caller has an authoritative session path that is
+// about to be deleted, so falling back to mtime-based discovery or the kojo
+// transcript would silently summarize the wrong conversation (e.g. another
+// Slack thread's JSONL that happens to be newest in the project dir).
+// strict=true therefore returns an error on path-validation failure and on
+// "no session messages found", letting the caller abort the reset/delete
+// rather than proceed with a misleading summary.
+func runAutoSummary(agentID string, tool string, transcriptPath string, strict bool, logger *slog.Logger) error {
 	mu := agentPreCompactLock(agentID)
 	mu.Lock()
 	defer mu.Unlock()
@@ -265,6 +282,12 @@ func PreCompactSummarize(agentID string, tool string, transcriptPath string, log
 		if v, err := validateTranscriptPath(agentID, transcriptPath); err == nil {
 			resolvedTranscript = v
 		} else {
+			if strict {
+				// Pre-reset path: the caller is about to delete this exact
+				// file. Falling back to discovery could pick another Slack
+				// thread's JSONL and summarise that into this agent's diary.
+				return fmt.Errorf("validate transcript path: %w", err)
+			}
 			logger.Warn("autosummary: invalid transcript_path, falling back",
 				"agent", agentID, "err", err)
 		}
@@ -272,6 +295,13 @@ func PreCompactSummarize(agentID string, tool string, transcriptPath string, log
 
 	msgs := loadSessionMessages(agentID, tool, resolvedTranscript, preCompactMaxMessages, logger)
 	if len(msgs) == 0 {
+		if strict {
+			// Don't fall back to kojo transcript when the caller named a
+			// specific session — that transcript belongs to whichever
+			// thread last wrote to messages.jsonl, not necessarily this
+			// one. Abort the reset instead of summarising the wrong data.
+			return fmt.Errorf("no messages found in session %q", resolvedTranscript)
+		}
 		// Fallback to kojo transcript
 		var err error
 		msgs, err = loadMessages(agentID, preCompactMaxMessages)
@@ -312,6 +342,14 @@ func PreCompactSummarize(agentID string, tool string, transcriptPath string, log
 
 	summary = strings.TrimSpace(summary)
 	if summary == "" {
+		if strict {
+			// Pre-reset path: the caller will delete the session JSONL after
+			// this returns nil. An empty summary means we have nothing to
+			// write to the diary, so going ahead with the delete would lose
+			// the conversation outright. Surface the failure so the caller
+			// keeps the session for the next attempt.
+			return fmt.Errorf("summary generator returned empty output")
+		}
 		return nil
 	}
 
@@ -500,30 +538,30 @@ func loadSessionMessages(agentID, tool string, transcriptPath string, limit int,
 	defer f.Close()
 
 	var msgs []*Message
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
-
-	for scanner.Scan() {
+	// Use the shared JSONL scanner so a corrupted/oversize line bounds
+	// allocations to MaxJSONLLineBytes instead of OOMing on a malformed
+	// session file. We log ErrLineTooLarge / I/O errors at Warn but keep
+	// whatever messages were successfully parsed up to that point —
+	// returning empty would force the summary generator to fall back to
+	// the kojo transcript, which can mix unrelated context.
+	if err := chathistory.ScanJSONLLines(f, func(line []byte) {
 		var raw struct {
 			Type    string          `json:"type"`
 			Message json.RawMessage `json:"message"`
 		}
-		if json.Unmarshal(scanner.Bytes(), &raw) != nil {
-			continue
+		if json.Unmarshal(line, &raw) != nil {
+			return
 		}
-
 		switch raw.Type {
 		case "user":
 			var msg struct {
 				Content json.RawMessage `json:"content"`
 			}
-			if json.Unmarshal(raw.Message, &msg) != nil {
-				continue
-			}
-			// Try as plain string
-			var text string
-			if json.Unmarshal(msg.Content, &text) == nil && text != "" {
-				msgs = append(msgs, &Message{Role: "user", Content: text})
+			if json.Unmarshal(raw.Message, &msg) == nil {
+				var text string
+				if json.Unmarshal(msg.Content, &text) == nil && text != "" {
+					msgs = append(msgs, &Message{Role: "user", Content: text})
+				}
 			}
 
 		case "assistant":
@@ -533,19 +571,22 @@ func loadSessionMessages(agentID, tool string, transcriptPath string, limit int,
 					Text string `json:"text"`
 				} `json:"content"`
 			}
-			if json.Unmarshal(raw.Message, &msg) != nil {
-				continue
-			}
-			var text strings.Builder
-			for _, block := range msg.Content {
-				if block.Type == "text" && block.Text != "" {
-					text.WriteString(block.Text)
+			if json.Unmarshal(raw.Message, &msg) == nil {
+				var text strings.Builder
+				for _, block := range msg.Content {
+					if block.Type == "text" && block.Text != "" {
+						text.WriteString(block.Text)
+					}
+				}
+				if text.Len() > 0 {
+					msgs = append(msgs, &Message{Role: "assistant", Content: text.String()})
 				}
 			}
-			if text.Len() > 0 {
-				msgs = append(msgs, &Message{Role: "assistant", Content: text.String()})
-			}
 		}
+	}); err != nil {
+		logger.Warn("autosummary: session scan failed",
+			"agent", agentID, "path", sessionFile, "err", err,
+			"parsedMessages", len(msgs))
 	}
 
 	// Return last N messages

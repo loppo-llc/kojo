@@ -31,7 +31,6 @@ export function AgentSettings() {
   const [silentStart, setSilentStart] = useState("");
   const [silentEnd, setSilentEnd] = useState("");
   const [notifyDuringSilent, setNotifyDuringSilent] = useState(false);
-  const [cronMessage, setCronMessage] = useState("");
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [archiving, setArchiving] = useState(false);
@@ -135,11 +134,103 @@ export function AgentSettings() {
   const [forkIncludeTranscript, setForkIncludeTranscript] = useState(false);
   const [forking, setForking] = useState(false);
   const [forkError, setForkError] = useState("");
+  const [userContext, setUserContext] = useState("");
+  // userContext mirrors cronMessage's three-state model: the textarea content,
+  // the last value the server confirmed it has, and whether what's currently
+  // shown is the in-memory default template (no user.md on disk).
+  //
+  // Without these guards an unconditional PUT on every Save would write
+  // DefaultUserContent back as a real user.md the first time the user edits
+  // any *other* field, flipping isDefault to false and pinning the agent to
+  // a frozen copy of whatever default existed at that save time. Future
+  // template updates would then never reach that agent.
+  const [savedUserContext, setSavedUserContext] = useState("");
+  const [userContextIsDefault, setUserContextIsDefault] = useState(false);
+  const [cronMessage, setCronMessage] = useState("");
+  // Track whether cronMessage diverges from what's persisted in checkin.md.
+  // Manual check-in runs against the persisted file, so editing the textarea
+  // without saving would silently fire with stale instructions. We block the
+  // button when this is true (see handleCheckin).
+  const [savedCronMessage, setSavedCronMessage] = useState("");
+  // cronIsDefault is true when the textarea is currently showing the server-
+  // supplied DefaultCheckinContent template (no checkin.md exists yet). In
+  // that state a Save click must NOT write the template back as a real
+  // checkin.md — that would erase the "uses default" distinction and pin
+  // whatever the default happens to be at this moment, freezing the agent on
+  // an old template if we update the default later. We only PUT when the
+  // textarea is dirty (user actually edited something). When the user has a
+  // real checkin.md already, isDefault is false and every save persists.
+  const [cronIsDefault, setCronIsDefault] = useState(false);
+  // Compare trimmed values so pure-whitespace edits (e.g. accidentally
+  // hitting Enter at the end while reading the default template) don't
+  // count as a real change. The server-side WriteCheckinFile trims before
+  // persisting, so an untrimmed-equal comparison would flag the textarea
+  // as dirty, then a Save would PUT, the server would trim, and the
+  // resulting checkin.md would be byte-identical to the previous default —
+  // except isDefault would now be false, silently pinning the agent to a
+  // frozen copy of whatever default existed at that save time.
+  const cronMessageDirty = cronMessage.trim() !== savedCronMessage.trim();
+  // Same trim-compare reasoning as cronMessageDirty: keep pure-whitespace
+  // edits from triggering a no-op PUT that would pin the default template.
+  const userContextDirty = userContext.trim() !== savedUserContext.trim();
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!id) return;
-    agentApi.get(id).then((a) => {
+    // Cancellation guard for the in-flight Promise.allSettled. When the user
+    // navigates between /agents/{a}/settings → /agents/{b}/settings before
+    // the previous fetch resolves, the older promise must NOT win the race
+    // and stomp on b's form state — that would silently mix a's fields into
+    // a save that targets b.
+    let cancelled = false;
+    // Reset all per-agent state up front so a partial-failure load can't
+    // leave the textareas showing the previous agent's content. If
+    // /user-context fetches for the new agent reject (transient 500, broken
+    // symlink, etc.) and we kept the previous values, the user could edit
+    // and Save that stale content as the new agent's user.md.
+    setAgent(null);
+    setError("");
+    setUserContext("");
+    setSavedUserContext("");
+    setUserContextIsDefault(false);
+    setCronMessage("");
+    setSavedCronMessage("");
+    setCronIsDefault(false);
+    // Promise.allSettled so a 500 from /user-context or /checkin-file (e.g.
+    // unreadable / broken symlink on disk) doesn't blank out the entire
+    // settings screen — the user still needs to see the agent fields, the
+    // Save / Reset / Archive buttons, and a concrete error so they can fix
+    // the bad file or pick another action. The previous Promise.all + catch
+    // redirected to "/" on any failure, which hid the underlying cause and
+    // left the broken file un-fixable from this UI.
+    Promise.allSettled([
+      agentApi.get(id),
+      agentApi.userContext.get(id),
+      agentApi.getCheckinFile(id),
+    ]).then(([agentRes, ucRes, checkinRes]) => {
+      if (cancelled) return;
+      // Agent itself missing or unfetchable. Only treat 404 (caller deleted
+      // it from another tab, or wrong ID) as "go home"; surface every other
+      // failure inline so the user can read the actual server response.
+      //
+      // httpClient throws `${res.status}: ${body}` for any non-2xx (see
+      // lib/httpClient.ts request()), so a real 404 always shows up as a
+      // string starting with "404:". Matching the substring "not found"
+      // instead would also fire on 500 bodies that happen to mention the
+      // phrase (e.g. "configuration file not found in cache") and silently
+      // bounce the user home on transient backend failures.
+      if (agentRes.status === "rejected") {
+        const msg = agentRes.reason instanceof Error
+          ? agentRes.reason.message
+          : String(agentRes.reason);
+        if (msg.startsWith("404:")) {
+          navigate("/");
+        } else {
+          setError(msg);
+        }
+        return;
+      }
+      const a = agentRes.value;
       setAgent(a);
       setName(a.name);
       setPersona(a.persona);
@@ -157,7 +248,6 @@ export function AgentSettings() {
       setSilentStart(a.silentStart ?? "");
       setSilentEnd(a.silentEnd ?? "");
       setNotifyDuringSilent(a.notifyDuringSilent ?? true);
-      setCronMessage(a.cronMessage ?? "");
       setAllowedTools(a.allowedTools ?? []);
       setAllowProtectedPaths(a.allowProtectedPaths ?? []);
       setPrivileged(a.privileged ?? false);
@@ -165,7 +255,35 @@ export function AgentSettings() {
       setTTSModel(a.tts?.model ?? "");
       setTTSVoice(a.tts?.voice ?? "");
       setTTSStylePrompt(a.tts?.stylePrompt ?? "");
-    }).catch(() => navigate("/"));
+
+      const loadErrors: string[] = [];
+      if (ucRes.status === "fulfilled") {
+        setUserContext(ucRes.value.content);
+        setSavedUserContext(ucRes.value.content);
+        setUserContextIsDefault(ucRes.value.isDefault);
+      } else {
+        const msg = ucRes.reason instanceof Error ? ucRes.reason.message : String(ucRes.reason);
+        loadErrors.push(`User Context: ${msg}`);
+      }
+      if (checkinRes.status === "fulfilled") {
+        setCronMessage(checkinRes.value.content);
+        // When the server reports isDefault=true the textarea is showing the
+        // template, not the persisted file. Mark savedCronMessage with the
+        // same value so cronMessageDirty stays false until the user actually
+        // types — and remember isDefault so handleSave can skip the no-op PUT.
+        setSavedCronMessage(checkinRes.value.content);
+        setCronIsDefault(checkinRes.value.isDefault);
+      } else {
+        const msg = checkinRes.reason instanceof Error ? checkinRes.reason.message : String(checkinRes.reason);
+        loadErrors.push(`Check-in Message: ${msg}`);
+      }
+      if (loadErrors.length > 0) {
+        setError(loadErrors.join("\n"));
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [id, navigate]);
 
   const needsCustomURL = tool === "custom" || tool === "llama.cpp";
@@ -190,6 +308,12 @@ export function AgentSettings() {
     setError("");
     setSuccess(false);
     try {
+      // Save sequentially rather than via Promise.all so a failure in any
+      // earlier write surfaces before later writes fire. Promise.all races
+      // them in parallel, which would leave partially-applied state on the
+      // server when one write fails and the others succeed (e.g. user
+      // context lands but agent.update rejects), and the user has to figure
+      // out from the error message alone what actually persisted.
       const updated = await agentApi.update(id!, {
         name: name.trim(),
         persona: persona.trim(),
@@ -207,7 +331,6 @@ export function AgentSettings() {
         silentStart,
         silentEnd,
         notifyDuringSilent,
-        cronMessage,
         allowedTools: (tool === "custom") ? allowedTools : undefined,
         allowProtectedPaths: (tool === "claude" || tool === "custom") ? allowProtectedPaths : undefined,
         tts: {
@@ -217,6 +340,40 @@ export function AgentSettings() {
           stylePrompt: ttsStylePrompt.trim() || undefined,
         },
       });
+      // Only PUT when the textarea actually changed. The previous condition
+      // (`userContextDirty || !userContextIsDefault`) re-wrote user.md on
+      // every save once the agent had a persisted file, which means a
+      // transient /user-context failure (network blip, EISDIR, etc.) would
+      // re-introduce the partial-update bug: agentApi.update has already
+      // succeeded, but the unrelated user-context write rejects and the
+      // whole save() throws — leaving name/persona persisted while the
+      // user thinks the save failed entirely.
+      //
+      // The isDefault skip-guard the earlier condition tried to address
+      // (don't pin the in-memory default by PUTting it back) is still
+      // covered: if the user didn't edit the textarea, dirty is false and
+      // we skip; if they did edit (whether starting from the default or
+      // from a custom file), dirty is true and we PUT, which is correct.
+      if (userContextDirty) {
+        const savedUC = await agentApi.userContext.set(id!, userContext);
+        setUserContext(savedUC.content);
+        setSavedUserContext(savedUC.content);
+        setUserContextIsDefault(savedUC.isDefault);
+      }
+      // Same logic as above for checkin.md — only PUT when the textarea
+      // changed. Previously a !cronIsDefault clause forced a PUT on every
+      // save once an agent had a persisted checkin.md; a transient
+      // /checkin-file failure would then block saving unrelated fields
+      // even though agentApi.update had already applied them.
+      if (cronMessageDirty) {
+        const savedCheckin = await agentApi.putCheckinFile(id!, cronMessage);
+        // Sync the textarea to the server-normalized value (WriteCheckinFile
+        // trims whitespace) so the UI matches what was actually persisted,
+        // and reset the dirty flag so manual check-in unblocks.
+        setCronMessage(savedCheckin.content);
+        setSavedCronMessage(savedCheckin.content);
+        setCronIsDefault(savedCheckin.isDefault);
+      }
       setAgent(updated);
       setPublicProfile(updated.publicProfile ?? "");
       setPublicProfileOverride(updated.publicProfileOverride ?? false);
@@ -230,24 +387,22 @@ export function AgentSettings() {
   };
 
   const handleCheckin = async () => {
-    // The server runs the check-in against the persisted agent record, not
-    // the in-flight edits in this form. Bail with a notice instead of
-    // silently using stale cronMessage/timeoutMinutes — fixing this with
-    // an auto-save would mean committing other unrelated dirty fields too.
-    // Match the same normalisations the load path applies so an agent that
-    // hasn't been touched doesn't read as dirty:
-    //   - timeoutMinutes: 0 (server default) is shown as 10 in the UI, so
-    //     compare against the same "|| 10" coercion done at load.
-    //   - cronMessage: the server trims on save, so a saved value of "x"
-    //     stays equal to "x" no matter how many spaces the textarea adds.
+    // The server runs the check-in against the persisted agent record and
+    // the persisted checkin.md, not the in-flight edits in this form. Bail
+    // with a notice if either Timeout or Check-in Message has unsaved
+    // changes — fixing this with an auto-save would mean committing other
+    // unrelated dirty fields too.
     const savedTimeout = agent ? (agent.timeoutMinutes || 10) : timeoutMinutes;
-    const savedMessage = (agent?.cronMessage ?? "").trim();
-    if (
-      agent &&
-      (cronMessage.trim() !== savedMessage || savedTimeout !== timeoutMinutes)
-    ) {
+    if (agent && savedTimeout !== timeoutMinutes) {
       setCheckinNotice(
-        "Save your changes first — manual check-in uses the saved Check-in Message and Timeout.",
+        "Save your changes first — manual check-in uses the saved Timeout.",
+      );
+      setTimeout(() => setCheckinNotice(""), 5000);
+      return;
+    }
+    if (cronMessageDirty) {
+      setCheckinNotice(
+        "Save your changes first — manual check-in uses the saved Check-in Message.",
       );
       setTimeout(() => setCheckinNotice(""), 5000);
       return;
@@ -479,7 +634,24 @@ export function AgentSettings() {
     }
   };
 
-  if (!agent) return null;
+  // Initial fetch failed before agentApi.get resolved. Show the error so
+  // the user can see what went wrong (and a Back link so they can leave)
+  // instead of a blank page.
+  if (!agent) {
+    return error ? (
+      <div className="min-h-full bg-neutral-950 text-neutral-200 p-4 max-w-md mx-auto">
+        <button
+          onClick={() => navigate("/")}
+          className="text-neutral-400 hover:text-neutral-200 text-sm mb-3"
+        >
+          ← Back
+        </button>
+        <div className="p-3 bg-red-950 border border-red-800 rounded-lg text-sm text-red-300 whitespace-pre-wrap">
+          {error}
+        </div>
+      </div>
+    ) : null;
+  }
 
   return (
     <div className="min-h-full bg-neutral-950 text-neutral-200">
@@ -577,6 +749,29 @@ export function AgentSettings() {
               )}
             </button>
           </div>
+        </div>
+
+        {/* User Context */}
+        <div>
+          <label className="block text-sm text-neutral-400 mb-2">
+            User Context
+          </label>
+          <textarea
+            value={userContext}
+            onChange={(e) => setUserContext(e.target.value)}
+            rows={6}
+            // Backend caps the PUT body at 1 MiB (http.MaxBytesReader in
+            // handleSetUserContext). Match it client-side using the most
+            // pessimistic UTF-8 footprint (4 bytes/char) so confusingly
+            // large pastes get blocked at the input instead of failing on
+            // save.
+            maxLength={Math.floor((1 << 20) / 4)}
+            placeholder="Record information about users and collaborators (agents also update this through conversation)"
+            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm resize-none focus:outline-none focus:border-neutral-500"
+          />
+          <p className="mt-1 text-xs text-neutral-600">
+            Injected into system prompt. Agents can also update this via their tools.
+          </p>
         </div>
 
         {/* Public Profile */}
@@ -827,8 +1022,6 @@ export function AgentSettings() {
           silentEnd={silentEnd}
           onSilentStartChange={setSilentStart}
           onSilentEndChange={setSilentEnd}
-          cronMessage={cronMessage}
-          onCronMessageChange={setCronMessage}
           nextCronAt={agent.nextCronAt}
           scheduleDirty={
             // Schedule-affecting fields differ from the persisted agent —
@@ -843,6 +1036,8 @@ export function AgentSettings() {
           // user doesn't fire repeated 409s in quick succession before the
           // server-side run actually gets going.
           checkingIn={checkingIn || checkinNotice !== ""}
+          cronMessage={cronMessage}
+          onCronMessageChange={setCronMessage}
         />
 
         {/* Notify During Silent Hours */}

@@ -249,17 +249,6 @@ func GenerateName(persona string, userPrompt string) (string, error) {
 	return name, nil
 }
 
-// SummarizePersona generates a concise summary of a persona.
-func SummarizePersona(persona string) (string, error) {
-	result, err := generate(summarizePrompt + persona)
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(result), nil
-}
-
-const summarizePrompt = "以下の人物設定を、核心的な性格・口調・行動パターンだけに絞って200文字以内で要約して。要約のみ出力。\n\n"
-
 const publicProfilePrompt = "以下の人物設定から、他者に見せる簡潔な自己紹介文を100文字以内で生成して。" +
 	"職業や専門分野は設定で明示された場合のみ含め、なければ付与しないこと。" +
 	"内部的な口調ルールや行動ルールは含めず、その人がどんな人物かだけを自然な文で。自己紹介文のみ出力。\n\n"
@@ -273,22 +262,6 @@ func GeneratePublicProfile(persona string) (string, error) {
 	return strings.TrimSpace(result), nil
 }
 
-// SummarizeWithCLI generates a persona summary using a specific CLI tool.
-// Supports "claude", "codex", and "gemini".
-func SummarizeWithCLI(tool string, persona string) (string, error) {
-	prompt := summarizePrompt + persona
-	switch tool {
-	case "claude":
-		return runClaude(prompt)
-	case "codex":
-		return runCodex(prompt)
-	case "gemini":
-		return runGemini(prompt)
-	default:
-		return "", fmt.Errorf("unsupported tool for CLI summarization: %s", tool)
-	}
-}
-
 // LoadGeminiAPIKey is the exported wrapper around loadGeminiAPIKey for
 // callers outside the agent package (e.g. internal/server's TTS handler).
 // It applies the same priority order: encrypted credential store first,
@@ -296,7 +269,6 @@ func SummarizeWithCLI(tool string, persona string) (string, error) {
 func LoadGeminiAPIKey(creds *CredentialStore) (string, error) {
 	return loadGeminiAPIKey(creds)
 }
-
 // loadGeminiAPIKey loads the Gemini API key.
 // Priority: 1) encrypted credential store, 2) nanobanana credentials file (fallback).
 func loadGeminiAPIKey(creds *CredentialStore) (string, error) {

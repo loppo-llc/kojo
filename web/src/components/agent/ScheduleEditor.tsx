@@ -16,8 +16,6 @@ interface Props {
   silentEnd: string;
   onSilentStartChange: (v: string) => void;
   onSilentEndChange: (v: string) => void;
-  cronMessage: string;
-  onCronMessageChange: (v: string) => void;
   // RFC3339 timestamp of the next scheduled run (silent-hours-adjusted).
   // Empty/undefined when scheduling is off or the agent has no schedule.
   nextCronAt?: string;
@@ -28,10 +26,20 @@ interface Props {
   // Fires a manual check-in. When omitted the button is hidden.
   onCheckin?: () => void;
   checkingIn?: boolean;
+  // Checkin message — managed by the parent and saved via the global
+  // Save Changes button alongside other agent settings. Omit both props
+  // (e.g. on the agent-create page, where checkin.md doesn't exist yet)
+  // to hide the Check-in Message field entirely.
+  cronMessage?: string;
+  onCronMessageChange?: (v: string) => void;
 }
 
+// Hint shown when the textarea is empty. Kept verbatim in sync with
+// DefaultCheckinContent in internal/agent/memory.go — when the textarea is
+// empty (user cleared it) the server falls back to that same string, so the
+// placeholder must show what will actually run.
 const DEFAULT_CRON_MESSAGE_HINT =
-  "最近の出来事や気づきがあれば memory/{date}.md に記録し、必要なタスクを実行してください。";
+  "If there are recent events or observations, record them in memory/{date}.md, and execute any necessary tasks.";
 
 /** Parse "HH:MM" to minutes since midnight. */
 function toMinutes(hhmm: string): number {
@@ -114,12 +122,12 @@ export function ScheduleEditor({
   silentEnd,
   onSilentStartChange,
   onSilentEndChange,
-  cronMessage,
-  onCronMessageChange,
   nextCronAt,
   scheduleDirty,
   onCheckin,
   checkingIn,
+  cronMessage,
+  onCronMessageChange,
 }: Props) {
   const showResumeIdle =
     onResumeIdleChange !== undefined && (tool === undefined || tool === "claude");
@@ -363,28 +371,35 @@ export function ScheduleEditor({
       )}
 
       {/* Custom Check-in Message — applied to BOTH periodic and manual
-          check-ins. The hint reflected that originally said "interval >
-          0 only", which was wrong: the manual "Check in now" button
-          calls the same prompt builder. */}
-      <div>
-        <label className="block text-sm text-neutral-400 mb-2">
-          Check-in Message
-        </label>
-        <textarea
-          value={cronMessage}
-          onChange={(e) => onCronMessageChange(e.target.value)}
-          rows={3}
-          maxLength={4096}
-          placeholder={DEFAULT_CRON_MESSAGE_HINT}
-          className="w-full px-2.5 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 resize-none focus:outline-none focus:border-amber-700/60"
-        />
-        <p className="mt-1.5 text-[11px] text-neutral-600">
-          Replaces the trailing instruction in periodic and manual check-in
-          prompts. Use <code className="text-neutral-500">{"{date}"}</code>{" "}
-          as a placeholder for today (YYYY-MM-DD). Leave blank for the
-          default.
-        </p>
-      </div>
+          check-ins. Saved independently via file-based API. Hidden on the
+          create page where checkin.md doesn't exist yet (handled by the
+          parent omitting cronMessage/onCronMessageChange). */}
+      {cronMessage !== undefined && onCronMessageChange && (
+        <div>
+          <label className="block text-sm text-neutral-400 mb-2">
+            Check-in Message
+          </label>
+          <textarea
+            value={cronMessage}
+            onChange={(e) => onCronMessageChange(e.target.value)}
+            rows={5}
+            // Backend caps the PUT body at 1 MiB (http.MaxBytesReader in
+            // handlePutCheckinFile). Match it client-side using the most
+            // pessimistic UTF-8 footprint (4 bytes/char) so confusingly
+            // large pastes get blocked at the input instead of failing on
+            // save.
+            maxLength={Math.floor((1 << 20) / 4)}
+            placeholder={DEFAULT_CRON_MESSAGE_HINT}
+            className="w-full px-2.5 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 resize-none focus:outline-none focus:border-amber-700/60"
+          />
+          <p className="mt-1.5 text-[11px] text-neutral-600">
+            Replaces the trailing instruction in periodic and manual check-in
+            prompts. Use <code className="text-neutral-500">{"{date}"}</code>{" "}
+            as a placeholder for today (YYYY-MM-DD). Leave blank for the
+            default.
+          </p>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,8 +1,11 @@
 package chathistory
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -154,6 +157,113 @@ func TestLoadHistoryMissingFile(t *testing.T) {
 	}
 	if msgs != nil {
 		t.Errorf("expected nil msgs, got %v", msgs)
+	}
+}
+
+// TestScanJSONLLines_BasicAndEOF guards the contract LoadHistory /
+// LastMessage / LastPlatformTS rely on: every newline-terminated line is
+// passed to onLine, the final line is delivered even without a trailing
+// newline, and the scan returns nil on a clean EOF.
+func TestScanJSONLLines_BasicAndEOF(t *testing.T) {
+	input := "line one\nline two\nline three no newline"
+	var got []string
+	err := ScanJSONLLines(strings.NewReader(input), func(line []byte) {
+		got = append(got, strings.TrimRight(string(line), "\n"))
+	})
+	if err != nil {
+		t.Fatalf("ScanJSONLLines: %v", err)
+	}
+	if len(got) != 3 || got[0] != "line one" || got[1] != "line two" || got[2] != "line three no newline" {
+		t.Errorf("unexpected lines: %#v", got)
+	}
+}
+
+// TestScanJSONLLines_LongLineCrossingBufioBuffer ensures that lines longer
+// than bufio's default buffer (4 KiB) are correctly reassembled across
+// ReadSlice/ErrBufferFull boundaries — this is the regression boundary the
+// switch from ReadBytes to a bounded scanner introduced.
+func TestScanJSONLLines_LongLineCrossingBufioBuffer(t *testing.T) {
+	long := strings.Repeat("a", 100_000) // > default bufio buffer
+	input := "first\n" + long + "\nlast\n"
+	var got []string
+	err := ScanJSONLLines(strings.NewReader(input), func(line []byte) {
+		got = append(got, strings.TrimRight(string(line), "\n"))
+	})
+	if err != nil {
+		t.Fatalf("ScanJSONLLines: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 lines, got %d", len(got))
+	}
+	if got[1] != long {
+		t.Errorf("long line corrupted: len=%d want=%d", len(got[1]), len(long))
+	}
+	if got[0] != "first" || got[2] != "last" {
+		t.Errorf("surrounding lines: %q / %q", got[0], got[2])
+	}
+}
+
+// TestScanJSONLLines_OversizeLineReturnsErr is the actual security-relevant
+// behavior of this helper: a single line that exceeds MaxJSONLLineBytes
+// must abort with ErrLineTooLarge instead of growing the buffer
+// unboundedly. We use a bytes.Reader so the test is deterministic even on
+// systems where allocations would otherwise be slow.
+func TestScanJSONLLines_OversizeLineReturnsErr(t *testing.T) {
+	// One line larger than the cap. Use a reader that doesn't actually
+	// allocate the full payload upfront (compose-on-demand) so the test
+	// itself stays cheap.
+	huge := bytes.Repeat([]byte("x"), MaxJSONLLineBytes+1)
+	var got int
+	err := ScanJSONLLines(bytes.NewReader(huge), func(line []byte) {
+		got++
+	})
+	if !errors.Is(err, ErrLineTooLarge) {
+		t.Fatalf("expected ErrLineTooLarge, got %v", err)
+	}
+	if got != 0 {
+		t.Errorf("onLine should not be called for an oversize line, got %d", got)
+	}
+}
+
+// TestScanJSONLLines_EmptyLinesIgnored ensures the helper treats lone
+// "\n\n" runs without crashing and passes through empty lines that the
+// caller can choose to skip (JSON unmarshal of "" is a no-op already).
+func TestScanJSONLLines_EmptyLinesIgnored(t *testing.T) {
+	input := "a\n\nb\n"
+	var got []string
+	err := ScanJSONLLines(strings.NewReader(input), func(line []byte) {
+		got = append(got, strings.TrimRight(string(line), "\n"))
+	})
+	if err != nil {
+		t.Fatalf("ScanJSONLLines: %v", err)
+	}
+	if len(got) != 3 || got[0] != "a" || got[1] != "" || got[2] != "b" {
+		t.Errorf("unexpected lines: %#v", got)
+	}
+}
+
+// TestLoadHistory_OversizeLinePropagates ensures that a corrupted history
+// file with an oversize line surfaces as an error to LoadHistory's caller
+// (instead of silently truncating the result or OOMing). LastMessage /
+// LastPlatformTS deliberately swallow this error — see their docstrings —
+// so they're not covered here.
+func TestLoadHistory_OversizeLinePropagates(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "huge.jsonl")
+	// One valid record followed by a line > MaxJSONLLineBytes so we can
+	// confirm the error fires on the second line and the first is reachable
+	// via partial-state tools if we ever change the contract.
+	first := `{"platform":"slack","messageId":"1.0","userName":"alice","text":"hi"}` + "\n"
+	huge := strings.Repeat("x", MaxJSONLLineBytes+1) + "\n"
+	if err := os.WriteFile(path, []byte(first+huge), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := LoadHistory(path)
+	if err == nil {
+		t.Fatalf("expected error on oversize line, got nil")
+	}
+	if !errors.Is(err, ErrLineTooLarge) {
+		t.Errorf("expected ErrLineTooLarge, got %v", err)
 	}
 }
 

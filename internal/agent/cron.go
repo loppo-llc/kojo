@@ -23,11 +23,13 @@ func cronPrompt(nextRun time.Time, timeoutMinutes int, customMessage string) str
 }
 
 // cronPromptAt is the time-injectable form of cronPrompt for unit testing.
-// If customMessage is non-empty it replaces the default trailing instruction;
-// the literal "{date}" inside customMessage is replaced with today's date in
-// YYYY-MM-DD form. The custom section is separated from the meta header by a
-// blank line so an injected "[system message]" prefix cannot blend in with the
-// surrounding meta text.
+// customMessage is the body of the agent's checkin.md (empty when the file
+// doesn't exist). When empty, DefaultCheckinContent is used so the prompt
+// that actually fires matches the template the settings UI shows. Either
+// way, the body is rendered under a blank-line "--- Instructions ---" heading so an
+// injected "[system message]" prefix in the content cannot blend in with the
+// surrounding meta text. The literal "{date}" inside the body is replaced
+// with today's date in YYYY-MM-DD form.
 func cronPromptAt(now, nextRun time.Time, timeoutMinutes int, customMessage string) string {
 	today := now.Format("2006-01-02")
 	msg := "[system message] " + now.Format("2006年1月2日 15:04") + "の定期チェックインです。"
@@ -43,30 +45,29 @@ func cronPromptAt(now, nextRun time.Time, timeoutMinutes int, customMessage stri
 		msg += "。完了後の次回のチェックインは最短" + formatUntil(nextRun, now) + "後 (" + nextFmt + ")"
 	}
 	msg += "）"
-	if trimmed := strings.TrimSpace(customMessage); trimmed != "" {
-		// Blank line + heading make the user-supplied section visually
-		// distinguishable from the meta header even if the value contains
-		// "[system message]" or similar prompt-bracketing.
-		msg += "\n\n--- 指示 ---\n" + strings.ReplaceAll(trimmed, "{date}", today)
-	} else {
-		msg += "最近の出来事や気づきがあれば memory/" + today + ".md に記録し、必要なタスクを実行してください。"
+	body := strings.TrimSpace(customMessage)
+	if body == "" {
+		body = DefaultCheckinContent
 	}
+	msg += "\n\n--- Instructions ---\n" + strings.ReplaceAll(body, "{date}", today)
 	return msg
 }
 
 // checkinPrompt builds the manual check-in prompt. Unlike cronPromptAt this
 // is fired on demand from the UI and has no scheduled successor, so it omits
 // the "次回のチェックイン" footer and uses the wording "チェックイン" (not
-// "定期チェックイン") to make the source visible in the transcript.
+// "定期チェックイン") to make the source visible in the transcript. Empty
+// customMessage falls back to DefaultCheckinContent — see cronPromptAt for the
+// rationale.
 func checkinPrompt(now time.Time, timeoutMinutes int, customMessage string) string {
 	today := now.Format("2006-01-02")
 	msg := "[system message] " + now.Format("2006年1月2日 15:04") + "のチェックインです。"
 	msg += fmt.Sprintf("（今回のタイムアウトは%d分）", timeoutMinutes)
-	if trimmed := strings.TrimSpace(customMessage); trimmed != "" {
-		msg += "\n\n--- 指示 ---\n" + strings.ReplaceAll(trimmed, "{date}", today)
-	} else {
-		msg += "最近の出来事や気づきがあれば memory/" + today + ".md に記録し、必要なタスクを実行してください。"
+	body := strings.TrimSpace(customMessage)
+	if body == "" {
+		body = DefaultCheckinContent
 	}
+	msg += "\n\n--- Instructions ---\n" + strings.ReplaceAll(body, "{date}", today)
 	return msg
 }
 
@@ -261,7 +262,7 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 	}
 
 	// Check silent hours and read agent config
-	var silentStart, silentEnd, cronMessage string
+	var silentStart, silentEnd string
 	var timeoutMinutes int
 	if a, ok := cs.mgr.Get(agentID); ok {
 		// Archived guard: a tick may have queued just before Archive ran
@@ -273,12 +274,21 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 		}
 		silentStart, silentEnd = a.SilentStart, a.SilentEnd
 		timeoutMinutes = a.TimeoutMinutes
-		cronMessage = a.CronMessage
 		if IsInSilentHours(silentStart, silentEnd) {
 			cs.logger.Debug("cron job skipped (silent hours)", "agent", agentID,
 				"silentStart", silentStart, "silentEnd", silentEnd)
 			return
 		}
+	}
+
+	cronMessage, err := readCheckinFile(agentID)
+	if err != nil {
+		// Refuse to run with the default prompt when a custom check-in
+		// exists but is unreadable: that would silently violate the
+		// operator's configured rules. Surfacing via Warn surfaces the
+		// permission / disk failure in logs.
+		cs.logger.Warn("cron job skipped (checkin read failed)", "agent", agentID, "err", err)
+		return
 	}
 
 	// Cross-process guard: atomic lock file prevents duplicate execution
