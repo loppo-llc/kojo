@@ -1,14 +1,12 @@
 package server
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/blob"
@@ -224,15 +222,17 @@ func (s *Server) relayPeerBlob(w http.ResponseWriter, r *http.Request, sourceDev
 	upstreamPath := r.URL.Path
 	upstreamURL := strings.TrimRight(srcAddr, "/") + upstreamPath
 
-	relayCtx, relayCancel := context.WithTimeout(r.Context(), 5*time.Minute)
-	defer relayCancel()
-	upReq, err := http.NewRequestWithContext(relayCtx, http.MethodGet, upstreamURL, nil)
+	// No fixed timeout: switch_device blob handoffs can be hundreds
+	// of MB on slow tailnet links. The request context is the only
+	// deadline (caller side enforces switchDeviceOpTimeout). Codex
+	// review: fixed 5-minute cap could chop long transfers.
+	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstreamURL, nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal",
 			"build relay request: "+err.Error())
 		return
 	}
-	if err := peer.AuthorizeOutbound(relayCtx, s.agents.Store(), upReq, sourceDeviceID); err != nil {
+	if err := peer.AuthorizeOutbound(r.Context(), s.agents.Store(), upReq, sourceDeviceID); err != nil {
 		writeError(w, http.StatusBadGateway, "bad_gateway",
 			"no Bearer available for source peer (pair it via the auto-pairing flow first): "+err.Error())
 		return

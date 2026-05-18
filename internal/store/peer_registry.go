@@ -454,11 +454,14 @@ UPDATE peer_registry
 	return stale, nil
 }
 
-// DeletePeer removes the row keyed by device_id AND revokes every
-// active peer_token bound to that device, in a single transaction.
-// Without the token revoke, re-adding the same device_id later
-// would resurrect any cached Bearer the prior pairing handed out
-// (Codex review hardening). Idempotent — a missing row returns nil.
+// DeletePeer removes the peer_registry row AND every related row
+// (peer_tokens, peer/out_bearer kv, peer/pairing_bearer_stash kv,
+// peer_pending) in a single transaction. Without the related-row
+// cleanup, re-adding the same device_id later would resurrect
+// cached Bearers, raw Hub→peer credentials, or a stale pairing
+// stash — Codex review hardening.
+//
+// Idempotent: missing rows return nil.
 //
 // Callers driving a "decommission" flow should also audit any
 // agent_locks rows whose holder_peer == deviceID; releasing those
@@ -479,6 +482,17 @@ func (s *Store) DeletePeer(ctx context.Context, deviceID string) error {
 		NowMillis(), deviceID,
 	); err != nil {
 		return fmt.Errorf("store.DeletePeer: revoke tokens: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM peer_pending WHERE device_id = ?`, deviceID,
+	); err != nil {
+		return fmt.Errorf("store.DeletePeer: pending: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM kv WHERE namespace IN ('peer/out_bearer', 'peer/pairing_bearer_stash') AND key = ?`,
+		deviceID,
+	); err != nil {
+		return fmt.Errorf("store.DeletePeer: kv cleanup: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store.DeletePeer: commit: %w", err)

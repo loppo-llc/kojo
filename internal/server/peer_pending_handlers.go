@@ -307,14 +307,30 @@ func (s *Server) processJoinRequest(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 
-	// Atomic first-write detection (Codex review). We always mint a
-	// candidate secret + supply its hash to UpsertPeerPending. The
-	// store's INSERT ... ON CONFLICT preserves the existing hash, so
-	// the RETURNING projection tells us whether the row already had
-	// a different hash (= repeat caller) or just took ours (= fresh
-	// insert). Two simultaneous first-time POSTs are serialised by
-	// SQLite; one wins as fresh insert, the other sees a foreign
-	// hash and must authenticate against the original secret.
+	// Split the unauth (insert-only) path from the auth (upsert)
+	// path. Codex review: a single UpsertPeerPending exposed
+	// metadata overwrites to unauth callers via the ON CONFLICT
+	// branch. Insert-only on the unauth path eliminates that.
+	if s.callerHoldsJoinIdentity(r.Context(), req.DeviceID, r) {
+		// Authenticated repeat: refresh name/url/last_seen via
+		// Upsert (join_secret_hash is preserved on conflict).
+		if _, err := st.UpsertPeerPending(r.Context(), &store.PeerPendingRecord{
+			DeviceID: req.DeviceID,
+			Name:     req.Name,
+			URL:      req.URL,
+		}); err != nil {
+			s.logger.Error("join-request: upsert pending", "device_id", req.DeviceID, "err", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, joinRequestResponse{State: "pending"})
+		return
+	}
+	// Unauthenticated: mint a candidate secret + try insert-if-absent.
+	// Two simultaneous first-time POSTs are serialised by SQLite at
+	// the row level; one wins as the inserter, the other gets
+	// inserted=false and is rejected — its only path forward is to
+	// authenticate against the existing secret.
 	candidate, sErr := mintJoinSecret()
 	if sErr != nil {
 		s.logger.Error("join-request: mint secret", "device_id", req.DeviceID, "err", sErr)
@@ -322,52 +338,26 @@ func (s *Server) processJoinRequest(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 	candidateHash := store.HashPeerToken(candidate)
-
-	// Pre-flight: if a row already exists, demand authentication
-	// BEFORE we touch UpsertPeerPending (which would refresh
-	// name/url). Otherwise an attacker who knows the device_id
-	// could still overwrite metadata without ever owning the
-	// secret.
-	if existing, gErr := st.GetPeerPending(r.Context(), req.DeviceID); gErr == nil && existing != nil {
-		if !s.callerHoldsJoinIdentity(r.Context(), req.DeviceID, r) {
-			writeError(w, http.StatusUnauthorized, "join_secret_required",
-				"a pending row already exists for this deviceId; subsequent /join-request calls must present the join_secret in Authorization: Bearer")
-			return
-		}
-	} else if gErr != nil && !errors.Is(gErr, store.ErrNotFound) {
-		s.logger.Error("join-request: pending lookup", "device_id", req.DeviceID, "err", gErr)
-		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-		return
-	}
-
-	out, err := st.UpsertPeerPending(r.Context(), &store.PeerPendingRecord{
+	_, inserted, err := st.InsertPeerPendingIfAbsent(r.Context(), &store.PeerPendingRecord{
 		DeviceID:       req.DeviceID,
 		Name:           req.Name,
 		URL:            req.URL,
 		JoinSecretHash: candidateHash,
 	})
 	if err != nil {
-		s.logger.Error("join-request: upsert pending", "device_id", req.DeviceID, "err", err)
+		s.logger.Error("join-request: insert pending", "device_id", req.DeviceID, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 		return
 	}
-	resp := joinRequestResponse{State: "pending"}
-	if out.JoinSecretHash == candidateHash {
-		// Our candidate landed → fresh insert (or a previous insert
-		// happened to have the same hash, statistically impossible
-		// against a 256-bit random). Persist the raw secret in kv
-		// so future callerHoldsJoinIdentity checks can validate it
-		// (the Hub stores raw OR hash there; for verification we
-		// compare against the raw kv copy first, falling back to
-		// peer_tokens for the permanent Bearer).
-		if err := s.persistJoinSecret(r.Context(), req.DeviceID, candidate); err != nil {
-			s.logger.Error("join-request: persist secret", "device_id", req.DeviceID, "err", err)
-			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-			return
-		}
-		resp.JoinSecret = candidate
+	if !inserted {
+		writeError(w, http.StatusUnauthorized, "join_secret_required",
+			"a pending row already exists for this deviceId; subsequent /join-request calls must present the join_secret in Authorization: Bearer")
+		return
 	}
-	writeJSONResponse(w, http.StatusOK, resp)
+	writeJSONResponse(w, http.StatusOK, joinRequestResponse{
+		State:      "pending",
+		JoinSecret: candidate,
+	})
 }
 
 // buildHubInfoResponse mirrors handleHubInfo without HTTP plumbing.
@@ -462,7 +452,7 @@ func (s *Server) handleApprovePeerPending(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	rec, err := s.agents.Store().ApprovePeerPending(r.Context(), id)
+	rec, joinSecretHash, err := s.agents.Store().ApprovePeerPending(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "not_found",
@@ -482,7 +472,7 @@ func (s *Server) handleApprovePeerPending(w http.ResponseWriter, r *http.Request
 	// surfaces a clear retry path (Codex review P2-4).
 	mintCtx, mintCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer mintCancel()
-	if err := s.mintAndStashPairingBearers(mintCtx, id); err != nil {
+	if err := s.mintAndStashPairingBearers(mintCtx, id, joinSecretHash); err != nil {
 		s.logger.Error("approve: bearer mint failed; rolling back approval",
 			"device_id", id, "err", err)
 		// Best-effort rollback: drop the trust bit so the next

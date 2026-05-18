@@ -213,6 +213,26 @@ func (s *Store) RevokePeerToken(ctx context.Context, raw string) error {
 	return nil
 }
 
+// RevokePeerTokenByHash stamps revoked_at on the row identified by
+// token_hash directly. Used by the pairing flow when re-minting a
+// peer→Hub Bearer between attach attempts — the previous attempt's
+// raw value is gone (never persisted), but the hash is still in
+// the stash for revocation. Returns nil for both missing and
+// already-revoked rows so the caller can call this unconditionally.
+func (s *Store) RevokePeerTokenByHash(ctx context.Context, tokenHash string) error {
+	if tokenHash == "" {
+		return nil
+	}
+	now := time.Now().UnixMilli()
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE peer_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL`,
+		now, tokenHash)
+	if err != nil {
+		return fmt.Errorf("store.RevokePeerTokenByHash: %w", err)
+	}
+	return nil
+}
+
 // RevokePeerTokensByDevice stamps revoked_at on every active token bound
 // to deviceID. Called from `kojo --peer-remove <device_id>` style flows so
 // a decommissioned peer can't replay any token it cached. Returns the
