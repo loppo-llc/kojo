@@ -230,6 +230,9 @@ func (s *Server) streamAgentEvents(
 		case <-ctx.Done():
 			// WebSocket disconnected — let chat continue in background.
 			// Don't abort: the response will be saved to transcript.
+			// Drain remaining events so the broadcaster's per-sub forwarder
+			// goroutine doesn't block on the unread channel.
+			drainEventsAsync(events)
 			return
 		case event, ok := <-events:
 			if !ok {
@@ -238,9 +241,12 @@ func (s *Server) streamAgentEvents(
 			}
 			if err := writeJSON(ctx, conn, event); err != nil {
 				// Write failed (WS disconnected) — let chat continue.
+				drainEventsAsync(events)
 				return
 			}
 			if event.Type == "done" || event.Type == "error" {
+				// Broadcaster already closed the sub after the terminal push;
+				// the forwarder will close the channel — no drain needed.
 				return
 			}
 		case msg := <-clientMsgs:
@@ -251,12 +257,26 @@ func (s *Server) streamAgentEvents(
 					_ = writeJSON(ctx, conn, *terminal)
 				} else {
 					_ = writeJSON(ctx, conn, agent.ChatEvent{Type: "done"})
+					// drainAfterAbort timed out — keep draining in background
+					// so the forwarder eventually exits.
+					drainEventsAsync(events)
 				}
 				return
 			}
 			// Ignore other messages while streaming
 		}
 	}
+}
+
+// drainEventsAsync consumes the remainder of an agent event channel in a
+// goroutine. Use it before returning from a streaming loop when the chat may
+// still be producing events — otherwise the per-subscriber forwarder
+// goroutine in chatBroadcaster will block on the unread channel and leak.
+func drainEventsAsync(events <-chan agent.ChatEvent) {
+	go func() {
+		for range events {
+		}
+	}()
 }
 
 // synthesizeTerminal creates a terminal event from the transcript when the
