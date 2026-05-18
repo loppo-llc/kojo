@@ -169,6 +169,84 @@ export function AgentSettings() {
     }).catch(() => navigate("/"));
   }, [id, navigate]);
 
+  // Keep nextCronAt fresh. The initial GET captures a snapshot; without
+  // this the displayed time drifts into the past (e.g. user leaves the
+  // tab open across a check-in) and the "(X ago)" relative label becomes
+  // a stale read of a value the server has long since recomputed.
+  //
+  // Strategy: schedule a single-shot refetch for ~5s after the displayed
+  // nextCronAt elapses (small grace so we land *after* the server-side
+  // tick fires and updates its own state), and refetch whenever the tab
+  // regains visibility (covers laptop-sleep + phone background cases
+  // where the timer doesn't fire on time).
+  //
+  // Merges ONLY the server-derived display fields (nextCronAt,
+  // cronPausedGlobal) into local agent state. Crucially does NOT
+  // overwrite `etag` — the form's snapshot etag must keep pointing at
+  // the version the user last loaded so a subsequent save still gets
+  // the 412 (precondition failed) on concurrent edits. Form fields
+  // aren't touched either, so unsaved edits survive.
+  useEffect(() => {
+    if (!id) return;
+    const next = agent?.nextCronAt;
+    if (!next) return;
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    // Cap at 1 day so browsers don't silently round huge int32 ms
+    // delays (~24.8d) to instant-fire — a monthly cron that schedules
+    // further out keeps re-arming each day until the real tick arrives.
+    const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+    const arm = (dueAt: number) => {
+      if (Number.isNaN(dueAt)) return;
+      // Clear any prior pending tick — a visibility-triggered refetch
+      // that lands while a timer is still armed must not leak the
+      // stale handle (the cleanup `clearTimeout(timer)` only sees the
+      // most recent assignment).
+      if (timer !== null) clearTimeout(timer);
+      // 5s grace lets the server's own scheduler advance its entry.Next
+      // past the firing tick before we ask. Negative delays (already
+      // overdue from a stale fetch) collapse to a near-immediate refetch.
+      const raw = dueAt + 5_000 - Date.now();
+      const delay = Math.max(0, Math.min(raw, ONE_DAY_MS));
+      timer = setTimeout(refetch, delay);
+    };
+
+    const refetch = () => {
+      if (cancelled) return;
+      agentApi.get(id).then((fresh) => {
+        // A late-arriving response from a refetch issued before the
+        // user navigated / edited could clobber newer state. Drop it.
+        if (cancelled) return;
+        setAgent((prev) => prev ? {
+          ...prev,
+          nextCronAt: fresh.nextCronAt,
+          cronPausedGlobal: fresh.cronPausedGlobal,
+        } : fresh);
+        // If the value is unchanged the outer effect won't re-run
+        // (deps still equal) — re-arm explicitly so a 1-day-capped
+        // timer for a far-future cron keeps making progress.
+        if (!cancelled && fresh.nextCronAt && fresh.nextCronAt === next) {
+          arm(new Date(fresh.nextCronAt).getTime());
+        }
+      }).catch(() => { /* keep prior */ });
+    };
+
+    const visibilityHandler = () => {
+      if (document.visibilityState === "visible") refetch();
+    };
+    document.addEventListener("visibilitychange", visibilityHandler);
+
+    arm(new Date(next).getTime());
+
+    return () => {
+      cancelled = true;
+      if (timer !== null) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", visibilityHandler);
+    };
+  }, [id, agent?.nextCronAt]);
+
   const needsCustomURL = tool === "custom" || tool === "llama.cpp";
 
   useEffect(() => {
