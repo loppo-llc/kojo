@@ -21,6 +21,17 @@ import (
 type ChatManager interface {
 	Chat(ctx context.Context, agentID, message, role string, attachments []agent.MessageAttachment, source ...agent.BusySource) (<-chan agent.ChatEvent, error)
 	ChatOneShot(ctx context.Context, agentID, message string, opts ...agent.OneShotOpts) (<-chan agent.ChatEvent, error)
+	// CanResumeSession reports whether the next ChatOneShot for this
+	// (agentID, sessionKey) pair is likely to resume an existing
+	// backend session. True when the backend honors SessionKey AND
+	// the on-disk session artifact exists AND is non-empty. The
+	// Slack bot uses this to gate the "skip FormatForInjection(history)"
+	// optimization: when false (backend runs OneShot, or the session
+	// file was removed/empty), history must be re-injected because
+	// the backend will see no prior context. See Manager.CanResumeSession
+	// for the threshold-reset edge case where this returns true but
+	// the backend ultimately starts a fresh session.
+	CanResumeSession(agentID, sessionKey string) bool
 }
 
 // Bot manages a single Slack Socket Mode connection for one agent.
@@ -364,9 +375,71 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		history = FetchChannelHistory(ctx, b.api, b.agentDataDir, channel, channelHistoryLimit, b.resolveUserName, b.logger)
 	}
 
+	// Build a session key that maps 1:1 to the chat_history file unit
+	// (per-thread or per-channel). This gives each Slack conversation its
+	// own resumable session with full context across messages. Computed
+	// here (rather than inline at the ChatOneShot call site) because the
+	// inject-history decision below needs to know whether the backend's
+	// session artifact for this conversation actually exists on disk.
+	slackSessionKey := b.agentID + ":slack:" + channel + ":" + replyTS
+
+	// Decide whether to inject history into the user message.
+	//
+	// When the backend supports SessionKey-based resumption (Claude), the
+	// first turn seeds the session with FormatForInjection(history); the
+	// backend then carries that context internally on every subsequent
+	// resume. Re-injecting on later turns duplicates every prior Slack
+	// message — once in the resumed transcript, once in the new user
+	// payload — burning context and risking confusion. So skip injection
+	// once both signals agree:
+	//
+	//   (a) the chat_history records a prior bot reply (we already had a
+	//       turn in this conversation), AND
+	//   (b) the backend's session artifact for this conversation still
+	//       exists on disk (claude /clear, upgrade or manual cleanup
+	//       can remove it independently of Slack-side history, so signal
+	//       (a) alone is not safe).
+	//
+	// For backends that do not support resume (codex, gemini, …) the
+	// ChatOneShot call falls back to OneShot:true, which carries no prior
+	// context across turns. Those backends must keep receiving injected
+	// history on every turn or they lose the conversation entirely.
+	//
+	// Remaining tradeoff: user messages that landed in the Slack thread
+	// between the last bot reply and this turn are not delta-injected;
+	// Claude sees them only as referenced text in the new user message.
+	// We accept this to avoid duplicating the full transcript.
+	injectHistory := true
+	if len(history) > 0 && b.mgr.CanResumeSession(b.agentID, slackSessionKey) {
+		// Match our own bot replies only. Two reliable signals are OR'd:
+		//
+		//   (1) UserID == b.botUserID — set by every AppendMessages write
+		//       below, and also by Slack's API for modern apps that expose
+		//       User on bot-posted messages.
+		//   (2) MessageID has a ".bot" suffix — the local sentinel that
+		//       AppendMessages assigns (see "%d.bot" formatting in the
+		//       bot-history append below). This catches replies that Slack
+		//       returns with an empty User and only BotID set, where (1)
+		//       alone would miss them.
+		//
+		// We deliberately do NOT match on IsBot alone, because unrelated
+		// bot posts in the same channel (GitHub, Datadog, …) would falsely
+		// suppress injection on the very first turn and start the resumed
+		// Claude session with no Slack context.
+		for i := range history {
+			if !history[i].IsBot {
+				continue
+			}
+			if history[i].UserID == b.botUserID || strings.HasSuffix(history[i].MessageID, ".bot") {
+				injectHistory = false
+				break
+			}
+		}
+	}
+
 	// Build enriched message with conversation history.
 	var sb strings.Builder
-	if len(history) > 0 {
+	if injectHistory && len(history) > 0 {
 		sb.WriteString(chathistory.FormatForInjection(history, b.botUserID, chathistory.DefaultMaxMessages, chathistory.DefaultMaxChars))
 		sb.WriteString("\n---\n\n")
 	}
@@ -387,11 +460,9 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		Status:    typingStatus,
 	})
 
-	// Build a session key that maps 1:1 to the chat_history file unit
-	// (per-thread or per-channel). This gives each Slack conversation its
-	// own Claude session with full context resumption across messages.
-	slackSessionKey := b.agentID + ":slack:" + channel + ":" + threadTS
-
+	// slackSessionKey was computed above (1:1 with the chat_history unit)
+	// so the inject-history decision could check for the backend session
+	// artifact on disk. threadTS is replyTS so the key is identical.
 	events, err := b.mgr.ChatOneShot(ctx, b.agentID, message, agent.OneShotOpts{
 		SessionKey:        slackSessionKey,
 		SystemPromptExtra: slackSystemPrompt,
@@ -548,10 +619,39 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			}
 			if _, _, _, err := b.api.UpdateMessageContext(finCtx, channel, streamTS, updateOpts...); err != nil {
 				b.logger.Warn("failed to update stream message with final text", "err", err)
+				// Fallback: post the first chunk as a fresh message so the
+				// final reply still reaches the user. Without this, a
+				// chat.update failure leaves the channel with whatever
+				// partial AppendStream output happened to land, possibly
+				// truncated. Symmetric with the empty-response branch below.
+				b.postMessage(finCtx, channel, threadTS, chunks[0])
 			}
 			// Remaining chunks: post as follow-up messages
 			for _, chunk := range chunks[1:] {
 				b.postMessage(finCtx, channel, threadTS, chunk)
+			}
+		} else {
+			// Stream was started — usually by the first tool_use event —
+			// but the assistant never produced any reply text. Without an
+			// overwrite, the user is left staring at a finalized message
+			// whose only content is one or more "_⏳ {tool}_" status
+			// indicators. Replace it with an error fallback so the channel
+			// reflects the actual outcome. The else-if branches below cannot
+			// run because streamTS != "" already matched, so this is the
+			// only place to surface the failure.
+			fallback := "Sorry, something went wrong while processing your request."
+			updateOpts := []slack.MsgOption{
+				slack.MsgOptionText(fallback, false),
+				slack.MsgOptionMarkdownText(fallback),
+			}
+			if threadTS != "" {
+				updateOpts = append(updateOpts, slack.MsgOptionTS(threadTS))
+			}
+			if _, _, _, err := b.api.UpdateMessageContext(finCtx, channel, streamTS, updateOpts...); err != nil {
+				b.logger.Warn("failed to overwrite empty-response stream", "err", err)
+				// Last resort: post a separate message so the user still
+				// gets feedback even if chat.update fails.
+				b.postMessage(finCtx, channel, threadTS, fallback)
 			}
 		}
 	} else if response.Len() > 0 {

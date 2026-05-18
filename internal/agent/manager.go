@@ -1068,7 +1068,8 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	// Build chat options.
 	//
 	// SessionKey-scoped resumption is only honored by backends that read
-	// opts.SessionKey when building their CLI args (currently: claude).
+	// opts.SessionKey when building their CLI args (see
+	// backendSupportsSessionKey for the canonical allow-list).
 	// Other backends like gemini interpret !OneShot as "resume the agent's
 	// latest session", which would incorrectly mix Slack thread context
 	// with the agent's normal WebUI context — or with a different Slack
@@ -1297,6 +1298,78 @@ func (m *Manager) resolveBackend(agentID string, agentCopy *Agent) (ChatBackend,
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedTool, agentCopy.Tool)
 	}
 	return backend, nil
+}
+
+// CanResumeSession reports whether the next ChatOneShot for this
+// (agentID, sessionKey) pair will actually resume an existing backend
+// session. Three conditions must hold: the configured backend honors
+// ChatOptions.SessionKey for resumption, the on-disk session artifact
+// exists, AND the artifact is non-empty (a zero-byte JSONL is treated
+// as "no session" because sessionFileUsable will delete it and start
+// fresh on the next invocation).
+//
+// Callers that inject conversation history into the user message use
+// this to skip re-injection once the backend has its own resumable
+// session — re-injecting would duplicate every prior message once in
+// the resumed transcript and once in the new payload. When false, the
+// caller should keep injecting history: either the backend runs in
+// OneShot mode (codex, gemini, …) or the session file was removed
+// (claude /clear, upgrade, manual cleanup) and the next run will
+// start fresh.
+//
+// Currently only Claude-family backends have a verifiable on-disk
+// artifact; future resumable backends with sessions elsewhere should
+// be dispatched in the switch below.
+//
+// Edge case not covered: if the existing session is over
+// sessionResetThresholdTokens, sessionFileUsable will preReset-summarize
+// and delete it, and Claude starts a new session with --session-id.
+// History injection was already skipped, so Claude loses the prior
+// Slack context — and once the new session is established,
+// CanResumeSession keeps returning true so subsequent turns also skip
+// injection. Recovery requires the user to re-share context (or a
+// future delta-injection feature). We accept this because reaching
+// sessionResetThresholdTokens within a single Slack thread is rare in
+// practice, and replicating sessionFileUsable's token check here would
+// either duplicate its destructive side effects (preReset summary,
+// file removal) or require splitting it into a read-only probe.
+func (m *Manager) CanResumeSession(agentID, sessionKey string) bool {
+	m.mu.Lock()
+	a, ok := m.agents[agentID]
+	if !ok {
+		m.mu.Unlock()
+		return false
+	}
+	tool := a.Tool
+	m.mu.Unlock()
+	backend, ok := m.backends[tool]
+	if !ok {
+		return false
+	}
+	if !backendSupportsSessionKey(backend) {
+		return false
+	}
+	switch backend.Name() {
+	case "claude", "custom":
+		sessionID := expectedClaudeSessionID(agentID, sessionKey, false)
+		if sessionID == "" {
+			return false
+		}
+		absDir, err := filepath.Abs(agentDir(agentID))
+		if err != nil {
+			return false
+		}
+		path := filepath.Join(claudeProjectDir(absDir), sessionID+".jsonl")
+		info, err := os.Stat(path)
+		if err != nil {
+			return false
+		}
+		// Zero-byte JSONL is unusable: sessionFileUsable would delete it
+		// on the next invocation, so it cannot anchor a resume.
+		return info.Size() > 0
+	default:
+		return false
+	}
 }
 
 // updatePostChatIndex updates the memory index after a chat completes.

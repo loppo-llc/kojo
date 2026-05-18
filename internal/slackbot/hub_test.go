@@ -43,6 +43,8 @@ func (m *mockMgr) ChatOneShot(_ context.Context, _, _ string, _ ...agent.OneShot
 	return ch, nil
 }
 
+func (m *mockMgr) CanResumeSession(_, _ string) bool { return false }
+
 var testLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 // mockSlackServer returns an httptest.Server that handles common Slack API calls.

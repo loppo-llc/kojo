@@ -67,7 +67,8 @@ func backendSupportsSessionKey(b ChatBackend) bool {
 		return false
 	}
 	switch b.Name() {
-	case "claude":
+	case "claude", "custom":
+		// custom delegates to ClaudeBackend.Chat, which honors SessionKey.
 		return true
 	default:
 		return false
