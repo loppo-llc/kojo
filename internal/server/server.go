@@ -156,6 +156,25 @@ type Server struct {
 	oauth2Once      sync.Once
 	idempSweepOnce  sync.Once // guards StartIdempotencySweep
 	webdavSweepOnce sync.Once // guards StartWebDAVTokenSweep
+	// nodeKeyResolver maps an HTTP request's RemoteAddr to the
+	// calling node's Tailscale NodeKey. cmd/kojo wires this from
+	// tsnet.LocalClient.WhoIs AFTER server.New returns — tsnet
+	// binding happens later in the boot sequence, so the field is
+	// set via SetNodeKeyResolver and protected by identityMu.
+	nodeKeyResolver func(ctx context.Context, remoteAddr string) (string, error)
+	// selfNodeKey is the local kojo's own Tailscale NodeKey. The
+	// tsnet identity middleware promotes a request whose
+	// WhoIs-resolved key matches this value to RoleOwner ("Tailscale
+	// reach == Owner"). Empty disables the promotion. Settable via
+	// SetSelfNodeKey for the same reason as nodeKeyResolver.
+	selfNodeKey string
+	// unsafePeer collapses the tsnet identity check. Every caller
+	// becomes RolePeer (on a peer daemon) or RoleOwner (on the Hub
+	// when the listener is the public one). Wired from --unsafe.
+	unsafePeer bool
+	// identityMu guards nodeKeyResolver + selfNodeKey, both of
+	// which can be (re)wired after server construction.
+	identityMu sync.RWMutex
 }
 
 type Config struct {
@@ -237,6 +256,13 @@ type Config struct {
 	// only); a restart with a pending op forces the
 	// orchestrator to re-run the whole switch.
 	PendingSyncKEK []byte
+	// Unsafe disables Tailscale identity verification. Every caller
+	// is admitted as RolePeer on a peer daemon, or as RoleOwner on
+	// the public Hub listener. Intended for LAN dev / docker / CI
+	// deployments. cmd/kojo gates this on the --unsafe flag and
+	// refuses to start when --unsafe is OFF but no NodeKeyResolver
+	// is available (i.e. the operator forgot to opt in).
+	Unsafe bool
 	// WebDAVTokenStore wires the short-lived WebDAV token surface
 	// (docs §3.4 / §5.6). When non-nil the server registers the
 	// /api/v1/auth/webdav-tokens issue/list/revoke handlers, exposes
@@ -294,6 +320,7 @@ func New(cfg Config) *Server {
 		logger:          logger,
 		devMode:         cfg.DevMode,
 		version:         cfg.Version,
+		unsafePeer: cfg.Unsafe,
 	}
 
 	// Initialize Slack bot hub — server owns the lifecycle. PeerOnly
@@ -344,49 +371,52 @@ func New(cfg Config) *Server {
 	// from a previous run is trimmed before the first synthesize call.
 	tts.StartCacheSweep()
 
-	// The public listener (the kojo user's mobile UI) is unconditionally
-	// trusted as Owner — preserves the original UX with no token setup.
-	// The agent-facing auth listener is created lazily by ServeAuth.
+	// Middleware order (innermost first):
 	//
-	// Middleware order: PeerAuth (Ed25519-signed inter-peer requests
-	// stamp RolePeer in ctx) → OwnerOnly (Guest → Owner, skips when
-	// PeerAuth already stamped a non-Guest principal) → Idempotency
-	// (24h dedup of write retries; pass-through for non-API/GET/SSE)
-	// → mux. PeerAuth runs first so a peer-signed request keeps its
-	// scoped identity rather than getting promoted to Owner by the
-	// "Tailscale reach == Owner" rule on the public listener.
+	//   mux
+	//     ← idempotencyMiddleware
+	//     ← remoteAgentProxyMiddleware
+	//     ← sessionPeerProxyMiddleware (when peer surface is wired)
+	//     ← auth.EnforceMiddleware  (route-level allowlist for RolePeer)
+	//     ← auth.TailnetIdentityMiddleware  (WhoIs → Principal)
 	//
-	// PeerOnly mode (daemon peer, `kojo --peer`) is an exception: the
-	// listener is plain HTTP on 0.0.0.0, and the only routes mounted
-	// are the inter-peer endpoints whose handlers accept Owner OR
-	// Peer. If OwnerOnlyMiddleware still ran here, every unsigned
-	// request reaching the peer over the tailnet would get Owner-
-	// promoted and waltz through those handlers without ever having
-	// to produce an Ed25519 signature — peer endpoints would be
-	// effectively unauth. Drop OwnerOnly in PeerOnly so the only
-	// accepted principal is RolePeer (peerAuth-stamped) or Guest
-	// (which the handlers refuse).
+	// TailnetIdentityMiddleware runs first so the Principal is
+	// stamped before any policy check. It promotes a request whose
+	// WhoIs-resolved NodeKey == selfNodeKey to RoleOwner (preserves
+	// the "Tailscale reach == Owner" UX on the same host) and
+	// resolves a paired peer's NodeKey via peer_registry.node_key.
+	// Unknown tailnet callers stay Guest; non-tsnet listeners (e.g.
+	// --local) admit Guest and rely on downstream auth.
+	//
+	// --unsafe collapses the WhoIs check and stamps RolePeer
+	// (peer-mode) or RoleOwner (Hub) unconditionally — LAN / docker
+	// / CI escape hatch.
+	var st *store.Store
+	if s.agents != nil {
+		st = s.agents.Store()
+	}
 	publicHandler := s.idempotencyMiddleware(mux)
 	publicHandler = s.remoteAgentProxyMiddleware(publicHandler)
-	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
+	if s.peerID != nil && st != nil {
 		publicHandler = s.sessionPeerProxyMiddleware(publicHandler)
 	}
-	// EnforceMiddleware gates non-Owner principals (RolePeer, future
-	// guest tokens) on the public listener too. Without it a peer-
-	// signed request bypasses AllowNonOwner entirely and lands on
-	// the mux with no route-level allowlist — the handler-side
-	// IsPeer() check is the last line of defence rather than the
-	// first. OwnerOnlyMiddleware below this line still promotes
-	// Tailscale-trusted Guest → Owner, so legitimate UI traffic is
-	// unaffected.
 	publicHandler = auth.EnforceMiddleware(publicHandler)
-	if !cfg.PeerOnly {
-		publicHandler = auth.OwnerOnlyMiddleware(publicHandler)
-	}
-	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
-		bearerPeer := peer.NewBearerPeerMiddleware(s.agents.Store(), s.peerID.DeviceID)
-		publicHandler = bearerPeer.Wrap(publicHandler)
-	}
+	publicHandler = auth.TailnetIdentityMiddleware(auth.TailnetIdentityConfig{
+		Resolver:        s.resolveNodeKey,
+		SelfNodeKeyFunc: s.currentSelfNodeKey,
+		Store:           st,
+		// On the Hub's public listener we restore the legacy
+		// "Tailscale reach == Owner" UX: a tailnet caller whose
+		// NodeKey doesn't match a paired peer is promoted to
+		// Owner so the operator can hit the UI from any tailnet
+		// device without pairing it. The peer-mode daemon does
+		// NOT promote (PromoteUnknownTailnetToOwner=false) — a
+		// stray tailnet caller on a peer host stays Guest.
+		PromoteUnknownTailnetToOwner: !cfg.PeerOnly,
+		Unsafe:                       cfg.Unsafe,
+		UnsafeAsHub:                  !cfg.PeerOnly,
+		Logger:                       logger,
+	})(publicHandler)
 	s.httpSrv = &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           publicHandler,
@@ -896,10 +926,13 @@ func (s *Server) ensureAuthServer(resolver *auth.Resolver) *http.Server {
 	}
 	handler = auth.EnforceMiddleware(handler)
 	handler = auth.AuthMiddleware(resolver)(handler)
-	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
-		bearerPeer := peer.NewBearerPeerMiddleware(s.agents.Store(), s.peerID.DeviceID)
-		handler = bearerPeer.Wrap(handler)
-	}
+	// The auth listener binds to 127.0.0.1 only. Agents reach it
+	// via their X-Kojo-Token / Bearer; that is the auth boundary
+	// here. We deliberately do NOT wire TailnetIdentityMiddleware
+	// on this listener — same-host tailnet WhoIs would resolve
+	// every same-host caller to the local NodeKey and stamp
+	// RolePeer / RoleOwner BEFORE AuthMiddleware ever sees the
+	// Bearer, silently bypassing the agent-token gate.
 	s.authSrv = &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -1137,6 +1170,48 @@ func (s *Server) SlackHub() *slackbot.Hub {
 // boot and never mutated under load.
 func (s *Server) SetOnAgentSynced(fn func(ctx context.Context, agentID string) error) {
 	s.onAgentSynced = fn
+}
+
+// SetNodeKeyResolver wires (or rewires) the tsnet WhoIs resolver.
+// cmd/kojo calls this AFTER tsnet.Server.LocalClient is available
+// (Hub) or once the OS tailscaled handshake completes (--peer).
+// Passing nil clears the resolver — every caller becomes Guest
+// unless Unsafe is set, which is the safe default on --local /
+// --dev where no tsnet boundary exists.
+func (s *Server) SetNodeKeyResolver(fn func(ctx context.Context, remoteAddr string) (string, error)) {
+	s.identityMu.Lock()
+	defer s.identityMu.Unlock()
+	s.nodeKeyResolver = fn
+}
+
+// SetSelfNodeKey records the local kojo's own NodeKey so the tsnet
+// identity middleware can promote requests from the same host to
+// RoleOwner. Same wiring contract as SetNodeKeyResolver.
+func (s *Server) SetSelfNodeKey(nk string) {
+	s.identityMu.Lock()
+	defer s.identityMu.Unlock()
+	s.selfNodeKey = nk
+}
+
+// resolveNodeKey is the late-bound resolver closure the tsnet
+// identity middleware calls per-request. Returns ("", error) when
+// no resolver is wired so the middleware falls through to Guest.
+func (s *Server) resolveNodeKey(ctx context.Context, remoteAddr string) (string, error) {
+	s.identityMu.RLock()
+	fn := s.nodeKeyResolver
+	s.identityMu.RUnlock()
+	if fn == nil {
+		return "", nil
+	}
+	return fn(ctx, remoteAddr)
+}
+
+// currentSelfNodeKey is the late-bound accessor for the self
+// NodeKey used by the tsnet identity middleware.
+func (s *Server) currentSelfNodeKey() string {
+	s.identityMu.RLock()
+	defer s.identityMu.RUnlock()
+	return s.selfNodeKey
 }
 
 // SetOnAgentSyncFinalized installs the post-complete hook that

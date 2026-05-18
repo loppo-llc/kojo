@@ -27,10 +27,10 @@ func fixedSourceFixture(t *testing.T, status int, body []byte, sha256Hdr string)
 			http.NotFound(w, r)
 			return
 		}
-		if !strings.HasPrefix(strings.ToLower(r.Header.Get("Authorization")), "bearer ") {
-			http.Error(w, "missing Authorization Bearer", http.StatusBadRequest)
-			return
-		}
+		// Auth no longer travels in the Authorization header — the
+		// receiving peer resolves identity via tsnet WhoIs
+		// (docs/peer-tsnet-identity.md). The test fixture trusts the
+		// caller; the production server applies its own check.
 		if sha256Hdr != "" {
 			w.Header().Set("X-Kojo-Blob-SHA256", sha256Hdr)
 		}
@@ -49,26 +49,18 @@ func newTestIdentity(t *testing.T) *Identity {
 	}
 }
 
-// newBlobTestStore opens a temp store and provisions an outbound
-// Bearer for the canonical source device used by the blob tests.
-// Returns the store so the caller can pass it to NewPullClient.
+// newBlobTestStore opens a temp store. With docs/peer-tsnet-identity.md
+// the outbound Bearer plumbing is gone — identity travels via tsnet
+// WhoIs on the receiving side — so the store is empty.
 func newBlobTestStore(t *testing.T, sourceDeviceID string) *store.Store {
 	t.Helper()
+	_ = sourceDeviceID
 	dir := t.TempDir()
 	st, err := store.Open(context.Background(), store.Options{ConfigDir: dir})
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	if _, err := st.PutKV(context.Background(), &store.KVRecord{
-		Namespace: OutBearerNS,
-		Key:       sourceDeviceID,
-		Value:     "test-bearer-raw-token",
-		Type:      store.KVTypeString,
-		Scope:     store.KVScopeMachine,
-	}, store.KVPutOptions{}); err != nil {
-		t.Fatalf("PutKV bearer: %v", err)
-	}
 	return st
 }
 

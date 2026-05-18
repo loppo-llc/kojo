@@ -1087,18 +1087,10 @@ func (s *Server) proxyPeerGetMessages(w http.ResponseWriter, r *http.Request, ag
 		return false
 	}
 
-	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, holderDeviceID); err != nil {
-		return false
-	}
 	// Forward the agent's own token so the holder's auth middleware
-	// can resolve the original principal. The X-Kojo-Token header is
-	// fine to copy — it's a separate channel from peer auth — but
-	// Authorization MUST NOT be overwritten: AuthorizeOutbound just
-	// stamped this Hub's peer→holder Bearer there, and the
-	// downstream BearerPeerMiddleware needs to see THAT to stamp the
-	// RolePeer principal (Codex review P2). The agent's
-	// Authorization, if any, flows on its own X-Kojo-Token-equivalent
-	// or via the agent's signed-token path.
+	// can resolve the original principal. Peer identity itself is
+	// carried in the WireGuard tunnel and resolved server-side via
+	// tsnet WhoIs (docs/peer-tsnet-identity.md).
 	if tok := r.Header.Get("X-Kojo-Token"); tok != "" {
 		req.Header.Set("X-Kojo-Token", tok)
 	}
@@ -1212,10 +1204,6 @@ func (s *Server) fetchRemoteLatestMessage(ctx context.Context, agentID, holderDe
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
-		return "", "", "", false
-	}
-
-	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, holderDeviceID); err != nil {
 		return "", "", "", false
 	}
 

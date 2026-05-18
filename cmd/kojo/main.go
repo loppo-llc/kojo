@@ -34,6 +34,7 @@ import (
 	"github.com/loppo-llc/kojo/internal/store/secretcrypto"
 	"github.com/loppo-llc/kojo/web"
 	"tailscale.com/ipn/ipnstate"
+	localTailscale "tailscale.com/client/local"
 	"tailscale.com/tsnet"
 )
 
@@ -64,6 +65,7 @@ func main() {
 	// Auto-onboarding flags (docs/peer-onboarding-plan.md).
 	hubURL := flag.String("hub", "", "with --peer: override Hub auto-discovery. Accepts host:port or scheme://host:port. Falls back to $KOJO_HUB_URL then MagicDNS default `https://kojo.<tailnet>.ts.net:<KOJO_HUB_PORT or 8080>`.")
 	tailnetOnly := flag.Bool("tailnet-only", false, "with --peer: bind the listener to the Tailscale interface IP only. Refuses to start if Tailscale is not running. Without this flag, peer mode falls back to 0.0.0.0 when Tailscale is unavailable.")
+	unsafePeer := flag.Bool("unsafe", false, "disable Tailscale identity verification on the inter-peer surface. Every caller is admitted as RolePeer (--peer) or RoleOwner (Hub). Intended for LAN / docker / CI deployments where the operator opts into trusting the listener boundary; do NOT use on a host with an Internet-routable bind.")
 	doSnapshot := flag.Bool("snapshot", false, "take a point-in-time snapshot of kojo.db + blobs/global into <configdir>/snapshots/<ts>/ and exit")
 	doRestore := flag.String("restore", "", "restore a snapshot (verified sha256) into <configdir>. The configdir must not be in use by a running kojo. KEK and per-peer credentials are NOT restored — supply them out-of-band before booting.")
 	restoreForce := flag.Bool("restore-force", false, "with --restore: overwrite an existing kojo.db in the target. Required when the target is a previously-used Hub being re-seeded.")
@@ -888,7 +890,11 @@ func main() {
 		V0LegacyDir:      sessionV0LegacyDir,
 		PeerOnly:         *peerMode,
 		PendingSyncKEK:   pendingSyncKEK,
+		Unsafe:           *unsafePeer,
 	})
+	if *unsafePeer {
+		logger.Warn("kojo: --unsafe set; tailnet identity disabled. Inter-peer endpoints are open to anyone reachable on the listener.")
+	}
 
 	// §3.7 device-switch agent-sync hook. When this peer
 	// receives a sync push from the source peer (handler
@@ -1219,6 +1225,28 @@ func main() {
 			printPairingSpec(peerIdentity, publicURL, "peer")
 		}
 
+		// Wire the OS tailscaled WhoIs into the Server's tsnet
+		// identity middleware. Peer mode does not run a tsnet.Server
+		// of its own — it borrows the host's tailscaled — so we hit
+		// the LocalAPI socket via tailscale.com/client/local. If
+		// tailscaled is not reachable (LAN-only deploy), the
+		// resolver returns ErrNoNodeKey and the middleware admits
+		// the caller as Guest; `--unsafe` is the supported escape
+		// hatch in that case.
+		if !*unsafePeer {
+			srv.SetNodeKeyResolver(func(ctx context.Context, remoteAddr string) (string, error) {
+				w, err := localTailscale.WhoIs(ctx, remoteAddr)
+				if err != nil {
+					return "", err
+				}
+				if w == nil || w.Node == nil {
+					return "", nil
+				}
+				return w.Node.Key.String(), nil
+			})
+			go captureSelfNodeKeyFromOSTailscale(ctx, srv, peerRegistrar, logger)
+		}
+
 		go func() {
 			if err := srv.ServeAuth(ln, resolver); err != nil && err != http.ErrServerClosed {
 				logger.Error("server error", "err", err)
@@ -1372,6 +1400,24 @@ func main() {
 				logger.Warn("could not get tailscale status", "err", err)
 				fmt.Fprintf(os.Stderr, "    https://%s.<tailnet>.ts.net:%d  (getting status...)\n", tsHost, *port)
 			}
+			// Wire the WhoIs-backed identity resolver into the
+			// Server now that LocalClient is ready. The closure
+			// stringifies the resolved tailcfg.Node.Key into the
+			// `nodekey:...` form peer_registry.node_key stores.
+			srv.SetNodeKeyResolver(func(ctx context.Context, remoteAddr string) (string, error) {
+				w, err := lc.WhoIs(ctx, remoteAddr)
+				if err != nil {
+					return "", err
+				}
+				if w == nil || w.Node == nil {
+					return "", nil
+				}
+				return w.Node.Key.String(), nil
+			})
+			// Capture self NodeKey in the background and write it
+			// into peer_registry's self-row so other peers learn
+			// the Hub's NodeKey via hub-info.
+			go captureSelfNodeKeyFromTailscale(ctx, lc, srv, peerRegistrar, logger)
 			// Background refresh: bounded retry until tsnet
 			// reports a DNSName, then SetPublicName +
 			// RefreshPublicName so other peers' Subscriber can
@@ -1380,14 +1426,6 @@ func main() {
 			// when Status() was momentarily not ready.
 			if peerRegistrar != nil {
 				go refreshPublicNameFromTailscale(ctx, lc, peerRegistrar, *port, logger)
-				// Print the Hub's own pairing spec once the tsnet
-				// listener has reported a stable FQDN so the
-				// operator can run `kojo --peer-add` on every peer
-				// host. Pairing is bidirectional: the Hub stores
-				// the peer via the operator's UI / CLI, and each
-				// peer must in turn store the Hub so the Hub's
-				// signed register-push / session-proxy requests
-				// pass the peer's PeerAuth middleware.
 				go printHubPairingSpecOnce(ctx, lc, peerIdentity, *port, logger)
 			}
 		}
@@ -1605,6 +1643,81 @@ func refreshPublicNameFromTailscale(ctx context.Context, lc tailscaleLocalClient
 // the Status method so test fixtures can inject a fake.
 type tailscaleLocalClient interface {
 	Status(ctx context.Context) (*ipnstate.Status, error)
+}
+
+// captureSelfNodeKeyFromOSTailscale is the peer-mode twin of
+// captureSelfNodeKeyFromTailscale. It calls into the host's
+// tailscaled LocalAPI (no tsnet.Server here) and stamps the
+// resolved Self NodeKey on the Server AND on the Registrar so
+// the peer_registry self-row carries node_key.
+func captureSelfNodeKeyFromOSTailscale(ctx context.Context, srv *server.Server, reg *peer.Registrar, logger *slog.Logger) {
+	const maxAttempts = 30
+	for i := 0; i < maxAttempts; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		statusCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		st, err := localTailscale.Status(statusCtx)
+		cancel()
+		if err == nil && st != nil && st.Self != nil {
+			nk := st.Self.PublicKey.String()
+			if nk != "" {
+				srv.SetSelfNodeKey(nk)
+				if reg != nil {
+					reg.SetSelfNodeKey(nk)
+					refreshCtx, refreshCancel := context.WithTimeout(ctx, 5*time.Second)
+					_ = reg.RefreshPublicName(refreshCtx)
+					refreshCancel()
+				}
+				return
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if logger != nil {
+		logger.Debug("could not capture self Tailscale NodeKey from OS tailscaled; same-host Owner promotion disabled")
+	}
+}
+
+// captureSelfNodeKeyFromTailscale polls LocalClient.Status() until
+// Self.NodeKey is populated, then stamps it on the Server AND on
+// the Registrar so peer_registry's self-row carries node_key (the
+// value other peers store and use to authenticate Hub-inbound
+// requests via tsnet identity).
+func captureSelfNodeKeyFromTailscale(ctx context.Context, lc tailscaleLocalClient, srv *server.Server, reg *peer.Registrar, logger *slog.Logger) {
+	const maxAttempts = 30
+	for i := 0; i < maxAttempts; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		statusCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		st, err := lc.Status(statusCtx)
+		cancel()
+		if err == nil && st != nil && st.Self != nil {
+			nk := st.Self.PublicKey.String()
+			if nk != "" {
+				srv.SetSelfNodeKey(nk)
+				if reg != nil {
+					reg.SetSelfNodeKey(nk)
+					refreshCtx, refreshCancel := context.WithTimeout(ctx, 5*time.Second)
+					_ = reg.RefreshPublicName(refreshCtx)
+					refreshCancel()
+				}
+				if logger != nil {
+					logger.Debug("captured self Tailscale NodeKey", "nodekey", nk)
+				}
+				return
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if logger != nil {
+		logger.Warn("could not capture self Tailscale NodeKey after retries; same-host Owner promotion disabled")
+	}
 }
 
 // peerSubscriberTargetsLoop reconciles the Subscriber's target

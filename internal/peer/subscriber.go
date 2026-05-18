@@ -292,13 +292,13 @@ func (s *Subscriber) connectOnce(ctx context.Context, t SubscriberTarget) error 
 	}
 	target.Path = "/api/v1/peers/events"
 
-	// Build the upgrade request to attach the Bearer.
+	// Build the upgrade request. No Authorization header — the
+	// receiving peer authenticates the caller via tsnet WhoIs
+	// (docs/peer-tsnet-identity.md) or the --unsafe bypass; either
+	// way the dialer's identity travels in the WireGuard tunnel.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
-	}
-	if err := AuthorizeOutbound(ctx, s.store, req, t.DeviceID); err != nil {
-		return fmt.Errorf("authorize request: %w", err)
 	}
 
 	dialOpts := &websocket.DialOptions{

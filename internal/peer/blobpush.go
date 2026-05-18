@@ -134,10 +134,9 @@ func (c *PushClient) PushOne(
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Kojo-Expected-SHA256", expectedSHA256)
-
-	if err := AuthorizeOutbound(ctx, c.store, req, dst.DeviceID); err != nil {
-		return fmt.Errorf("peer.PushOne: authorize: %w", err)
-	}
+	// No Authorization header — identity travels via tsnet WhoIs
+	// on the receiving side. dst.DeviceID is still validated at
+	// the top of this function as part of the input contract.
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

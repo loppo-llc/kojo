@@ -356,10 +356,6 @@ func (s *Server) proxySessionWebSocket(w http.ResponseWriter, r *http.Request, s
 		return
 	}
 
-	if err := peer.AuthorizeOutbound(r.Context(), s.agents.Store(), upgrade, targetDeviceID); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "authorize: "+err.Error())
-		return
-	}
 	targetConn, _, err := websocket.Dial(r.Context(), targetURL.String(),
 		&websocket.DialOptions{
 			HTTPHeader: upgrade.Header,

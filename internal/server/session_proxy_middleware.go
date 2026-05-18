@@ -140,10 +140,6 @@ func (s *Server) proxySessionRequest(w http.ResponseWriter, r *http.Request, pee
 		}
 	}
 
-	if err := peer.AuthorizeOutbound(proxyReq.Context(), s.agents.Store(), proxyReq, peerID); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "authorize: "+err.Error())
-		return
-	}
 	// No HTTP client timeout: large uploads (multi-GiB blobs,
 	// attachments) easily blow past any fixed budget. The
 	// request context (request-scoped, cancelled when the

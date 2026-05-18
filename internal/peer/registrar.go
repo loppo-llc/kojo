@@ -47,9 +47,10 @@ type Registrar struct {
 	// where a slow retry goroutine still calls RefreshPublicName
 	// after Stop has emitted the final offline-touch — without it
 	// the post-Stop refresh would flip the row back to online.
-	publicMu  sync.RWMutex
-	publicURL string
-	stopped   bool
+	publicMu     sync.RWMutex
+	publicURL    string
+	selfNodeKey  string
+	stopped      bool
 
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -95,6 +96,19 @@ func (r *Registrar) SetPublicURL(url string) {
 	r.publicMu.Unlock()
 }
 
+// SetSelfNodeKey records the local Tailscale NodeKey to stamp on the
+// self-row's node_key column. cmd/kojo wires this from
+// tsnet.LocalClient.Status (Hub) or localTailscale.Status (--peer).
+// Empty leaves the column unchanged.
+func (r *Registrar) SetSelfNodeKey(nk string) {
+	if r == nil {
+		return
+	}
+	r.publicMu.Lock()
+	r.selfNodeKey = nk
+	r.publicMu.Unlock()
+}
+
 // RefreshPublicName re-upserts the self-row with the current
 // publicURL. Called by cmd/kojo AFTER tsnet has reported its
 // assigned FQDN — Start runs before tsnet is up, so the initial
@@ -123,11 +137,12 @@ func (r *Registrar) RefreshPublicName(ctx context.Context) error {
 	url := r.selfURLLocked()
 	nowMs := store.NowMillis()
 	rec, err := r.st.UpsertPeer(ctx, &store.PeerRecord{
-		DeviceID:  r.id.DeviceID,
-		Name:      r.id.Name,
-		URL:       url,
-		LastSeen:  nowMs,
-		Status:    store.PeerStatusOnline,
+		DeviceID: r.id.DeviceID,
+		Name:     r.id.Name,
+		URL:      url,
+		NodeKey:  r.selfNodeKey,
+		LastSeen: nowMs,
+		Status:   store.PeerStatusOnline,
 	})
 	if err != nil {
 		return fmt.Errorf("peer.Registrar.RefreshPublicName: upsert: %w", err)

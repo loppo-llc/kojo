@@ -274,10 +274,6 @@ func (s *Server) proxyCreateSessionToPeer(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	if err := peer.AuthorizeOutbound(proxyReq.Context(), s.agents.Store(), proxyReq, peerID); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "authorize: "+err.Error())
-		return
-	}
 	client := peer.NoKeepAliveHTTPClient(proxySessionCreateTimeout)
 	resp, err := client.Do(proxyReq)
 	if err != nil {

@@ -264,11 +264,6 @@ func (s *Server) relayPeerBlob(w http.ResponseWriter, r *http.Request, sourceDev
 			"build relay request: "+err.Error())
 		return
 	}
-	if err := peer.AuthorizeOutbound(r.Context(), s.agents.Store(), upReq, sourceDeviceID); err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway",
-			"no Bearer available for source peer (pair it via the auto-pairing flow first): "+err.Error())
-		return
-	}
 	client := peer.NoKeepAliveHTTPClient(0)
 	resp, err := client.Do(upReq)
 	if err != nil {

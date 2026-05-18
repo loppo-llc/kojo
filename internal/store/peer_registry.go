@@ -8,9 +8,10 @@ import (
 )
 
 // PeerRecord mirrors one row of the `peer_registry` table. device_id is
-// a stable GUID minted by the peer the first time it joins the cluster
-// — public_key is its long-lived identity for inter-peer auth (separate
-// from per-user Bearer tokens).
+// a stable GUID minted by the peer the first time it joins the cluster.
+// Per docs/peer-tsnet-identity.md, identity is anchored on the
+// Tailscale stable NodeKey (column `node_key`), looked up via
+// tsnet.LocalClient.WhoIs on every incoming inter-peer request.
 //
 // `Status` is one of the schema's CHECK values: 'online' | 'offline' |
 // 'degraded'. The Hub flips it to 'offline' after a heartbeat-miss
@@ -28,7 +29,15 @@ type PeerRecord struct {
 	// registrar stamps it from tsnet's FQDN (Hub) or the Tailscale
 	// IPv4 (--peer). Empty until the daemon has been started at least
 	// once so the listener bound its port.
-	URL      string
+	URL string
+	// NodeKey is the Tailscale stable NodeKey of this peer
+	// (`nodekey:...`). Empty when the row was imported before
+	// migration 0013 or when the registering peer hadn't observed its
+	// own NodeKey yet. The tsnet identity middleware refuses to admit
+	// requests whose WhoIs-resolved NodeKey doesn't match a row here,
+	// so a NULL/empty column effectively quarantines the row until
+	// the next join-request re-stamps it.
+	NodeKey  string
 	LastSeen int64 // unix millis, 0 = NULL
 	Status   string
 }
@@ -79,18 +88,25 @@ func (s *Store) UpsertPeer(ctx context.Context, rec *PeerRecord) (*PeerRecord, e
 	}
 
 	// On conflict only the *mutable* columns update. Status /
-	// last_seen / name / url drift over time and overwrite cleanly.
+	// last_seen / name / url / node_key drift over time and overwrite
+	// cleanly. NodeKey "" is treated as "no change" so a status-only
+	// touch from a code path that doesn't carry the NodeKey doesn't
+	// blank out the identity column.
 	const q = `
-INSERT INTO peer_registry (device_id, name, url, last_seen, status)
-VALUES (?, ?, ?, ?, ?)
+INSERT INTO peer_registry (device_id, name, url, node_key, last_seen, status)
+VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(device_id) DO UPDATE SET
   name      = excluded.name,
   url       = excluded.url,
+  node_key  = CASE WHEN excluded.node_key IS NULL OR excluded.node_key = ''
+                   THEN peer_registry.node_key
+                   ELSE excluded.node_key END,
   last_seen = excluded.last_seen,
   status    = excluded.status
 `
 	if _, err := s.db.ExecContext(ctx, q,
 		rec.DeviceID, rec.Name, rec.URL,
+		nullableText(rec.NodeKey),
 		nullableInt64(rec.LastSeen),
 		rec.Status,
 	); err != nil {
@@ -135,15 +151,20 @@ func (s *Store) RegisterPeerMetadata(ctx context.Context, rec *PeerRecord) (*Pee
 	// Same for name — the operator-supplied label is more
 	// authoritative than the bare hostname.
 	const q = `
-INSERT INTO peer_registry (device_id, name, url, last_seen, status)
-VALUES (?, ?, ?, NULL, ?)
+INSERT INTO peer_registry (device_id, name, url, node_key, last_seen, status)
+VALUES (?, ?, ?, ?, NULL, ?)
 ON CONFLICT(device_id) DO UPDATE SET
-  name = CASE WHEN excluded.name = '' THEN peer_registry.name ELSE excluded.name END,
-  url  = CASE WHEN excluded.url  = '' THEN peer_registry.url  ELSE excluded.url  END
+  name     = CASE WHEN excluded.name = '' THEN peer_registry.name ELSE excluded.name END,
+  url      = CASE WHEN excluded.url  = '' THEN peer_registry.url  ELSE excluded.url  END,
+  node_key = CASE WHEN excluded.node_key IS NULL OR excluded.node_key = ''
+                  THEN peer_registry.node_key
+                  ELSE excluded.node_key END
   -- last_seen, status intentionally NOT touched on conflict
 `
 	if _, err := s.db.ExecContext(ctx, q,
-		rec.DeviceID, rec.Name, rec.URL, PeerStatusOffline,
+		rec.DeviceID, rec.Name, rec.URL,
+		nullableText(rec.NodeKey),
+		PeerStatusOffline,
 	); err != nil {
 		return nil, fmt.Errorf("store.RegisterPeerMetadata: %w", err)
 	}
@@ -197,7 +218,7 @@ UPDATE peer_registry
 // GetPeer returns the row keyed by device_id or ErrNotFound.
 func (s *Store) GetPeer(ctx context.Context, deviceID string) (*PeerRecord, error) {
 	const q = `
-SELECT device_id, name, url,
+SELECT device_id, name, url, COALESCE(node_key, ''),
        COALESCE(last_seen,0), status
   FROM peer_registry WHERE device_id = ?`
 	rec, err := scanPeerRow(s.db.QueryRowContext(ctx, q, deviceID))
@@ -220,7 +241,7 @@ type ListPeersOptions struct {
 // recently-active peers float to the top.
 func (s *Store) ListPeers(ctx context.Context, opts ListPeersOptions) ([]*PeerRecord, error) {
 	q := `
-SELECT device_id, name, url,
+SELECT device_id, name, url, COALESCE(node_key, ''),
        COALESCE(last_seen,0), status
   FROM peer_registry
  WHERE 1=1`
@@ -406,12 +427,11 @@ UPDATE peer_registry
 	return stale, nil
 }
 
-// DeletePeer removes the peer_registry row AND every related row
-// (peer_tokens, peer/out_bearer kv, peer/pairing_bearer_stash kv,
-// peer_pending) in a single transaction. Without the related-row
-// cleanup, re-adding the same device_id later would resurrect
-// cached Bearers, raw Hub→peer credentials, or a stale pairing
-// stash — Codex review hardening.
+// DeletePeer removes the peer_registry row and the matching pending
+// row in a single transaction. With the Bearer-issuance flow retired
+// (docs/peer-tsnet-identity.md) there is no longer any token or kv
+// stash to clean up — identity is anchored on the NodeKey column and
+// disappears with the row.
 //
 // Idempotent: missing rows return nil.
 //
@@ -430,21 +450,9 @@ func (s *Store) DeletePeer(ctx context.Context, deviceID string) error {
 		return fmt.Errorf("store.DeletePeer: registry: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE peer_tokens SET revoked_at = ? WHERE device_id = ? AND revoked_at IS NULL`,
-		NowMillis(), deviceID,
-	); err != nil {
-		return fmt.Errorf("store.DeletePeer: revoke tokens: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM peer_pending WHERE device_id = ?`, deviceID,
 	); err != nil {
 		return fmt.Errorf("store.DeletePeer: pending: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM kv WHERE namespace IN ('peer/out_bearer', 'peer/pairing_bearer_stash') AND key = ?`,
-		deviceID,
-	); err != nil {
-		return fmt.Errorf("store.DeletePeer: kv cleanup: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store.DeletePeer: commit: %w", err)
@@ -455,10 +463,32 @@ func (s *Store) DeletePeer(ctx context.Context, deviceID string) error {
 func scanPeerRow(r rowScanner) (*PeerRecord, error) {
 	var rec PeerRecord
 	if err := r.Scan(
-		&rec.DeviceID, &rec.Name, &rec.URL,
+		&rec.DeviceID, &rec.Name, &rec.URL, &rec.NodeKey,
 		&rec.LastSeen, &rec.Status,
 	); err != nil {
 		return nil, err
 	}
 	return &rec, nil
+}
+
+// GetPeerByNodeKey returns the registry row whose node_key column matches
+// `nodeKey`. Used by the tsnet identity middleware to translate the
+// WhoIs-resolved NodeKey into a Principal.PeerID. Empty nodeKey is
+// rejected so a row with a NULL/empty column can never match a caller
+// that failed WhoIs resolution.
+func (s *Store) GetPeerByNodeKey(ctx context.Context, nodeKey string) (*PeerRecord, error) {
+	if nodeKey == "" {
+		return nil, ErrNotFound
+	}
+	const q = `
+SELECT device_id, name, url, COALESCE(node_key, ''),
+       COALESCE(last_seen,0), status
+  FROM peer_registry
+ WHERE node_key = ?
+ LIMIT 1`
+	rec, err := scanPeerRow(s.db.QueryRowContext(ctx, q, nodeKey))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return rec, err
 }

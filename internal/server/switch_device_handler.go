@@ -950,9 +950,6 @@ func (s *Server) dispatchPeerAgentSyncPhase2(ctx context.Context, targetAddr, ta
 		return fmt.Errorf("build phase-2 request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, targetDeviceID); err != nil {
-		return fmt.Errorf("sign phase-2 request: %w", err)
-	}
 	client := peer.NoKeepAliveHTTPClient(switchDeviceOpTimeout)
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1077,9 +1074,6 @@ func (s *Server) dispatchPeerPull(ctx context.Context, targetAddr, targetDeviceI
 		return nil, fmt.Errorf("build pull request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, targetDeviceID); err != nil {
-		return nil, fmt.Errorf("sign pull request: %w", err)
-	}
 
 	// One-shot HTTP client with a generous timeout — the body is
 	// just the result manifest, but the target loops blob GETs
@@ -1286,9 +1280,6 @@ func (s *Server) dispatchPeerAgentSyncState(ctx context.Context, targetAddr, tar
 		return nil, fmt.Errorf("build state request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, targetDeviceID); err != nil {
-		return nil, fmt.Errorf("sign state request: %w", err)
-	}
 	client := peer.NoKeepAliveHTTPClient(handoffOpTimeout)
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1359,9 +1350,6 @@ func (s *Server) dispatchPeerAgentSync(ctx context.Context, targetAddr, targetDe
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Content-Encoding", "gzip")
-	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, targetDeviceID); err != nil {
-		return fmt.Errorf("sign sync request: %w", err)
-	}
 
 	client := peer.NoKeepAliveHTTPClient(switchDeviceOpTimeout)
 	resp, err := client.Do(req)

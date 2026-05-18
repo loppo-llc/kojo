@@ -190,12 +190,6 @@ func (s *Server) proxyToHolderPeer(w http.ResponseWriter, r *http.Request, agent
 		}
 	}
 
-	// Attach the Bearer that pairs this Hub with the holder peer.
-	if err := peer.AuthorizeOutbound(proxyReq.Context(), s.agents.Store(), proxyReq, holderDeviceID); err != nil {
-		writeError(w, http.StatusInternalServerError, "authorize", err.Error())
-		return
-	}
-
 	// No HTTP client timeout: avatar uploads can be 128 MiB and
 	// raw fetches stream arbitrary body sizes. The request
 	// context cancels the dispatch when the caller disconnects.

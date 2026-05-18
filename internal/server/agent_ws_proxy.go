@@ -134,12 +134,6 @@ func (s *Server) proxyAgentWebSocket(w http.ResponseWriter, r *http.Request, age
 			"build upgrade request: "+err.Error())
 		return
 	}
-	if err := peer.AuthorizeOutbound(r.Context(), s.agents.Store(), upgrade, targetDeviceID); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal",
-			"authorize upgrade: "+err.Error())
-		return
-	}
-
 	// Dial the target's WS FIRST so a target-side reject (lock
 	// has rotated again, target down, etc.) surfaces as a clean
 	// HTTP error before we've upgraded the inbound conn.

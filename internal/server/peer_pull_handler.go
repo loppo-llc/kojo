@@ -168,14 +168,12 @@ func (s *Server) handlePeerPull(w http.ResponseWriter, r *http.Request) {
 
 	// Hub-relay decision (docs/peer-simplify-plan.md Codex P1-2):
 	// when the source is NOT the orchestrator (signer != source),
-	// we lack a direct peer↔peer Bearer to source and MUST route
-	// through the orchestrator. Owner-driven pulls (drill mode)
-	// leave p.PeerID empty and skip relay; for them AuthorizeOutbound
-	// returns ErrNoOutboundBearer and the operator sees a clear
-	// failure. For RolePeer signers, relay construction failure
-	// fails closed with 503 — silently falling back to direct
-	// would just produce the same ErrNoOutboundBearer error per
-	// item and surface as an opaque batch failure.
+	// we route through the orchestrator so the source recognises
+	// the caller via tsnet WhoIs. Owner-driven pulls (drill mode)
+	// leave p.PeerID empty and skip relay. For RolePeer signers,
+	// relay construction failure fails closed with 503 — silently
+	// falling back to direct would surface as an opaque batch
+	// failure.
 	var relayVia *peer.PullSource
 	if p.IsPeer() && p.PeerID != req.SourceDeviceID {
 		relayRec, relayErr := s.agents.Store().GetPeer(r.Context(), p.PeerID)

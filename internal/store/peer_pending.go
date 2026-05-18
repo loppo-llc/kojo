@@ -10,32 +10,30 @@ import (
 // PeerPendingRecord mirrors one row of `peer_pending` — a peer that
 // has called Hub's POST /api/v1/peers/join-request but is still
 // awaiting Owner approval. Approve moves the row into
-// `peer_registry` (trusted=true) and drops the pending row. Reject
-// drops it only (peer is free to re-request).
+// `peer_registry` and drops the pending row. Reject drops it only
+// (peer is free to re-request).
 //
-// first_seen / last_seen are unix millis. JoinSecretHash is the
-// sha256 of the per-join secret the Hub returned to the original
-// requester on first contact; the raw secret never lands in the
-// DB (Codex review hardening).
+// first_seen / last_seen are unix millis. NodeKey is the Tailscale
+// stable NodeKey of the requesting peer, observed by the Hub via
+// LocalClient.WhoIs on the inbound HTTP request — the peer never
+// sends it. The handler refuses a repeat /join-request whose
+// device_id binds to a different NodeKey than the one originally
+// recorded (the operator must explicitly delete the stale row to
+// rotate identity).
 type PeerPendingRecord struct {
-	DeviceID       string
-	Name           string
-	URL            string
-	FirstSeen      int64
-	LastSeen       int64
-	JoinSecretHash string
+	DeviceID  string
+	Name      string
+	URL       string
+	NodeKey   string
+	FirstSeen int64
+	LastSeen  int64
 }
 
-// UpsertPeerPending is used only by AUTHENTICATED join-request
-// repeats — the handler verifies the caller's join_secret BEFORE
-// calling here, so refreshing name/url/last_seen is safe. The
-// join_secret_hash column is PRESERVED on conflict; this method
-// is NOT a path to claim a new device_id (use
-// InsertPeerPendingIfAbsent for that).
-//
-// Codex review: the previous version exposed unauth name/url
-// overwrites because both fresh-insert and post-conflict-update
-// went through the same SQL. The split removes that footgun.
+// UpsertPeerPending refreshes name/url/last_seen on an existing pending
+// row. node_key is PRESERVED on conflict — only the original NodeKey
+// observed at insert time stays authoritative. A repeat /join-request
+// whose WhoIs-resolved NodeKey differs from the stored value should
+// be rejected at the handler before reaching here.
 func (s *Store) UpsertPeerPending(ctx context.Context, rec *PeerPendingRecord) (*PeerPendingRecord, error) {
 	if rec == nil {
 		return nil, errors.New("store.UpsertPeerPending: nil record")
@@ -54,44 +52,43 @@ func (s *Store) UpsertPeerPending(ctx context.Context, rec *PeerPendingRecord) (
 		now = NowMillis()
 	}
 	const q = `
-INSERT INTO peer_pending (device_id, name, url, first_seen, last_seen, join_secret_hash)
+INSERT INTO peer_pending (device_id, name, url, first_seen, last_seen, node_key)
 VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(device_id) DO UPDATE SET
   name      = excluded.name,
   url       = excluded.url,
   last_seen = excluded.last_seen
-  -- join_secret_hash PRESERVED on conflict so the first-writer
-  -- retains the binding; later callers can't overwrite it.
-RETURNING first_seen, last_seen, join_secret_hash`
+  -- node_key PRESERVED on conflict: identity binding is set once
+  -- at first insert.
+RETURNING first_seen, last_seen, node_key`
 	var firstSeen, lastSeen int64
-	var hash string
+	var nk string
 	if err := s.db.QueryRowContext(ctx, q,
-		rec.DeviceID, rec.Name, rec.URL, now, now, rec.JoinSecretHash,
-	).Scan(&firstSeen, &lastSeen, &hash); err != nil {
+		rec.DeviceID, rec.Name, rec.URL, now, now, rec.NodeKey,
+	).Scan(&firstSeen, &lastSeen, &nk); err != nil {
 		return nil, fmt.Errorf("store.UpsertPeerPending: %w", err)
 	}
 	return &PeerPendingRecord{
-		DeviceID:       rec.DeviceID,
-		Name:           rec.Name,
-		URL:            rec.URL,
-		FirstSeen:      firstSeen,
-		LastSeen:       lastSeen,
-		JoinSecretHash: hash,
+		DeviceID:  rec.DeviceID,
+		Name:      rec.Name,
+		URL:       rec.URL,
+		NodeKey:   nk,
+		FirstSeen: firstSeen,
+		LastSeen:  lastSeen,
 	}, nil
 }
 
 // InsertPeerPendingIfAbsent tries to insert a fresh pending row.
 // Returns (inserted=true, …) when the row landed; (inserted=false,
 // …) when a row already exists for that device_id and the existing
-// state is returned untouched (no metadata overwrite, no
-// join_secret_hash overwrite).
+// state is returned untouched (no metadata overwrite, no node_key
+// overwrite).
 //
-// This is the UNAUTHENTICATED entry point: the FIRST /join-request
-// POST for a fresh device_id calls here. A concurrent first-time
-// POST race is serialised by SQLite at the row level; one caller
-// wins as the inserter, the other receives inserted=false and is
-// rejected unless it can prove ownership via Authorization: Bearer
-// against the stored join_secret_hash (Codex review hardening).
+// The handler is expected to use this on first contact. A concurrent
+// race is serialised by SQLite at the row level; one caller wins as
+// the inserter, the other receives inserted=false and is told to
+// take the repeat path (which the handler gates on NodeKey
+// equality before calling UpsertPeerPending).
 func (s *Store) InsertPeerPendingIfAbsent(ctx context.Context, rec *PeerPendingRecord) (*PeerPendingRecord, bool, error) {
 	if rec == nil {
 		return nil, false, errors.New("store.InsertPeerPendingIfAbsent: nil record")
@@ -109,16 +106,11 @@ func (s *Store) InsertPeerPendingIfAbsent(ctx context.Context, rec *PeerPendingR
 	if now == 0 {
 		now = NowMillis()
 	}
-	// INSERT ... ON CONFLICT DO NOTHING returns 0 rows on conflict;
-	// the second SELECT then surfaces whichever state landed. Both
-	// statements run on the same connection so RETURNING wouldn't
-	// help (DO NOTHING + RETURNING combinations are still touchy on
-	// older SQLite; the explicit two-statement form is unambiguous).
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO peer_pending (device_id, name, url, first_seen, last_seen, join_secret_hash)
+		`INSERT INTO peer_pending (device_id, name, url, first_seen, last_seen, node_key)
 		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(device_id) DO NOTHING`,
-		rec.DeviceID, rec.Name, rec.URL, now, now, rec.JoinSecretHash,
+		rec.DeviceID, rec.Name, rec.URL, now, now, rec.NodeKey,
 	)
 	if err != nil {
 		return nil, false, fmt.Errorf("store.InsertPeerPendingIfAbsent: insert: %w", err)
@@ -133,9 +125,27 @@ func (s *Store) InsertPeerPendingIfAbsent(ctx context.Context, rec *PeerPendingR
 
 // GetPeerPending returns the row keyed by device_id or ErrNotFound.
 func (s *Store) GetPeerPending(ctx context.Context, deviceID string) (*PeerPendingRecord, error) {
-	const q = `SELECT device_id, name, url, first_seen, last_seen, join_secret_hash
+	const q = `SELECT device_id, name, url, first_seen, last_seen, node_key
                  FROM peer_pending WHERE device_id = ?`
 	rec, err := scanPeerPendingRow(s.db.QueryRowContext(ctx, q, deviceID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return rec, err
+}
+
+// GetPeerPendingByNodeKey returns the pending row whose node_key
+// column matches `nodeKey`. Used by the join-request handler to detect
+// a repeat POST from the same Tailscale node arriving against a
+// different device_id (= NodeKey collision; handler rejects with
+// 409 so the operator can clean up the old row).
+func (s *Store) GetPeerPendingByNodeKey(ctx context.Context, nodeKey string) (*PeerPendingRecord, error) {
+	if nodeKey == "" {
+		return nil, ErrNotFound
+	}
+	const q = `SELECT device_id, name, url, first_seen, last_seen, node_key
+                 FROM peer_pending WHERE node_key = ? LIMIT 1`
+	rec, err := scanPeerPendingRow(s.db.QueryRowContext(ctx, q, nodeKey))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -145,7 +155,7 @@ func (s *Store) GetPeerPending(ctx context.Context, deviceID string) (*PeerPendi
 // ListPeerPending returns every pending row ordered by last_seen DESC
 // then device_id ASC.
 func (s *Store) ListPeerPending(ctx context.Context) ([]*PeerPendingRecord, error) {
-	const q = `SELECT device_id, name, url, first_seen, last_seen, join_secret_hash
+	const q = `SELECT device_id, name, url, first_seen, last_seen, node_key
                  FROM peer_pending
                 ORDER BY last_seen DESC, device_id ASC`
 	rows, err := s.db.QueryContext(ctx, q)
@@ -180,72 +190,71 @@ func (s *Store) DeletePeerPending(ctx context.Context, deviceID string) error {
 }
 
 // ApprovePeerPending promotes the pending row keyed by device_id into
-// peer_registry (trusted=true) and removes the pending row in one
-// transaction. Returns ErrNotFound when no pending row matches.
-//
-// The second return value is the pending row's join_secret_hash —
-// the caller carries it into the pairing stash so the peer's
-// join_secret continues to authenticate /join-request polls after
-// the pending row is gone (Codex review hardening).
-func (s *Store) ApprovePeerPending(ctx context.Context, deviceID string) (*PeerRecord, string, error) {
+// peer_registry (carrying NodeKey across) and removes the pending row
+// in one transaction. Returns ErrNotFound when no pending row matches.
+func (s *Store) ApprovePeerPending(ctx context.Context, deviceID string) (*PeerRecord, error) {
 	if deviceID == "" {
-		return nil, "", errors.New("store.ApprovePeerPending: device_id required")
+		return nil, errors.New("store.ApprovePeerPending: device_id required")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("store.ApprovePeerPending: begin: %w", err)
+		return nil, fmt.Errorf("store.ApprovePeerPending: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	pending, err := scanPeerPendingRow(tx.QueryRowContext(ctx,
-		`SELECT device_id, name, url, first_seen, last_seen, join_secret_hash
+		`SELECT device_id, name, url, first_seen, last_seen, node_key
 		   FROM peer_pending WHERE device_id = ?`, deviceID))
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, "", ErrNotFound
+		return nil, ErrNotFound
 	}
 	if err != nil {
-		return nil, "", fmt.Errorf("store.ApprovePeerPending: select pending: %w", err)
+		return nil, fmt.Errorf("store.ApprovePeerPending: select pending: %w", err)
 	}
 
 	// Upsert into peer_registry. Insert when fresh, refresh
-	// name/url on conflict. With the trusted column gone, Bearer
-	// existence IS the trust signal.
+	// name/url/node_key on conflict. NodeKey carries the
+	// identity binding established at pending-insert time.
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO peer_registry (device_id, name, url, last_seen, status)
-VALUES (?, ?, ?, NULL, ?)
+INSERT INTO peer_registry (device_id, name, url, node_key, last_seen, status)
+VALUES (?, ?, ?, ?, NULL, ?)
 ON CONFLICT(device_id) DO UPDATE SET
-  name = excluded.name,
-  url  = excluded.url`,
+  name     = excluded.name,
+  url      = excluded.url,
+  node_key = CASE WHEN excluded.node_key IS NULL OR excluded.node_key = ''
+                  THEN peer_registry.node_key
+                  ELSE excluded.node_key END`,
 		pending.DeviceID, pending.Name, pending.URL,
+		nullableText(pending.NodeKey),
 		PeerStatusOffline,
 	); err != nil {
-		return nil, "", fmt.Errorf("store.ApprovePeerPending: upsert registry: %w", err)
+		return nil, fmt.Errorf("store.ApprovePeerPending: upsert registry: %w", err)
 	}
 
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM peer_pending WHERE device_id = ?`, deviceID,
 	); err != nil {
-		return nil, "", fmt.Errorf("store.ApprovePeerPending: delete pending: %w", err)
+		return nil, fmt.Errorf("store.ApprovePeerPending: delete pending: %w", err)
 	}
 
 	rec, err := scanPeerRow(tx.QueryRowContext(ctx, `
-SELECT device_id, name, url,
+SELECT device_id, name, url, COALESCE(node_key,''),
        COALESCE(last_seen,0), status
   FROM peer_registry WHERE device_id = ?`, deviceID))
 	if err != nil {
-		return nil, "", fmt.Errorf("store.ApprovePeerPending: re-read: %w", err)
+		return nil, fmt.Errorf("store.ApprovePeerPending: re-read: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, "", fmt.Errorf("store.ApprovePeerPending: commit: %w", err)
+		return nil, fmt.Errorf("store.ApprovePeerPending: commit: %w", err)
 	}
-	return rec, pending.JoinSecretHash, nil
+	return rec, nil
 }
 
 func scanPeerPendingRow(r rowScanner) (*PeerPendingRecord, error) {
 	var rec PeerPendingRecord
 	if err := r.Scan(
 		&rec.DeviceID, &rec.Name, &rec.URL,
-		&rec.FirstSeen, &rec.LastSeen, &rec.JoinSecretHash,
+		&rec.FirstSeen, &rec.LastSeen, &rec.NodeKey,
 	); err != nil {
 		return nil, err
 	}

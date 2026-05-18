@@ -212,14 +212,12 @@ func (c *PullClient) PullOne(ctx context.Context, src PullSource, item PullItem,
 	// strips the query and re-issues the upstream GET with its own
 	// Hub→source Bearer.
 	dialBase := src.Address
-	authTarget := src.DeviceID
 	relayFrom := ""
 	if src.RelayVia != nil {
 		if src.RelayVia.Address == "" || src.RelayVia.DeviceID == "" {
 			return res, errors.New("peer.PullClient: RelayVia missing Address or DeviceID")
 		}
 		dialBase = src.RelayVia.Address
-		authTarget = src.RelayVia.DeviceID
 		relayFrom = src.DeviceID
 	}
 	reqURL, err := buildPeerBlobURL(dialBase, item.URI)
@@ -232,14 +230,12 @@ func (c *PullClient) PullOne(ctx context.Context, src PullSource, item PullItem,
 		reqURL += "?relay_from=" + url.QueryEscape(relayFrom)
 	}
 
+	// No Authorization header. Identity travels via tsnet WhoIs on
+	// the receiving side (docs/peer-tsnet-identity.md).
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return res, fmt.Errorf("peer.PullOne: new request: %w", err)
 	}
-	if err := AuthorizeOutbound(ctx, c.store, req, authTarget); err != nil {
-		return res, fmt.Errorf("peer.PullOne: authorize: %w", err)
-	}
-
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return res, fmt.Errorf("peer.PullOne: do: %w", err)
