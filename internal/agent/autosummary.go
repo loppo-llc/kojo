@@ -68,8 +68,9 @@ const (
 	// transcriptMaxBytes caps how much of a session JSONL we'll read.
 	// Bounds memory + DoS exposure on the (now-validated) transcript
 	// path coming from the PreCompact hook. Generous compared to
-	// sessionTailReadBytes because PreCompactSummarize uses bufio.Scanner
-	// streaming, not a slurp.
+	// sessionTailReadBytes because PreCompactSummarize streams the file
+	// line-by-line via chathistory.ScanJSONLLines (per-line cap
+	// MaxJSONLLineBytes, no full-file slurp).
 	transcriptMaxBytes = 256 * 1024 * 1024
 )
 

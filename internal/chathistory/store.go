@@ -12,13 +12,16 @@ import (
 )
 
 // MaxJSONLLineBytes caps the size of a single JSONL line read by LoadHistory,
-// LastMessage, LastPlatformTS, and autosummary.loadSessionMessages.
-// bufio.Reader.ReadBytes('\n') will grow its internal buffer until a newline
-// appears, so a corrupted/extremely-long line could otherwise allocate
-// arbitrarily large amounts of memory. 10 MiB is far above realistic message
-// payloads (a Slack message is < 40 KiB, a Claude transcript turn rarely
-// exceeds 1 MiB), but small enough that hitting it almost certainly indicates
-// corruption or attack.
+// LastMessage, LastPlatformTS, and autosummary.loadSessionMessages — all of
+// which go through ScanJSONLLines below. Without a cap the per-line
+// accumulator buffer (filled across repeated ReadSlice+ErrBufferFull chunks
+// when a line exceeds bufio's default buffer) could grow without bound, so a
+// corrupted/adversarial extremely-long line could allocate arbitrarily large
+// amounts of memory. 10 MiB is far above realistic message payloads (a Slack
+// message is < 40 KiB, a Claude transcript turn rarely exceeds 1 MiB), but
+// small enough that hitting it almost certainly indicates corruption or
+// attack. ScanJSONLLines surfaces ErrLineTooLarge once accumulated bytes
+// would cross this threshold and stops reading.
 const MaxJSONLLineBytes = 10 << 20
 
 // ErrLineTooLarge is returned by ScanJSONLLines when a single line exceeds
