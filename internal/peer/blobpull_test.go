@@ -80,7 +80,7 @@ func TestPullOne_HappyPath(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	client := NewPullClient(id, nil, nil)
+	client := NewPullClient(id, nil, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	uri := "kojo://global/agents/ag_x/transcript"
@@ -120,7 +120,7 @@ func TestPullOne_SHA256Mismatch(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	client := NewPullClient(id, nil, nil)
+	client := NewPullClient(id, nil, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	// No orchestrator-supplied digest: only the response header
@@ -150,7 +150,7 @@ func TestPullOne_HTTPNon200(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	client := NewPullClient(id, nil, nil)
+	client := NewPullClient(id, nil, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	res, err := client.PullOne(context.Background(),
@@ -176,7 +176,7 @@ func TestPullOne_MissingSHAHeader(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	client := NewPullClient(id, nil, nil)
+	client := NewPullClient(id, nil, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	// Pass an empty ExpectedSHA256 so the helper has nothing to
@@ -206,7 +206,7 @@ func TestPullOne_OrchestratorDigestOverridesHeader(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	client := NewPullClient(id, nil, nil)
+	client := NewPullClient(id, nil, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	res, err := client.PullOne(context.Background(),
@@ -235,7 +235,7 @@ func TestPullMany_StopsOnLocalFatal(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	client := NewPullClient(id, nil, nil)
+	client := NewPullClient(id, nil, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/loppo-llc/kojo/internal/blob"
+	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // kojo-attach hub forwarding.
@@ -56,14 +57,21 @@ type PushTarget struct {
 // transport disables keep-alives so each PushOne opens a fresh
 // TCP/TLS connection — same reasoning as PullClient.
 type PushClient struct {
-	identity   *Identity
+	identity *Identity
+	// store carries the dual-stack Bearer lookup for the kojo-attach
+	// hub-forwarding leg (docs/peer-simplify-plan.md step 7). When a
+	// Hub-paired Bearer is present AuthorizeOutbound uses it;
+	// otherwise SignRequest still runs so the legacy path keeps the
+	// blob ingest unblocked until a follow-up capability-URL flow
+	// lands.
+	store      *store.Store
 	httpClient *http.Client
 	logger     *slog.Logger
 }
 
 // NewPushClient wires the client. Pass nil for httpClient to use
 // a no-keep-alive default; tests can inject a fixture client.
-func NewPushClient(id *Identity, httpClient *http.Client, logger *slog.Logger) *PushClient {
+func NewPushClient(id *Identity, st *store.Store, httpClient *http.Client, logger *slog.Logger) *PushClient {
 	if httpClient == nil {
 		httpClient = &http.Client{
 			Transport: noKeepAliveTransport(),
@@ -72,7 +80,7 @@ func NewPushClient(id *Identity, httpClient *http.Client, logger *slog.Logger) *
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &PushClient{identity: id, httpClient: httpClient, logger: logger}
+	return &PushClient{identity: id, store: st, httpClient: httpClient, logger: logger}
 }
 
 // PushOne uploads body to dst's ingest endpoint as (scope, path).
@@ -131,8 +139,10 @@ func (c *PushClient) PushOne(
 	if err != nil {
 		return fmt.Errorf("peer.PushOne: nonce: %w", err)
 	}
-	if err := SignRequest(req, c.identity.DeviceID, c.identity.PrivateKey, nonce, dst.DeviceID); err != nil {
-		return fmt.Errorf("peer.PushOne: sign: %w", err)
+	// Bearer first when paired (step 7 dual-stack); SignRequest is
+	// the fallback. See PushClient.store doc for the migration story.
+	if err := AuthorizeOutbound(ctx, c.store, req, c.identity, dst.DeviceID, nonce); err != nil {
+		return fmt.Errorf("peer.PushOne: authorize: %w", err)
 	}
 
 	resp, err := c.httpClient.Do(req)

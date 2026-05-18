@@ -204,7 +204,7 @@ func (s *Server) handlePeerPull(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	client := peer.NewPullClient(s.peerID, nil, s.logger)
+	client := peer.NewPullClient(s.peerID, s.agents.Store(), nil, s.logger)
 	src := peer.PullSource{DeviceID: req.SourceDeviceID, Address: srcAddr}
 
 	// No batch timeout: large blob handoffs (multi-GiB) over slow

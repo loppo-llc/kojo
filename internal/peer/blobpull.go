@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/blob"
+	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // docs/multi-device-storage.md §3.7 step 4 — target-side blob pull.
@@ -81,7 +82,15 @@ type PullResult struct {
 // the same signed nonce; see NewPullClient for the full
 // rationale.
 type PullClient struct {
-	identity   *Identity
+	identity *Identity
+	// store is consulted by AuthorizeOutbound during the dual-stack
+	// window (docs/peer-simplify-plan.md step 7): when a Bearer for
+	// the source peer is present it's used for the GET, otherwise
+	// the legacy SignRequest path runs. peer↔peer Bearers do NOT
+	// exist after the simplification's first wave (Hub mints only
+	// Hub↔peer pairs), so this fallback is the load-bearing branch
+	// until a follow-up capability-URL flow lands.
+	store      *store.Store
 	httpClient *http.Client
 	logger     *slog.Logger
 }
@@ -100,7 +109,7 @@ type PullClient struct {
 // the stale-conn retry path never fires. Cost: a few extra
 // handshakes per switch — negligible against the blob payload
 // sizes — vs the 401 that aborts the whole switch.
-func NewPullClient(id *Identity, httpClient *http.Client, logger *slog.Logger) *PullClient {
+func NewPullClient(id *Identity, st *store.Store, httpClient *http.Client, logger *slog.Logger) *PullClient {
 	if httpClient == nil {
 		// No per-blob HTTP ceiling: a multi-GiB blob over a slow
 		// Tailscale link easily exceeds any fixed timeout, and the
@@ -113,7 +122,7 @@ func NewPullClient(id *Identity, httpClient *http.Client, logger *slog.Logger) *
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &PullClient{identity: id, httpClient: httpClient, logger: logger}
+	return &PullClient{identity: id, store: st, httpClient: httpClient, logger: logger}
 }
 
 // noKeepAliveTransport returns an http.Transport with idle-
@@ -204,8 +213,12 @@ func (c *PullClient) PullOne(ctx context.Context, src PullSource, item PullItem,
 	if err != nil {
 		return res, fmt.Errorf("peer.PullOne: nonce: %w", err)
 	}
-	if err := SignRequest(req, c.identity.DeviceID, c.identity.PrivateKey, nonce, src.DeviceID); err != nil {
-		return res, fmt.Errorf("peer.PullOne: sign: %w", err)
+	// Bearer first when paired (step 7 dual-stack); SignRequest is
+	// the fallback for the peer↔peer leg where no Bearer exists yet.
+	// Once a follow-up adds Hub-issued blob capabilities, swap this
+	// for a capability presentation and drop the sign branch.
+	if err := AuthorizeOutbound(ctx, c.store, req, c.identity, src.DeviceID, nonce); err != nil {
+		return res, fmt.Errorf("peer.PullOne: authorize: %w", err)
 	}
 
 	resp, err := c.httpClient.Do(req)
