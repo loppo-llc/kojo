@@ -163,13 +163,6 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			// successful complete; drop rolls back on abort.
 			return true
 		}
-		if method == http.MethodPost && path == "/api/v1/peers/register-push" {
-			// Hub fan-out of its own self-row to a paired peer so
-			// the peer's registry learns the Hub's url/name. The
-			// handler enforces signer == req.DeviceID, so even a
-			// leaked peer signing key can only update its own row.
-			return true
-		}
 		if method == http.MethodPost && path == "/api/v1/peers/agent-sync/state" {
 			// Incremental device-switch preflight (§3.7): source
 			// peer asks target for its high-water marks so the

@@ -574,13 +574,6 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 			mux.HandleFunc("POST /api/v1/peers/pending/{deviceId}/approve", s.handleApprovePeerPending)
 			mux.HandleFunc("POST /api/v1/peers/pending/{deviceId}/reject", s.handleRejectPeerPending)
 		}
-		// Inter-peer registration push (Hub fans out a newly-paired
-		// peer's row to every online peer; receivers RegisterPeerMetadata
-		// the row locally so the cluster's registries converge without
-		// manual --peer-add on every host). Auth: RolePeer (Ed25519
-		// signed). Available on every host so a peer can both receive
-		// and forward the broadcast.
-		mux.HandleFunc("POST /api/v1/peers/register-push", s.handlePeerRegisterPush)
 		// Cross-peer status push (§3.10). Auth: RolePeer (Ed25519-
 		// signed inter-peer request) OR RoleOwner. Wired only when
 		// the bus is supplied — nil leaves the route unregistered

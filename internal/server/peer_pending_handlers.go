@@ -405,7 +405,8 @@ func (s *Server) handleApprovePeerPending(w http.ResponseWriter, r *http.Request
 		s.logger.Warn("approve: bearer mint failed; peer will fall back to signing",
 			"device_id", id, "err", err)
 	}
-	s.broadcastPeerRegistration(rec)
+	// No fan-out broadcast — sibling peers learn about this row when
+	// they next GET /api/v1/peers from the Hub.
 	writeJSONResponse(w, http.StatusOK, s.toPeerResponse(rec))
 }
 
