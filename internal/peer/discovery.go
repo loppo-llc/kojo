@@ -535,6 +535,22 @@ func (d *Discovery) persistPairingBearers(ctx context.Context, hubDeviceID, peer
 	if hubDeviceID == "" {
 		return errors.New("hub device_id required to persist bearers")
 	}
+	// Order matters (Codex review). We MUST persist the
+	// Hub→peer hash before treating the Hub's delivery as ACKed:
+	//
+	//   1. StorePeerTokenHash(hubBearer) — peer can authenticate
+	//      incoming Hub calls. If this fails we bail BEFORE
+	//      clearing the join_secret so the operator's next
+	//      re-approve can redeliver.
+	//   2. PutKV(OutBearerNS, peerBearer) — peer can call Hub.
+	//   3. clearJoinSecret — only after the permanent pair is
+	//      fully landed.
+	if hubBearer != "" {
+		hash := store.HashPeerToken(hubBearer)
+		if err := d.store.StorePeerTokenHash(ctx, hubDeviceID, store.PeerTokenRoleHubToPeer, hash); err != nil {
+			return fmt.Errorf("stash hub→peer hash: %w", err)
+		}
+	}
 	if peerBearer != "" {
 		rec := &store.KVRecord{
 			Namespace: OutBearerNS,
@@ -546,16 +562,10 @@ func (d *Discovery) persistPairingBearers(ctx context.Context, hubDeviceID, peer
 		if _, err := d.store.PutKV(ctx, rec, store.KVPutOptions{}); err != nil {
 			return fmt.Errorf("persist peer→hub bearer: %w", err)
 		}
-		// Permanent Bearer in hand — the per-join secret is no
-		// longer needed (and a stale row would mislead a future
-		// re-pair attempt).
+		// Both halves of the permanent pair are now in place —
+		// the per-join secret has done its job and a stale row
+		// would mislead a future re-pair attempt.
 		d.clearJoinSecret(ctx)
-	}
-	if hubBearer != "" {
-		hash := store.HashPeerToken(hubBearer)
-		if err := d.store.StorePeerTokenHash(ctx, hubDeviceID, store.PeerTokenRoleHubToPeer, hash); err != nil {
-			return fmt.Errorf("stash hub→peer hash: %w", err)
-		}
 	}
 	return nil
 }

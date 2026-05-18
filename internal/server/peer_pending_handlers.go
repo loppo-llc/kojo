@@ -212,15 +212,18 @@ func (s *Server) handleJoinRequestPoll(w http.ResponseWriter, r *http.Request) {
 	if rec, err := st.GetPeer(r.Context(), id); err == nil && rec.Trusted {
 		hub := s.buildHubInfoResponse(r.Context())
 		resp := joinRequestResponse{State: "approved", Hub: hub}
-		if s.callerHoldsJoinIdentity(r.Context(), id, r) {
-			s.attachPairingBearers(r.Context(), id, &resp)
-		}
-		// ACK-based consumption (Codex review): clear the delivery
-		// stash + join_secret ONLY when the peer presents its
-		// permanent peer→Hub Bearer. A dropped first-delivery
-		// response leaves the stash intact for the peer to re-poll.
+		// ACK check FIRST. If the peer presents its permanent
+		// peer→Hub Bearer, the previous delivery landed — consume
+		// the stash and return state+hub without re-minting
+		// (re-minting now would revoke the very token the peer
+		// just authenticated with, an infinite remint/revoke loop
+		// flagged by Codex critical).
 		if s.callerHoldsPeerBearer(r, id) {
 			s.consumePairingStashOnAck(r.Context(), id)
+		} else if s.callerHoldsJoinIdentity(r.Context(), id, r) {
+			// Peer is still on the join_secret credential → attach
+			// + (re-)mint a fresh peer→Hub Bearer for delivery.
+			s.attachPairingBearers(r.Context(), id, &resp)
 		}
 		writeJSONResponse(w, http.StatusOK, resp)
 		return
@@ -292,9 +295,13 @@ func (s *Server) processJoinRequest(w http.ResponseWriter, r *http.Request, req 
 		_ = st.TouchPeer(r.Context(), req.DeviceID, store.PeerStatusOnline, 0)
 		hub := s.buildHubInfoResponse(r.Context())
 		resp := joinRequestResponse{State: "approved", Hub: hub}
-		s.attachPairingBearers(r.Context(), req.DeviceID, &resp)
+		// ACK first — see handleJoinRequestPoll for the loop
+		// rationale; only mint when the caller is still on the
+		// join_secret credential.
 		if s.callerHoldsPeerBearer(r, req.DeviceID) {
 			s.consumePairingStashOnAck(r.Context(), req.DeviceID)
+		} else {
+			s.attachPairingBearers(r.Context(), req.DeviceID, &resp)
 		}
 		writeJSONResponse(w, http.StatusOK, resp)
 		return
