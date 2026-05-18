@@ -22,7 +22,7 @@ func openStoreWithPeer(t *testing.T, deviceID string, trusted bool) *store.Store
 		DeviceID:  deviceID,
 		Name:      "test-peer",
 		URL:       "http://example:8080",
-		PublicKey: "fake-pubkey-base64==",
+		
 		Trusted:   trusted,
 	}
 	if _, err := st.RegisterPeerMetadata(context.Background(), rec); err != nil {

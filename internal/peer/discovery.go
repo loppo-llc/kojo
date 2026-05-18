@@ -284,9 +284,6 @@ func (d *Discovery) fetchHubInfo(ctx context.Context, hubURL string) (*HubInfo, 
 	if err := ValidateName(info.Name); err != nil {
 		return nil, fmt.Errorf("hub name: %w", err)
 	}
-	if err := ValidatePublicKey(info.PublicKey); err != nil {
-		return nil, fmt.Errorf("hub publicKey: %w", err)
-	}
 	return &info, nil
 }
 
@@ -294,12 +291,11 @@ func (d *Discovery) fetchHubInfo(ctx context.Context, hubURL string) (*HubInfo, 
 // trusted=true. If URL is empty (Hub hasn't bound its listener yet),
 // fall back to the dialing URL we already used to fetch hub-info.
 //
-// RegisterPeerMetadata preserves public_key on conflict (identity
-// immutability — see store/peer_registry.go). If the Hub returned a
-// key that disagrees with the stored row, the silent preserve would
-// leave us trusting the OLD key while talking to the NEW Hub; refuse
-// loudly so the operator notices and runs `kojo --peer-remove <hub>`
-// to re-pair.
+// With Ed25519 signing retired (docs/peer-simplify-plan.md step 9),
+// there is no per-peer public_key to compare; identity is rooted in
+// the Hub's TLS certificate (or, on a Tailscale tailnet, the
+// WireGuard node fingerprint) and in the Bearer pair delivered by
+// the approve flow.
 func (d *Discovery) upsertHubIntoRegistry(ctx context.Context, hub *HubInfo, fallbackURL string) error {
 	if hub == nil {
 		return errors.New("nil hub")
@@ -311,28 +307,17 @@ func (d *Discovery) upsertHubIntoRegistry(ctx context.Context, hub *HubInfo, fal
 	if !IsDialAddress(rowURL) {
 		return fmt.Errorf("hub URL not dialable: %q", rowURL)
 	}
-	// Check existing row's public_key BEFORE writing — RegisterPeerMetadata
-	// preserves public_key on conflict but updates name/url, so calling it
-	// first then comparing would already have written the new dial URL
-	// against a row we no longer trust to be the same identity.
-	if existing, err := d.store.GetPeer(ctx, hub.DeviceID); err == nil && existing != nil {
-		if existing.PublicKey != "" && existing.PublicKey != hub.PublicKey {
-			return fmt.Errorf("hub public_key mismatch: stored row has a different key (deviceId=%s); operator must run `kojo --peer-remove %s` to re-pair", hub.DeviceID, hub.DeviceID)
-		}
-	}
 	rec, err := d.store.RegisterPeerMetadata(ctx, &store.PeerRecord{
-		DeviceID:  hub.DeviceID,
-		Name:      hub.Name,
-		URL:       rowURL,
-		PublicKey: hub.PublicKey,
+		DeviceID: hub.DeviceID,
+		Name:     hub.Name,
+		URL:      rowURL,
 	})
 	if err != nil {
 		return err
 	}
 	// trusted=true unconditionally — operator opted in by running
-	// `kojo --peer`, the Hub it auto-discovered must be admitted on
-	// the privileged surface for register-push / session-proxy /
-	// agent-sync to land.
+	// `kojo --peer`; the Hub it auto-discovered must be admitted on
+	// the privileged surface for session-proxy / agent-sync to land.
 	if rec == nil || !rec.Trusted {
 		if err := d.store.UpdatePeerTrust(ctx, hub.DeviceID, true); err != nil {
 			return fmt.Errorf("trust apply: %w", err)
@@ -345,10 +330,9 @@ func (d *Discovery) upsertHubIntoRegistry(ctx context.Context, hub *HubInfo, fal
 // response.
 func (d *Discovery) postJoinRequest(ctx context.Context, hubURL string) (*JoinResponse, error) {
 	body, err := json.Marshal(map[string]string{
-		"deviceId":  d.identity.DeviceID,
-		"name":      d.identity.Name,
-		"url":       d.cfg.PeerPublicURL,
-		"publicKey": d.identity.PublicKeyBase64(),
+		"deviceId": d.identity.DeviceID,
+		"name":     d.identity.Name,
+		"url":      d.cfg.PeerPublicURL,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal: %w", err)

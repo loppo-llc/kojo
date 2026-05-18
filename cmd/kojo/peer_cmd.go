@@ -160,14 +160,15 @@ func relativeTime(deltaMillis int64) string {
 // the local binary can address it by device_id. Format of the spec
 // argument:
 //
-//	<device_id>|<name>|<url>|<base64-public-key>
+//	<device_id>|<name>|<url>
 //
-// All four components are required. `name` is the human-friendly
+// All three components are required. `name` is the human-friendly
 // device label; `url` is the dial address other peers reach it on
 // (`host:port` for tsnet/HTTPS or `http://host:port` for peer-mode).
-// The public key is the remote peer's Ed25519 public key, base64-
-// encoded — passing a key that doesn't round-trip through base64 →
-// 32 bytes returns an error and the row is NOT inserted.
+// The Ed25519 public_key field that used to live in the fourth slot
+// was retired in docs/peer-simplify-plan.md step 9 — Bearer tokens
+// delivered through the auto-pairing approve flow now carry the
+// identity material.
 //
 // Status defaults to "offline" — the operator only asserted the
 // peer's identity, not its current reachability. The Hub flips it
@@ -181,20 +182,15 @@ func runPeerAddCommand(logger *slog.Logger, configDir, spec string, trusted bool
 	}
 	defer closeFn()
 
-	// Pipe separator (not colon) so <url> can hold a
-	// `host:port` form. The base64 alphabet doesn't include `|`
-	// and peer name validation refuses control chars, so `|`
-	// is safe as a delimiter against every field's contents.
-	parts := strings.SplitN(spec, "|", 4)
-	if len(parts) != 4 || parts[0] == "" || parts[1] == "" || parts[2] == "" || parts[3] == "" {
-		fmt.Fprintf(os.Stderr, "peer-add: spec must be <device_id>|<name>|<url>|<base64-public-key>\n")
+	parts := strings.SplitN(spec, "|", 3)
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		fmt.Fprintf(os.Stderr, "peer-add: spec must be <device_id>|<name>|<url>\n")
 		return 1
 	}
-	deviceID, name, peerURL, pubB64 := parts[0], parts[1], parts[2], parts[3]
+	deviceID, name, peerURL := parts[0], parts[1], parts[2]
 
 	// Shape gates shared with the HTTP handler so a typo doesn't
-	// reach UpsertPeer (which would store a junk row that later
-	// auth attempts surface as `public_key shape invalid` 500s).
+	// reach UpsertPeer.
 	if err := peer.ValidateDeviceID(deviceID); err != nil {
 		fmt.Fprintf(os.Stderr, "peer-add: %v\n", err)
 		return 1
@@ -207,10 +203,6 @@ func runPeerAddCommand(logger *slog.Logger, configDir, spec string, trusted bool
 		fmt.Fprintf(os.Stderr, "peer-add: url must look like host:port or http(s)://host:port (got %q)\n", peerURL)
 		return 1
 	}
-	if err := peer.ValidatePublicKey(pubB64); err != nil {
-		fmt.Fprintf(os.Stderr, "peer-add: %v\n", err)
-		return 1
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -220,11 +212,10 @@ func runPeerAddCommand(logger *slog.Logger, configDir, spec string, trusted bool
 	// (offline, 0) and the operator-visible `peer-list` would
 	// flip the peer offline until the next heartbeat.
 	if _, err := st.RegisterPeerMetadata(ctx, &store.PeerRecord{
-		DeviceID:  deviceID,
-		Name:      name,
-		URL:       peerURL,
-		PublicKey: pubB64,
-		Trusted:   trusted,
+		DeviceID: deviceID,
+		Name:     name,
+		URL:      peerURL,
+		Trusted:  trusted,
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "peer-add: register: %v\n", err)
 		return 1
@@ -346,7 +337,11 @@ func printPairingSpec(id *peer.Identity, peerURL, role string) {
 	if id == nil {
 		return
 	}
-	spec := fmt.Sprintf("%s|%s|%s|%s", id.DeviceID, id.Name, peerURL, id.PublicKeyBase64())
+	// Pairing spec carries only metadata now — the Ed25519 public key
+	// that used to occupy the fourth field was retired in
+	// docs/peer-simplify-plan.md step 9. Bearer tokens replace it via
+	// the auto-pairing flow.
+	spec := fmt.Sprintf("%s|%s|%s", id.DeviceID, id.Name, peerURL)
 	// Hub-side pairing must combine `--peer-add <spec>` with the
 	// bool flag `--peer-add-trusted` so the peer admits the Hub
 	// on the privileged surface (session create, files, git, ...).

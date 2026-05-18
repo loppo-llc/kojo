@@ -42,7 +42,7 @@ func hubFixture(t *testing.T) (string, *Identity, *store.Store) {
 		// public_key is still NOT NULL in the schema; step 10
 		// drops the column once the signing layer is fully out.
 		// Use a placeholder to satisfy the constraint.
-		PublicKey: "deadbeef-placeholder-base64==",
+		
 		Status:    store.PeerStatusOnline,
 		Trusted:   true,
 	}); err != nil {

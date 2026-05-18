@@ -445,7 +445,7 @@ func main() {
 			} else {
 				pendingSyncKEK = kek
 				idCtx, idCancel := context.WithTimeout(context.Background(), 10*time.Second)
-				peerIdentity, err = peer.LoadOrCreate(idCtx, st, kek)
+				peerIdentity, err = peer.LoadOrCreate(idCtx, st)
 				idCancel()
 				if err != nil {
 					logger.Warn("peer identity: load failed; running without peer registry",

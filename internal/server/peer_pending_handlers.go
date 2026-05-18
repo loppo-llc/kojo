@@ -39,25 +39,23 @@ import (
 
 // hubInfoResponse is the wire shape of GET /api/v1/peers/hub-info.
 // The peer writes this into its local peer_registry (trusted=true)
-// before sending the first join-request — that's how Hub becomes a
-// signing-key the peer's PeerAuth middleware trusts.
+// before sending the first join-request so any subsequent Hub→peer
+// signed Bearer can be looked up by device_id.
 //
 // `version` carries the Hub binary's version string so a peer can
 // log a useful mismatch warning if it ever needs to.
 type hubInfoResponse struct {
-	DeviceID  string `json:"deviceId"`
-	Name      string `json:"name"`
-	PublicKey string `json:"publicKey"`
-	URL       string `json:"url"`
-	Version   string `json:"version"`
+	DeviceID string `json:"deviceId"`
+	Name     string `json:"name"`
+	URL      string `json:"url"`
+	Version  string `json:"version"`
 }
 
 // handleHubInfo returns the Hub's identity row + dial URL so a
-// peer can populate its peer_registry before signing its first
+// peer can populate its peer_registry before sending its first
 // join-request. Unauthenticated by design (the peer has no
-// credential yet); the response carries only the public identity
-// material that any tailnet member could otherwise learn by
-// inspecting a signed inter-peer request.
+// credential yet); the response carries only the metadata any
+// tailnet member could otherwise learn by querying the Hub.
 func (s *Server) handleHubInfo(w http.ResponseWriter, r *http.Request) {
 	if s.peerID == nil || s.agents == nil || s.agents.Store() == nil {
 		writeError(w, http.StatusServiceUnavailable, "unavailable",
@@ -71,29 +69,26 @@ func (s *Server) handleHubInfo(w http.ResponseWriter, r *http.Request) {
 		// peer's NormalizeAddress(...) call will refuse and the
 		// peer retries hub-info on its next discovery tick.
 		writeJSONResponse(w, http.StatusOK, hubInfoResponse{
-			DeviceID:  s.peerID.DeviceID,
-			Name:      s.peerID.Name,
-			PublicKey: s.peerID.PublicKeyBase64(),
-			Version:   s.version,
+			DeviceID: s.peerID.DeviceID,
+			Name:     s.peerID.Name,
+			Version:  s.version,
 		})
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, hubInfoResponse{
-		DeviceID:  rec.DeviceID,
-		Name:      rec.Name,
-		PublicKey: rec.PublicKey,
-		URL:       rec.URL,
-		Version:   s.version,
+		DeviceID: rec.DeviceID,
+		Name:     rec.Name,
+		URL:      rec.URL,
+		Version:  s.version,
 	})
 }
 
 // joinRequestBody is the wire shape a peer POSTs to
 // /api/v1/peers/join-request.
 type joinRequestBody struct {
-	DeviceID  string `json:"deviceId"`
-	Name      string `json:"name"`
-	URL       string `json:"url"`
-	PublicKey string `json:"publicKey"`
+	DeviceID string `json:"deviceId"`
+	Name     string `json:"name"`
+	URL      string `json:"url"`
 }
 
 // joinRequestResponse is what the Hub answers. state="approved"
@@ -171,10 +166,6 @@ func (s *Server) handleJoinRequest(w http.ResponseWriter, r *http.Request) {
 			"url must be host:port or http(s)://host:port")
 		return
 	}
-	if err := peer.ValidatePublicKey(req.PublicKey); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
 	if req.DeviceID == s.peerID.DeviceID {
 		writeError(w, http.StatusConflict, "conflict",
 			"deviceId collides with Hub self-row")
@@ -228,15 +219,7 @@ func (s *Server) processJoinRequest(w http.ResponseWriter, r *http.Request, req 
 	existing, err := st.GetPeer(r.Context(), req.DeviceID)
 	switch {
 	case err == nil:
-		// Existing registry row. public_key immutability: a
-		// peer that has rotated keys cannot silently re-pair —
-		// Owner must `kojo --peer-remove` first.
-		if existing.PublicKey != req.PublicKey {
-			writeError(w, http.StatusConflict, "conflict",
-				"public_key disagrees with existing registry row; ask Owner to --peer-remove and re-pair")
-			return
-		}
-		// Trust gate. The auto-onboarding flow's contract is
+		// Existing registry row. Trust gate: the auto-onboarding flow's contract is
 		// "Approve → trusted=true"; an existing untrusted row
 		// means the peer was paired via `--peer-add` (no
 		// --trusted) or had its trust revoked. Either way,
@@ -265,10 +248,9 @@ func (s *Server) processJoinRequest(w http.ResponseWriter, r *http.Request, req 
 	}
 
 	pending := &store.PeerPendingRecord{
-		DeviceID:  req.DeviceID,
-		Name:      req.Name,
-		URL:       req.URL,
-		PublicKey: req.PublicKey,
+		DeviceID: req.DeviceID,
+		Name:     req.Name,
+		URL:      req.URL,
 	}
 	if _, err := st.UpsertPeerPending(r.Context(), pending); err != nil {
 		s.logger.Error("join-request: upsert pending", "device_id", req.DeviceID, "err", err)
@@ -291,17 +273,15 @@ func (s *Server) buildHubInfoResponse(ctx context.Context) *hubInfoResponse {
 	rec, err := s.agents.Store().GetPeer(ctx, s.peerID.DeviceID)
 	if err != nil {
 		return &hubInfoResponse{
-			DeviceID:  s.peerID.DeviceID,
-			Name:      s.peerID.Name,
-			PublicKey: s.peerID.PublicKeyBase64(),
-			Version:   s.version,
+			DeviceID: s.peerID.DeviceID,
+			Name:     s.peerID.Name,
+			Version:  s.version,
 		}
 	}
 	return &hubInfoResponse{
-		DeviceID:  rec.DeviceID,
-		Name:      rec.Name,
-		PublicKey: rec.PublicKey,
-		URL:       rec.URL,
+		DeviceID: rec.DeviceID,
+		Name:     rec.Name,
+		URL:      rec.URL,
 		Version:   s.version,
 	}
 }
@@ -313,7 +293,6 @@ type peerPendingResponse struct {
 	DeviceID  string `json:"deviceId"`
 	Name      string `json:"name"`
 	URL       string `json:"url"`
-	PublicKey string `json:"publicKey"`
 	FirstSeen int64  `json:"firstSeen"`
 	LastSeen  int64  `json:"lastSeen"`
 }
@@ -347,7 +326,6 @@ func (s *Server) handleListPeerPending(w http.ResponseWriter, r *http.Request) {
 			DeviceID:  rec.DeviceID,
 			Name:      rec.Name,
 			URL:       rec.URL,
-			PublicKey: rec.PublicKey,
 			FirstSeen: rec.FirstSeen,
 			LastSeen:  rec.LastSeen,
 		})
@@ -382,11 +360,6 @@ func (s *Server) handleApprovePeerPending(w http.ResponseWriter, r *http.Request
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "not_found",
 				"no pending join request for this deviceId")
-			return
-		}
-		if errors.Is(err, store.ErrPeerPendingPubkeyMismatch) {
-			writeError(w, http.StatusConflict, "conflict",
-				"existing peer_registry row has a different public_key; --peer-remove first")
 			return
 		}
 		s.logger.Error("approve: failed", "device_id", id, "err", err)

@@ -38,12 +38,6 @@ import (
 )
 
 // peerResponse is the wire shape for one peer_registry row.
-//
-// `publicKey` is the base64-standard encoding of the raw 32-byte
-// Ed25519 public key — same wire form as `peer/public_key` in kv.
-// `capabilities` is opaque JSON (forwarded through as a string so
-// the client can json.parse only when it cares); empty means the
-// peer never reported any.
 type peerResponse struct {
 	DeviceID string `json:"deviceId"`
 	// Name is the human-friendly device label (OS hostname by
@@ -52,16 +46,9 @@ type peerResponse struct {
 	// URL is the dial address other peers reach this row on
 	// (`host:port` or `http(s)://host:port`). Empty until the
 	// daemon has bound a listener at least once.
-	URL string `json:"url,omitempty"`
-	// PublicKey / Capabilities are omitempty so the reduced-view
-	// path for RoleAgent (which blanks both) drops the JSON keys
-	// entirely instead of emitting `"publicKey":""` — that would
-	// leak the field's existence to a caller the handler
-	// intentionally hides it from.
-	PublicKey    string `json:"publicKey,omitempty"`
-	Capabilities string `json:"capabilities,omitempty"`
-	LastSeen     int64  `json:"lastSeen,omitempty"`
-	Status       string `json:"status"`
+	URL      string `json:"url,omitempty"`
+	LastSeen int64  `json:"lastSeen,omitempty"`
+	Status   string `json:"status"`
 	IsSelf       bool   `json:"isSelf"`
 	// Trusted mirrors peer_registry.trusted. When true the peer's
 	// signed requests are admitted on the privileged surface
@@ -82,11 +69,9 @@ type peerListResponse struct {
 }
 
 type peerRegisterRequest struct {
-	DeviceID     string `json:"deviceId"`
-	Name         string `json:"name"`
-	URL          string `json:"url"`
-	PublicKey    string `json:"publicKey"`
-	Capabilities string `json:"capabilities,omitempty"`
+	DeviceID string `json:"deviceId"`
+	Name     string `json:"name"`
+	URL      string `json:"url"`
 	// Trusted opts the peer into the privileged cross-peer surface
 	// at registration time. Defaults to false; the UI checkbox
 	// flips it to true and operators who paste an unmodified
@@ -130,14 +115,12 @@ func (s *Server) requireOwnerForPeers(w http.ResponseWriter, r *http.Request) bo
 // unit-test isolation, in which case no row is ever flagged self.
 func (s *Server) toPeerResponse(rec *store.PeerRecord) peerResponse {
 	out := peerResponse{
-		DeviceID:     rec.DeviceID,
-		Name:         rec.Name,
-		URL:          rec.URL,
-		PublicKey:    rec.PublicKey,
-		Capabilities: rec.Capabilities,
-		LastSeen:     rec.LastSeen,
-		Status:       rec.Status,
-		Trusted:      rec.Trusted,
+		DeviceID: rec.DeviceID,
+		Name:     rec.Name,
+		URL:      rec.URL,
+		LastSeen: rec.LastSeen,
+		Status:   rec.Status,
+		Trusted:  rec.Trusted,
 	}
 	if s.peerID != nil && rec.DeviceID == s.peerID.DeviceID {
 		out.IsSelf = true
@@ -203,50 +186,6 @@ func validatePeerURL(rawURL string) error {
 	return nil
 }
 
-// validatePeerPublicKey decodes the wire-form (base64 std strict,
-// raw 32-byte Ed25519) and rejects anything else. The strict decoder
-// is required so embedded whitespace / line breaks / non-canonical
-// padding don't get smuggled into peer_registry — two clients
-// submitting the "same" public key with different whitespace would
-// otherwise land as distinct rows, defeating the dedup the device_id
-// PK is meant to give us. The round-trip check (re-encode == input)
-// also guards against alternate-but-decoder-accepting forms.
-func validatePeerPublicKey(b64 string) error {
-	return peer.ValidatePublicKey(b64)
-}
-
-// validatePeerCapabilities accepts an empty string or a single JSON
-// object of bounded size. Object specifically (not scalar / array /
-// null) — the design doc (docs/multi-device-storage.md §3.3) types
-// this column as `JSON: {os, arch, gpu, ...}` and every consumer is
-// written to peek keys. Letting a scalar through would force every
-// caller to second-guess the shape.
-//
-// The schema beyond "object" is intentionally not enforced — the
-// field is extensible — but the JSON has to parse so a buggy client
-// can't poison the registry with an unparseable blob that every UI
-// would then bounce off.
-func validatePeerCapabilities(s string) error {
-	if s == "" {
-		return nil
-	}
-	if len(s) > peerCapabilitiesMaxBytes {
-		return errors.New("capabilities exceeds maximum length")
-	}
-	// Decode into map[string]any so non-objects (scalar/array/null)
-	// fail at the JSON layer with a "cannot unmarshal X into Y of
-	// type map" error rather than silently passing through.
-	var v map[string]any
-	if err := json.Unmarshal([]byte(s), &v); err != nil {
-		return errors.New("capabilities must be a JSON object")
-	}
-	if v == nil {
-		// `null` decodes successfully into a nil map — reject it
-		// explicitly so the registry never stores a literal "null".
-		return errors.New("capabilities must be a JSON object, not null")
-	}
-	return nil
-}
 
 // handleListPeers returns every row in peer_registry. The local row
 // is included — UIs are expected to render it differently using the
@@ -280,15 +219,12 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, rec := range rows {
 		row := s.toPeerResponse(rec)
-		if !p.IsOwner() {
-			// Reduced view: drop the identity-sensitive +
-			// capabilities fields. Name + status are enough
-			// for the agent to pick a handoff target.
-			row.PublicKey = ""
-			row.Capabilities = ""
-		}
 		out.Items = append(out.Items, row)
 	}
+	_ = p // (peerResponse no longer carries identity-sensitive
+	// fields, so the previous Owner-vs-Agent reduced view is
+	// unnecessary. The principal handle is retained for any
+	// future surface that wants role-based gating.)
 	writeJSONResponse(w, http.StatusOK, out)
 }
 
@@ -376,14 +312,6 @@ func (s *Server) handleRegisterPeer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	if err := validatePeerPublicKey(req.PublicKey); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	if err := validatePeerCapabilities(req.Capabilities); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
 	if s.peerID != nil && req.DeviceID == s.peerID.DeviceID {
 		writeError(w, http.StatusConflict, "conflict",
 			"cannot register self via this endpoint; the registrar manages the local peer row")
@@ -397,12 +325,10 @@ func (s *Server) handleRegisterPeer(w http.ResponseWriter, r *http.Request) {
 	// roll back the heartbeat's status flip if it landed between
 	// the GetPeer and the UpsertPeer.
 	rec := &store.PeerRecord{
-		DeviceID:     req.DeviceID,
-		Name:         req.Name,
-		URL:          req.URL,
-		PublicKey:    req.PublicKey,
-		Capabilities: req.Capabilities,
-		Trusted:      req.Trusted,
+		DeviceID: req.DeviceID,
+		Name:     req.Name,
+		URL:      req.URL,
+		Trusted:  req.Trusted,
 	}
 	out, err := s.agents.Store().RegisterPeerMetadata(r.Context(), rec)
 	if err != nil {
@@ -428,108 +354,6 @@ func (s *Server) handleRegisterPeer(w http.ResponseWriter, r *http.Request) {
 	// (docs/peer-simplify-plan.md). Other peers see this row through
 	// their next /api/v1/peers GET against the Hub.
 	writeJSONResponse(w, http.StatusOK, s.toPeerResponse(out))
-}
-
-// peerRotateKeyRequest is the wire shape for POST
-// /api/v1/peers/{id}/rotate-key.
-type peerRotateKeyRequest struct {
-	PublicKey string `json:"publicKey"`
-}
-
-// peerRotateKeyResponse echoes the updated row plus the prior key
-// fingerprint so the operator UI can display "<old> → <new>" in an
-// audit-trail panel without doing its own pre-rotation read.
-type peerRotateKeyResponse struct {
-	Peer              peerResponse `json:"peer"`
-	PreviousPublicKey string       `json:"previousPublicKey"`
-}
-
-// handleRotatePeerKey is the explicit, audited swap of a peer's
-// long-lived Ed25519 identity key. The store's UpsertPeer /
-// RegisterPeerMetadata contracts intentionally preserve public_key on
-// conflict — re-registering a paired peer cannot rotate its identity
-// silently — so this endpoint exists as the only path that mutates
-// the column.
-//
-// Self-rotation is intentionally refused with 409. The local peer's
-// public key is one half of a kv-stored identity (peer/public_key +
-// peer/private_key, see internal/peer/identity.go); rotating only the
-// registry copy would leave the binary signing with the old private
-// key while the cluster advertises the new public key. A future slice
-// will deliver a coordinated "rotate local identity" path that also
-// re-seals the private key envelope.
-//
-// The handler logs an Info-level audit line with old/new key
-// fingerprints (first 16 base64 chars each — full keys appear in the
-// response body, but the log is the durable audit surface). slog is
-// the audit channel for now; a dedicated audit_log table is a v2
-// concern (no formal facility exists yet, see store/peer_registry.go
-// comments).
-func (s *Server) handleRotatePeerKey(w http.ResponseWriter, r *http.Request) {
-	if !s.requireOwnerForPeers(w, r) {
-		return
-	}
-	id := r.PathValue("id")
-	if err := validateDeviceID(id); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	if s.peerID != nil && id == s.peerID.DeviceID {
-		writeError(w, http.StatusConflict, "conflict",
-			"cannot rotate the local peer's key via this endpoint; local-identity rotation requires re-sealing the private key envelope")
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, peerRequestCap)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "request body exceeds 16 KiB cap")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
-		return
-	}
-	var req peerRotateKeyRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON")
-		return
-	}
-	if err := validatePeerPublicKey(req.PublicKey); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	oldKey, rec, err := s.agents.Store().RotatePeerKey(r.Context(), id, req.PublicKey)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", "peer not registered")
-			return
-		}
-		// store.RotatePeerKey returns ErrPeerKeyUnchanged when the
-		// supplied key equals the existing one; surface it as 409 so
-		// the UI knows the no-op was refused intentionally.
-		if errors.Is(err, store.ErrPeerKeyUnchanged) {
-			writeError(w, http.StatusConflict, "conflict",
-				"new publicKey matches the current key; nothing to rotate")
-			return
-		}
-		s.logger.Error("peer handler: rotate-key failed", "device_id", id, "err", err)
-		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-		return
-	}
-	// Audit. fingerprint() trims to 16 chars so the log line stays
-	// readable; the response body carries the full new key for any
-	// downstream verifier (e.g. the operator's UI showing a QR code
-	// to the paired peer).
-	s.logger.Info("peer key rotated",
-		"device_id", id,
-		"old_key_fp", peerKeyFingerprint(oldKey),
-		"new_key_fp", peerKeyFingerprint(req.PublicKey),
-	)
-	writeJSONResponse(w, http.StatusOK, peerRotateKeyResponse{
-		Peer:              s.toPeerResponse(rec),
-		PreviousPublicKey: oldKey,
-	})
 }
 
 // peerKeyFingerprint returns the first 16 chars of a base64-std
