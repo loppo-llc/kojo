@@ -594,24 +594,23 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		// Use MsgOptionMarkdownText (markdown_text param) so Slack uses the
 		// same full-Markdown renderer as chat.appendStream; the legacy mrkdwn
 		// renderer (text param) does not support tables, headings, etc.
+		//
+		// IMPORTANT: send markdown_text ALONE — do NOT pair it with
+		// MsgOptionText. Slack's chat.update docs only state that
+		// markdown_text may be sent without text (it does not document
+		// the streamed-buffer interaction directly), but empirically
+		// pairing both leaves Slack rendering as "{accumulated stream
+		// markdown_text} + {final body}" — i.e. the chat.update text
+		// field is overwritten while the streamed markdown_text buffer
+		// stays intact. Sending markdown_text alone empirically yields
+		// the desired replacement (this matched the working behavior
+		// observed up to 2026-05-17, before MsgOptionText was added).
+		// Push notification previews lose their body text as a side
+		// effect; handled outside the stream-finalize path.
 		if response.Len() > 0 {
 			text := response.String()
 			chunks := SplitMessage(text, slackMaxMsgLen)
-			// First chunk: update the streaming message in-place. We send
-			// markdown_text (full-Markdown renderer matching appendStream) AND
-			// the legacy text param. Clients that ignore markdown_text — push
-			// notifications, search-result previews, certain integrations —
-			// surface text instead, so without the fallback those surfaces
-			// would show "no preview available" for every bot reply. Slack
-			// uses markdown_text for in-channel rendering when both are set.
-			//
-			// Both fields use the raw body (escape=false) so that mention
-			// tokens the LLM intentionally emits (<!channel>, <@U…>, …) are
-			// resolved consistently across in-channel rendering and push
-			// previews. Mention misuse is controlled by the agent's system
-			// prompt, not by escaping at this layer.
 			updateOpts := []slack.MsgOption{
-				slack.MsgOptionText(chunks[0], false),
 				slack.MsgOptionMarkdownText(chunks[0]),
 			}
 			if threadTS != "" {
@@ -638,7 +637,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			// was emitted is the most useful debugging artifact when
 			// this path triggers. Surface the failure as a new message
 			// (threaded when threadTS is set, top-level otherwise — same
-			// behavior as the non-empty path's fallback below) instead
+			// behavior as the non-empty path's fallback above) instead
 			// of overwriting the stream via chat.update, which would
 			// erase the execution trail. The StopStream call above is
 			// best-effort: if it failed the stream may briefly remain
@@ -756,8 +755,17 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) {
 	// markdown_text in-channel (full Markdown: tables, headings, etc.) while
 	// surfaces that ignore markdown_text — push notifications, link
 	// unfurls, search previews — fall back to text. Without the fallback
-	// those surfaces would show empty previews for every bot reply. See the
-	// streaming-update path above for the symmetric treatment.
+	// those surfaces would show empty previews for every bot reply.
+	//
+	// Note: Slack's chat.postMessage docs document markdown_text as a
+	// standalone field (and discourage pairing with text). In practice
+	// the API accepts both together and uses text for the surfaces that
+	// ignore markdown_text — we rely on that as a compatibility fallback
+	// for push previews. Unlike the streaming-update path (chat.update),
+	// chat.postMessage produces a fresh message with no streamed buffer
+	// to interact with, so the empirical conflict that forced
+	// markdown_text-alone in chat.update does not apply here. See the
+	// // Finalize block for that rationale.
 	//
 	// Both fields use the raw body (escape=false) so mention tokens the LLM
 	// intentionally emits (<!channel>, <@U…>, …) resolve consistently across
