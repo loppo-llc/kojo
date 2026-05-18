@@ -55,11 +55,33 @@ const (
 	peerJoinSecretNS = "peer/join_secret"
 )
 
-// stashedPairingBearers is the JSON envelope kv writes from approve and
-// reads from the poll handler.
+// stashedPairingBearers is the JSON envelope kv writes from approve
+// and reads from the poll handler.
+//
+// CRITICAL: NEVER persist the raw peer→Hub Bearer here. That raw
+// value, once minted, is the peer's permanent credential against
+// the Hub — a Hub DB read-only leak between approve and the peer's
+// first authenticated poll would otherwise hand an attacker a
+// reusable credential. Instead we record a "mint pending" flag and
+// defer the actual mint to the authenticated poll, where the raw
+// value goes straight onto the response wire and only the hash
+// lands in peer_tokens. The Hub→peer Bearer raw still lives here
+// (Hub-side credential, needs the raw to dial peer) but that's
+// scoped to Hub compromise, which is already cluster-fatal in this
+// threat model.
 type stashedPairingBearers struct {
-	PeerBearer string `json:"peer_bearer"` // raw Token A (peer→Hub)
-	HubBearer  string `json:"hub_bearer"`  // raw Token B (Hub→peer)
+	// NeedsPeerBearerMint is true between approve and the first
+	// authenticated poll. When the poll arrives the handler mints
+	// the peer→Hub Bearer, ships the raw in the response, stores
+	// only the hash in peer_tokens, and flips this flag false.
+	NeedsPeerBearerMint bool `json:"needs_peer_bearer_mint"`
+	// HubBearer is the raw Hub→peer Bearer. Hub keeps it so it
+	// can present `Authorization: Bearer …` when calling the peer.
+	// Stays in the stash until the peer presents a permanent
+	// peer→Hub Bearer (proof of receipt), at which point the
+	// whole stash row can be deleted — the raw also lives in
+	// OutBearerNS for Hub's runtime dial path.
+	HubBearer string `json:"hub_bearer"`
 }
 
 // mintAndStashPairingBearers is called from handleApprovePeerPending right
@@ -89,23 +111,13 @@ func (s *Server) mintAndStashPairingBearers(ctx context.Context, peerDeviceID st
 	}
 	st := s.agents.Store()
 
-	// Token A — peer → Hub. Hub stores the hash here; raw goes to peer.
-	issuedA, err := st.IssuePeerToken(ctx, peerDeviceID, store.PeerTokenRolePeerToHub)
-	if err != nil {
-		return fmt.Errorf("issue peer→hub token: %w", err)
-	}
-
-	// Token B — Hub → peer. Raw stays on Hub; hash is sent to peer for
-	// it to insert in its own peer_tokens.
+	// Hub → peer raw. Hub keeps the raw in OutBearerNS (needs it to
+	// dial peer) and a copy in the stash for delivery on the first
+	// authenticated poll.
 	rawB, err := store.MintPeerTokenRaw()
 	if err != nil {
-		// Best-effort revoke Token A so we don't leave a dangling
-		// half-paired credential.
-		_ = st.RevokePeerToken(ctx, issuedA.Raw)
 		return fmt.Errorf("mint hub→peer token: %w", err)
 	}
-
-	// Persist raw Token B in Hub's outbound kv.
 	outRec := &store.KVRecord{
 		Namespace: pairingHubOutNS,
 		Key:       peerDeviceID,
@@ -114,12 +126,16 @@ func (s *Server) mintAndStashPairingBearers(ctx context.Context, peerDeviceID st
 		Scope:     store.KVScopeMachine,
 	}
 	if _, err := st.PutKV(ctx, outRec, store.KVPutOptions{}); err != nil {
-		_ = st.RevokePeerToken(ctx, issuedA.Raw)
 		return fmt.Errorf("persist hub→peer raw: %w", err)
 	}
 
-	// Stash both raws for delivery on next poll.
-	stash := stashedPairingBearers{PeerBearer: issuedA.Raw, HubBearer: rawB}
+	// Peer → Hub Bearer is DEFERRED. We record a `NeedsPeerBearerMint`
+	// flag in the stash; the first authenticated poll mints the
+	// Bearer, hashes it into peer_tokens, and ships the raw on the
+	// wire — the raw never touches Hub disk. See the file-level
+	// comment on stashedPairingBearers for the Codex-flagged
+	// rationale.
+	stash := stashedPairingBearers{NeedsPeerBearerMint: true, HubBearer: rawB}
 	body, _ := json.Marshal(stash)
 	stashRec := &store.KVRecord{
 		Namespace: pairingBearerStashNS,
@@ -129,21 +145,30 @@ func (s *Server) mintAndStashPairingBearers(ctx context.Context, peerDeviceID st
 		Scope:     store.KVScopeMachine,
 	}
 	if _, err := st.PutKV(ctx, stashRec, store.KVPutOptions{}); err != nil {
-		_ = st.RevokePeerToken(ctx, issuedA.Raw)
 		_ = st.DeleteKV(ctx, pairingHubOutNS, peerDeviceID, "")
 		return fmt.Errorf("stash pairing bearers: %w", err)
 	}
 	return nil
 }
 
-// attachPairingBearers consumes the kv stash, populates resp.{PeerBearer,
-// HubBearer}, and deletes the stash so the next poll returns approved
-// without re-issuing. A missing stash is the steady-state for subsequent
-// polls — leave resp.*Bearer empty and return.
+// attachPairingBearers reads the stash and populates resp.{PeerBearer,
+// HubBearer}. The peer→Hub Bearer is minted lazily HERE — the stash
+// only carries a NeedsPeerBearerMint flag, so a Hub DB read-only
+// leak between approve and the authenticated poll can never yield
+// the peer's permanent credential (Codex review critical).
 //
-// Errors are logged at Warn (the operator might want to know the stash
-// JSON decode broke) but the poll response itself stays state=approved;
-// the peer can re-trigger via operator re-approve if Bearers never land.
+// The stash is NOT deleted on attach. ACK-based consumption: the
+// stash row stays until the peer presents its permanent peer→Hub
+// Bearer on a later call (consumePairingStashOnAck). That way a
+// dropped first response leaves the peer recoverable — the next
+// authenticated poll re-reads the same stash and re-delivers the
+// already-minted credentials (idempotent on the peer side; peer's
+// PutKV / StorePeerTokenHash both no-op on identical values).
+//
+// Errors are logged at Warn (the operator might want to know the
+// stash JSON decode broke) but the poll response itself stays
+// state=approved; the peer can re-trigger via operator re-approve
+// if Bearers never land.
 func (s *Server) attachPairingBearers(ctx context.Context, peerDeviceID string, resp *joinRequestResponse) {
 	if s == nil || s.agents == nil || s.agents.Store() == nil || resp == nil {
 		return
@@ -167,16 +192,53 @@ func (s *Server) attachPairingBearers(ctx context.Context, peerDeviceID string, 
 		_ = st.DeleteKV(ctx, pairingBearerStashNS, peerDeviceID, "")
 		return
 	}
-	resp.PeerBearer = stash.PeerBearer
-	resp.HubBearer = stash.HubBearer
-	// Delete the stash so the raw tokens never come back over the
-	// wire. A retried poll lands here too, but with an empty stash it
-	// produces an empty-bearer response that the peer side treats as a
-	// no-op (the peer already persisted on first receipt).
+	if stash.NeedsPeerBearerMint {
+		issued, err := st.IssuePeerToken(ctx, peerDeviceID, store.PeerTokenRolePeerToHub)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("peer-pairing: peer→hub mint failed",
+					"device_id", peerDeviceID, "err", err)
+			}
+			return
+		}
+		resp.PeerBearer = issued.Raw
+		stash.NeedsPeerBearerMint = false
+		// Persist the flag flip so a retried (same-stash) poll
+		// can't double-mint. We deliberately keep HubBearer in
+		// the stash so retries still hand it over alongside an
+		// empty PeerBearer (the peer has it now and discards
+		// duplicate hash inserts via INSERT OR IGNORE).
+		flipped, _ := json.Marshal(stash)
+		_, _ = st.PutKV(ctx, &store.KVRecord{
+			Namespace: pairingBearerStashNS,
+			Key:       peerDeviceID,
+			Value:     string(flipped),
+			Type:      store.KVTypeJSON,
+			Scope:     store.KVScopeMachine,
+		}, store.KVPutOptions{})
+	}
+	if stash.HubBearer != "" {
+		resp.HubBearer = stash.HubBearer
+	}
+}
+
+// consumePairingStashOnAck removes the stash + the per-pending
+// join_secret. Called when the peer presents its permanent peer→Hub
+// Bearer (callerHoldsPeerBearer) — that's the implicit ACK that the
+// previous poll's response landed and the peer is now operating on
+// the permanent credential. The HubBearer raw stays in OutBearerNS
+// (Hub uses it to dial peer); only the delivery side-channel
+// (stash + join_secret) is cleaned up.
+func (s *Server) consumePairingStashOnAck(ctx context.Context, peerDeviceID string) {
+	if s == nil || s.agents == nil || s.agents.Store() == nil {
+		return
+	}
+	st := s.agents.Store()
 	if err := st.DeleteKV(ctx, pairingBearerStashNS, peerDeviceID, ""); err != nil && s.logger != nil {
-		s.logger.Warn("peer-pairing: stash delete failed",
+		s.logger.Warn("peer-pairing: stash ack-delete failed",
 			"device_id", peerDeviceID, "err", err)
 	}
+	s.consumeJoinSecret(ctx, peerDeviceID)
 }
 
 // loadHubOutBearer fetches the Hub's outbound Bearer for a given peer.

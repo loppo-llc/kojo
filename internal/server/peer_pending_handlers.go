@@ -214,12 +214,13 @@ func (s *Server) handleJoinRequestPoll(w http.ResponseWriter, r *http.Request) {
 		resp := joinRequestResponse{State: "approved", Hub: hub}
 		if s.callerHoldsJoinIdentity(r.Context(), id, r) {
 			s.attachPairingBearers(r.Context(), id, &resp)
-			// Successful Bearer delivery consumes the join secret
-			// — peer now holds the permanent peer→Hub Bearer and
-			// must use it for any future /join-request calls.
-			if resp.PeerBearer != "" {
-				s.consumeJoinSecret(r.Context(), id)
-			}
+		}
+		// ACK-based consumption (Codex review): clear the delivery
+		// stash + join_secret ONLY when the peer presents its
+		// permanent peer→Hub Bearer. A dropped first-delivery
+		// response leaves the stash intact for the peer to re-poll.
+		if s.callerHoldsPeerBearer(r, id) {
+			s.consumePairingStashOnAck(r.Context(), id)
 		}
 		writeJSONResponse(w, http.StatusOK, resp)
 		return
@@ -292,8 +293,8 @@ func (s *Server) processJoinRequest(w http.ResponseWriter, r *http.Request, req 
 		hub := s.buildHubInfoResponse(r.Context())
 		resp := joinRequestResponse{State: "approved", Hub: hub}
 		s.attachPairingBearers(r.Context(), req.DeviceID, &resp)
-		if resp.PeerBearer != "" {
-			s.consumeJoinSecret(r.Context(), req.DeviceID)
+		if s.callerHoldsPeerBearer(r, req.DeviceID) {
+			s.consumePairingStashOnAck(r.Context(), req.DeviceID)
 		}
 		writeJSONResponse(w, http.StatusOK, resp)
 		return
@@ -306,51 +307,65 @@ func (s *Server) processJoinRequest(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 
-	// First-time vs repeat pending: differentiated by whether a row
-	// already exists. On first contact mint a fresh join_secret and
-	// return it once in the response. On every subsequent contact
-	// the caller MUST present that secret in Authorization: Bearer
-	// — otherwise refuse to update the row (an attacker who knows
-	// the device_id would otherwise be able to overwrite name/url
-	// on the pending row at will).
-	existingPending, pendErr := st.GetPeerPending(r.Context(), req.DeviceID)
-	if pendErr != nil && !errors.Is(pendErr, store.ErrNotFound) {
-		s.logger.Error("join-request: pending lookup", "device_id", req.DeviceID, "err", pendErr)
+	// Atomic first-write detection (Codex review). We always mint a
+	// candidate secret + supply its hash to UpsertPeerPending. The
+	// store's INSERT ... ON CONFLICT preserves the existing hash, so
+	// the RETURNING projection tells us whether the row already had
+	// a different hash (= repeat caller) or just took ours (= fresh
+	// insert). Two simultaneous first-time POSTs are serialised by
+	// SQLite; one wins as fresh insert, the other sees a foreign
+	// hash and must authenticate against the original secret.
+	candidate, sErr := mintJoinSecret()
+	if sErr != nil {
+		s.logger.Error("join-request: mint secret", "device_id", req.DeviceID, "err", sErr)
 		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 		return
 	}
-	resp := joinRequestResponse{State: "pending"}
-	if existingPending == nil {
-		secret, sErr := mintJoinSecret()
-		if sErr != nil {
-			s.logger.Error("join-request: mint secret", "device_id", req.DeviceID, "err", sErr)
-			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-			return
-		}
-		if err := s.persistJoinSecret(r.Context(), req.DeviceID, secret); err != nil {
-			s.logger.Error("join-request: persist secret", "device_id", req.DeviceID, "err", err)
-			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-			return
-		}
-		resp.JoinSecret = secret
-	} else {
-		// Repeat POST on an existing pending row — accept the
-		// metadata update only when the caller authenticates with
-		// the previously-issued secret.
+	candidateHash := store.HashPeerToken(candidate)
+
+	// Pre-flight: if a row already exists, demand authentication
+	// BEFORE we touch UpsertPeerPending (which would refresh
+	// name/url). Otherwise an attacker who knows the device_id
+	// could still overwrite metadata without ever owning the
+	// secret.
+	if existing, gErr := st.GetPeerPending(r.Context(), req.DeviceID); gErr == nil && existing != nil {
 		if !s.callerHoldsJoinIdentity(r.Context(), req.DeviceID, r) {
 			writeError(w, http.StatusUnauthorized, "join_secret_required",
 				"a pending row already exists for this deviceId; subsequent /join-request calls must present the join_secret in Authorization: Bearer")
 			return
 		}
+	} else if gErr != nil && !errors.Is(gErr, store.ErrNotFound) {
+		s.logger.Error("join-request: pending lookup", "device_id", req.DeviceID, "err", gErr)
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
 	}
-	if _, err := st.UpsertPeerPending(r.Context(), &store.PeerPendingRecord{
-		DeviceID: req.DeviceID,
-		Name:     req.Name,
-		URL:      req.URL,
-	}); err != nil {
+
+	out, err := st.UpsertPeerPending(r.Context(), &store.PeerPendingRecord{
+		DeviceID:       req.DeviceID,
+		Name:           req.Name,
+		URL:            req.URL,
+		JoinSecretHash: candidateHash,
+	})
+	if err != nil {
 		s.logger.Error("join-request: upsert pending", "device_id", req.DeviceID, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 		return
+	}
+	resp := joinRequestResponse{State: "pending"}
+	if out.JoinSecretHash == candidateHash {
+		// Our candidate landed → fresh insert (or a previous insert
+		// happened to have the same hash, statistically impossible
+		// against a 256-bit random). Persist the raw secret in kv
+		// so future callerHoldsJoinIdentity checks can validate it
+		// (the Hub stores raw OR hash there; for verification we
+		// compare against the raw kv copy first, falling back to
+		// peer_tokens for the permanent Bearer).
+		if err := s.persistJoinSecret(r.Context(), req.DeviceID, candidate); err != nil {
+			s.logger.Error("join-request: persist secret", "device_id", req.DeviceID, "err", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		resp.JoinSecret = candidate
 	}
 	writeJSONResponse(w, http.StatusOK, resp)
 }

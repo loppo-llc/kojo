@@ -454,16 +454,34 @@ UPDATE peer_registry
 	return stale, nil
 }
 
-// DeletePeer removes the row keyed by device_id. Idempotent — a missing
-// row returns nil. Callers driving a "decommission" flow should also
-// audit any agent_locks rows whose holder_peer == deviceID; releasing
-// those is a separate operation (see ReleaseAgentLockByPeer).
+// DeletePeer removes the row keyed by device_id AND revokes every
+// active peer_token bound to that device, in a single transaction.
+// Without the token revoke, re-adding the same device_id later
+// would resurrect any cached Bearer the prior pairing handed out
+// (Codex review hardening). Idempotent — a missing row returns nil.
+//
+// Callers driving a "decommission" flow should also audit any
+// agent_locks rows whose holder_peer == deviceID; releasing those
+// is a separate operation (see ReleaseAgentLockByPeer).
 func (s *Store) DeletePeer(ctx context.Context, deviceID string) error {
-	if _, err := s.db.ExecContext(ctx,
-		`DELETE FROM peer_registry WHERE device_id = ?`,
-		deviceID,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store.DeletePeer: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM peer_registry WHERE device_id = ?`, deviceID,
 	); err != nil {
-		return fmt.Errorf("store.DeletePeer: %w", err)
+		return fmt.Errorf("store.DeletePeer: registry: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE peer_tokens SET revoked_at = ? WHERE device_id = ? AND revoked_at IS NULL`,
+		NowMillis(), deviceID,
+	); err != nil {
+		return fmt.Errorf("store.DeletePeer: revoke tokens: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store.DeletePeer: commit: %w", err)
 	}
 	return nil
 }

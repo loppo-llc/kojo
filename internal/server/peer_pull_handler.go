@@ -175,23 +175,30 @@ func (s *Server) handlePeerPull(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Hub-relay decision (docs/peer-simplify-plan.md Codex P1-2):
-	// when the source is NOT the orchestrator (i.e. the signer that
-	// dispatched this pull is the Hub, and source is a third peer),
-	// we lack a direct peer↔peer Bearer to the source and must
-	// route through the orchestrator. The orchestrator's identity
-	// arrives as p.PeerID when the request is signed. Owner-driven
-	// pulls (drill mode) leave p.PeerID empty and skip relay; in
-	// that case AuthorizeOutbound falls through to ErrNoOutbound-
-	// Bearer and the operator sees a clear failure.
+	// when the source is NOT the orchestrator (signer != source),
+	// we lack a direct peer↔peer Bearer to source and MUST route
+	// through the orchestrator. Owner-driven pulls (drill mode)
+	// leave p.PeerID empty and skip relay; for them AuthorizeOutbound
+	// returns ErrNoOutboundBearer and the operator sees a clear
+	// failure. For RolePeer signers, relay construction failure
+	// fails closed with 503 — silently falling back to direct
+	// would just produce the same ErrNoOutboundBearer error per
+	// item and surface as an opaque batch failure.
 	var relayVia *peer.PullSource
 	if p.IsPeer() && p.PeerID != req.SourceDeviceID {
 		relayRec, relayErr := s.agents.Store().GetPeer(r.Context(), p.PeerID)
-		if relayErr == nil {
-			relayAddr, addrErr := peer.NormalizeAddress(relayRec.URL)
-			if addrErr == nil {
-				relayVia = &peer.PullSource{DeviceID: p.PeerID, Address: relayAddr}
-			}
+		if relayErr != nil {
+			writeError(w, http.StatusServiceUnavailable, "relay_unavailable",
+				"signer peer not in registry; cannot construct Hub-relay path: "+relayErr.Error())
+			return
 		}
+		relayAddr, addrErr := peer.NormalizeAddress(relayRec.URL)
+		if addrErr != nil {
+			writeError(w, http.StatusServiceUnavailable, "relay_unavailable",
+				"signer peer has no usable dial address for relay: "+addrErr.Error())
+			return
+		}
+		relayVia = &peer.PullSource{DeviceID: p.PeerID, Address: relayAddr}
 	}
 
 	if len(req.Items) == 0 {

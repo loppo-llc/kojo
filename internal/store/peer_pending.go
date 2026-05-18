@@ -13,13 +13,17 @@ import (
 // `peer_registry` (trusted=true) and drops the pending row. Reject
 // drops it only (peer is free to re-request).
 //
-// first_seen / last_seen are unix millis.
+// first_seen / last_seen are unix millis. JoinSecretHash is the
+// sha256 of the per-join secret the Hub returned to the original
+// requester on first contact; the raw secret never lands in the
+// DB (Codex review hardening).
 type PeerPendingRecord struct {
-	DeviceID  string
-	Name      string
-	URL       string
-	FirstSeen int64
-	LastSeen  int64
+	DeviceID       string
+	Name           string
+	URL            string
+	FirstSeen      int64
+	LastSeen       int64
+	JoinSecretHash string
 }
 
 // UpsertPeerPending inserts a fresh pending row or overwrites the
@@ -27,6 +31,16 @@ type PeerPendingRecord struct {
 // conflict). Single-statement INSERT ... ON CONFLICT so concurrent
 // join-requests for the same device_id can't race the
 // SELECT→INSERT window into a UNIQUE constraint error.
+//
+// join_secret_hash is PRESERVED on conflict (not in the UPDATE SET
+// clause). The returned row carries the canonical hash AFTER the
+// upsert, so the handler can compare it against the hash it just
+// supplied: if they match, this was a fresh insert and the caller
+// owns the secret; if they differ, the row already had a different
+// hash from a prior caller, and the upsert succeeded only because
+// SQLite's ON CONFLICT path doesn't fail — the metadata update
+// landed but the hash is the original one. The handler then refuses
+// the call unless it can prove ownership via Authorization: Bearer.
 func (s *Store) UpsertPeerPending(ctx context.Context, rec *PeerPendingRecord) (*PeerPendingRecord, error) {
 	if rec == nil {
 		return nil, errors.New("store.UpsertPeerPending: nil record")
@@ -45,31 +59,35 @@ func (s *Store) UpsertPeerPending(ctx context.Context, rec *PeerPendingRecord) (
 		now = NowMillis()
 	}
 	const q = `
-INSERT INTO peer_pending (device_id, name, url, first_seen, last_seen)
-VALUES (?, ?, ?, ?, ?)
+INSERT INTO peer_pending (device_id, name, url, first_seen, last_seen, join_secret_hash)
+VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(device_id) DO UPDATE SET
   name      = excluded.name,
   url       = excluded.url,
   last_seen = excluded.last_seen
-RETURNING first_seen, last_seen`
+  -- join_secret_hash PRESERVED on conflict so the first-writer
+  -- retains the binding; later callers can't overwrite it.
+RETURNING first_seen, last_seen, join_secret_hash`
 	var firstSeen, lastSeen int64
+	var hash string
 	if err := s.db.QueryRowContext(ctx, q,
-		rec.DeviceID, rec.Name, rec.URL, now, now,
-	).Scan(&firstSeen, &lastSeen); err != nil {
+		rec.DeviceID, rec.Name, rec.URL, now, now, rec.JoinSecretHash,
+	).Scan(&firstSeen, &lastSeen, &hash); err != nil {
 		return nil, fmt.Errorf("store.UpsertPeerPending: %w", err)
 	}
 	return &PeerPendingRecord{
-		DeviceID:  rec.DeviceID,
-		Name:      rec.Name,
-		URL:       rec.URL,
-		FirstSeen: firstSeen,
-		LastSeen:  lastSeen,
+		DeviceID:       rec.DeviceID,
+		Name:           rec.Name,
+		URL:            rec.URL,
+		FirstSeen:      firstSeen,
+		LastSeen:       lastSeen,
+		JoinSecretHash: hash,
 	}, nil
 }
 
 // GetPeerPending returns the row keyed by device_id or ErrNotFound.
 func (s *Store) GetPeerPending(ctx context.Context, deviceID string) (*PeerPendingRecord, error) {
-	const q = `SELECT device_id, name, url, first_seen, last_seen
+	const q = `SELECT device_id, name, url, first_seen, last_seen, join_secret_hash
                  FROM peer_pending WHERE device_id = ?`
 	rec, err := scanPeerPendingRow(s.db.QueryRowContext(ctx, q, deviceID))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -81,7 +99,7 @@ func (s *Store) GetPeerPending(ctx context.Context, deviceID string) (*PeerPendi
 // ListPeerPending returns every pending row ordered by last_seen DESC
 // then device_id ASC.
 func (s *Store) ListPeerPending(ctx context.Context) ([]*PeerPendingRecord, error) {
-	const q = `SELECT device_id, name, url, first_seen, last_seen
+	const q = `SELECT device_id, name, url, first_seen, last_seen, join_secret_hash
                  FROM peer_pending
                 ORDER BY last_seen DESC, device_id ASC`
 	rows, err := s.db.QueryContext(ctx, q)
@@ -129,7 +147,7 @@ func (s *Store) ApprovePeerPending(ctx context.Context, deviceID string) (*PeerR
 	defer func() { _ = tx.Rollback() }()
 
 	pending, err := scanPeerPendingRow(tx.QueryRowContext(ctx,
-		`SELECT device_id, name, url, first_seen, last_seen
+		`SELECT device_id, name, url, first_seen, last_seen, join_secret_hash
 		   FROM peer_pending WHERE device_id = ?`, deviceID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -177,7 +195,7 @@ func scanPeerPendingRow(r rowScanner) (*PeerPendingRecord, error) {
 	var rec PeerPendingRecord
 	if err := r.Scan(
 		&rec.DeviceID, &rec.Name, &rec.URL,
-		&rec.FirstSeen, &rec.LastSeen,
+		&rec.FirstSeen, &rec.LastSeen, &rec.JoinSecretHash,
 	); err != nil {
 		return nil, err
 	}
