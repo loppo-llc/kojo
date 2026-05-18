@@ -285,8 +285,8 @@ const (
 type oplogEntryState struct {
 	state       entryState
 	priorRec    *store.OplogAppliedRecord // populated for stateAlreadyApplied
-	probeError  string                     // populated for stateLedgerError
-	fingerprint string                     // sha256(table, op, body) — used by all phases
+	probeError  string                    // populated for stateLedgerError
+	fingerprint string                    // sha256(table, op, body) — used by all phases
 }
 
 // oplogClassifyByLedger probes the ledger for every entry and

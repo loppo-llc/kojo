@@ -160,14 +160,15 @@ func relativeTime(deltaMillis int64) string {
 // the local binary can address it by device_id. Format of the spec
 // argument:
 //
-//	<device_id>|<name>|<url>|<base64-public-key>
+//	<device_id>|<name>|<url>
 //
-// All four components are required. `name` is the human-friendly
+// All three components are required. `name` is the human-friendly
 // device label; `url` is the dial address other peers reach it on
 // (`host:port` for tsnet/HTTPS or `http://host:port` for peer-mode).
-// The public key is the remote peer's Ed25519 public key, base64-
-// encoded — passing a key that doesn't round-trip through base64 →
-// 32 bytes returns an error and the row is NOT inserted.
+// The Ed25519 public_key field that used to live in the fourth slot
+// was retired in docs/peer-simplify-plan.md step 9 — Bearer tokens
+// delivered through the auto-pairing approve flow now carry the
+// identity material.
 //
 // Status defaults to "offline" — the operator only asserted the
 // peer's identity, not its current reachability. The Hub flips it
@@ -181,20 +182,15 @@ func runPeerAddCommand(logger *slog.Logger, configDir, spec string, trusted bool
 	}
 	defer closeFn()
 
-	// Pipe separator (not colon) so <url> can hold a
-	// `host:port` form. The base64 alphabet doesn't include `|`
-	// and peer name validation refuses control chars, so `|`
-	// is safe as a delimiter against every field's contents.
-	parts := strings.SplitN(spec, "|", 4)
-	if len(parts) != 4 || parts[0] == "" || parts[1] == "" || parts[2] == "" || parts[3] == "" {
-		fmt.Fprintf(os.Stderr, "peer-add: spec must be <device_id>|<name>|<url>|<base64-public-key>\n")
+	parts := strings.SplitN(spec, "|", 3)
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		fmt.Fprintf(os.Stderr, "peer-add: spec must be <device_id>|<name>|<url>\n")
 		return 1
 	}
-	deviceID, name, peerURL, pubB64 := parts[0], parts[1], parts[2], parts[3]
+	deviceID, name, peerURL := parts[0], parts[1], parts[2]
 
 	// Shape gates shared with the HTTP handler so a typo doesn't
-	// reach UpsertPeer (which would store a junk row that later
-	// auth attempts surface as `public_key shape invalid` 500s).
+	// reach UpsertPeer.
 	if err := peer.ValidateDeviceID(deviceID); err != nil {
 		fmt.Fprintf(os.Stderr, "peer-add: %v\n", err)
 		return 1
@@ -207,10 +203,6 @@ func runPeerAddCommand(logger *slog.Logger, configDir, spec string, trusted bool
 		fmt.Fprintf(os.Stderr, "peer-add: url must look like host:port or http(s)://host:port (got %q)\n", peerURL)
 		return 1
 	}
-	if err := peer.ValidatePublicKey(pubB64); err != nil {
-		fmt.Fprintf(os.Stderr, "peer-add: %v\n", err)
-		return 1
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -220,11 +212,10 @@ func runPeerAddCommand(logger *slog.Logger, configDir, spec string, trusted bool
 	// (offline, 0) and the operator-visible `peer-list` would
 	// flip the peer offline until the next heartbeat.
 	if _, err := st.RegisterPeerMetadata(ctx, &store.PeerRecord{
-		DeviceID:  deviceID,
-		Name:      name,
-		URL:       peerURL,
-		PublicKey: pubB64,
-		Trusted:   trusted,
+		DeviceID: deviceID,
+		Name:     name,
+		URL:      peerURL,
+		Trusted:  trusted,
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "peer-add: register: %v\n", err)
 		return 1
@@ -241,6 +232,15 @@ func runPeerAddCommand(logger *slog.Logger, configDir, spec string, trusted bool
 		trustLabel = " [trusted]"
 	}
 	fmt.Printf("peer added: %s (%s, %s)%s\n", deviceID, name, peerURL, trustLabel)
+	// docs/peer-simplify-plan.md: --peer-add only writes the
+	// peer_registry row. Without a Bearer pair, inter-peer auth
+	// will reject every call from this row. Tell the operator so
+	// they aren't surprised.
+	fmt.Fprintln(os.Stderr,
+		"\n  WARNING: --peer-add writes metadata only. Bearer tokens are\n"+
+			"  NOT minted by this path; inter-peer requests against this row\n"+
+			"  will fail until you pair via `kojo --peer` against the Hub OR\n"+
+			"  a future --peer-mint-bearer command lands.")
 	return 0
 }
 
@@ -327,51 +327,38 @@ func runPeerRemoveCommand(logger *slog.Logger, configDir, deviceID string) int {
 	return 0
 }
 
-// printPairingSpec prints the pairing triple (device_id|name|url|pubkey)
-// to stderr at startup so the operator can paste it into the OTHER
-// host's `kojo --peer-add` flag. Pairing is bidirectional: each
-// host stores the other's row so signed inter-peer requests pass
-// the receiver's PeerAuth middleware.
+// printPairingSpec prints the pairing identity to stderr at startup.
+// With Ed25519 signing retired (docs/peer-simplify-plan.md) the
+// authoritative pairing channel is the auto-pairing flow: peer hosts
+// run `kojo --peer` against this Hub's URL and the Owner approves
+// the pending join request in Settings. That flow mints + delivers
+// the Bearer pair end-to-end with no manual paste.
 //
-// The pipe `|` separator is shell-active in bash/zsh/cmd/PowerShell,
-// so paste-without-quotes turns the spec into two phantom commands —
-// exactly the failure mode the operator hits when they copy the
-// printed line and run it verbatim. Spell out the single-quote form,
-// with paths for every shell we expect operators to use.
+// `--peer-add` survives only as a metadata-only escape hatch (writes
+// peer_registry without Bearer tokens). Until a follow-up adds
+// matching `--peer-mint-bearer` / `--peer-import-bearer` commands,
+// rows added that way cannot authenticate inter-peer requests.
 //
-// role is "Hub" or "peer" — wording in the banner shifts so the
-// operator knows which side they are sitting on and which side to
-// run --peer-add on.
+// role is "hub" or "peer" — wording in the banner shifts so the
+// operator knows which side they are sitting on.
 func printPairingSpec(id *peer.Identity, peerURL, role string) {
 	if id == nil {
 		return
 	}
-	spec := fmt.Sprintf("%s|%s|%s|%s", id.DeviceID, id.Name, peerURL, id.PublicKeyBase64())
-	// Hub-side pairing must combine `--peer-add <spec>` with the
-	// bool flag `--peer-add-trusted` so the peer admits the Hub
-	// on the privileged surface (session create, files, git, ...).
-	// A plain `--peer-add` leaves the row as trusted=0 and every
-	// Hub→peer proxy call would 403. Peer-side pairing on the Hub
-	// uses plain `--peer-add` because the Hub should NOT trust an
-	// arbitrary peer to drive its own session / file surface; the
-	// operator can flip `--peer-trust <device_id>` later if they
-	// decide to.
-	var headline, suffix string
-	switch role {
-	case "hub":
-		headline = "Hub pairing spec — run on every peer host so the peer admits Hub-driven session/file/git proxy:"
-		suffix = " --peer-add-trusted"
-	case "peer":
-		headline = "peer pairing spec — run on the Hub to register this peer (Hub stays default-untrusted; use `kojo --peer-trust <device_id>` to promote):"
-		suffix = ""
-	default:
-		headline = "peer pairing spec — run on the other host:"
-		suffix = ""
+	spec := fmt.Sprintf("%s|%s|%s", id.DeviceID, id.Name, peerURL)
+	hubURL := peerURL
+	if role == "peer" {
+		hubURL = "<hub-url>"
 	}
 	fmt.Fprintf(os.Stderr,
-		"  %s\n\n"+
-			"    bash/zsh:    kojo --peer-add '%[3]s'%[2]s\n"+
-			"    cmd.exe:     kojo --peer-add \"%[3]s\"%[2]s\n"+
-			"    PowerShell:  kojo --peer-add '%[3]s'%[2]s\n\n",
-		headline, suffix, spec)
+		"  Pairing — recommended (auto-pairing via Hub Approve):\n\n"+
+			"    On EACH peer host:\n"+
+			"        kojo --peer --hub %s\n"+
+			"    Then on the Hub, Settings → Pending → Approve.\n\n"+
+			"  This host's identity (for diagnostics / manual offline rows):\n"+
+			"        %s\n\n"+
+			"  Manual `--peer-add '<spec>'` writes the registry row only;\n"+
+			"  it does NOT mint Bearer tokens, so the resulting peer cannot\n"+
+			"  authenticate until a future --peer-mint-bearer command lands.\n\n",
+		hubURL, spec)
 }

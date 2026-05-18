@@ -3,7 +3,6 @@ package peer
 import (
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // docs/multi-device-storage.md §3.10 calls for cross-peer
@@ -53,6 +53,7 @@ type SubscriberTarget struct {
 // authenticates us as RolePeer.
 type Subscriber struct {
 	id     *Identity
+	store  *store.Store
 	logger *slog.Logger
 	// bus is the LOCAL pub/sub the Subscriber would forward
 	// remote events into. In v1 we keep it wired but NEVER
@@ -96,9 +97,10 @@ type subTarget struct {
 // Subscriber observes — useful in multi-peer setups where a peer
 // learning of a status change should propagate it back through
 // its own /api/v1/peers/events WS to other subscribers.
-func NewSubscriber(id *Identity, bus *EventBus, logger *slog.Logger) *Subscriber {
+func NewSubscriber(id *Identity, st *store.Store, bus *EventBus, logger *slog.Logger) *Subscriber {
 	return &Subscriber{
 		id:      id,
+		store:   st,
 		logger:  logger,
 		bus:     bus,
 		live:    make(map[string]map[string]StatusEvent),
@@ -290,17 +292,13 @@ func (s *Subscriber) connectOnce(ctx context.Context, t SubscriberTarget) error 
 	}
 	target.Path = "/api/v1/peers/events"
 
-	// Build the upgrade request to attach peer-auth headers.
+	// Build the upgrade request to attach the Bearer.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
-	nonce, err := newNonce()
-	if err != nil {
-		return fmt.Errorf("nonce: %w", err)
-	}
-	if err := SignRequest(req, s.id.DeviceID, s.id.PrivateKey, nonce, t.DeviceID); err != nil {
-		return fmt.Errorf("sign request: %w", err)
+	if err := AuthorizeOutbound(ctx, s.store, req, t.DeviceID); err != nil {
+		return fmt.Errorf("authorize request: %w", err)
 	}
 
 	dialOpts := &websocket.DialOptions{
@@ -423,18 +421,6 @@ func (s *Subscriber) republish(evt StatusEvent) {
 	_ = evt
 }
 
-// newNonce returns a fresh 32-byte base64 nonce for use in
-// AuthHeaderNonce. The dedicated helper lives here so the
-// subscriber doesn't have to import crypto/rand at every call
-// site.
-func newNonce() (string, error) {
-	var b [AuthNonceLen]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(b[:]), nil
-}
-
 // jitter applies ±25% to d. Helps avoid synchronised reconnect
 // storms when many peers come back at once.
 func jitter(d time.Duration) time.Duration {
@@ -461,4 +447,3 @@ func previewBytes(b []byte, n int) string {
 	}
 	return string(b[:n]) + "...(" + fmt.Sprint(len(b)) + " bytes total)"
 }
-

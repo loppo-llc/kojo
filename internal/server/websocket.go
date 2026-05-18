@@ -355,14 +355,9 @@ func (s *Server) proxySessionWebSocket(w http.ResponseWriter, r *http.Request, s
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
-	nonce, err := peer.MakeNonce()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "nonce: "+err.Error())
-		return
-	}
-	if err := peer.SignRequest(upgrade,
-		s.peerID.DeviceID, s.peerID.PrivateKey, nonce, targetDeviceID); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "sign: "+err.Error())
+
+	if err := peer.AuthorizeOutbound(r.Context(), s.agents.Store(), upgrade, targetDeviceID); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "authorize: "+err.Error())
 		return
 	}
 	targetConn, _, err := websocket.Dial(r.Context(), targetURL.String(),
@@ -396,4 +391,3 @@ func (s *Server) proxySessionWebSocket(w http.ResponseWriter, r *http.Request, s
 	go func() { defer wg.Done(); defer cancel(); copyWS(ctx, targetConn, clientConn) }()
 	wg.Wait()
 }
-

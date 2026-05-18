@@ -95,9 +95,9 @@ type switchDeviceRequest struct {
 }
 
 type switchDeviceResponse struct {
-	AgentID      string            `json:"agent_id"`
-	TargetPeerID string            `json:"target_peer_id"`
-	Outcome      string            `json:"outcome"`
+	AgentID      string `json:"agent_id"`
+	TargetPeerID string `json:"target_peer_id"`
+	Outcome      string `json:"outcome"`
 	// OpID is the orchestrator-minted UUID stamped on the
 	// agent-sync request, replayed on finalize/drop. Always
 	// surfaced (even on early failures BEFORE sync dispatch)
@@ -950,11 +950,7 @@ func (s *Server) dispatchPeerAgentSyncPhase2(ctx context.Context, targetAddr, ta
 		return fmt.Errorf("build phase-2 request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	nonce, err := peer.MakeNonce()
-	if err != nil {
-		return fmt.Errorf("nonce: %w", err)
-	}
-	if err := peer.SignRequest(req, s.peerID.DeviceID, s.peerID.PrivateKey, nonce, targetDeviceID); err != nil {
+	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, targetDeviceID); err != nil {
 		return fmt.Errorf("sign phase-2 request: %w", err)
 	}
 	client := peer.NoKeepAliveHTTPClient(switchDeviceOpTimeout)
@@ -1081,12 +1077,7 @@ func (s *Server) dispatchPeerPull(ctx context.Context, targetAddr, targetDeviceI
 		return nil, fmt.Errorf("build pull request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-
-	nonce, err := peer.MakeNonce()
-	if err != nil {
-		return nil, fmt.Errorf("nonce: %w", err)
-	}
-	if err := peer.SignRequest(req, s.peerID.DeviceID, s.peerID.PrivateKey, nonce, targetDeviceID); err != nil {
+	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, targetDeviceID); err != nil {
 		return nil, fmt.Errorf("sign pull request: %w", err)
 	}
 
@@ -1295,11 +1286,7 @@ func (s *Server) dispatchPeerAgentSyncState(ctx context.Context, targetAddr, tar
 		return nil, fmt.Errorf("build state request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	nonce, err := peer.MakeNonce()
-	if err != nil {
-		return nil, fmt.Errorf("nonce: %w", err)
-	}
-	if err := peer.SignRequest(req, s.peerID.DeviceID, s.peerID.PrivateKey, nonce, targetDeviceID); err != nil {
+	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, targetDeviceID); err != nil {
 		return nil, fmt.Errorf("sign state request: %w", err)
 	}
 	client := peer.NoKeepAliveHTTPClient(handoffOpTimeout)
@@ -1372,12 +1359,7 @@ func (s *Server) dispatchPeerAgentSync(ctx context.Context, targetAddr, targetDe
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Content-Encoding", "gzip")
-
-	nonce, err := peer.MakeNonce()
-	if err != nil {
-		return fmt.Errorf("nonce: %w", err)
-	}
-	if err := peer.SignRequest(req, s.peerID.DeviceID, s.peerID.PrivateKey, nonce, targetDeviceID); err != nil {
+	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, targetDeviceID); err != nil {
 		return fmt.Errorf("sign sync request: %w", err)
 	}
 

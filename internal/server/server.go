@@ -69,8 +69,7 @@ type Server struct {
 	events          *eventbus.Bus  // invalidation broadcast (Phase 4); nil disables /api/v1/events
 	peerID          *peer.Identity // local peer identity (Phase G); nil disables /api/v1/peers
 	peerEvents      *peer.EventBus // cross-peer status push bus (§3.10); nil disables /api/v1/peers/events
-	peerNonces      *peer.NonceCache
-	requireIfMatch  bool           // 428 on missing If-Match (docs §3.5 transition)
+	requireIfMatch  bool // 428 on missing If-Match (docs §3.5 transition)
 	webdavTokens    *auth.WebDAVTokenStore
 	// onAgentSynced is fired by handlePeerAgentSync after the
 	// store rows commit. ONLY the minimum side effects that are
@@ -145,7 +144,7 @@ type Server struct {
 	// (the same handle session.Manager gets) so the persistence
 	// path doesn't depend on an agent.Manager — tests can wire a
 	// bare *store.Store without spinning up a Manager.
-	pendingSyncDB *store.Store
+	pendingSyncDB   *store.Store
 	logger          *slog.Logger
 	mux             *http.ServeMux
 	httpSrv         *http.Server // public (Owner-trusted) listener
@@ -205,11 +204,6 @@ type Config struct {
 	// OfflineSweeper publish to it on every status change.
 	// Nil disables the cross-peer push surface.
 	PeerEvents *peer.EventBus
-	// PeerNonces backs the peer-auth replay cache. Shared by the
-	// AuthMiddleware that fronts /api/v1/peers/* routes. nil =>
-	// NewNonceCache(AuthMaxClockSkew) auto-default.
-	PeerNonces *peer.NonceCache
-
 	// PeerOnly switches the server into the daemon-mode shape used
 	// by `kojo --peer`: only the two inbound peer endpoints
 	// (/api/v1/peers/events, /api/v1/peers/blobs/) are registered,
@@ -293,7 +287,6 @@ func New(cfg Config) *Server {
 		events:          cfg.EventBus,
 		peerID:          cfg.PeerIdentity,
 		peerEvents:      cfg.PeerEvents,
-		peerNonces:      cfg.PeerNonces,
 		requireIfMatch:  cfg.RequireIfMatch,
 		webdavTokens:    cfg.WebDAVTokenStore,
 		pendingSyncKEK:  cfg.PendingSyncKEK,
@@ -401,8 +394,8 @@ func New(cfg Config) *Server {
 		publicHandler = auth.OwnerOnlyMiddleware(publicHandler)
 	}
 	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
-		peerAuth := peer.NewAuthMiddleware(s.agents.Store(), s.peerNonces, s.peerID.DeviceID)
-		publicHandler = peerAuth.Wrap(publicHandler)
+		bearerPeer := peer.NewBearerPeerMiddleware(s.agents.Store(), s.peerID.DeviceID)
+		publicHandler = bearerPeer.Wrap(publicHandler)
 	}
 	s.httpSrv = &http.Server{
 		Addr:              cfg.Addr,
@@ -560,7 +553,6 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 			mux.HandleFunc("POST /api/v1/peers", s.handleRegisterPeer)
 			mux.HandleFunc("PATCH /api/v1/peers/{id}", s.handlePatchPeerMetadata)
 			mux.HandleFunc("DELETE /api/v1/peers/{id}", s.handleDeletePeer)
-			mux.HandleFunc("POST /api/v1/peers/{id}/rotate-key", s.handleRotatePeerKey)
 			mux.HandleFunc("PATCH /api/v1/peers/{id}/trust", s.handlePatchPeerTrust)
 			// Peer onboarding (docs/peer-onboarding-plan.md).
 			// hub-info + join-request are unauthenticated: the
@@ -574,13 +566,6 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 			mux.HandleFunc("POST /api/v1/peers/pending/{deviceId}/approve", s.handleApprovePeerPending)
 			mux.HandleFunc("POST /api/v1/peers/pending/{deviceId}/reject", s.handleRejectPeerPending)
 		}
-		// Inter-peer registration push (Hub fans out a newly-paired
-		// peer's row to every online peer; receivers RegisterPeerMetadata
-		// the row locally so the cluster's registries converge without
-		// manual --peer-add on every host). Auth: RolePeer (Ed25519
-		// signed). Available on every host so a peer can both receive
-		// and forward the broadcast.
-		mux.HandleFunc("POST /api/v1/peers/register-push", s.handlePeerRegisterPush)
 		// Cross-peer status push (§3.10). Auth: RolePeer (Ed25519-
 		// signed inter-peer request) OR RoleOwner. Wired only when
 		// the bus is supplied — nil leaves the route unregistered
@@ -918,8 +903,8 @@ func (s *Server) ensureAuthServer(resolver *auth.Resolver) *http.Server {
 	}
 	handler = auth.AuthMiddleware(resolver)(handler)
 	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
-		peerAuth := peer.NewAuthMiddleware(s.agents.Store(), s.peerNonces, s.peerID.DeviceID)
-		handler = peerAuth.Wrap(handler)
+		bearerPeer := peer.NewBearerPeerMiddleware(s.agents.Store(), s.peerID.DeviceID)
+		handler = bearerPeer.Wrap(handler)
 	}
 	s.authSrv = &http.Server{
 		Handler:           handler,

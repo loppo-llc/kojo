@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/blob"
+	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -51,6 +53,19 @@ func (s *Server) handlePeerBlobGet(w http.ResponseWriter, r *http.Request) {
 	if !p.IsPeer() && !p.IsOwner() {
 		writeError(w, http.StatusForbidden, "forbidden",
 			"peer or owner principal required")
+		return
+	}
+
+	// Hub-relay path (docs/peer-simplify-plan.md Codex review P1-2):
+	// with Ed25519 signing retired, peer↔peer blob pulls can no
+	// longer authenticate against the source directly. Target peers
+	// instead ask the Hub to relay the fetch — both legs are
+	// Hub↔peer Bearer-authenticated. When the URL carries
+	// `?relay_from=<source_device_id>` AND the caller is a trusted
+	// RolePeer, this handler becomes a streaming proxy to the
+	// source's own /peers/blobs/{uri} endpoint.
+	if relayFrom := r.URL.Query().Get("relay_from"); relayFrom != "" {
+		s.relayPeerBlob(w, r, relayFrom)
 		return
 	}
 
@@ -146,4 +161,97 @@ func (s *Server) handlePeerBlobGet(w http.ResponseWriter, r *http.Request) {
 	// whole body into memory. We accept that range requests aren't
 	// honoured for peer-fetch (the target reads the full body).
 	_, _ = io.Copy(w, f)
+}
+
+// relayPeerBlob is the Hub-relay arm of handlePeerBlobGet. The
+// caller is a paired peer asking the Hub to fetch a blob from a
+// THIRD peer on its behalf; this exists because peer↔peer Bearers
+// no longer exist (each peer has only Hub↔peer credentials). The
+// Hub dials the source's own /peers/blobs/{uri} with the Hub→source
+// Bearer, then streams the response back to the caller. Both legs
+// authenticate as Hub-paired traffic, so the auth chain stays
+// intact without re-introducing per-pair credentials.
+//
+// Trust gates:
+//   - caller must be RolePeer + PeerTrusted (an untrusted peer
+//     can't ask the Hub to read blobs out of arbitrary other
+//     peers' stores).
+//   - source must be in the local peer_registry (otherwise we
+//     have no URL + Bearer to dial).
+//   - source must not equal caller / Hub (loop prevention).
+//
+// The relay does NOT inspect blob_refs: that gate lives on the
+// source side and the Hub is just a streaming proxy.
+func (s *Server) relayPeerBlob(w http.ResponseWriter, r *http.Request, sourceDeviceID string) {
+	p := auth.FromContext(r.Context())
+	if !(p.IsPeer() && p.PeerTrusted) && !p.IsOwner() {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"blob relay requires trusted peer or owner principal")
+		return
+	}
+	if s.peerID != nil && sourceDeviceID == s.peerID.DeviceID {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"relay_from must not equal the local peer (would loop)")
+		return
+	}
+	if p.IsPeer() && sourceDeviceID == p.PeerID {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"relay_from must not equal the caller (would loop)")
+		return
+	}
+	srcRec, err := s.agents.Store().GetPeer(r.Context(), sourceDeviceID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusBadRequest, "bad_request",
+				"relay_from peer not in peer_registry: "+sourceDeviceID)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal",
+			"peer_registry lookup: "+err.Error())
+		return
+	}
+	srcAddr, err := peer.NormalizeAddress(srcRec.URL)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway",
+			"source peer has no usable dial address: "+err.Error())
+		return
+	}
+
+	// Strip the relay_from param before re-issuing — the upstream
+	// /peers/blobs handler expects the original (no-query) URL form.
+	upstreamPath := r.URL.Path
+	upstreamURL := strings.TrimRight(srcAddr, "/") + upstreamPath
+
+	// No fixed timeout: switch_device blob handoffs can be hundreds
+	// of MB on slow tailnet links. The request context is the only
+	// deadline (caller side enforces switchDeviceOpTimeout). Codex
+	// review: fixed 5-minute cap could chop long transfers.
+	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstreamURL, nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal",
+			"build relay request: "+err.Error())
+		return
+	}
+	if err := peer.AuthorizeOutbound(r.Context(), s.agents.Store(), upReq, sourceDeviceID); err != nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway",
+			"no Bearer available for source peer (pair it via the auto-pairing flow first): "+err.Error())
+		return
+	}
+	client := peer.NoKeepAliveHTTPClient(0)
+	resp, err := client.Do(upReq)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway",
+			fmt.Sprintf("source dial failed: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+	// Preserve the digest + size headers so the caller's sha256
+	// check still works.
+	for _, h := range []string{"Content-Type", "ETag", "X-Kojo-Blob-SHA256", "Content-Length", "Cache-Control"} {
+		if v := resp.Header.Get(h); v != "" {
+			w.Header().Set(h, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
 }

@@ -2,8 +2,6 @@ package peer
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +12,7 @@ import (
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/blob"
+	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // docs/multi-device-storage.md §3.7 step 4 — target-side blob pull.
@@ -40,13 +39,22 @@ import (
 
 // PullSource identifies the peer to fetch from.
 type PullSource struct {
-	// DeviceID is the source peer's identity, used as the
-	// SigningInput.Audience and as a sanity check on incoming
-	// blob_refs rows.
+	// DeviceID is the logical source peer's identity. When RelayVia
+	// is nil, used as the AuthorizeOutbound target; otherwise it
+	// rides in the `?relay_from=` query so the relayer (typically
+	// the Hub) knows which third peer to forward to.
 	DeviceID string
-	// Address is the base URL (e.g. "http://hub.tail-net.ts.net:8080")
-	// returned by NormalizeAddress. The blob URI path is appended.
+	// Address is the base URL of whoever this client should dial.
+	// Direct mode: source's URL. Relay mode: relayer's URL (Hub).
 	Address string
+	// RelayVia, when non-nil, makes PullOne dial RelayVia.Address
+	// with `?relay_from=<DeviceID>` appended, and authenticate as
+	// the Bearer paired with RelayVia.DeviceID (Hub↔peer). This is
+	// the Bearer-only-auth replacement for direct peer↔peer pulls
+	// (docs/peer-simplify-plan.md Codex P1-2): each peer carries
+	// only Hub↔peer credentials, so peer-to-peer blob transfers
+	// pass through the Hub as a streaming proxy.
+	RelayVia *PullSource
 }
 
 // PullItem is one entry in a pull batch — the URI to fetch plus
@@ -81,7 +89,15 @@ type PullResult struct {
 // the same signed nonce; see NewPullClient for the full
 // rationale.
 type PullClient struct {
-	identity   *Identity
+	identity *Identity
+	// store is consulted by AuthorizeOutbound during the dual-stack
+	// window (docs/peer-simplify-plan.md step 7): when a Bearer for
+	// the source peer is present it's used for the GET, otherwise
+	// the legacy SignRequest path runs. peer↔peer Bearers do NOT
+	// exist after the simplification's first wave (Hub mints only
+	// Hub↔peer pairs), so this fallback is the load-bearing branch
+	// until a follow-up capability-URL flow lands.
+	store      *store.Store
 	httpClient *http.Client
 	logger     *slog.Logger
 }
@@ -100,7 +116,7 @@ type PullClient struct {
 // the stale-conn retry path never fires. Cost: a few extra
 // handshakes per switch — negligible against the blob payload
 // sizes — vs the 401 that aborts the whole switch.
-func NewPullClient(id *Identity, httpClient *http.Client, logger *slog.Logger) *PullClient {
+func NewPullClient(id *Identity, st *store.Store, httpClient *http.Client, logger *slog.Logger) *PullClient {
 	if httpClient == nil {
 		// No per-blob HTTP ceiling: a multi-GiB blob over a slow
 		// Tailscale link easily exceeds any fixed timeout, and the
@@ -113,7 +129,7 @@ func NewPullClient(id *Identity, httpClient *http.Client, logger *slog.Logger) *
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &PullClient{identity: id, httpClient: httpClient, logger: logger}
+	return &PullClient{identity: id, store: st, httpClient: httpClient, logger: logger}
 }
 
 // noKeepAliveTransport returns an http.Transport with idle-
@@ -189,23 +205,39 @@ func (c *PullClient) PullOne(ctx context.Context, src PullSource, item PullItem,
 		return res, nil
 	}
 
-	reqURL, err := buildPeerBlobURL(src.Address, item.URI)
+	// Direct mode: dial source, authenticate as source's Bearer.
+	// Relay mode: dial RelayVia (Hub), authenticate as Hub's Bearer,
+	// append `?relay_from=<source_device_id>` so the Hub knows whom
+	// to forward to. The Hub side (peer_blob_handler.go relayPeerBlob)
+	// strips the query and re-issues the upstream GET with its own
+	// Hub→source Bearer.
+	dialBase := src.Address
+	authTarget := src.DeviceID
+	relayFrom := ""
+	if src.RelayVia != nil {
+		if src.RelayVia.Address == "" || src.RelayVia.DeviceID == "" {
+			return res, errors.New("peer.PullClient: RelayVia missing Address or DeviceID")
+		}
+		dialBase = src.RelayVia.Address
+		authTarget = src.RelayVia.DeviceID
+		relayFrom = src.DeviceID
+	}
+	reqURL, err := buildPeerBlobURL(dialBase, item.URI)
 	if err != nil {
 		res.Status = "error"
 		res.Error = "build url: " + err.Error()
 		return res, nil
+	}
+	if relayFrom != "" {
+		reqURL += "?relay_from=" + url.QueryEscape(relayFrom)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return res, fmt.Errorf("peer.PullOne: new request: %w", err)
 	}
-	nonce, err := MakeNonce()
-	if err != nil {
-		return res, fmt.Errorf("peer.PullOne: nonce: %w", err)
-	}
-	if err := SignRequest(req, c.identity.DeviceID, c.identity.PrivateKey, nonce, src.DeviceID); err != nil {
-		return res, fmt.Errorf("peer.PullOne: sign: %w", err)
+	if err := AuthorizeOutbound(ctx, c.store, req, authTarget); err != nil {
+		return res, fmt.Errorf("peer.PullOne: authorize: %w", err)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -365,14 +397,3 @@ func buildPeerBlobURL(base, blobURI string) (string, error) {
 	return u.String(), nil
 }
 
-// MakeNonce returns a fresh 32-byte base64 nonce for use in
-// AuthHeaderNonce. Same shape as subscriber.newNonce; duplicated
-// here so the pull client can stand alone without coupling to the
-// status-subscribe machinery.
-func MakeNonce() (string, error) {
-	var b [AuthNonceLen]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(b[:]), nil
-}

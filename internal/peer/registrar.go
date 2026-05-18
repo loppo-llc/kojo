@@ -126,7 +126,6 @@ func (r *Registrar) RefreshPublicName(ctx context.Context) error {
 		DeviceID:  r.id.DeviceID,
 		Name:      r.id.Name,
 		URL:       url,
-		PublicKey: r.id.PublicKeyBase64(),
 		LastSeen:  nowMs,
 		Status:    store.PeerStatusOnline,
 	})
@@ -177,7 +176,6 @@ func (r *Registrar) Start(ctx context.Context) error {
 		DeviceID:  r.id.DeviceID,
 		Name:      r.id.Name,
 		URL:       r.selfURL(),
-		PublicKey: r.id.PublicKeyBase64(),
 		LastSeen:  nowMs,
 		Status:    store.PeerStatusOnline,
 	}); err != nil {
@@ -315,7 +313,6 @@ func (r *Registrar) tickOnce() {
 		DeviceID:  r.id.DeviceID,
 		Name:      r.id.Name,
 		URL:       r.selfURL(),
-		PublicKey: r.id.PublicKeyBase64(),
 		LastSeen:  nowMs,
 		Status:    store.PeerStatusOnline,
 	}); upErr != nil {

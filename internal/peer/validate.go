@@ -1,8 +1,6 @@
 package peer
 
 import (
-	"crypto/ed25519"
-	"encoding/base64"
 	"errors"
 	"strings"
 	"unicode"
@@ -62,25 +60,3 @@ func ValidateName(name string) error {
 	return nil
 }
 
-// ValidatePublicKey decodes the wire-form (strict base64-std,
-// raw 32-byte Ed25519) and rejects anything else. Strict
-// decoding catches embedded whitespace / non-canonical padding
-// that would otherwise let the "same" public key land as two
-// distinct rows. The round-trip check (re-encode == input) also
-// guards against alternate-but-decoder-accepting forms.
-func ValidatePublicKey(b64 string) error {
-	if b64 == "" {
-		return errors.New("publicKey is required")
-	}
-	raw, err := base64.StdEncoding.Strict().DecodeString(b64)
-	if err != nil {
-		return errors.New("publicKey must be base64-standard encoded (no whitespace, canonical padding)")
-	}
-	if len(raw) != ed25519.PublicKeySize {
-		return errors.New("publicKey must be a 32-byte Ed25519 public key")
-	}
-	if base64.StdEncoding.EncodeToString(raw) != b64 {
-		return errors.New("publicKey must be canonical base64-standard encoding")
-	}
-	return nil
-}

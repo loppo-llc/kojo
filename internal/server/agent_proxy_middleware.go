@@ -190,14 +190,9 @@ func (s *Server) proxyToHolderPeer(w http.ResponseWriter, r *http.Request, agent
 		}
 	}
 
-	// Sign with this peer's identity.
-	nonce, err := peer.MakeNonce()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "nonce", err.Error())
-		return
-	}
-	if err := peer.SignRequest(proxyReq, s.peerID.DeviceID, s.peerID.PrivateKey, nonce, holderDeviceID); err != nil {
-		writeError(w, http.StatusInternalServerError, "sign", err.Error())
+	// Attach the Bearer that pairs this Hub with the holder peer.
+	if err := peer.AuthorizeOutbound(proxyReq.Context(), s.agents.Store(), proxyReq, holderDeviceID); err != nil {
+		writeError(w, http.StatusInternalServerError, "authorize", err.Error())
 		return
 	}
 

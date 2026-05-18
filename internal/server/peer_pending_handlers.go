@@ -31,6 +31,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/peer"
@@ -39,25 +40,23 @@ import (
 
 // hubInfoResponse is the wire shape of GET /api/v1/peers/hub-info.
 // The peer writes this into its local peer_registry (trusted=true)
-// before sending the first join-request — that's how Hub becomes a
-// signing-key the peer's PeerAuth middleware trusts.
+// before sending the first join-request so any subsequent Hub→peer
+// signed Bearer can be looked up by device_id.
 //
 // `version` carries the Hub binary's version string so a peer can
 // log a useful mismatch warning if it ever needs to.
 type hubInfoResponse struct {
-	DeviceID  string `json:"deviceId"`
-	Name      string `json:"name"`
-	PublicKey string `json:"publicKey"`
-	URL       string `json:"url"`
-	Version   string `json:"version"`
+	DeviceID string `json:"deviceId"`
+	Name     string `json:"name"`
+	URL      string `json:"url"`
+	Version  string `json:"version"`
 }
 
 // handleHubInfo returns the Hub's identity row + dial URL so a
-// peer can populate its peer_registry before signing its first
+// peer can populate its peer_registry before sending its first
 // join-request. Unauthenticated by design (the peer has no
-// credential yet); the response carries only the public identity
-// material that any tailnet member could otherwise learn by
-// inspecting a signed inter-peer request.
+// credential yet); the response carries only the metadata any
+// tailnet member could otherwise learn by querying the Hub.
 func (s *Server) handleHubInfo(w http.ResponseWriter, r *http.Request) {
 	if s.peerID == nil || s.agents == nil || s.agents.Store() == nil {
 		writeError(w, http.StatusServiceUnavailable, "unavailable",
@@ -71,29 +70,26 @@ func (s *Server) handleHubInfo(w http.ResponseWriter, r *http.Request) {
 		// peer's NormalizeAddress(...) call will refuse and the
 		// peer retries hub-info on its next discovery tick.
 		writeJSONResponse(w, http.StatusOK, hubInfoResponse{
-			DeviceID:  s.peerID.DeviceID,
-			Name:      s.peerID.Name,
-			PublicKey: s.peerID.PublicKeyBase64(),
-			Version:   s.version,
+			DeviceID: s.peerID.DeviceID,
+			Name:     s.peerID.Name,
+			Version:  s.version,
 		})
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, hubInfoResponse{
-		DeviceID:  rec.DeviceID,
-		Name:      rec.Name,
-		PublicKey: rec.PublicKey,
-		URL:       rec.URL,
-		Version:   s.version,
+		DeviceID: rec.DeviceID,
+		Name:     rec.Name,
+		URL:      rec.URL,
+		Version:  s.version,
 	})
 }
 
 // joinRequestBody is the wire shape a peer POSTs to
 // /api/v1/peers/join-request.
 type joinRequestBody struct {
-	DeviceID  string `json:"deviceId"`
-	Name      string `json:"name"`
-	URL       string `json:"url"`
-	PublicKey string `json:"publicKey"`
+	DeviceID string `json:"deviceId"`
+	Name     string `json:"name"`
+	URL      string `json:"url"`
 }
 
 // joinRequestResponse is what the Hub answers. state="approved"
@@ -104,9 +100,33 @@ type joinRequestBody struct {
 // When state="approved", Hub carries its own pairing spec in `hub`
 // so the peer can populate / refresh its local registry without a
 // second round-trip to /hub-info.
+//
+// PeerBearer / HubBearer are the two halves of the Bearer-over-TLS
+// pair docs/peer-simplify-plan.md introduces. They are delivered
+// EXACTLY ONCE per approve event: the first /join-request poll
+// returning state="approved" after the operator approves carries
+// the raw values; subsequent polls return state="approved" with
+// the bearer fields empty. The peer side MUST persist both on
+// first receipt:
+//   - PeerBearer (the peer→Hub credential) → peer kv outbound
+//   - HubBearer (the Hub→peer credential) → peer_tokens hash row
+//
+// A peer that crashes between receiving and persisting must
+// trigger operator re-approve to mint a fresh pair; the same raw
+// tokens never come back over the wire.
 type joinRequestResponse struct {
-	State string           `json:"state"` // "approved" | "pending"
-	Hub   *hubInfoResponse `json:"hub,omitempty"`
+	State      string           `json:"state"` // "approved" | "pending"
+	Hub        *hubInfoResponse `json:"hub,omitempty"`
+	PeerBearer string           `json:"peerBearer,omitempty"`
+	HubBearer  string           `json:"hubBearer,omitempty"`
+	// JoinSecret is the per-pending one-time credential the Hub
+	// returns on the FIRST POST /join-request for a given
+	// device_id. Subsequent /join-request POST and GET poll
+	// calls MUST present it in Authorization: Bearer so the
+	// peer's URL and Bearer-stash delivery can be bound to the
+	// original requester. Empty on every response after the
+	// first mint (peer stashes the raw value once and reuses it).
+	JoinSecret string `json:"joinSecret,omitempty"`
 }
 
 // joinRequestBodyCap bounds the join-request body. A few hundred
@@ -155,10 +175,6 @@ func (s *Server) handleJoinRequest(w http.ResponseWriter, r *http.Request) {
 			"url must be host:port or http(s)://host:port")
 		return
 	}
-	if err := peer.ValidatePublicKey(req.PublicKey); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
 	if req.DeviceID == s.peerID.DeviceID {
 		writeError(w, http.StatusConflict, "conflict",
 			"deviceId collides with Hub self-row")
@@ -168,9 +184,16 @@ func (s *Server) handleJoinRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleJoinRequestPoll is the GET companion to POST
-// /api/v1/peers/join-request. peer side uses it to poll for
-// Approve without re-shipping its full identity body. The path
-// param carries deviceId; the response shape matches the POST.
+// /api/v1/peers/join-request. Peer side uses it to poll for Approve
+// without re-shipping its full identity body. The path param carries
+// deviceId; the response shape matches the POST.
+//
+// Bearer-stash delivery on the approved branch is gated on the caller
+// presenting either the per-join secret (issued on first POST) or the
+// permanent peer→Hub Bearer (issued on first approved delivery). Any
+// unauthenticated GET returns state + hub spec only — Codex review
+// P1: prevents an attacker who knows the device_id from claiming the
+// one-shot stash by polling faster than the legitimate peer.
 func (s *Server) handleJoinRequestPoll(w http.ResponseWriter, r *http.Request) {
 	if s.peerID == nil || s.agents == nil || s.agents.Store() == nil {
 		writeError(w, http.StatusServiceUnavailable, "unavailable",
@@ -188,10 +211,21 @@ func (s *Server) handleJoinRequestPoll(w http.ResponseWriter, r *http.Request) {
 	// state from the peer's point of view — answer pending below.
 	if rec, err := st.GetPeer(r.Context(), id); err == nil && rec.Trusted {
 		hub := s.buildHubInfoResponse(r.Context())
-		writeJSONResponse(w, http.StatusOK, joinRequestResponse{
-			State: "approved",
-			Hub:   hub,
-		})
+		resp := joinRequestResponse{State: "approved", Hub: hub}
+		// ACK check FIRST. If the peer presents its permanent
+		// peer→Hub Bearer, the previous delivery landed — consume
+		// the stash and return state+hub without re-minting
+		// (re-minting now would revoke the very token the peer
+		// just authenticated with, an infinite remint/revoke loop
+		// flagged by Codex critical).
+		if s.callerHoldsPeerBearer(r, id) {
+			s.consumePairingStashOnAck(r.Context(), id)
+		} else if s.callerHoldsJoinIdentity(r.Context(), id, r) {
+			// Peer is still on the join_secret credential → attach
+			// + (re-)mint a fresh peer→Hub Bearer for delivery.
+			s.attachPairingBearers(r.Context(), id, &resp)
+		}
+		writeJSONResponse(w, http.StatusOK, resp)
 		return
 	}
 	// pending branch: still in peer_pending.
@@ -213,15 +247,7 @@ func (s *Server) processJoinRequest(w http.ResponseWriter, r *http.Request, req 
 	existing, err := st.GetPeer(r.Context(), req.DeviceID)
 	switch {
 	case err == nil:
-		// Existing registry row. public_key immutability: a
-		// peer that has rotated keys cannot silently re-pair —
-		// Owner must `kojo --peer-remove` first.
-		if existing.PublicKey != req.PublicKey {
-			writeError(w, http.StatusConflict, "conflict",
-				"public_key disagrees with existing registry row; ask Owner to --peer-remove and re-pair")
-			return
-		}
-		// Trust gate. The auto-onboarding flow's contract is
+		// Existing registry row. Trust gate: the auto-onboarding flow's contract is
 		// "Approve → trusted=true"; an existing untrusted row
 		// means the peer was paired via `--peer-add` (no
 		// --trusted) or had its trust revoked. Either way,
@@ -231,15 +257,53 @@ func (s *Server) processJoinRequest(w http.ResponseWriter, r *http.Request, req 
 		if !existing.Trusted {
 			break
 		}
-		// Refresh name/url + last_seen so the operator-visible
-		// row tracks the peer's current advertised address.
+		// /join-request is unauthenticated by design (the first-time
+		// peer has no credential yet). Once a row is trusted, the
+		// metadata-update + Bearer-attach paths must require proof
+		// of ownership — otherwise any host that can reach the Hub
+		// and knows the device_id can overwrite the URL and start
+		// receiving Hub→peer traffic against an attacker-controlled
+		// listener (Codex review: P1 binding gap).
+		//
+		// Proof = the existing peer→Hub Bearer in Authorization.
+		// Missing or mismatched header => read-only response: state +
+		// hub spec only, no URL update, no Bearer attach. The
+		// legitimate peer always presents this Bearer after its first
+		// approve (it's exactly the credential it uses for every
+		// other Hub call), so this gate is transparent to the
+		// real client.
+		// Bearer-attach + URL update require the permanent peer→Hub
+		// Bearer; the per-join secret is NOT sufficient here because
+		// after the peer has been delivered Bearers the join secret
+		// is gone, and any future URL update should authenticate
+		// against the real credential. The first approved POST that
+		// claims the stash MUST go through callerHoldsJoinIdentity
+		// instead — see the approved branch in handleJoinRequestPoll
+		// for the GET-poll path, which is the recommended channel
+		// for first delivery. POST /join-request after approval is
+		// only used for URL refresh.
+		isAuth := s.callerHoldsJoinIdentity(r.Context(), req.DeviceID, r)
+		if !isAuth {
+			hub := s.buildHubInfoResponse(r.Context())
+			writeJSONResponse(w, http.StatusOK, joinRequestResponse{State: "approved", Hub: hub})
+			return
+		}
+		// callerHoldsJoinIdentity == true ⇒ peer presented either
+		// the per-join secret (first delivery) or the permanent
+		// Bearer. Both are safe to gate URL update + stash claim.
 		_ = st.UpdatePeerMetadata(r.Context(), req.DeviceID, req.Name, req.URL)
 		_ = st.TouchPeer(r.Context(), req.DeviceID, store.PeerStatusOnline, 0)
 		hub := s.buildHubInfoResponse(r.Context())
-		writeJSONResponse(w, http.StatusOK, joinRequestResponse{
-			State: "approved",
-			Hub:   hub,
-		})
+		resp := joinRequestResponse{State: "approved", Hub: hub}
+		// ACK first — see handleJoinRequestPoll for the loop
+		// rationale; only mint when the caller is still on the
+		// join_secret credential.
+		if s.callerHoldsPeerBearer(r, req.DeviceID) {
+			s.consumePairingStashOnAck(r.Context(), req.DeviceID)
+		} else {
+			s.attachPairingBearers(r.Context(), req.DeviceID, &resp)
+		}
+		writeJSONResponse(w, http.StatusOK, resp)
 		return
 	case errors.Is(err, store.ErrNotFound):
 		// Fall through to pending.
@@ -250,20 +314,56 @@ func (s *Server) processJoinRequest(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 
-	pending := &store.PeerPendingRecord{
-		DeviceID:  req.DeviceID,
-		Name:      req.Name,
-		URL:       req.URL,
-		PublicKey: req.PublicKey,
+	// Split the unauth (insert-only) path from the auth (upsert)
+	// path. Codex review: a single UpsertPeerPending exposed
+	// metadata overwrites to unauth callers via the ON CONFLICT
+	// branch. Insert-only on the unauth path eliminates that.
+	if s.callerHoldsJoinIdentity(r.Context(), req.DeviceID, r) {
+		// Authenticated repeat: refresh name/url/last_seen via
+		// Upsert (join_secret_hash is preserved on conflict).
+		if _, err := st.UpsertPeerPending(r.Context(), &store.PeerPendingRecord{
+			DeviceID: req.DeviceID,
+			Name:     req.Name,
+			URL:      req.URL,
+		}); err != nil {
+			s.logger.Error("join-request: upsert pending", "device_id", req.DeviceID, "err", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, joinRequestResponse{State: "pending"})
+		return
 	}
-	if _, err := st.UpsertPeerPending(r.Context(), pending); err != nil {
-		s.logger.Error("join-request: upsert pending", "device_id", req.DeviceID, "err", err)
-		writeError(w, http.StatusInternalServerError, "internal_error",
-			"internal server error")
+	// Unauthenticated: mint a candidate secret + try insert-if-absent.
+	// Two simultaneous first-time POSTs are serialised by SQLite at
+	// the row level; one wins as the inserter, the other gets
+	// inserted=false and is rejected — its only path forward is to
+	// authenticate against the existing secret.
+	candidate, sErr := mintJoinSecret()
+	if sErr != nil {
+		s.logger.Error("join-request: mint secret", "device_id", req.DeviceID, "err", sErr)
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+	candidateHash := store.HashPeerToken(candidate)
+	_, inserted, err := st.InsertPeerPendingIfAbsent(r.Context(), &store.PeerPendingRecord{
+		DeviceID:       req.DeviceID,
+		Name:           req.Name,
+		URL:            req.URL,
+		JoinSecretHash: candidateHash,
+	})
+	if err != nil {
+		s.logger.Error("join-request: insert pending", "device_id", req.DeviceID, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+	if !inserted {
+		writeError(w, http.StatusUnauthorized, "join_secret_required",
+			"a pending row already exists for this deviceId; subsequent /join-request calls must present the join_secret in Authorization: Bearer")
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, joinRequestResponse{
-		State: "pending",
+		State:      "pending",
+		JoinSecret: candidate,
 	})
 }
 
@@ -277,17 +377,15 @@ func (s *Server) buildHubInfoResponse(ctx context.Context) *hubInfoResponse {
 	rec, err := s.agents.Store().GetPeer(ctx, s.peerID.DeviceID)
 	if err != nil {
 		return &hubInfoResponse{
-			DeviceID:  s.peerID.DeviceID,
-			Name:      s.peerID.Name,
-			PublicKey: s.peerID.PublicKeyBase64(),
-			Version:   s.version,
+			DeviceID: s.peerID.DeviceID,
+			Name:     s.peerID.Name,
+			Version:  s.version,
 		}
 	}
 	return &hubInfoResponse{
-		DeviceID:  rec.DeviceID,
-		Name:      rec.Name,
-		PublicKey: rec.PublicKey,
-		URL:       rec.URL,
+		DeviceID: rec.DeviceID,
+		Name:     rec.Name,
+		URL:      rec.URL,
 		Version:   s.version,
 	}
 }
@@ -299,7 +397,6 @@ type peerPendingResponse struct {
 	DeviceID  string `json:"deviceId"`
 	Name      string `json:"name"`
 	URL       string `json:"url"`
-	PublicKey string `json:"publicKey"`
 	FirstSeen int64  `json:"firstSeen"`
 	LastSeen  int64  `json:"lastSeen"`
 }
@@ -333,7 +430,6 @@ func (s *Server) handleListPeerPending(w http.ResponseWriter, r *http.Request) {
 			DeviceID:  rec.DeviceID,
 			Name:      rec.Name,
 			URL:       rec.URL,
-			PublicKey: rec.PublicKey,
 			FirstSeen: rec.FirstSeen,
 			LastSeen:  rec.LastSeen,
 		})
@@ -363,16 +459,11 @@ func (s *Server) handleApprovePeerPending(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	rec, err := s.agents.Store().ApprovePeerPending(r.Context(), id)
+	rec, joinSecretHash, err := s.agents.Store().ApprovePeerPending(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "not_found",
 				"no pending join request for this deviceId")
-			return
-		}
-		if errors.Is(err, store.ErrPeerPendingPubkeyMismatch) {
-			writeError(w, http.StatusConflict, "conflict",
-				"existing peer_registry row has a different public_key; --peer-remove first")
 			return
 		}
 		s.logger.Error("approve: failed", "device_id", id, "err", err)
@@ -380,7 +471,36 @@ func (s *Server) handleApprovePeerPending(w http.ResponseWriter, r *http.Request
 			"internal server error")
 		return
 	}
-	s.broadcastPeerRegistration(rec)
+	// Mint the Bearer pair (docs/peer-simplify-plan.md step 4) and
+	// stash both raw values for the next /join-request poll to
+	// consume. With Ed25519 signing gone (step 9) the peer has NO
+	// fallback credential — a mint failure leaves the peer approved
+	// but unreachable. Roll back the promotion so the operator
+	// surfaces a clear retry path (Codex review P2-4).
+	mintCtx, mintCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer mintCancel()
+	if err := s.mintAndStashPairingBearers(mintCtx, id, joinSecretHash); err != nil {
+		s.logger.Error("approve: bearer mint failed; rolling back approval",
+			"device_id", id, "err", err)
+		// Best-effort rollback: drop the trust bit so the next
+		// /join-request poll re-enters the pending state and the
+		// operator can re-approve. Leaving the row in
+		// peer_registry with trusted=false is the closest we can
+		// get to "undo" without re-introducing the pending row,
+		// which a cooperating client could re-create on its next
+		// 60s tick anyway.
+		rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer rollbackCancel()
+		if rErr := s.agents.Store().UpdatePeerTrust(rollbackCtx, id, false); rErr != nil {
+			s.logger.Error("approve: rollback trust flip failed",
+				"device_id", id, "err", rErr)
+		}
+		writeError(w, http.StatusInternalServerError, "bearer_mint_failed",
+			"bearer pair mint failed; the peer has been rolled back to untrusted, retry approve")
+		return
+	}
+	// No fan-out broadcast — sibling peers learn about this row when
+	// they next GET /api/v1/peers from the Hub.
 	writeJSONResponse(w, http.StatusOK, s.toPeerResponse(rec))
 }
 

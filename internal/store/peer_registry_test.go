@@ -9,10 +9,9 @@ import (
 func seedPeer(t *testing.T, s *Store, id, name string) *PeerRecord {
 	t.Helper()
 	rec, err := s.UpsertPeer(context.Background(), &PeerRecord{
-		DeviceID:  id,
-		Name:      name,
-		PublicKey: "pk-" + id,
-		Status:    PeerStatusOnline,
+		DeviceID: id,
+		Name:     name,
+		Status:   PeerStatusOnline,
 	})
 	if err != nil {
 		t.Fatalf("seed peer %s: %v", id, err)
@@ -28,10 +27,9 @@ func TestUpsertPeerRequiredFields(t *testing.T) {
 		rec  *PeerRecord
 	}{
 		{"nil", nil},
-		{"empty device_id", &PeerRecord{Name: "n", PublicKey: "k"}},
-		{"empty name", &PeerRecord{DeviceID: "d", PublicKey: "k"}},
-		{"empty public_key", &PeerRecord{DeviceID: "d", Name: "n"}},
-		{"invalid status", &PeerRecord{DeviceID: "d", Name: "n", PublicKey: "k", Status: "weird"}},
+		{"empty device_id", &PeerRecord{Name: "n"}},
+		{"empty name", &PeerRecord{DeviceID: "d"}},
+		{"invalid status", &PeerRecord{DeviceID: "d", Name: "n", Status: "weird"}},
 	}
 	for _, c := range cases {
 		if _, err := s.UpsertPeer(ctx, c.rec); err == nil {
@@ -44,52 +42,24 @@ func TestUpsertPeerRoundTrip(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 	first, err := s.UpsertPeer(ctx, &PeerRecord{
-		DeviceID:     "dev-1",
-		Name:         "alice-mac",
-		PublicKey:    "pk-1",
-		Capabilities: `{"os":"darwin"}`,
-		LastSeen:     1700,
-		Status:       PeerStatusOnline,
+		DeviceID: "dev-1",
+		Name:     "alice-mac",
+		URL:      "http://alice:8080",
+		LastSeen: 1700,
+		Status:   PeerStatusOnline,
 	})
 	if err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
-	if first.Status != "online" || first.Capabilities != `{"os":"darwin"}` {
+	if first.Status != "online" || first.URL != "http://alice:8080" {
 		t.Errorf("round-trip mismatch: %+v", first)
 	}
 	got, err := s.GetPeer(ctx, "dev-1")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if got.PublicKey != "pk-1" {
-		t.Errorf("public_key: %q", got.PublicKey)
-	}
-}
-
-func TestUpsertPeerPreservesPublicKey(t *testing.T) {
-	s := openTestStore(t)
-	ctx := context.Background()
-	if _, err := s.UpsertPeer(ctx, &PeerRecord{
-		DeviceID: "dev-1", Name: "n", PublicKey: "pk-original", Status: "online",
-	}); err != nil {
-		t.Fatalf("first: %v", err)
-	}
-	// Re-upsert with a different public_key — the schema tolerates this
-	// at SQL level, but our helper preserves the prior key so a hostile
-	// peer can't silently rotate identity. The mutable columns
-	// (capabilities / status / name) overwrite as expected.
-	rec, err := s.UpsertPeer(ctx, &PeerRecord{
-		DeviceID: "dev-1", Name: "renamed", PublicKey: "pk-rotation",
-		Status: "degraded", Capabilities: `{"gpu":true}`,
-	})
-	if err != nil {
-		t.Fatalf("re-upsert: %v", err)
-	}
-	if rec.PublicKey != "pk-original" {
-		t.Errorf("public_key rotated silently: %q", rec.PublicKey)
-	}
-	if rec.Name != "renamed" || rec.Status != "degraded" || rec.Capabilities != `{"gpu":true}` {
-		t.Errorf("mutable cols not refreshed: %+v", rec)
+	if got.DeviceID != "dev-1" {
+		t.Errorf("device_id: %q", got.DeviceID)
 	}
 }
 
@@ -113,7 +83,7 @@ func TestListPeersOrderAndStatusFilter(t *testing.T) {
 		{"dev-c", "online", 2000},
 	} {
 		if _, err := s.UpsertPeer(ctx, &PeerRecord{
-			DeviceID: p.id, Name: p.id, PublicKey: "pk-" + p.id,
+			DeviceID: p.id, Name: p.id,
 			LastSeen: p.seen, Status: p.status,
 		}); err != nil {
 			t.Fatalf("seed %s: %v", p.id, err)

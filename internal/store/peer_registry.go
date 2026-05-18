@@ -28,19 +28,18 @@ type PeerRecord struct {
 	// registrar stamps it from tsnet's FQDN (Hub) or the Tailscale
 	// IPv4 (--peer). Empty until the daemon has been started at least
 	// once so the listener bound its port.
-	URL          string
-	PublicKey    string
-	Capabilities string // raw JSON, empty = NULL
-	LastSeen     int64  // unix millis, 0 = NULL
-	Status       string
+	URL      string
+	LastSeen int64 // unix millis, 0 = NULL
+	Status   string
 	// Trusted gates the privileged cross-peer surface: when set,
-	// requests signed by this row's public_key are admitted on
-	// /api/v1/sessions, /api/v1/ws, /api/v1/info, /api/v1/dirs,
-	// /api/v1/files, /api/v1/git, /api/v1/upload. Without it the
-	// signer can only reach the minimal inter-peer endpoints
-	// (peers/events, peers/blobs, peers/pull, peers/agent-sync,
-	// peers/register-push). Operator-controlled at pairing time
-	// (--peer-add --trusted, or the UI checkbox).
+	// requests authenticated by this row's outbound Bearer are
+	// admitted on /api/v1/sessions, /api/v1/ws, /api/v1/info,
+	// /api/v1/dirs, /api/v1/files, /api/v1/git, /api/v1/upload.
+	// Without it the bearer can only reach the minimal inter-peer
+	// endpoints (peers/events, peers/blobs, peers/pull,
+	// peers/agent-sync). Operator-controlled at pairing time (the
+	// auto-pairing Approve flow flips it on; --peer-trust toggles
+	// it after the fact).
 	Trusted bool
 }
 
@@ -50,12 +49,6 @@ const (
 	PeerStatusOffline  = "offline"
 	PeerStatusDegraded = "degraded"
 )
-
-// ErrPeerKeyUnchanged is returned by RotatePeerKey when the supplied
-// new public_key matches the existing one. Callers (e.g. the HTTP
-// handler) should `errors.Is` against this sentinel rather than
-// pattern-matching on the message string.
-var ErrPeerKeyUnchanged = errors.New("store: rotate-key: new public_key matches existing")
 
 // validPeerStatus mirrors the CHECK constraint so callers can fail
 // fast at the Go layer instead of getting a SQLITE_CONSTRAINT error
@@ -88,9 +81,6 @@ func (s *Store) UpsertPeer(ctx context.Context, rec *PeerRecord) (*PeerRecord, e
 	if rec.Name == "" {
 		return nil, errors.New("store.UpsertPeer: name required")
 	}
-	if rec.PublicKey == "" {
-		return nil, errors.New("store.UpsertPeer: public_key required")
-	}
 	if rec.Status == "" {
 		rec.Status = PeerStatusOnline
 	}
@@ -98,28 +88,21 @@ func (s *Store) UpsertPeer(ctx context.Context, rec *PeerRecord) (*PeerRecord, e
 		return nil, fmt.Errorf("store.UpsertPeer: invalid status %q", rec.Status)
 	}
 
-	// On conflict only the *mutable* columns update — preserving the
-	// public_key column blocks a silent identity-key rotation (a
-	// hostile or buggy peer can re-register but cannot also swap its
-	// long-lived key without a separate RotatePeerKey path that
-	// audits the swap). The `trusted` column is operator-controlled
-	// and likewise preserved on conflict: a heartbeat / register-push
-	// must never silently flip a peer's trust state.
-	// Status / capabilities / last_seen / name / url are expected
-	// to drift over time and overwrite cleanly.
+	// On conflict only the *mutable* columns update. `trusted` is
+	// operator-controlled and preserved on conflict so a heartbeat
+	// never silently flips trust. Status / last_seen / name / url
+	// are expected to drift over time and overwrite cleanly.
 	const q = `
-INSERT INTO peer_registry (device_id, name, url, public_key, capabilities, last_seen, status, trusted)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO peer_registry (device_id, name, url, last_seen, status, trusted)
+VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(device_id) DO UPDATE SET
-  name         = excluded.name,
-  url          = excluded.url,
-  capabilities = excluded.capabilities,
-  last_seen    = excluded.last_seen,
-  status       = excluded.status
+  name      = excluded.name,
+  url       = excluded.url,
+  last_seen = excluded.last_seen,
+  status    = excluded.status
 `
 	if _, err := s.db.ExecContext(ctx, q,
-		rec.DeviceID, rec.Name, rec.URL, rec.PublicKey,
-		nullableText(rec.Capabilities),
+		rec.DeviceID, rec.Name, rec.URL,
 		nullableInt64(rec.LastSeen),
 		rec.Status, boolToInt(rec.Trusted),
 	); err != nil {
@@ -164,34 +147,24 @@ func (s *Store) RegisterPeerMetadata(ctx context.Context, rec *PeerRecord) (*Pee
 	if rec.Name == "" {
 		return nil, errors.New("store.RegisterPeerMetadata: name required")
 	}
-	if rec.PublicKey == "" {
-		return nil, errors.New("store.RegisterPeerMetadata: public_key required")
-	}
 	// On conflict, treat empty url as "no change" instead of
-	// blanking the existing column. A startup-time register-push
-	// from a peer that hasn't bound its listener yet would
-	// otherwise wipe the Hub's known URL for that peer and break
-	// every subsequent Hub→peer dial. The same applies to name —
-	// the operator-supplied label on the Hub is more authoritative
-	// than the bare hostname a fresh peer emits.
-	//
-	// `trusted` mirrors UpsertPeer's preserve-on-conflict semantics:
-	// register-push from a peer is operator-paired metadata, not an
-	// operator authorization decision, so the receiver's existing
-	// trust state stays canonical. Promotion / demotion of trust
-	// flows through the explicit UI / CLI path (see UpdatePeerTrust).
+	// blanking the existing column. A startup-time register from a
+	// peer that hasn't bound its listener yet would otherwise wipe
+	// the Hub's known URL for that peer and break every subsequent
+	// Hub→peer dial. The same applies to name — the operator-
+	// supplied label on the Hub is more authoritative than the
+	// bare hostname a fresh peer emits. `trusted` is operator-
+	// controlled and preserved on conflict.
 	const q = `
-INSERT INTO peer_registry (device_id, name, url, public_key, capabilities, last_seen, status, trusted)
-VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+INSERT INTO peer_registry (device_id, name, url, last_seen, status, trusted)
+VALUES (?, ?, ?, NULL, ?, ?)
 ON CONFLICT(device_id) DO UPDATE SET
-  name         = CASE WHEN excluded.name = '' THEN peer_registry.name ELSE excluded.name END,
-  url          = CASE WHEN excluded.url  = '' THEN peer_registry.url  ELSE excluded.url  END,
-  capabilities = excluded.capabilities
-  -- public_key, last_seen, status, trusted intentionally NOT touched on conflict
+  name = CASE WHEN excluded.name = '' THEN peer_registry.name ELSE excluded.name END,
+  url  = CASE WHEN excluded.url  = '' THEN peer_registry.url  ELSE excluded.url  END
+  -- last_seen, status, trusted intentionally NOT touched on conflict
 `
 	if _, err := s.db.ExecContext(ctx, q,
-		rec.DeviceID, rec.Name, rec.URL, rec.PublicKey,
-		nullableText(rec.Capabilities),
+		rec.DeviceID, rec.Name, rec.URL,
 		PeerStatusOffline, boolToInt(rec.Trusted),
 	); err != nil {
 		return nil, fmt.Errorf("store.RegisterPeerMetadata: %w", err)
@@ -268,92 +241,12 @@ func (s *Store) UpdatePeerTrust(ctx context.Context, deviceID string, trusted bo
 	return nil
 }
 
-// RotatePeerKey swaps public_key for the row keyed by device_id and
-// returns (oldKey, updatedRecord, nil). ErrNotFound is returned if no
-// row matches.
-//
-// This is the explicit, audited path that the UpsertPeer /
-// RegisterPeerMetadata contracts intentionally do NOT take: those
-// preserve public_key on conflict so a hostile or buggy peer cannot
-// silently rotate its long-lived identity by re-registering. Callers
-// MUST be the operator (Owner principal at the HTTP layer) and MUST
-// log the old → new fingerprint pair so the swap is reviewable.
-//
-// The transaction reads the current public_key under the same SQL
-// statement that updates it so the returned `oldKey` matches the
-// row that was actually overwritten — without that the caller would
-// have to GetPeer first and the read-modify-write window could drop
-// a concurrent rotation. SQLite serializes writes at the database
-// level so the SELECT-then-UPDATE inside one tx is race-free against
-// other writers.
-//
-// `last_seen` and `status` are intentionally NOT touched: an
-// operator-driven rotation does not imply the peer is reachable
-// right now, and the heartbeat loop is the authoritative writer for
-// liveness columns.
-func (s *Store) RotatePeerKey(ctx context.Context, deviceID, newPublicKey string) (string, *PeerRecord, error) {
-	if deviceID == "" {
-		return "", nil, errors.New("store.RotatePeerKey: device_id required")
-	}
-	if newPublicKey == "" {
-		return "", nil, errors.New("store.RotatePeerKey: public_key required")
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", nil, fmt.Errorf("store.RotatePeerKey: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	var oldKey string
-	if err := tx.QueryRowContext(ctx,
-		`SELECT public_key FROM peer_registry WHERE device_id = ?`,
-		deviceID,
-	).Scan(&oldKey); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", nil, ErrNotFound
-		}
-		return "", nil, fmt.Errorf("store.RotatePeerKey: select: %w", err)
-	}
-	if oldKey == newPublicKey {
-		// No-op rotations are explicitly rejected — the caller
-		// almost certainly meant a different key, and silently
-		// pretending the swap happened would prevent useful audit
-		// review of "I expected my new key to be different". The
-		// sentinel error lets HTTP handlers use errors.Is rather
-		// than pattern-matching on the message string.
-		return "", nil, ErrPeerKeyUnchanged
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE peer_registry SET public_key = ? WHERE device_id = ?`,
-		newPublicKey, deviceID,
-	); err != nil {
-		return "", nil, fmt.Errorf("store.RotatePeerKey: update: %w", err)
-	}
-	// Re-read inside the same transaction so the returned record
-	// reflects the row exactly as we left it. A post-commit GetPeer
-	// would expose a window where another rotate (or a registrar
-	// heartbeat) could land first, so the response would describe a
-	// row the caller never saw. Inside the tx the read is serialized
-	// with the UPDATE we just issued, so the returned record is
-	// guaranteed to carry our newPublicKey.
-	rec, err := scanPeerRow(tx.QueryRowContext(ctx, `
-SELECT device_id, name, url, public_key,
-       COALESCE(capabilities,''), COALESCE(last_seen,0), status, trusted
-  FROM peer_registry WHERE device_id = ?`, deviceID))
-	if err != nil {
-		return "", nil, fmt.Errorf("store.RotatePeerKey: re-read: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return "", nil, fmt.Errorf("store.RotatePeerKey: commit: %w", err)
-	}
-	return oldKey, rec, nil
-}
 
 // GetPeer returns the row keyed by device_id or ErrNotFound.
 func (s *Store) GetPeer(ctx context.Context, deviceID string) (*PeerRecord, error) {
 	const q = `
-SELECT device_id, name, url, public_key,
-       COALESCE(capabilities,''), COALESCE(last_seen,0), status, trusted
+SELECT device_id, name, url,
+       COALESCE(last_seen,0), status, trusted
   FROM peer_registry WHERE device_id = ?`
 	rec, err := scanPeerRow(s.db.QueryRowContext(ctx, q, deviceID))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -375,8 +268,8 @@ type ListPeersOptions struct {
 // recently-active peers float to the top.
 func (s *Store) ListPeers(ctx context.Context, opts ListPeersOptions) ([]*PeerRecord, error) {
 	q := `
-SELECT device_id, name, url, public_key,
-       COALESCE(capabilities,''), COALESCE(last_seen,0), status, trusted
+SELECT device_id, name, url,
+       COALESCE(last_seen,0), status, trusted
   FROM peer_registry
  WHERE 1=1`
 	args := []any{}
@@ -561,16 +454,48 @@ UPDATE peer_registry
 	return stale, nil
 }
 
-// DeletePeer removes the row keyed by device_id. Idempotent — a missing
-// row returns nil. Callers driving a "decommission" flow should also
-// audit any agent_locks rows whose holder_peer == deviceID; releasing
-// those is a separate operation (see ReleaseAgentLockByPeer).
+// DeletePeer removes the peer_registry row AND every related row
+// (peer_tokens, peer/out_bearer kv, peer/pairing_bearer_stash kv,
+// peer_pending) in a single transaction. Without the related-row
+// cleanup, re-adding the same device_id later would resurrect
+// cached Bearers, raw Hub→peer credentials, or a stale pairing
+// stash — Codex review hardening.
+//
+// Idempotent: missing rows return nil.
+//
+// Callers driving a "decommission" flow should also audit any
+// agent_locks rows whose holder_peer == deviceID; releasing those
+// is a separate operation (see ReleaseAgentLockByPeer).
 func (s *Store) DeletePeer(ctx context.Context, deviceID string) error {
-	if _, err := s.db.ExecContext(ctx,
-		`DELETE FROM peer_registry WHERE device_id = ?`,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store.DeletePeer: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM peer_registry WHERE device_id = ?`, deviceID,
+	); err != nil {
+		return fmt.Errorf("store.DeletePeer: registry: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE peer_tokens SET revoked_at = ? WHERE device_id = ? AND revoked_at IS NULL`,
+		NowMillis(), deviceID,
+	); err != nil {
+		return fmt.Errorf("store.DeletePeer: revoke tokens: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM peer_pending WHERE device_id = ?`, deviceID,
+	); err != nil {
+		return fmt.Errorf("store.DeletePeer: pending: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM kv WHERE namespace IN ('peer/out_bearer', 'peer/pairing_bearer_stash') AND key = ?`,
 		deviceID,
 	); err != nil {
-		return fmt.Errorf("store.DeletePeer: %w", err)
+		return fmt.Errorf("store.DeletePeer: kv cleanup: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store.DeletePeer: commit: %w", err)
 	}
 	return nil
 }
@@ -579,8 +504,8 @@ func scanPeerRow(r rowScanner) (*PeerRecord, error) {
 	var rec PeerRecord
 	var trustedInt int
 	if err := r.Scan(
-		&rec.DeviceID, &rec.Name, &rec.URL, &rec.PublicKey,
-		&rec.Capabilities, &rec.LastSeen, &rec.Status, &trustedInt,
+		&rec.DeviceID, &rec.Name, &rec.URL,
+		&rec.LastSeen, &rec.Status, &trustedInt,
 	); err != nil {
 		return nil, err
 	}

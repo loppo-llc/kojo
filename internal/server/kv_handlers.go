@@ -33,9 +33,9 @@ type kvListResponse struct {
 
 type kvPutRequest struct {
 	Value  string `json:"value"`
-	Type   string `json:"type"`            // "string" / "json" / "binary"; default "string"
+	Type   string `json:"type"`             // "string" / "json" / "binary"; default "string"
 	Secret bool   `json:"secret,omitempty"` // refused at this slice — daemon-internal only
-	Scope  string `json:"scope"`           // "global" / "local" / "machine"; default "global"
+	Scope  string `json:"scope"`            // "global" / "local" / "machine"; default "global"
 }
 
 // kvRequestCap caps the JSON request size. KV values are config /

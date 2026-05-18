@@ -1,8 +1,6 @@
 package server
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
 	"io"
 	"log/slog"
 	"net/http"
@@ -27,15 +25,9 @@ import (
 func TestPeerOnlyMux(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("ed25519: %v", err)
-	}
 	id := &peer.Identity{
-		DeviceID:   uuid.NewString(),
-		Name:       "peer-test",
-		PublicKey:  pub,
-		PrivateKey: priv,
+		DeviceID: uuid.NewString(),
+		Name:     "peer-test",
 	}
 
 	// Direct mux construction so we don't pull in agent.Manager.

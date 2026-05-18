@@ -90,8 +90,8 @@ func (s *Server) handlePeerEventsWS(w http.ResponseWriter, r *http.Request) {
 
 	// Snapshot frame.
 	snapshotFrame := struct {
-		Type  string              `json:"type"`
-		Peers []peer.StatusEvent  `json:"peers"`
+		Type  string             `json:"type"`
+		Peers []peer.StatusEvent `json:"peers"`
 	}{
 		Type:  "snapshot",
 		Peers: peerRecordsToStatusEvents(rows),

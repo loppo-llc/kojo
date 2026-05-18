@@ -17,8 +17,8 @@ import (
 
 // Agent WebSocket message types
 type agentWSClientMsg struct {
-	Type        string                  `json:"type"`                  // "message", "abort"
-	Content     string                  `json:"content"`               // for "message" type
+	Type        string                    `json:"type"`                  // "message", "abort"
+	Content     string                    `json:"content"`               // for "message" type
 	Attachments []agent.MessageAttachment `json:"attachments,omitempty"` // file attachments
 }
 

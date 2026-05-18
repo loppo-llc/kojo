@@ -39,17 +39,17 @@ func (s *Server) buildWebDAVHandler() (http.Handler, error) {
 // webdavGate authenticates a WebDAV request and forwards it to the
 // underlying handler when authorized. It accepts three credentials:
 //
-//   1. The Owner principal already stamped into ctx by the public
-//      listener's OwnerOnlyMiddleware. Trusting it preserves the
-//      "Tailscale reach == Owner" UX so a browser-driven WebDAV mount
-//      keeps working.
-//   2. The RoleWebDAV principal stamped by the auth listener's
-//      AuthMiddleware after the resolver matched the presented
-//      Bearer/X-Kojo-Token against the WebDAVTokenStore.
-//   3. A short-lived WebDAV token presented via HTTP Basic auth — the
-//      only form most OS WebDAV clients (Finder, Explorer, Files)
-//      know how to send. The username is ignored; the password is
-//      verified against the WebDAVTokenStore.
+//  1. The Owner principal already stamped into ctx by the public
+//     listener's OwnerOnlyMiddleware. Trusting it preserves the
+//     "Tailscale reach == Owner" UX so a browser-driven WebDAV mount
+//     keeps working.
+//  2. The RoleWebDAV principal stamped by the auth listener's
+//     AuthMiddleware after the resolver matched the presented
+//     Bearer/X-Kojo-Token against the WebDAVTokenStore.
+//  3. A short-lived WebDAV token presented via HTTP Basic auth — the
+//     only form most OS WebDAV clients (Finder, Explorer, Files)
+//     know how to send. The username is ignored; the password is
+//     verified against the WebDAVTokenStore.
 //
 // On failure the gate emits 401 with a `WWW-Authenticate: Basic`
 // challenge so OS mount clients re-prompt the user instead of

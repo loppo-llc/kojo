@@ -42,7 +42,7 @@ import (
 // first dial, brief listener restart on hub) no longer drops the
 // attachment.
 func wireAttachForwarder(mgr *agent.Manager, st *store.Store, self *peer.Identity, logger *slog.Logger) {
-	pushClient := peer.NewPushClient(self, nil, logger)
+	pushClient := peer.NewPushClient(self, st, nil, logger)
 	selfID := self.DeviceID
 	mgr.SetAttachmentForwarder(func(
 		ctx context.Context,

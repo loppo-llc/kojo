@@ -27,15 +27,10 @@ package server
 // validate against.
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
-	"sync"
-	"time"
 
 	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/peer"
@@ -43,12 +38,6 @@ import (
 )
 
 // peerResponse is the wire shape for one peer_registry row.
-//
-// `publicKey` is the base64-standard encoding of the raw 32-byte
-// Ed25519 public key — same wire form as `peer/public_key` in kv.
-// `capabilities` is opaque JSON (forwarded through as a string so
-// the client can json.parse only when it cares); empty means the
-// peer never reported any.
 type peerResponse struct {
 	DeviceID string `json:"deviceId"`
 	// Name is the human-friendly device label (OS hostname by
@@ -57,16 +46,9 @@ type peerResponse struct {
 	// URL is the dial address other peers reach this row on
 	// (`host:port` or `http(s)://host:port`). Empty until the
 	// daemon has bound a listener at least once.
-	URL string `json:"url,omitempty"`
-	// PublicKey / Capabilities are omitempty so the reduced-view
-	// path for RoleAgent (which blanks both) drops the JSON keys
-	// entirely instead of emitting `"publicKey":""` — that would
-	// leak the field's existence to a caller the handler
-	// intentionally hides it from.
-	PublicKey    string `json:"publicKey,omitempty"`
-	Capabilities string `json:"capabilities,omitempty"`
-	LastSeen     int64  `json:"lastSeen,omitempty"`
-	Status       string `json:"status"`
+	URL      string `json:"url,omitempty"`
+	LastSeen int64  `json:"lastSeen,omitempty"`
+	Status   string `json:"status"`
 	IsSelf       bool   `json:"isSelf"`
 	// Trusted mirrors peer_registry.trusted. When true the peer's
 	// signed requests are admitted on the privileged surface
@@ -87,11 +69,9 @@ type peerListResponse struct {
 }
 
 type peerRegisterRequest struct {
-	DeviceID     string `json:"deviceId"`
-	Name         string `json:"name"`
-	URL          string `json:"url"`
-	PublicKey    string `json:"publicKey"`
-	Capabilities string `json:"capabilities,omitempty"`
+	DeviceID string `json:"deviceId"`
+	Name     string `json:"name"`
+	URL      string `json:"url"`
 	// Trusted opts the peer into the privileged cross-peer surface
 	// at registration time. Defaults to false; the UI checkbox
 	// flips it to true and operators who paste an unmodified
@@ -135,14 +115,12 @@ func (s *Server) requireOwnerForPeers(w http.ResponseWriter, r *http.Request) bo
 // unit-test isolation, in which case no row is ever flagged self.
 func (s *Server) toPeerResponse(rec *store.PeerRecord) peerResponse {
 	out := peerResponse{
-		DeviceID:     rec.DeviceID,
-		Name:         rec.Name,
-		URL:          rec.URL,
-		PublicKey:    rec.PublicKey,
-		Capabilities: rec.Capabilities,
-		LastSeen:     rec.LastSeen,
-		Status:       rec.Status,
-		Trusted:      rec.Trusted,
+		DeviceID: rec.DeviceID,
+		Name:     rec.Name,
+		URL:      rec.URL,
+		LastSeen: rec.LastSeen,
+		Status:   rec.Status,
+		Trusted:  rec.Trusted,
 	}
 	if s.peerID != nil && rec.DeviceID == s.peerID.DeviceID {
 		out.IsSelf = true
@@ -208,50 +186,6 @@ func validatePeerURL(rawURL string) error {
 	return nil
 }
 
-// validatePeerPublicKey decodes the wire-form (base64 std strict,
-// raw 32-byte Ed25519) and rejects anything else. The strict decoder
-// is required so embedded whitespace / line breaks / non-canonical
-// padding don't get smuggled into peer_registry — two clients
-// submitting the "same" public key with different whitespace would
-// otherwise land as distinct rows, defeating the dedup the device_id
-// PK is meant to give us. The round-trip check (re-encode == input)
-// also guards against alternate-but-decoder-accepting forms.
-func validatePeerPublicKey(b64 string) error {
-	return peer.ValidatePublicKey(b64)
-}
-
-// validatePeerCapabilities accepts an empty string or a single JSON
-// object of bounded size. Object specifically (not scalar / array /
-// null) — the design doc (docs/multi-device-storage.md §3.3) types
-// this column as `JSON: {os, arch, gpu, ...}` and every consumer is
-// written to peek keys. Letting a scalar through would force every
-// caller to second-guess the shape.
-//
-// The schema beyond "object" is intentionally not enforced — the
-// field is extensible — but the JSON has to parse so a buggy client
-// can't poison the registry with an unparseable blob that every UI
-// would then bounce off.
-func validatePeerCapabilities(s string) error {
-	if s == "" {
-		return nil
-	}
-	if len(s) > peerCapabilitiesMaxBytes {
-		return errors.New("capabilities exceeds maximum length")
-	}
-	// Decode into map[string]any so non-objects (scalar/array/null)
-	// fail at the JSON layer with a "cannot unmarshal X into Y of
-	// type map" error rather than silently passing through.
-	var v map[string]any
-	if err := json.Unmarshal([]byte(s), &v); err != nil {
-		return errors.New("capabilities must be a JSON object")
-	}
-	if v == nil {
-		// `null` decodes successfully into a nil map — reject it
-		// explicitly so the registry never stores a literal "null".
-		return errors.New("capabilities must be a JSON object, not null")
-	}
-	return nil
-}
 
 // handleListPeers returns every row in peer_registry. The local row
 // is included — UIs are expected to render it differently using the
@@ -285,15 +219,12 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, rec := range rows {
 		row := s.toPeerResponse(rec)
-		if !p.IsOwner() {
-			// Reduced view: drop the identity-sensitive +
-			// capabilities fields. Name + status are enough
-			// for the agent to pick a handoff target.
-			row.PublicKey = ""
-			row.Capabilities = ""
-		}
 		out.Items = append(out.Items, row)
 	}
+	_ = p // (peerResponse no longer carries identity-sensitive
+	// fields, so the previous Owner-vs-Agent reduced view is
+	// unnecessary. The principal handle is retained for any
+	// future surface that wants role-based gating.)
 	writeJSONResponse(w, http.StatusOK, out)
 }
 
@@ -381,14 +312,6 @@ func (s *Server) handleRegisterPeer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	if err := validatePeerPublicKey(req.PublicKey); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	if err := validatePeerCapabilities(req.Capabilities); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
 	if s.peerID != nil && req.DeviceID == s.peerID.DeviceID {
 		writeError(w, http.StatusConflict, "conflict",
 			"cannot register self via this endpoint; the registrar manages the local peer row")
@@ -402,12 +325,10 @@ func (s *Server) handleRegisterPeer(w http.ResponseWriter, r *http.Request) {
 	// roll back the heartbeat's status flip if it landed between
 	// the GetPeer and the UpsertPeer.
 	rec := &store.PeerRecord{
-		DeviceID:     req.DeviceID,
-		Name:         req.Name,
-		URL:          req.URL,
-		PublicKey:    req.PublicKey,
-		Capabilities: req.Capabilities,
-		Trusted:      req.Trusted,
+		DeviceID: req.DeviceID,
+		Name:     req.Name,
+		URL:      req.URL,
+		Trusted:  req.Trusted,
 	}
 	out, err := s.agents.Store().RegisterPeerMetadata(r.Context(), rec)
 	if err != nil {
@@ -428,114 +349,11 @@ func (s *Server) handleRegisterPeer(w http.ResponseWriter, r *http.Request) {
 		}
 		out.Trusted = req.Trusted
 	}
-	// Best-effort fan-out: tell every other online peer about the new
-	// row so the cluster's registries converge without waiting on each
-	// peer's manual `--peer-add`. Runs in the background — a slow or
-	// offline peer must not block the operator's HTTP response.
-	s.broadcastPeerRegistration(out)
+	// Cluster convergence is no longer push-replicated: peers learn
+	// each other lazily via the Hub-mediated Bearer pairing flow
+	// (docs/peer-simplify-plan.md). Other peers see this row through
+	// their next /api/v1/peers GET against the Hub.
 	writeJSONResponse(w, http.StatusOK, s.toPeerResponse(out))
-}
-
-// peerRotateKeyRequest is the wire shape for POST
-// /api/v1/peers/{id}/rotate-key.
-type peerRotateKeyRequest struct {
-	PublicKey string `json:"publicKey"`
-}
-
-// peerRotateKeyResponse echoes the updated row plus the prior key
-// fingerprint so the operator UI can display "<old> → <new>" in an
-// audit-trail panel without doing its own pre-rotation read.
-type peerRotateKeyResponse struct {
-	Peer              peerResponse `json:"peer"`
-	PreviousPublicKey string       `json:"previousPublicKey"`
-}
-
-// handleRotatePeerKey is the explicit, audited swap of a peer's
-// long-lived Ed25519 identity key. The store's UpsertPeer /
-// RegisterPeerMetadata contracts intentionally preserve public_key on
-// conflict — re-registering a paired peer cannot rotate its identity
-// silently — so this endpoint exists as the only path that mutates
-// the column.
-//
-// Self-rotation is intentionally refused with 409. The local peer's
-// public key is one half of a kv-stored identity (peer/public_key +
-// peer/private_key, see internal/peer/identity.go); rotating only the
-// registry copy would leave the binary signing with the old private
-// key while the cluster advertises the new public key. A future slice
-// will deliver a coordinated "rotate local identity" path that also
-// re-seals the private key envelope.
-//
-// The handler logs an Info-level audit line with old/new key
-// fingerprints (first 16 base64 chars each — full keys appear in the
-// response body, but the log is the durable audit surface). slog is
-// the audit channel for now; a dedicated audit_log table is a v2
-// concern (no formal facility exists yet, see store/peer_registry.go
-// comments).
-func (s *Server) handleRotatePeerKey(w http.ResponseWriter, r *http.Request) {
-	if !s.requireOwnerForPeers(w, r) {
-		return
-	}
-	id := r.PathValue("id")
-	if err := validateDeviceID(id); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	if s.peerID != nil && id == s.peerID.DeviceID {
-		writeError(w, http.StatusConflict, "conflict",
-			"cannot rotate the local peer's key via this endpoint; local-identity rotation requires re-sealing the private key envelope")
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, peerRequestCap)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "request body exceeds 16 KiB cap")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
-		return
-	}
-	var req peerRotateKeyRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON")
-		return
-	}
-	if err := validatePeerPublicKey(req.PublicKey); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	oldKey, rec, err := s.agents.Store().RotatePeerKey(r.Context(), id, req.PublicKey)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", "peer not registered")
-			return
-		}
-		// store.RotatePeerKey returns ErrPeerKeyUnchanged when the
-		// supplied key equals the existing one; surface it as 409 so
-		// the UI knows the no-op was refused intentionally.
-		if errors.Is(err, store.ErrPeerKeyUnchanged) {
-			writeError(w, http.StatusConflict, "conflict",
-				"new publicKey matches the current key; nothing to rotate")
-			return
-		}
-		s.logger.Error("peer handler: rotate-key failed", "device_id", id, "err", err)
-		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-		return
-	}
-	// Audit. fingerprint() trims to 16 chars so the log line stays
-	// readable; the response body carries the full new key for any
-	// downstream verifier (e.g. the operator's UI showing a QR code
-	// to the paired peer).
-	s.logger.Info("peer key rotated",
-		"device_id", id,
-		"old_key_fp", peerKeyFingerprint(oldKey),
-		"new_key_fp", peerKeyFingerprint(req.PublicKey),
-	)
-	writeJSONResponse(w, http.StatusOK, peerRotateKeyResponse{
-		Peer:              s.toPeerResponse(rec),
-		PreviousPublicKey: oldKey,
-	})
 }
 
 // peerKeyFingerprint returns the first 16 chars of a base64-std
@@ -626,12 +444,9 @@ func (s *Server) handlePatchPeerMetadata(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, "internal_error", "post-update lookup failed")
 		return
 	}
-	// Propagate the edit to other paired peers so their registry
-	// converges. broadcastPeerRegistration ships the local self-
-	// row + the edited row; receivers admit the third-party row
-	// because the local host signs as trusted from their side
-	// (operator pairing prerequisite for this edit to matter).
-	s.broadcastPeerRegistration(rec)
+	// Edit propagation is no longer push-replicated. Other peers see
+	// the new url/name through their next /api/v1/peers GET against
+	// the Hub (docs/peer-simplify-plan.md).
 	writeJSONResponse(w, http.StatusOK, s.toPeerResponse(rec))
 }
 
@@ -707,371 +522,6 @@ func (s *Server) handleDeletePeer(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.agents.Store().DeletePeer(r.Context(), id); err != nil {
 		s.logger.Error("peer handler: delete failed", "device_id", id, "err", err)
-		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// peerRegisterPushBroadcastTimeout bounds a single peer fan-out
-// dial. The HTTP request that triggers broadcast already returned
-// to the operator by the time this runs (the broadcast goroutine
-// detaches), so we trade prompt error surfacing for predictable
-// upper-bounded wall time per peer.
-const peerRegisterPushBroadcastTimeout = 10 * time.Second
-
-// broadcastPeerRegistration fans the cluster topology out so every
-// paired peer's registry converges on the same view without the
-// operator running `--peer-add` on every host. Detached goroutine —
-// the operator's POST /api/v1/peers (or the approve handler's)
-// response has already been written by the time this runs.
-//
-// Payload per target:
-//
-//   - For target == newRow (the freshly-paired / freshly-approved
-//     peer): push EVERY paired peer's row (cluster snapshot, minus
-//     newRow itself). Without this, the new peer would only know
-//     the Hub (via its own discovery upsertHubIntoRegistry) and
-//     inbound signed requests from any sibling peer would fail
-//     auth with "unknown device_id" until the operator manually
-//     re-broadcast every existing peer.
-//
-//   - For target ≠ newRow (existing peers): push [selfRec,
-//     newRow]. selfRec keeps the cluster's view of THIS host's
-//     url/name fresh through topology changes; newRow teaches
-//     the existing peer about the newly-paired one.
-//
-// Trust model: register-push receivers admit a third-party row
-// only when the signer carries the trusted bit (see
-// handlePeerRegisterPush). The Hub is trusted on every peer it
-// approves (discovery sets trusted=true on the Hub row), so the
-// new-peer-payload path lands cleanly. A non-Hub broadcast that
-// includes third-party rows would get 403'd at trust gate, so the
-// cluster snapshot only converges when broadcast originates from
-// a host trusted on the receiving peer — that's the Hub or a
-// peer explicitly trusted via `--peer-trust`.
-//
-// Bootstrap chicken-and-egg: a brand-new peer doesn't have this
-// host's public_key in its registry yet, so the very first push
-// fails at the receiver's PeerAuth middleware with 401 — that's
-// expected. The auto-pairing flow (docs/peer-onboarding-plan.md)
-// closes the gap: discovery on the peer side writes the Hub into
-// its registry BEFORE join-request fires, so by the time
-// broadcastPeerRegistration runs on approve the receiver
-// recognises the Hub's signature.
-// peerRegisterPushFanoutConcurrency bounds the number of in-flight
-// register-push dials. A serial loop would multiply the total
-// fan-out wall time by N peers × 10s timeout when several targets
-// are unreachable; a 4-way bound keeps small clusters fast while
-// preventing a 100-peer registry from triggering 100 simultaneous
-// TCP/TLS handshakes against an offline tailnet.
-const peerRegisterPushFanoutConcurrency = 4
-
-// broadcastPeerRegistration kicks off a fully detached fan-out
-// goroutine. The DB snapshot (ListPeers + self lookup) runs INSIDE
-// the goroutine so the operator's POST /api/v1/peers response
-// returns the moment the inserted row is committed — no extra
-// SQLite round-trip in the request path.
-//
-// newRow is captured by value (not pointer) so a concurrent
-// mutation of the caller's struct can't race the goroutine.
-func (s *Server) broadcastPeerRegistration(newRow *store.PeerRecord) {
-	if s == nil || newRow == nil || s.peerID == nil || s.agents == nil || s.agents.Store() == nil {
-		return
-	}
-	captured := *newRow
-	go s.runBroadcastPeerRegistration(&captured)
-}
-
-func (s *Server) runBroadcastPeerRegistration(newRow *store.PeerRecord) {
-	st := s.agents.Store()
-	ctx, cancel := context.WithTimeout(context.Background(), peerRegisterPushBroadcastTimeout*2)
-	defer cancel()
-	// Include offline peers too: a freshly-paired peer's row lands
-	// with status=offline because the heartbeat hasn't fired yet.
-	rows, err := st.ListPeers(ctx, store.ListPeersOptions{})
-	if err != nil {
-		s.logger.Warn("broadcastPeerRegistration: list peers", "err", err)
-		return
-	}
-	if !containsPeer(rows, newRow.DeviceID) {
-		rows = append(rows, newRow)
-	}
-	selfRec, err := st.GetPeer(ctx, s.peerID.DeviceID)
-	if err != nil {
-		s.logger.Warn("broadcastPeerRegistration: self lookup", "err", err)
-		return
-	}
-	// Existing-peer payload: this host's self-row + the freshly-
-	// paired newRow. Receivers admit the self-row (signer == row)
-	// and the third-party newRow (signer is trusted at the
-	// receiver, see handlePeerRegisterPush's trust gate). Each row
-	// reaches every existing paired peer once.
-	existingPayload := []*store.PeerRecord{selfRec}
-	if newRow.DeviceID != selfRec.DeviceID {
-		existingPayload = append(existingPayload, newRow)
-	}
-	// New-peer payload: every paired peer EXCEPT newRow itself.
-	// Without this, the freshly-approved peer learns only the
-	// Hub (via its own discovery upsertHubIntoRegistry) but has
-	// no way to learn about its sibling peers — inbound signed
-	// requests from any non-Hub peer hit AuthMiddleware's
-	// peer_registry lookup and 401 with "unknown device_id".
-	// Sending the whole cluster on approve closes the gap so
-	// every sibling can talk to the new peer immediately.
-	newPeerPayload := make([]*store.PeerRecord, 0, len(rows))
-	for _, r := range rows {
-		if r == nil || r.DeviceID == newRow.DeviceID || r.DeviceID == "" {
-			continue
-		}
-		newPeerPayload = append(newPeerPayload, r)
-	}
-	s.fanOutPeerRegistrationsPerTarget(rows, func(t *store.PeerRecord) []*store.PeerRecord {
-		if t != nil && t.DeviceID == newRow.DeviceID {
-			return newPeerPayload
-		}
-		return existingPayload
-	})
-}
-
-func containsPeer(rows []*store.PeerRecord, id string) bool {
-	for _, r := range rows {
-		if r != nil && r.DeviceID == id {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *Server) fanOutPeerRegistrations(targets []*store.PeerRecord, rows []*store.PeerRecord) {
-	// Preserve the historical len(rows)==0 fast-path: callers
-	// passing a precomputed empty slice expect the function to
-	// no-op without touching targets at all. Without this guard
-	// the per-target variant would still iterate every target
-	// (skip-URL warnings, peerID lookups) for zero work.
-	if len(rows) == 0 {
-		return
-	}
-	s.fanOutPeerRegistrationsPerTarget(targets, func(_ *store.PeerRecord) []*store.PeerRecord {
-		return rows
-	})
-}
-
-// fanOutPeerRegistrationsPerTarget dispatches register-push with a
-// per-target row selector. The selector lets the caller send the
-// freshly-approved peer a different payload (the whole cluster
-// view, so it can answer inbound signed requests) than the rest of
-// the cluster receives (just selfRec + newRow, the existing
-// behavior). Passing a constant selector recovers the original
-// fan-out semantics — fanOutPeerRegistrations stays the
-// fixed-payload entry point for non-approval call sites.
-func (s *Server) fanOutPeerRegistrationsPerTarget(
-	targets []*store.PeerRecord,
-	rowsFor func(*store.PeerRecord) []*store.PeerRecord,
-) {
-	if rowsFor == nil {
-		return
-	}
-	sem := make(chan struct{}, peerRegisterPushFanoutConcurrency)
-	var wg sync.WaitGroup
-	for _, t := range targets {
-		if t == nil || t.DeviceID == s.peerID.DeviceID || t.DeviceID == "" {
-			continue
-		}
-		if t.URL == "" {
-			continue
-		}
-		addr, err := peer.NormalizeAddress(t.URL)
-		if err != nil {
-			s.logger.Warn("broadcastPeerRegistration: skip target",
-				"device_id", t.DeviceID, "err", err)
-			continue
-		}
-		rows := rowsFor(t)
-		if len(rows) == 0 {
-			continue
-		}
-		for _, row := range rows {
-			if row == nil || row.DeviceID == t.DeviceID {
-				// Skip pushing a peer its own row — the receiver
-				// short-circuits self-rows anyway, but skipping
-				// here saves a wasted round-trip.
-				continue
-			}
-			wg.Add(1)
-			sem <- struct{}{}
-			go func(addr, target string, row *store.PeerRecord) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				if err := s.sendPeerRegisterPush(addr, target, row); err != nil {
-					// 401 is the expected first-time state when the
-					// target hasn't been paired against us yet, or
-					// when this host isn't trusted on the receiver.
-					// Log at Debug so real failures aren't buried.
-					s.logger.Debug("broadcastPeerRegistration: push failed",
-						"target", target, "row", row.DeviceID, "err", err)
-				}
-			}(addr, t.DeviceID, row)
-		}
-	}
-	wg.Wait()
-}
-
-// sendPeerRegisterPush dials `addr/api/v1/peers/register-push`
-// with an Ed25519-signed body containing the row to register on
-// the receiver. Receiver-side handler validates the body's shape
-// and calls RegisterPeerMetadata.
-func (s *Server) sendPeerRegisterPush(addr, targetDeviceID string, row *store.PeerRecord) error {
-	if row == nil {
-		return errors.New("nil row")
-	}
-	body, err := json.Marshal(peerRegisterRequest{
-		DeviceID:     row.DeviceID,
-		Name:         row.Name,
-		URL:          row.URL,
-		PublicKey:    row.PublicKey,
-		Capabilities: row.Capabilities,
-	})
-	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), peerRegisterPushBroadcastTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, addr+"/api/v1/peers/register-push", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("build: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	nonce, err := peer.MakeNonce()
-	if err != nil {
-		return fmt.Errorf("nonce: %w", err)
-	}
-	if err := peer.SignRequest(req, s.peerID.DeviceID, s.peerID.PrivateKey, nonce, targetDeviceID); err != nil {
-		return fmt.Errorf("sign: %w", err)
-	}
-	client := peer.NoKeepAliveHTTPClient(peerRegisterPushBroadcastTimeout)
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("status %d", resp.StatusCode)
-	}
-	return nil
-}
-
-// handlePeerRegisterPush is the receiver-side endpoint for the
-// Hub's fan-out broadcast. Auth: RolePeer only (Ed25519 signed
-// inter-peer request). Refuses self-rows so the local registrar's
-// heartbeat keeps authority over its own row.
-func (s *Server) handlePeerRegisterPush(w http.ResponseWriter, r *http.Request) {
-	p := auth.FromContext(r.Context())
-	if !p.IsPeer() {
-		writeError(w, http.StatusForbidden, "forbidden",
-			"register-push requires an Ed25519-signed inter-peer request")
-		return
-	}
-	if s.agents == nil || s.agents.Store() == nil {
-		writeError(w, http.StatusServiceUnavailable, "unavailable",
-			"agent store not available")
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, peerRequestCap)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large",
-				"request body exceeds 16 KiB cap")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
-		return
-	}
-	var req peerRegisterRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON")
-		return
-	}
-	if err := validateDeviceID(req.DeviceID); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	if err := validatePeerName(req.Name); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	if err := validatePeerURL(req.URL); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	if err := validatePeerPublicKey(req.PublicKey); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	if err := validatePeerCapabilities(req.Capabilities); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	if s.peerID != nil && req.DeviceID == s.peerID.DeviceID {
-		// Local row — refuse silently with 200 so the broadcaster's
-		// fan-out loop doesn't error-log. The local registrar already
-		// owns this row.
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	// Trust gate. A peer may push:
-	//   - its OWN row (signer == req.DeviceID) — kept as an
-	//     audited code path even though the PeerAuth middleware
-	//     above this handler refuses an unknown signer with 401
-	//     long before we reach this gate. The branch survives so
-	//     a future bootstrap path (a signed self-introduction
-	//     against an explicit operator-bound nonce, say) doesn't
-	//     have to re-litigate the rule. v1 pairing is operator-
-	//     driven via `kojo --peer-add` on BOTH hosts.
-	//   - a THIRD-PARTY row only when the signer carries the
-	//     trusted bit on this host. That's the cluster-bootstrap
-	//     path: the Hub (whom the operator explicitly trusted via
-	//     `--peer-add --trusted`) fans out every paired peer's
-	//     row to every other paired peer so peer A → peer B
-	//     handoff can resolve B's URL without manual all-pairs
-	//     `--peer-add` on every host.
-	// An untrusted signer attempting a third-party push gets 403.
-	// public_key immutability (below) blocks even a trusted signer
-	// from silently rotating another peer's identity key, so the
-	// privilege exposed here is name/url/capabilities only.
-	signerIsRow := p.PeerID != "" && p.PeerID == req.DeviceID
-	if !signerIsRow && !p.PeerTrusted {
-		writeError(w, http.StatusForbidden, "forbidden",
-			"register-push: third-party row pushes require a trusted signer; signer="+p.PeerID+", row="+req.DeviceID)
-		return
-	}
-	// Identity immutability: an existing row's public_key cannot be
-	// rewritten via register-push. The handler-level guard mirrors
-	// RegisterPeerMetadata's ON CONFLICT (which preserves
-	// public_key) but surfaces 409 instead of a silent no-op so a
-	// buggy peer detects the rejection.
-	if existing, err := s.agents.Store().GetPeer(r.Context(), req.DeviceID); err == nil && existing != nil {
-		if existing.PublicKey != "" && existing.PublicKey != req.PublicKey {
-			s.logger.Warn("register-push: refusing pubkey change",
-				"device_id", req.DeviceID,
-				"existing_fp", peerKeyFingerprint(existing.PublicKey),
-				"incoming_fp", peerKeyFingerprint(req.PublicKey),
-			)
-			writeError(w, http.StatusConflict, "conflict",
-				"register-push: public_key disagrees with existing row; use the rotate-key path for audited rotations")
-			return
-		}
-	}
-	if _, err := s.agents.Store().RegisterPeerMetadata(r.Context(), &store.PeerRecord{
-		DeviceID:     req.DeviceID,
-		Name:         req.Name,
-		URL:          req.URL,
-		PublicKey:    req.PublicKey,
-		Capabilities: req.Capabilities,
-	}); err != nil {
-		s.logger.Error("register-push: store write", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 		return
 	}

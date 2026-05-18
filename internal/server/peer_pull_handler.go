@@ -140,24 +140,22 @@ func (s *Server) handlePeerPull(w http.ResponseWriter, r *http.Request) {
 			"source_device_id must not equal the local peer")
 		return
 	}
-	// Caller-source identity binding: a RolePeer signature only
-	// authorizes a pull whose declared source matches the
-	// signer. Without this check, a registered peer A could ask
-	// us to pull arbitrary URIs from a third peer B and surface
-	// any of B's blobs to itself by reading our local store —
-	// the §3.7 trust model assumes the orchestrator IS the
-	// source.
-	if p.IsPeer() && p.PeerID != req.SourceDeviceID {
+	// Trust gate: a RolePeer signer can dispatch a pull regardless
+	// of whether they are themselves the source — orchestrators
+	// (typically the Hub) drive switches between two other peers,
+	// so the historical "signer == source" check is too strict
+	// once peer↔peer Bearers are gone (the target relays through
+	// the orchestrator's Hub-relay endpoint, see relayPeerBlob).
+	// PeerTrusted is the authorisation bar instead: an untrusted
+	// peer cannot ask us to fetch arbitrary URIs.
+	if p.IsPeer() && !p.PeerTrusted {
 		writeError(w, http.StatusForbidden, "forbidden",
-			"signer peer device_id does not match request source_device_id")
+			"peer-signed pull requires the signer's peer_registry row to be trusted")
 		return
 	}
 
 	// Resolve the source's dial address from OUR peer_registry
-	// row — never from the request body. The signer already
-	// proved control of source_device_id; trusting them to also
-	// name their own address widens the attack surface (a
-	// malicious peer could redirect us at an arbitrary URL).
+	// row — never from the request body.
 	srcRec, err := s.agents.Store().GetPeer(r.Context(), req.SourceDeviceID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -174,6 +172,33 @@ func (s *Server) handlePeerPull(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"source peer has no usable dial name in peer_registry: "+err.Error())
 		return
+	}
+
+	// Hub-relay decision (docs/peer-simplify-plan.md Codex P1-2):
+	// when the source is NOT the orchestrator (signer != source),
+	// we lack a direct peer↔peer Bearer to source and MUST route
+	// through the orchestrator. Owner-driven pulls (drill mode)
+	// leave p.PeerID empty and skip relay; for them AuthorizeOutbound
+	// returns ErrNoOutboundBearer and the operator sees a clear
+	// failure. For RolePeer signers, relay construction failure
+	// fails closed with 503 — silently falling back to direct
+	// would just produce the same ErrNoOutboundBearer error per
+	// item and surface as an opaque batch failure.
+	var relayVia *peer.PullSource
+	if p.IsPeer() && p.PeerID != req.SourceDeviceID {
+		relayRec, relayErr := s.agents.Store().GetPeer(r.Context(), p.PeerID)
+		if relayErr != nil {
+			writeError(w, http.StatusServiceUnavailable, "relay_unavailable",
+				"signer peer not in registry; cannot construct Hub-relay path: "+relayErr.Error())
+			return
+		}
+		relayAddr, addrErr := peer.NormalizeAddress(relayRec.URL)
+		if addrErr != nil {
+			writeError(w, http.StatusServiceUnavailable, "relay_unavailable",
+				"signer peer has no usable dial address for relay: "+addrErr.Error())
+			return
+		}
+		relayVia = &peer.PullSource{DeviceID: p.PeerID, Address: relayAddr}
 	}
 
 	if len(req.Items) == 0 {
@@ -204,8 +229,8 @@ func (s *Server) handlePeerPull(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	client := peer.NewPullClient(s.peerID, nil, s.logger)
-	src := peer.PullSource{DeviceID: req.SourceDeviceID, Address: srcAddr}
+	client := peer.NewPullClient(s.peerID, s.agents.Store(), nil, s.logger)
+	src := peer.PullSource{DeviceID: req.SourceDeviceID, Address: srcAddr, RelayVia: relayVia}
 
 	// No batch timeout: large blob handoffs (multi-GiB) over slow
 	// links easily blow past any fixed ceiling. The parent
@@ -239,4 +264,3 @@ func (s *Server) handlePeerPull(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSONResponse(w, http.StatusOK, peerPullResponse{Results: results})
 }
-
