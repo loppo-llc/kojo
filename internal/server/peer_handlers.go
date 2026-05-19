@@ -1,16 +1,17 @@
 package server
 
-// Peer registry HTTP surface (Phase G slice 2).
+// Peer registry HTTP surface.
 //
 // These handlers expose `peer_registry` rows so the Web UI (and a
 // future inter-peer subscriber) can list cluster members, identify the
-// local device, register a remote peer the operator just paired with,
-// and decommission a peer that has been retired.
+// local device, register a remote peer's metadata, and decommission a
+// peer that has been retired.
 //
-// Auth: every route is gated by OwnerOnlyMiddleware on the public
-// listener. The agent-facing listener does not include /api/v1/peers
-// in its allowlist — agent Bearer principals cannot reach these
-// endpoints.
+// Auth: GET /api/v1/peers is open to Owner and Agent principals
+// (agents need it to discover handoff targets by Tailscale machine
+// name; the wire shape carries no identity-sensitive fields). Every
+// other route — /self plus POST/PATCH/DELETE — is owner-only via
+// the handler-level requireOwnerForPeers gate.
 //
 // "Self" semantics: the server holds a *peer.Identity reference at
 // boot. Responses tag the row whose device_id matches that identity
@@ -18,13 +19,15 @@ package server
 // (decommissioning the local peer must be done from a different peer
 // to avoid a peer killing its own registry row mid-write).
 //
-// Wire format follows the existing kv / blob handler conventions:
-// JSON objects, snake_case-free camelCase fields, `{error:{code,
-// message}}` for non-2xx, no ETag yet (peer rows mutate on every
+// Wire format: JSON objects, camelCase fields, `{error:{code,
+// message}}` for non-2xx, no ETag (peer rows mutate on every
 // heartbeat — etag would churn without giving editing UIs anything
-// useful). When a future slice adds inter-peer mTLS the public_key
-// and capabilities fields here are the wire surface peers will
-// validate against.
+// useful).
+//
+// Trust model: a peer's NodeKey binding (the actual admit-on-the-
+// privileged-surface signal, validated via tsnet WhoIs) is captured
+// by the join-request flow, NOT by this metadata surface. POST here
+// pre-seeds a row; the NodeKey lands later when the peer dials in.
 
 import (
 	"encoding/json"
@@ -80,17 +83,11 @@ const peerRequestCap = 16 * 1024
 // the JSON-decoded struct).
 const peerNameMaxBytes = 255
 
-// peerCapabilitiesMaxBytes bounds the opaque capabilities JSON. Peers
-// are expected to advertise a small fixed set of feature flags here;
-// 8 KiB leaves room for growth without inviting abuse. Stored verbatim
-// (not parsed) so the limit is a byte-length not a structure depth.
-const peerCapabilitiesMaxBytes = 8 * 1024
-
-// requireOwnerForPeers gates every /api/v1/peers route. Returns
-// false (after writing a 403) when the request is not from the Owner
-// principal — never reached on the public listener (Owner-only
-// middleware) but the agent listener routes through the same mux
-// and the allowlist is the only barrier.
+// requireOwnerForPeers gates the owner-only /api/v1/peers routes
+// (/self, POST, PATCH, DELETE — everything except the list GET,
+// which the policy layer admits for both Owner and Agent). Returns
+// false (after writing a 403) when the caller is not the Owner
+// principal.
 func (s *Server) requireOwnerForPeers(w http.ResponseWriter, r *http.Request) bool {
 	if !auth.FromContext(r.Context()).IsOwner() {
 		writeError(w, http.StatusForbidden, "forbidden", "peers API is owner-only")
@@ -180,12 +177,10 @@ func validatePeerURL(rawURL string) error {
 // `isSelf` flag, but a full listing makes "this device's identity
 // drifted" cases visible.
 //
-// Auth: Owner sees every field. RoleAgent / RolePrivAgent see a
-// reduced view (device_id, name, status, isSelf) so an agent
-// driving a handoff/switch can discover the target's device_id by
-// name without learning every peer's Ed25519 public key. Other
-// non-Owner principals (Guest, Peer, WebDAV) fall through the
-// policy gate and never reach the handler.
+// Auth: Owner and Agent principals are admitted. The response shape
+// carries no identity-sensitive fields, so both roles see the same
+// view. Other non-Owner principals (Guest, Peer, WebDAV) fall
+// through the policy gate and never reach the handler.
 func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 	p := auth.FromContext(r.Context())
 	if !p.IsOwner() && !p.IsAgent() {
@@ -209,20 +204,15 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 		row := s.toPeerResponse(rec)
 		out.Items = append(out.Items, row)
 	}
-	_ = p // (peerResponse no longer carries identity-sensitive
-	// fields, so the previous Owner-vs-Agent reduced view is
-	// unnecessary. The principal handle is retained for any
-	// future surface that wants role-based gating.)
 	writeJSONResponse(w, http.StatusOK, out)
 }
 
 // handleGetSelfPeer returns the local peer's identity row. Used by
-// the UI to render a stable "this device" badge and by tooling that
-// pairs a remote peer (the remote needs the local public key to
-// register us). The handler resolves the row through the store — it
-// does NOT serialize the in-memory Identity directly — so a stale
-// registry row (e.g. heartbeat hasn't fired yet on this boot) shows
-// up here too rather than silently being papered over.
+// the UI to render a stable "this device" badge. The handler
+// resolves the row through the store — it does NOT serialize the
+// in-memory Identity directly — so a stale registry row (e.g.
+// heartbeat hasn't fired yet on this boot) shows up here too
+// rather than silently being papered over.
 func (s *Server) handleGetSelfPeer(w http.ResponseWriter, r *http.Request) {
 	if !s.requireOwnerForPeers(w, r) {
 		return
@@ -252,17 +242,13 @@ func (s *Server) handleGetSelfPeer(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, s.toPeerResponse(rec))
 }
 
-// handleRegisterPeer adds (or updates) a remote peer the operator
-// has just paired with. The body MUST carry the remote's
-// {deviceId, name, publicKey}; capabilities is optional.
-//
-// Identity-key rotation is intentionally NOT exposed here — the
-// store's UpsertPeer preserves public_key on conflict. A registered
-// peer that wants to rotate its key has to go through a future
-// /api/v1/peers/{id}/rotate-key path that captures the audit trail.
-// Re-POSTing a different publicKey for an existing deviceId silently
-// keeps the original key (UpsertPeer contract); status / name /
-// capabilities update normally.
+// handleRegisterPeer adds (or updates) a remote peer's metadata.
+// The body carries {deviceId, name, url} only — this endpoint is
+// metadata-only and does NOT mint the NodeKey binding that admits
+// the peer on the privileged surface. The NodeKey is captured when
+// the peer sends its first join-request (back-filled into an
+// existing row, or parked in peer_pending for Approve when no row
+// exists).
 //
 // Self-registration is rejected — the local peer's row is owned by
 // the registrar's heartbeat loop. Letting a Web UI overwrite it
@@ -308,10 +294,10 @@ func (s *Server) handleRegisterPeer(w http.ResponseWriter, r *http.Request) {
 	// RegisterPeerMetadata is a single SQL statement (INSERT ... ON
 	// CONFLICT DO UPDATE), so a heartbeat that fires concurrently
 	// cannot race the metadata edit: the conflict-update branch only
-	// touches name / capabilities, leaving last_seen / status (and
-	// public_key) alone. A read-modify-write would, by contrast,
-	// roll back the heartbeat's status flip if it landed between
-	// the GetPeer and the UpsertPeer.
+	// touches name / url, leaving last_seen / status / node_key
+	// alone. A read-modify-write would, by contrast, roll back the
+	// heartbeat's status flip if it landed between the GetPeer and
+	// the UpsertPeer.
 	rec := &store.PeerRecord{
 		DeviceID: req.DeviceID,
 		Name:     req.Name,
@@ -324,34 +310,19 @@ func (s *Server) handleRegisterPeer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Cluster convergence is no longer push-replicated: peers learn
-	// each other lazily via the Hub-mediated Bearer pairing flow
-	// (docs/peer-simplify-plan.md). Other peers see this row through
-	// their next /api/v1/peers GET against the Hub.
+	// each other lazily via the join-request / NodeKey pairing flow
+	// (tsnet WhoIs admits paired peers on the inter-peer surface).
+	// Other peers see this row through their next /api/v1/peers GET
+	// against the Hub.
 	writeJSONResponse(w, http.StatusOK, s.toPeerResponse(out))
-}
-
-// peerKeyFingerprint returns the first 16 chars of a base64-std
-// public key for log-line use. The full key is identity surface and
-// 64 chars, which clutters logs without adding distinguishing power
-// at the audit-line scan level. Truncation here is OK because (a)
-// 16 base64 chars = 96 bits, well above collision-class for the few
-// peers a single cluster will ever carry, and (b) the response body
-// always includes the full key for verifiers.
-func peerKeyFingerprint(b64 string) string {
-	if len(b64) <= 16 {
-		return b64
-	}
-	return b64[:16] + "…"
 }
 
 // peerMetadataPatchRequest is the wire shape for PATCH
 // /api/v1/peers/{id}. Only the operator-editable name + url
-// are accepted here; identity rotation flows through
-// /rotate-key, trust flip through /trust, and capabilities
-// are owned by the peer's own self-report (so the GUI must
-// not clobber them). Limiting the patch shape keeps a stale
-// browser tab from accidentally rolling back fields another
-// surface just changed.
+// are accepted here; device_id is immutable and NodeKey /
+// last_seen / status are server-owned (heartbeat / join-request
+// flow). Limiting the patch shape keeps a stale browser tab from
+// accidentally rolling back fields another surface just changed.
 type peerMetadataPatchRequest struct {
 	Name string `json:"name"`
 	URL  string `json:"url"`
@@ -362,11 +333,9 @@ type peerMetadataPatchRequest struct {
 // self-row's url/name (operator must use the daemon's hostname /
 // pairing spec to rename this host).
 //
-// Successful edits fan out via broadcastPeerRegistration so other
-// paired peers learn the new url/name without waiting for the
-// next register-push roundtrip. fan-out is best-effort; the row
-// is already committed locally so an unreachable peer just keeps
-// the stale view until its next inbound heartbeat / re-broadcast.
+// Edit propagation is lazy: there is no push fan-out, so other
+// peers see the new url/name through their next /api/v1/peers GET
+// against the Hub.
 func (s *Server) handlePatchPeerMetadata(w http.ResponseWriter, r *http.Request) {
 	if !s.requireOwnerForPeers(w, r) {
 		return

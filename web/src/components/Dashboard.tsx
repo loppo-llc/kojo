@@ -126,11 +126,11 @@ export function Dashboard() {
     // local-row updates for 30s behind the allSettled barrier.
     //
     // Expiry: cached entries older than peerCacheTTL are dropped.
-    // Without this, a peer that flipped to "not trusted on the
-    // other side" (or had its session genuinely deleted while we
-    // were unable to reach it) would haunt the dashboard with
-    // ghost rows forever — the rejected fetches would keep them
-    // pinned. The TTL bounds that staleness to one window.
+    // Without this, a peer that was unpaired on the other side
+    // (or had its session genuinely deleted while we were unable
+    // to reach it) would haunt the dashboard with ghost rows
+    // forever — the rejected fetches would keep them pinned. The
+    // TTL bounds that staleness to one window.
     const peerCacheTTL = 60_000;
     let inflight = false;
     let cancelled = false;

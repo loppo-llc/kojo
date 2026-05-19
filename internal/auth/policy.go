@@ -250,11 +250,11 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		return true
 	}
 	// Peer list: agents need this to discover handoff targets
-	// by Tailscale machine name. The handler returns a reduced
-	// view (no public_key, no capabilities) for non-Owner
-	// principals so identity material doesn't leak. Other
-	// /api/v1/peers/* routes (POST, DELETE, /self, /rotate-key)
-	// stay owner-only via the handler-level gate.
+	// by Tailscale machine name. The wire shape carries no
+	// identity-sensitive fields, so Owner and Agent see the same
+	// response. Mutating /api/v1/peers/* routes (POST, PATCH,
+	// DELETE) and /self stay owner-only via the handler-level
+	// gate.
 	if method == http.MethodGet && path == "/api/v1/peers" && p.IsAgent() {
 		return true
 	}

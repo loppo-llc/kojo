@@ -236,7 +236,7 @@ type Config struct {
 	// inter-peer surface — all registered — that's how a switch
 	// can land the agent CLI on this host. What stays Hub-only
 	// and 404s on a peer:
-	//   - peer-registry mutation (POST/DELETE/rotate-key on
+	//   - peer-registry mutation (POST/PATCH/DELETE on
 	//     /api/v1/peers): pairing is an operator workflow, not
 	//     something an agent or peer drives.
 	//   - static SPA / dev proxy: peer hosts have no Web UI.
@@ -467,7 +467,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	// host. Only the Hub-management surface stays Hub-only —
 	// gated below with `cfg.PeerOnly`:
 	//
-	//   - peer_registry mutation (POST/DELETE/rotate-key on
+	//   - peer_registry mutation (POST/PATCH/DELETE on
 	//     /api/v1/peers): pairing is operator workflow, not
 	//     something an agent or peer drives.
 	//   - static Web UI / dev proxy: peer hosts have no UI.
@@ -592,11 +592,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		mux.HandleFunc("GET /api/v1/changes", s.handleChanges)
 	}
 
-	// Peer registry HTTP surface (Phase G slice 2). Reads
-	// (list / self) are available on every host so an agent or
-	// the UI can discover targets; the MUTATION routes
-	// (register / delete / rotate-key) are Hub-only — peer
-	// pairing is an operator workflow that runs on the Hub.
+	// Peer registry HTTP surface. Reads (list / self) are
+	// available on every host so an agent or the UI can discover
+	// targets; the MUTATION routes (POST register, PATCH metadata,
+	// DELETE) are Hub-only — peer pairing is an operator workflow
+	// that runs on the Hub.
 	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
 		mux.HandleFunc("GET /api/v1/peers", s.handleListPeers)
 		mux.HandleFunc("GET /api/v1/peers/self", s.handleGetSelfPeer)

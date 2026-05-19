@@ -40,7 +40,8 @@ export function NewSession() {
   // remote peer when one is chosen) so tool availability / homeDir
   // reflect what's actually installed on that machine. Re-runs on
   // peer switch — the Hub proxy forwards the info call when
-  // ?peer=<id> is present and the peer is marked trusted.
+  // ?peer=<id> is present and the peer is paired (registered on
+  // both sides via the join-request flow).
   //
   // Concurrency: a rapid peer switch can spawn two info() promises;
   // without a guard the slower (older) reply could overwrite the
@@ -81,7 +82,7 @@ export function NewSession() {
       console.error(err);
       setInfoLoading(false);
       if (selectedPeerId && selectedPeerId !== selfPeerId) {
-        setError("Peer info unavailable. Is the peer online and marked trusted on its own host?");
+        setError("Peer info unavailable. Is the peer online and paired with this host?");
       }
     });
   }, [searchParams, selectedPeerId, selfPeerId]);
@@ -176,13 +177,12 @@ export function NewSession() {
               {peers.map((p) => {
                 const isSelf = p.deviceId === selfPeerId;
                 const offline = p.status !== "online";
-                // A non-self peer needs the operator's explicit trust
-                // flag set on THE OTHER SIDE (the peer's trust column
-                // on its own host). We don't know the peer side's
-                // view, so the local UI can only hint at what we
-                // know: status + name. The Hub-side proxy will 403
-                // if trust isn't set there — surface it as a runtime
-                // error rather than disabling here.
+                // A non-self peer needs to be paired (registered on
+                // both sides via the join-request flow). The local
+                // UI can only hint at what we know: status + name.
+                // The Hub-side proxy will 403 if the pairing is
+                // missing on the other side — surface it as a
+                // runtime error rather than disabling here.
                 const disabled = !isSelf && offline;
                 return (
                   <option key={p.deviceId} value={p.deviceId} disabled={disabled}>
