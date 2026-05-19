@@ -352,7 +352,7 @@ func isSelfScopedRoute(method, sub string) bool {
 		return method == http.MethodPost
 	case "/avatar/generated":
 		return method == http.MethodPost
-	case "/files", "/files/view", "/files/raw":
+	case "/files", "/files/view", "/files/raw", "/files/thumb":
 		return method == http.MethodGet
 	case "/messages":
 		return method == http.MethodGet

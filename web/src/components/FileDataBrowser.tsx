@@ -13,6 +13,11 @@ interface FileDataSource {
   list: (path: string, hidden: boolean) => Promise<{ path: string; absPath?: string; entries: DirEntry[] }>;
   view: (path: string) => Promise<FileView>;
   rawUrl: (path: string, download?: boolean) => string;
+  // Optional thumbnail URL — list cells use this for image previews so a
+  // directory full of screenshots doesn't transfer megabytes per row.
+  // Sources that don't implement it fall back to rawUrl. `v` is an
+  // optional cache-busting string (typically the source's modTime).
+  thumbUrl?: (path: string, size?: number, v?: string) => string;
 }
 
 interface FileDataBrowserProps {
@@ -733,6 +738,14 @@ function EntryRow({
   const style = kind ? KIND_STYLES[kind] : null;
   const showThumb = entry.type === "file" && isImage(entry.name);
   const path = joinBrowserPath(parentPath, entry.name, pathMode);
+  // The thumb endpoint only handles png/jpeg/gif/webp. svg/bmp/avif/ico
+  // skip the thumb and load the raw directly — usually small anyway,
+  // and the resize would only marginally help.
+  const ext = entry.name.toLowerCase().split(".").pop() ?? "";
+  const thumbSupported = ext === "png" || ext === "jpg" || ext === "jpeg" || ext === "gif" || ext === "webp";
+  const thumbSrc = showThumb && thumbSupported && dataSource.thumbUrl
+    ? dataSource.thumbUrl(path, 96, entry.modTime)
+    : dataSource.rawUrl(path);
   const meta =
     entry.type === "dir"
       ? timeAgo(entry.modTime)
@@ -751,11 +764,19 @@ function EntryRow({
             <FolderIcon className="w-6 h-6 text-blue-400" />
           ) : showThumb ? (
             <img
-              src={dataSource.rawUrl(path)}
+              src={thumbSrc}
               alt=""
               className="w-full h-full object-cover"
               loading="lazy"
+              decoding="async"
               onError={(e) => {
+                // We only hit thumb for supported extensions, so a
+                // failure here is most likely a 413 (too big) or
+                // a transient server error. In either case, falling
+                // back to the raw is wrong — 413 implies a huge file
+                // that would defeat the bandwidth-saving purpose, and
+                // for transient errors the list view can just show
+                // the placeholder. Hide instead of trying raw.
                 (e.currentTarget as HTMLImageElement).style.display = "none";
               }}
             />

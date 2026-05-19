@@ -3,7 +3,7 @@ import type { AgentMessage, AgentMessageAttachment } from "../../lib/agentApi";
 import { ToolUseCard } from "./ToolUseCard";
 import { AgentAvatar } from "./AgentAvatar";
 import { MarkdownRenderer } from "./MarkdownRenderer";
-import { api } from "../../lib/api";
+import { api, isThumbSupported } from "../../lib/api";
 import { authHeaders } from "../../lib/auth";
 import { formatSize } from "../../lib/utils";
 
@@ -194,6 +194,17 @@ function attachmentURL(path: string): string {
   return api.blob.urlFromKojoURI(path) ?? api.files.rawUrl(path);
 }
 
+// attachmentThumbURL is the inline-grid variant of attachmentURL.
+// kojo:// URIs go to the blob store at full size (no thumb endpoint
+// over there yet). Filesystem paths with a thumb-friendly extension
+// route through /api/v1/files/thumb so a message with several
+// screenshots doesn't ship megabytes per chip.
+function attachmentThumbURL(path: string, size = 400): string {
+  const blob = api.blob.urlFromKojoURI(path);
+  if (blob) return blob;
+  return isThumbSupported(path) ? api.files.thumbUrl(path, size) : api.files.rawUrl(path);
+}
+
 /**
  * Image attachment chip with onError fallback.
  *
@@ -280,6 +291,7 @@ export function AttachmentList({ attachments, isUser }: { attachments: AgentMess
       <div className="flex flex-wrap gap-1.5 mb-2">
         {attachments.map((att) => {
           const url = attachmentURL(att.path);
+          const thumbUrl = attachmentThumbURL(att.path, 400);
           const extType = getFileType(att.name || att.path);
           const isImage = att.mime.startsWith("image/") || extType === "image";
           const isVideo = !isImage && (att.mime.startsWith("video/") || extType === "video");
@@ -288,7 +300,7 @@ export function AttachmentList({ attachments, isUser }: { attachments: AgentMess
               <ImageAttachmentChip
                 key={att.path}
                 att={att}
-                url={url}
+                url={thumbUrl}
                 onPreview={() => setPreview({ path: att.path, type: "image" })}
               />
             );
@@ -353,6 +365,10 @@ function FilePathChip({
   const [fileSize, setFileSize] = useState<string | null>(null);
   const fetchedRef = useRef(false);
   const rawUrl = api.files.rawUrl(path);
+  // Hover thumbnail uses the thumb endpoint only for formats it can
+  // decode; everything else falls back to raw so we never end up
+  // requesting a known-415 URL.
+  const thumbHoverUrl = isThumbSupported(path) ? api.files.thumbUrl(path, 400) : rawUrl;
   const linkUrl = api.files.rawUrl(path, fileType === "other");
   const fileName = path.split(/[/\\]/).pop() || path;
 
@@ -424,9 +440,11 @@ function FilePathChip({
         <div className="absolute bottom-full left-0 mb-1.5 z-40 pointer-events-none">
           {fileType === "image" ? (
             <img
-              src={rawUrl}
+              src={thumbHoverUrl}
               alt={fileName}
               className="max-w-[200px] max-h-[150px] object-contain rounded-lg shadow-lg border border-neutral-700 bg-neutral-900"
+              loading="lazy"
+              decoding="async"
             />
           ) : (
             <div className="px-2 py-1 bg-neutral-800 rounded text-xs text-neutral-300 shadow-lg border border-neutral-700 whitespace-nowrap">

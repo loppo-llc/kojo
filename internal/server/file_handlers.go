@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/filebrowser"
@@ -48,6 +49,16 @@ func (s *Server) handleRawFile(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(path)}))
 	}
 	s.files.ServeRaw(w, r, path)
+}
+
+// handleThumbFile serves a JPEG thumbnail for an arbitrary user-space
+// image. Used by the attachments grid / inline message previews so a
+// 5-MB screenshot doesn't have to ship in full just to render a 150-px
+// tile.
+func (s *Server) handleThumbFile(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	size, _ := strconv.Atoi(r.URL.Query().Get("size"))
+	s.files.ServeThumb(w, r, path, size)
 }
 
 // --- Upload Handler ---

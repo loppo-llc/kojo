@@ -31,6 +31,7 @@ import (
 	"github.com/loppo-llc/kojo/internal/slackbot"
 	"github.com/loppo-llc/kojo/internal/store"
 	"github.com/loppo-llc/kojo/internal/store/secretcrypto"
+	"github.com/loppo-llc/kojo/internal/thumbnail"
 	"github.com/loppo-llc/kojo/internal/tts"
 )
 
@@ -175,6 +176,10 @@ type Server struct {
 	// identityMu guards nodeKeyResolver + selfNodeKey, both of
 	// which can be (re)wired after server construction.
 	identityMu sync.RWMutex
+
+	// thumbPurgeDone is closed on Shutdown to stop the background
+	// thumbnail-cache sweeper goroutine.
+	thumbPurgeDone chan struct{}
 }
 
 type Config struct {
@@ -320,8 +325,14 @@ func New(cfg Config) *Server {
 		logger:          logger,
 		devMode:         cfg.DevMode,
 		version:         cfg.Version,
-		unsafePeer: cfg.Unsafe,
+		unsafePeer:      cfg.Unsafe,
+		thumbPurgeDone:  make(chan struct{}),
 	}
+	// Sweep aged thumbnail-cache entries in the background. The cache is
+	// keyed by (path, mtime, size, dimensions) so an edited image
+	// produces a new entry — without periodic purge the cache would grow
+	// without bound on long-running deployments.
+	thumbnail.StartPurger(s.thumbPurgeDone)
 
 	// Initialize Slack bot hub — server owns the lifecycle. PeerOnly
 	// skips this: the daemon-only peer is an inbound-traffic
@@ -466,6 +477,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	mux.HandleFunc("GET /api/v1/files", s.handleListFiles)
 	mux.HandleFunc("GET /api/v1/files/view", s.handleViewFile)
 	mux.HandleFunc("GET /api/v1/files/raw", s.handleRawFile)
+	mux.HandleFunc("GET /api/v1/files/thumb", s.handleThumbFile)
 
 	// File upload
 	mux.HandleFunc("POST /api/v1/upload", s.handleUpload)
@@ -706,6 +718,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents/{id}/files", s.handleListAgentFiles)
 	mux.HandleFunc("GET /api/v1/agents/{id}/files/view", s.handleViewAgentFile)
 	mux.HandleFunc("GET /api/v1/agents/{id}/files/raw", s.handleRawAgentFile)
+	mux.HandleFunc("GET /api/v1/agents/{id}/files/thumb", s.handleThumbAgentFile)
 	mux.HandleFunc("PATCH /api/v1/agents/{id}", s.handleUpdateAgent)
 	mux.HandleFunc("POST /api/v1/agents/{id}/reset", s.handleResetAgentData)
 	mux.HandleFunc("POST /api/v1/agents/{id}/memory/truncate", s.handleTruncateAgentMemory)
@@ -1296,6 +1309,16 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.events.Close()
 	}
 	cleanupUploads()
+	if s.thumbPurgeDone != nil {
+		// Signal the thumbnail purger to exit. Close is idempotent under a
+		// sync.Once-style guard but Shutdown is only meant to be called
+		// once; protect against double-close just in case.
+		select {
+		case <-s.thumbPurgeDone:
+		default:
+			close(s.thumbPurgeDone)
+		}
+	}
 	return nil
 }
 

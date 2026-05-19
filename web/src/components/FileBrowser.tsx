@@ -23,6 +23,7 @@ export function FileBrowser({ embedded, initialPath, peerId }: FileBrowserProps 
       })),
     view: (path: string) => api.files.view(path, peerId),
     rawUrl: (path: string, download?: boolean) => api.files.rawUrl(path, download, peerId),
+    thumbUrl: (path: string, size?: number, v?: string) => api.files.thumbUrl(path, size, v, peerId),
   }), [peerId]);
 
   return (

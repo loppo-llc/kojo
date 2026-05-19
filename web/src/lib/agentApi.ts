@@ -360,6 +360,12 @@ export const agentApi = {
       const base = `/api/v1/agents/${agentId}/files/raw?path=${encodeURIComponent(relPath)}`;
       return appendTokenQuery(download ? `${base}&download=1` : base);
     },
+    thumbUrl: (agentId: string, relPath: string, size = 256, v?: string) => {
+      const q = v ? `&v=${encodeURIComponent(v)}` : "";
+      return appendTokenQuery(
+        `/api/v1/agents/${agentId}/files/thumb?path=${encodeURIComponent(relPath)}&size=${size}${q}`,
+      );
+    },
   },
 
   create: (cfg: AgentConfig) => post<AgentInfo>("/api/v1/agents", cfg),

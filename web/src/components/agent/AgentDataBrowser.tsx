@@ -32,6 +32,7 @@ export function AgentDataBrowser() {
       list: (path: string, hidden: boolean) => agentApi.files.list(id, path, hidden),
       view: (path: string) => agentApi.files.view(id, path),
       rawUrl: (path: string, download?: boolean) => agentApi.files.rawUrl(id, path, download),
+      thumbUrl: (path: string, size?: number, v?: string) => agentApi.files.thumbUrl(id, path, size, v),
     };
   }, [id]);
 

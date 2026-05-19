@@ -84,6 +84,25 @@ function withPeer(url: string, peerId?: string): string {
   return `${url}${sep}peer=${encodeURIComponent(peerId)}`;
 }
 
+// isThumbSupported reports whether the given filename has an extension
+// the server thumb endpoint can decode. The endpoint rejects everything
+// else with 415, so the UI should request the raw URL directly for those
+// instead of hitting thumb and falling back on error. Keep this in sync
+// with internal/thumbnail.IsSupportedExt.
+export function isThumbSupported(nameOrPath: string): boolean {
+  const m = /\.([^./\\]+)$/.exec(nameOrPath.toLowerCase());
+  if (!m) return false;
+  switch (m[1]) {
+    case "png":
+    case "jpg":
+    case "jpeg":
+    case "gif":
+    case "webp":
+      return true;
+  }
+  return false;
+}
+
 export const api = {
   info: (peerId?: string) => get<ServerInfo>(withPeer("/api/v1/info", peerId)),
   dirSuggest: (prefix: string, peerId?: string) =>
@@ -135,6 +154,18 @@ export const api = {
     },
     rawPath: (path: string, peerId?: string) =>
       withPeer(`/api/v1/files/raw?path=${encodeURIComponent(path)}`, peerId),
+    // thumbUrl returns a low-res JPEG thumbnail URL. Use this for grid
+    // tiles / inline message previews — original raws are too heavy for
+    // dozens at once over Tailscale. `size` is the longer-edge in pixels;
+    // the server clamps to [16, 1024]. `v` is an optional cache-busting
+    // string (typically the source's modTime) so an edit produces a
+    // fresh URL even though the server caches for a day.
+    thumbUrl: (path: string, size = 256, v?: string, peerId?: string) => {
+      const q = v ? `&v=${encodeURIComponent(v)}` : "";
+      return appendTokenQuery(
+        withPeer(`/api/v1/files/thumb?path=${encodeURIComponent(path)}&size=${size}${q}`, peerId),
+      );
+    },
   },
 
   // blob serves the native blob store. Used by attachments that

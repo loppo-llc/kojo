@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, type Attachment } from "../lib/api";
+import { api, isThumbSupported, type Attachment } from "../lib/api";
 import { authHeaders } from "../lib/auth";
 import { formatSize } from "../lib/utils";
 
@@ -222,10 +222,15 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
                   className="w-full aspect-square bg-neutral-900 relative block"
                 >
                   <img
-                    src={api.files.rawUrl(att.path, false, peerId)}
+                    src={
+                      isThumbSupported(att.path)
+                        ? api.files.thumbUrl(att.path, 384, att.modTime, peerId)
+                        : api.files.rawUrl(att.path, false, peerId)
+                    }
                     alt={att.name}
                     className="w-full h-full object-cover"
                     loading="lazy"
+                    decoding="async"
                   />
                   {feedback?.path === att.path && (
                     <div className="absolute inset-0 bg-black/60 flex items-center justify-center text-xs text-green-400 pointer-events-none">

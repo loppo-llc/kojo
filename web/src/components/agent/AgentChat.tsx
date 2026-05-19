@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { useParams, useNavigate } from "react-router";
 import { agentApi, type AgentInfo, type AgentMessage, type AgentMessageAttachment, type ChatEvent } from "../../lib/agentApi";
-import { api } from "../../lib/api";
+import { api, isThumbSupported } from "../../lib/api";
 import { localRFC3339 } from "../../lib/utils";
 import { useEnterSends } from "../../lib/preferences";
 import { useAgentWebSocket } from "../../hooks/useAgentWebSocket";
@@ -722,9 +722,15 @@ export function AgentChat() {
               >
                 {file.mime.startsWith("image/") ? (
                   <img
-                    src={api.files.rawUrl(file.path)}
+                    src={
+                      isThumbSupported(file.path)
+                        ? api.files.thumbUrl(file.path, 64)
+                        : api.files.rawUrl(file.path)
+                    }
                     alt={file.name}
                     className="w-6 h-6 rounded object-cover"
+                    loading="lazy"
+                    decoding="async"
                   />
                 ) : (
                   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-neutral-500">
