@@ -34,6 +34,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -68,12 +69,20 @@ func isNodeKeyUniqueViolation(err error) bool {
 // RolePeer and admit the request. Empty until tsnet finishes its
 // login handshake; the peer's discovery loop tolerates that and
 // re-fetches on the next tick.
+//
+// ProtocolVersion advertises the pairing protocol the Hub speaks
+// (see peer.PairingProtocolVersion). A peer whose own version
+// differs MUST refuse to write the Hub row / send a join-request;
+// the Hub also re-validates this on /join-request so the gap
+// surfaces explicitly rather than silently re-pairing under a
+// stale contract.
 type hubInfoResponse struct {
-	DeviceID string `json:"deviceId"`
-	Name     string `json:"name"`
-	URL      string `json:"url"`
-	NodeKey  string `json:"nodeKey,omitempty"`
-	Version  string `json:"version"`
+	DeviceID        string `json:"deviceId"`
+	Name            string `json:"name"`
+	URL             string `json:"url"`
+	NodeKey         string `json:"nodeKey,omitempty"`
+	Version         string `json:"version"`
+	ProtocolVersion int    `json:"protocolVersion"`
 }
 
 // handleHubInfo returns the Hub's identity row + dial URL so a
@@ -88,27 +97,36 @@ func (s *Server) handleHubInfo(w http.ResponseWriter, r *http.Request) {
 	rec, err := s.agents.Store().GetPeer(r.Context(), s.peerID.DeviceID)
 	if err != nil {
 		writeJSONResponse(w, http.StatusOK, hubInfoResponse{
-			DeviceID: s.peerID.DeviceID,
-			Name:     s.peerID.Name,
-			Version:  s.version,
+			DeviceID:        s.peerID.DeviceID,
+			Name:            s.peerID.Name,
+			Version:         s.version,
+			ProtocolVersion: peer.PairingProtocolVersion,
 		})
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, hubInfoResponse{
-		DeviceID: rec.DeviceID,
-		Name:     rec.Name,
-		URL:      rec.URL,
-		NodeKey:  rec.NodeKey,
-		Version:  s.version,
+		DeviceID:        rec.DeviceID,
+		Name:            rec.Name,
+		URL:             rec.URL,
+		NodeKey:         rec.NodeKey,
+		Version:         s.version,
+		ProtocolVersion: peer.PairingProtocolVersion,
 	})
 }
 
 // joinRequestBody is the wire shape a peer POSTs to
 // /api/v1/peers/join-request.
+//
+// ProtocolVersion advertises the pairing protocol the caller speaks
+// (see peer.PairingProtocolVersion). The Hub rejects any value that
+// does not equal its own constant so a v1 peer (Bearer-era) and a
+// v2 Hub (NodeKey-only) cannot accidentally re-pair under a stale
+// auth contract. Zero / missing is treated as legacy and rejected.
 type joinRequestBody struct {
-	DeviceID string `json:"deviceId"`
-	Name     string `json:"name"`
-	URL      string `json:"url"`
+	DeviceID        string `json:"deviceId"`
+	Name            string `json:"name"`
+	URL             string `json:"url"`
+	ProtocolVersion int    `json:"protocolVersion"`
 }
 
 // joinRequestResponse is what the Hub answers.
@@ -189,6 +207,18 @@ func (s *Server) handleJoinRequest(w http.ResponseWriter, r *http.Request) {
 	if !peer.IsDialAddress(req.URL) {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"url must be host:port or http(s)://host:port")
+		return
+	}
+	// Pairing-protocol version gate. A mismatch means the caller was
+	// built against a different auth contract (e.g. v1 Bearer-era
+	// vs. v2 NodeKey-only); silently accepting the row would leave
+	// the registry in a state where the §3.7 inter-peer surface
+	// later 403s under conditions the operator can't diagnose.
+	// Reject explicitly so the upgrade gap surfaces at pairing time.
+	if req.ProtocolVersion != peer.PairingProtocolVersion {
+		writeError(w, http.StatusBadRequest, "protocol_version_mismatch",
+			fmt.Sprintf("caller speaks pairing protocol v%d; this Hub speaks v%d — upgrade both ends to the same kojo release",
+				req.ProtocolVersion, peer.PairingProtocolVersion))
 		return
 	}
 	if req.DeviceID == s.peerID.DeviceID {
@@ -401,17 +431,19 @@ func (s *Server) buildHubInfoResponse(ctx context.Context) *hubInfoResponse {
 	rec, err := s.agents.Store().GetPeer(ctx, s.peerID.DeviceID)
 	if err != nil {
 		return &hubInfoResponse{
-			DeviceID: s.peerID.DeviceID,
-			Name:     s.peerID.Name,
-			Version:  s.version,
+			DeviceID:        s.peerID.DeviceID,
+			Name:            s.peerID.Name,
+			Version:         s.version,
+			ProtocolVersion: peer.PairingProtocolVersion,
 		}
 	}
 	return &hubInfoResponse{
-		DeviceID: rec.DeviceID,
-		Name:     rec.Name,
-		URL:      rec.URL,
-		NodeKey:  rec.NodeKey,
-		Version:  s.version,
+		DeviceID:        rec.DeviceID,
+		Name:            rec.Name,
+		URL:             rec.URL,
+		NodeKey:         rec.NodeKey,
+		Version:         s.version,
+		ProtocolVersion: peer.PairingProtocolVersion,
 	}
 }
 

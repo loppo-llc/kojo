@@ -52,12 +52,20 @@ const JoinHeartbeat = 60 * time.Second
 // (Subscriber WS, blob push, agent-sync) to RolePeer. Empty until
 // the Hub's tsnet has finished its login handshake; the peer
 // re-fetches hub-info on the next discovery tick in that case.
+//
+// ProtocolVersion is the pairing protocol the Hub advertises (see
+// PairingProtocolVersion). Enforced by the discovery loop: a
+// mismatch causes the peer to wipe its local peer_registry row for
+// this Hub and retry on the next tick (see Run). The Hub also
+// re-validates the field on /join-request, so neither end can keep
+// a half-paired record across a version boundary.
 type HubInfo struct {
-	DeviceID string `json:"deviceId"`
-	Name     string `json:"name"`
-	URL      string `json:"url"`
-	NodeKey  string `json:"nodeKey,omitempty"`
-	Version  string `json:"version"`
+	DeviceID        string `json:"deviceId"`
+	Name            string `json:"name"`
+	URL             string `json:"url"`
+	NodeKey         string `json:"nodeKey,omitempty"`
+	Version         string `json:"version"`
+	ProtocolVersion int    `json:"protocolVersion"`
 }
 
 // JoinResponse is the response shape of POST/GET /api/v1/peers/join-request.
@@ -140,6 +148,32 @@ func (d *Discovery) Run(ctx context.Context) {
 		if err != nil {
 			d.logger.Warn("peer discovery: hub-info fetch failed; retrying",
 				"hub", hubURL, "err", err)
+			d.sleep(ctx, JoinHeartbeat)
+			continue
+		}
+		// Pairing-protocol version gate. A Hub that does not speak
+		// our version is unsafe to keep in peer_registry: a stale row
+		// would let an inbound Hub request (Subscriber WS, blob
+		// push, agent-sync) resolve to a peer record minted under
+		// the wrong auth contract. Wipe the local row (if any) and
+		// loop — the next tick re-fetches, so an in-flight Hub
+		// upgrade closes the gap automatically once both ends carry
+		// the same constant.
+		//
+		// Empty ProtocolVersion is treated as legacy (v1) because a
+		// pre-v2 Hub does not know the field exists and json
+		// unmarshal leaves it zero.
+		if hub.ProtocolVersion != PairingProtocolVersion {
+			d.logger.Warn("peer discovery: Hub speaks a different pairing protocol; wiping local Hub row and retrying",
+				"hub", hubURL,
+				"hub_protocol_version", hub.ProtocolVersion,
+				"peer_protocol_version", PairingProtocolVersion)
+			if hub.DeviceID != "" {
+				if derr := d.store.DeletePeer(ctx, hub.DeviceID); derr != nil {
+					d.logger.Warn("peer discovery: wipe stale Hub row failed",
+						"hub_device_id", hub.DeviceID, "err", derr)
+				}
+			}
 			d.sleep(ctx, JoinHeartbeat)
 			continue
 		}
@@ -353,10 +387,11 @@ func (d *Discovery) upsertHubIntoRegistry(ctx context.Context, hub *HubInfo, fal
 // response. No Authorization — the Hub reads our identity from
 // tsnet WhoIs on its side.
 func (d *Discovery) postJoinRequest(ctx context.Context, hubURL string) (*JoinResponse, error) {
-	body, err := json.Marshal(map[string]string{
-		"deviceId": d.identity.DeviceID,
-		"name":     d.identity.Name,
-		"url":      d.cfg.PeerPublicURL,
+	body, err := json.Marshal(map[string]any{
+		"deviceId":        d.identity.DeviceID,
+		"name":            d.identity.Name,
+		"url":             d.cfg.PeerPublicURL,
+		"protocolVersion": PairingProtocolVersion,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal: %w", err)
