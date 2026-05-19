@@ -843,28 +843,28 @@ func (b *Bot) clearAssistantStatus(ctx context.Context, channel, threadTS string
 // surface a user-visible notice; callers that only need best-effort
 // delivery may ignore it.
 func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) bool {
-	// Send both markdown_text and the legacy text param. Slack renders
-	// markdown_text in-channel (full Markdown: tables, headings, etc.) while
-	// surfaces that ignore markdown_text — push notifications, link
-	// unfurls, search previews — fall back to text. Without the fallback
-	// those surfaces would show empty previews for every bot reply.
+	// Send markdown_text alone. Pairing MsgOptionText with
+	// MsgOptionMarkdownText was empirically observed (2026-05-19
+	// production logs) to make Slack return markdown_text_conflict, so
+	// every chat.postMessage call silently fails. This broke the
+	// finalize block: stream chunks[1:] (multi-chunk replies) and the
+	// truncation-notice fallback were both dropped, leaving the channel
+	// with only chunks[0] visible. The streaming-update path already
+	// went markdown_text-alone for an unrelated reason (3987158); make
+	// chat.postMessage symmetric.
 	//
-	// Note: Slack's chat.postMessage docs document markdown_text as a
-	// standalone field (and discourage pairing with text). In practice
-	// the API accepts both together and uses text for the surfaces that
-	// ignore markdown_text — we rely on that as a compatibility fallback
-	// for push previews. Unlike the streaming-update path (chat.update),
-	// chat.postMessage produces a fresh message with no streamed buffer
-	// to interact with, so the empirical conflict that forced
-	// markdown_text-alone in chat.update does not apply here. See the
-	// Finalize block for that rationale.
+	// Trade-off: push notification previews, link unfurls and other
+	// surfaces that ignore markdown_text now show whatever fallback
+	// Slack auto-generates from the blocks (typically incomplete for
+	// tables/code blocks). That is strictly better than the previous
+	// behavior, where the message itself never reached Slack at all.
 	//
-	// Both fields use the raw body (escape=false) so mention tokens the LLM
-	// intentionally emits (<!channel>, <@U…>, …) resolve consistently across
-	// in-channel rendering and push previews. Mention misuse is controlled by
-	// the agent's system prompt, not by escaping at this layer.
+	// markdown_text is sent raw — Slack parses Markdown directly and
+	// resolves mention tokens the LLM intentionally emits (<!channel>,
+	// <@U…>, …) the same way as the chat.update path. Mention misuse
+	// is controlled by the agent's system prompt, not by escaping at
+	// this layer.
 	opts := []slack.MsgOption{
-		slack.MsgOptionText(text, false),
 		slack.MsgOptionMarkdownText(text),
 	}
 	if threadTS != "" {

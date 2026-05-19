@@ -2,6 +2,9 @@ package slackbot
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/loppo-llc/kojo/internal/agent"
@@ -204,5 +207,59 @@ func TestBotShouldAutoReplyEmptyDataDir(t *testing.T) {
 
 	if bot.shouldAutoReply("C1", "ts1", "hello") {
 		t.Fatal("should not auto-reply with empty agentDataDir")
+	}
+}
+
+// --- postMessage tests ---
+
+// TestBotPostMessageSendsMarkdownTextOnly verifies that postMessage emits
+// only the markdown_text form field. Pairing it with text triggers Slack's
+// markdown_text_conflict error and the call silently fails — observed in
+// production (2026-05-19) and the cause of stream finalize truncation in
+// multi-chunk replies. Regression guard: if a future change re-adds
+// MsgOptionText to postMessage, this test must fail.
+func TestBotPostMessageSendsMarkdownTextOnly(t *testing.T) {
+	type captured struct {
+		text         string
+		markdownText string
+		called       int
+	}
+	var got captured
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/chat.postMessage":
+			_ = r.ParseForm()
+			got.text = r.FormValue("text")
+			got.markdownText = r.FormValue("markdown_text")
+			got.called++
+			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":"123.456"}`)
+		default:
+			fmt.Fprintf(w, `{"ok":true}`)
+		}
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bot := &Bot{
+		api:    api,
+		logger: testLogger,
+		ctx:    ctx,
+	}
+
+	if !bot.postMessage(context.Background(), "C1", "", "hello world") {
+		t.Fatal("postMessage should succeed against a mock returning ok")
+	}
+	if got.called != 1 {
+		t.Fatalf("chat.postMessage called %d times, want 1", got.called)
+	}
+	if got.markdownText != "hello world" {
+		t.Errorf("markdown_text = %q, want %q", got.markdownText, "hello world")
+	}
+	if got.text != "" {
+		t.Errorf("text must be empty to avoid markdown_text_conflict, got %q", got.text)
 	}
 }
