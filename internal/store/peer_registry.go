@@ -215,6 +215,35 @@ UPDATE peer_registry
 }
 
 
+// ClearPeerNodeKey sets the node_key column to NULL for the given
+// device_id. Used on Hub-mode startup to drop a stale value left by
+// a previous binary that wrote tsnet.Server's NodeKey into the
+// self-row; the post-clear value is then refilled with the host
+// tailscaled NodeKey via the OS LocalAPI capture goroutine. UpsertPeer
+// treats empty NodeKey as "no change", so this dedicated path is the
+// only way to actively wipe the column without touching the other
+// columns.
+//
+// Returns ErrNotFound when no row matches.
+func (s *Store) ClearPeerNodeKey(ctx context.Context, deviceID string) error {
+	if deviceID == "" {
+		return errors.New("store.ClearPeerNodeKey: device_id required")
+	}
+	const q = `UPDATE peer_registry SET node_key = NULL WHERE device_id = ?`
+	res, err := s.db.ExecContext(ctx, q, deviceID)
+	if err != nil {
+		return fmt.Errorf("store.ClearPeerNodeKey: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store.ClearPeerNodeKey: rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // GetPeer returns the row keyed by device_id or ErrNotFound.
 func (s *Store) GetPeer(ctx context.Context, deviceID string) (*PeerRecord, error) {
 	const q = `

@@ -96,6 +96,35 @@ func (r *Registrar) SetPublicURL(url string) {
 	r.publicMu.Unlock()
 }
 
+// ClearSelfNodeKey wipes the self-row's node_key column AND the
+// in-memory cache. Used at Hub-mode boot to drop a stale value left
+// by a previous binary that stamped tsnet.Server's NodeKey here —
+// the post-clear value is then refilled with the host tailscaled
+// NodeKey via cmd/kojo's captureOSSelfNodeKeyForRegistrar. Without
+// this, hub-info would keep advertising the stale tsnet NodeKey
+// (which peers stamp into their local Hub-row but never observe on
+// the inbound side, because Hub's outbound HTTP runs through
+// http.DefaultTransport not tsnet.Server.Dial), and the §3.7
+// inter-peer surface would keep 403-ing forbidden.
+func (r *Registrar) ClearSelfNodeKey(ctx context.Context) error {
+	if r == nil || r.st == nil || r.id == nil {
+		return errors.New("peer.Registrar.ClearSelfNodeKey: nil deps")
+	}
+	r.publicMu.Lock()
+	r.selfNodeKey = ""
+	r.publicMu.Unlock()
+	if err := r.st.ClearPeerNodeKey(ctx, r.id.DeviceID); err != nil {
+		// ErrNotFound is expected when Registrar.Start has not run
+		// yet (or the migration just wiped the row); the next Start
+		// / refresh will (re)create the row with node_key=NULL.
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("peer.Registrar.ClearSelfNodeKey: %w", err)
+	}
+	return nil
+}
+
 // SetSelfNodeKey records the local Tailscale NodeKey to stamp on the
 // self-row's node_key column. cmd/kojo wires this from
 // tsnet.LocalClient.Status (Hub) or localTailscale.Status (--peer).

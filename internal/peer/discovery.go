@@ -15,9 +15,14 @@
 //  5. Hub answers state="approved" (already paired) or state=
 //     "pending" (parked, awaiting Owner Approve). On "pending",
 //     poll GET /join-request/{deviceId} every JoinHeartbeat.
-//  6. On approved, log + return. The discovery loop EXITS — there
-//     is nothing to refresh; the Registrar's heartbeat keeps
-//     last_seen current.
+//  6. On approved, log and hand off to refreshLoop. refreshLoop
+//     periodically re-fetches hub-info and re-stamps the local
+//     Hub-row when NodeKey drifts (Hub key rotation, Hub binary
+//     upgrade flipping its advertised identity). It exits only on
+//     ctx cancellation or a pairing-protocol mismatch — the latter
+//     bounces back through the outer Run loop so the peer re-enters
+//     the join dance under the new contract. The Registrar's own
+//     heartbeat keeps last_seen current independently.
 
 package peer
 
@@ -43,6 +48,17 @@ import (
 // JoinHeartbeat is the polling cadence while a join-request sits
 // in `pending`.
 const JoinHeartbeat = 60 * time.Second
+
+// HubRowRefreshInterval is how often Discovery re-fetches hub-info
+// AFTER approval to detect a NodeKey change on the Hub side (e.g.
+// Hub upgrade that swaps the advertised NodeKey, Tailscale key
+// rotation). Without this refresh the local peer_registry.Hub-row
+// would freeze on the NodeKey observed at first pairing and any
+// later Hub→peer call signed by a different NodeKey would 403
+// forbidden — exactly the failure mode the §3.7 inter-peer surface
+// hit when Hub switched its advertised NodeKey from tsnet's to the
+// host tailscaled's.
+const HubRowRefreshInterval = 5 * time.Minute
 
 // HubInfo is the response shape of GET /api/v1/peers/hub-info.
 //
@@ -113,10 +129,17 @@ func NewDiscovery(cfg DiscoveryConfig, identity *Identity, st *store.Store, logg
 	}, nil
 }
 
-// Run blocks until ctx is cancelled or the join is approved AND
-// the Hub row in peer_registry carries a non-empty node_key. The
-// extra "Hub NodeKey landed" condition closes a critical race
-// flagged in the Codex re-review:
+// Run blocks until ctx is cancelled. The initial pass loops until
+// the join is approved AND the Hub row in peer_registry carries a
+// non-empty node_key; once that landed, it hands off to refreshLoop
+// which keeps re-fetching hub-info and re-stamping the row on
+// NodeKey drift. Lifecycle exits only on ctx cancellation. A
+// mid-life pairing-protocol drift surfaces by bouncing back here
+// (refreshLoop returns) so the outer for re-enters the join dance
+// under the new contract.
+//
+// The "Hub NodeKey landed" initial-pass condition closes a critical
+// race flagged in the Codex re-review:
 //
 //   - peer hits Hub immediately after Hub boot.
 //   - Hub's tsnet hasn't finished its login handshake yet → hub-info
@@ -128,9 +151,9 @@ func NewDiscovery(cfg DiscoveryConfig, identity *Identity, st *store.Store, logg
 //     looks it up in peer_registry — finds the row with an EMPTY
 //     node_key. Mismatch → caller stays Guest → 403 → ghosted peer.
 //
-// Fix: discovery does not exit until peer_registry carries the
-// Hub's real NodeKey. We accept the latest Hub spec returned in
-// JoinResponse on every poll and rewrite the row.
+// Fix: discovery does not hand off to refreshLoop until peer_registry
+// carries the Hub's real NodeKey. We accept the latest Hub spec
+// returned in JoinResponse on every poll and rewrite the row.
 func (d *Discovery) Run(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {
@@ -210,7 +233,28 @@ func (d *Discovery) Run(ctx context.Context) {
 				continue
 			}
 			d.logger.Info("peer discovery: paired with Hub", "hub", hubURL)
-			return
+			// Hand off to the long-cycle refresh loop. Without
+			// this, a later Hub NodeKey change (key rotation, Hub
+			// binary upgrade that flips tsnet→host tailscaled
+			// identity, operator wiping Hub's own self-row) leaves
+			// the peer's local Hub-row pinned to the value
+			// observed at first pairing — every subsequent
+			// Hub-inbound request would be classified Guest at
+			// peer's TailnetIdentityMiddleware and 403 forbidden.
+			//
+			// refreshLoop returns either on ctx cancellation
+			// (genuine shutdown) or because it detected a Hub
+			// pairing-protocol drift mid-life — the latter means
+			// our previously-approved row is no longer valid and
+			// we must re-enter the join dance from the top. Fall
+			// through to the outer for so resolveHubURL → fetchHubInfo
+			// → version gate → join runs again under the new
+			// contract.
+			d.refreshLoop(ctx, hubURL)
+			if ctx.Err() != nil {
+				return
+			}
+			continue
 		}
 		// Approved but Hub NodeKey still missing. Re-fetch and
 		// loop. Common during the brief window between Hub boot
@@ -218,6 +262,70 @@ func (d *Discovery) Run(ctx context.Context) {
 		d.logger.Info("peer discovery: approved but Hub NodeKey not yet observed; waiting for tsnet to finish login",
 			"hub", hubURL)
 		d.sleep(ctx, JoinHeartbeat)
+	}
+}
+
+// refreshLoop keeps the local Hub-row in sync with whatever
+// hub-info advertises after approval. Runs until ctx is cancelled.
+// Only re-upserts when the freshly-fetched NodeKey differs from the
+// stored value — a no-op tick is cheap (one GET, one DB read).
+//
+// Why not periodically re-POST /join-request: the peer is already
+// approved, posting again would needlessly stamp last_seen and put
+// load on Hub. hub-info is the read-only twin: same NodeKey field,
+// no side effects on Hub.
+func (d *Discovery) refreshLoop(ctx context.Context, hubURL string) {
+	t := time.NewTicker(HubRowRefreshInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		hub, err := d.fetchHubInfo(ctx, hubURL)
+		if err != nil {
+			d.logger.Warn("peer discovery: post-pair hub-info refresh failed; retrying next tick",
+				"hub", hubURL, "err", err)
+			continue
+		}
+		if hub.ProtocolVersion != PairingProtocolVersion {
+			// Protocol-version drift mid-life: wipe the local row
+			// and return so Run's outer loop re-enters the join
+			// dance under the new contract. Without that re-entry
+			// the peer would stay un-paired with no recovery path
+			// short of a daemon restart.
+			d.logger.Warn("peer discovery: Hub pairing protocol drifted; wiping local Hub row",
+				"hub", hubURL,
+				"hub_protocol_version", hub.ProtocolVersion,
+				"peer_protocol_version", PairingProtocolVersion)
+			if hub.DeviceID != "" {
+				if derr := d.store.DeletePeer(ctx, hub.DeviceID); derr != nil {
+					d.logger.Warn("peer discovery: wipe stale Hub row failed",
+						"hub_device_id", hub.DeviceID, "err", derr)
+				}
+			}
+			return
+		}
+		if hub.NodeKey == "" {
+			// Hub is mid-rebind (tsnet login in progress, host
+			// LocalAPI not ready). Don't overwrite a previously-
+			// observed good NodeKey with blank — wait for the
+			// next tick.
+			continue
+		}
+		existing, err := d.store.GetPeer(ctx, hub.DeviceID)
+		if err == nil && existing != nil && existing.NodeKey == hub.NodeKey {
+			// No change — skip the upsert.
+			continue
+		}
+		if err := d.upsertHubIntoRegistry(ctx, hub, hubURL); err != nil {
+			d.logger.Warn("peer discovery: post-pair Hub-row refresh upsert failed",
+				"hub", hubURL, "err", err)
+			continue
+		}
+		d.logger.Info("peer discovery: refreshed Hub row with updated NodeKey",
+			"hub", hubURL, "nodekey", hub.NodeKey)
 	}
 }
 

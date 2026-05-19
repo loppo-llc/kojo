@@ -1427,10 +1427,28 @@ func main() {
 				}
 				return w.Node.Key.String(), nil
 			})
-			// Capture self NodeKey in the background and write it
-			// into peer_registry's self-row so other peers learn
-			// the Hub's NodeKey via hub-info.
-			go captureSelfNodeKeyFromTailscale(ctx, lc, srv, peerRegistrar, logger)
+			// Capture self NodeKey in the background.
+			//
+			// Two distinct NodeKeys are at play in Hub mode:
+			//
+			//   1. tsnet.Server's NodeKey — the identity bound to the
+			//      tsnet listener (kojo.<tailnet>.ts.net). srv uses this
+			//      via SelfNodeKeyFunc to demote self-loop requests
+			//      that come back in through the tsnet listener.
+			//
+			//   2. The host's tailscaled NodeKey — the identity OUTBOUND
+			//      HTTP requests originate from. Hub's outbound peer
+			//      dials use http.DefaultTransport, NOT tsnet.Server.Dial,
+			//      so the source IP/NodeKey peers observe (and resolve
+			//      via their WhoIs) is the host's tailscaled node, not
+			//      the tsnet.Server. This is what we MUST advertise via
+			//      hub-info so peer_registry rows on the receiving end
+			//      key off the same NodeKey the peer's WhoIs returns —
+			//      a tsnet NodeKey there would never match an inbound
+			//      Hub call and every §3.7 inter-peer surface (notably
+			//      /agent-sync/state) would 403 forbidden.
+			go captureSelfNodeKeyFromTailscale(ctx, lc, srv, nil, logger)
+			go captureOSSelfNodeKeyForRegistrar(ctx, peerRegistrar, logger)
 			// Background refresh: bounded retry until tsnet
 			// reports a DNSName, then SetPublicName +
 			// RefreshPublicName so other peers' Subscriber can
@@ -1694,11 +1712,150 @@ func captureSelfNodeKeyFromOSTailscale(ctx context.Context, srv *server.Server, 
 	}
 }
 
+// captureOSSelfNodeKeyForRegistrar polls the host's tailscaled
+// LocalAPI until Self.NodeKey is populated, then stamps it ONLY on
+// the Registrar (peer_registry self-row + hub-info advertisement).
+//
+// Hub mode runs a tsnet.Server with its own NodeKey distinct from
+// the host's tailscaled NodeKey, but outbound HTTP from this
+// process goes through http.DefaultTransport — not tsnet's dialer —
+// so the source NodeKey peers observe on Hub-outbound calls is the
+// host's tailscaled NodeKey. peer_registry rows on the receiving
+// end key off the WhoIs-resolved NodeKey, so the value Hub
+// advertises via hub-info MUST be the host's tailscaled NodeKey
+// (not tsnet.Server's). Without this the §3.7 inter-peer surface
+// (POST /api/v1/peers/agent-sync/state, /agent-sync, /agent-sync/
+// finalize|drop, /peers/pull) all 403 forbidden on the target
+// because its peer_registry lookup misses.
+//
+// Boot-time the self-row's node_key column is actively wiped (Step
+// 1 below) BEFORE OS LocalAPI polling starts, so hub-info advertises
+// an empty NodeKey while the host tailscaled answer is still in
+// flight — peer Discovery treats empty as "wait" and never latches
+// onto a stale value left by a previous binary. If the OS LocalAPI
+// never resolves (no host tailscaled installed or running), the
+// column stays empty for the binary's lifetime; Hub outbound also
+// can't reach peers in that configuration, so the broken pairing is
+// moot.
+func captureOSSelfNodeKeyForRegistrar(ctx context.Context, reg *peer.Registrar, logger *slog.Logger) {
+	if reg == nil {
+		return
+	}
+	// Step 1: actively wipe the existing self-row NodeKey. A previous
+	// binary may have stamped tsnet.Server's NodeKey here; if we
+	// merely overwrite when the OS LocalAPI eventually succeeds,
+	// hub-info would keep advertising the stale tsnet value in the
+	// interim and peer Discovery (which exits once approved + NodeKey
+	// non-empty) would either skip the refresh entirely (already
+	// approved from a previous boot) or latch onto the stale value.
+	// Setting it to NULL up-front means hub-info advertises an
+	// empty NodeKey until we've confirmed the host tailscaled one,
+	// which peer Discovery treats as "wait" rather than "use stale".
+	clearCtx, clearCancel := context.WithTimeout(ctx, 5*time.Second)
+	if err := reg.ClearSelfNodeKey(clearCtx); err != nil {
+		if logger != nil {
+			logger.Warn("could not wipe stale Hub self-row NodeKey before OS LocalAPI capture", "err", err)
+		}
+	}
+	clearCancel()
+
+	// Step 2: poll the OS LocalAPI until Self.NodeKey lands.
+	// Cadence: 2s for the first 30 attempts (fast path for the
+	// common case where tailscaled is already running at boot),
+	// then 60s indefinitely until ctx cancellation. A short-circuit
+	// "give up at 30" loses recoverability when tailscaled comes
+	// online later (laptop wake, daemon restart, network resume) —
+	// hub-info would keep advertising an empty NodeKey and the
+	// §3.7 inter-peer surface would stay 403'd until kojo itself
+	// is restarted.
+	attempts := 0
+	warned := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		statusCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		st, err := localTailscale.Status(statusCtx)
+		cancel()
+		if err == nil && st != nil && st.Self != nil {
+			nk := st.Self.PublicKey.String()
+			if nk != "" {
+				reg.SetSelfNodeKey(nk)
+				// Step 3: persist via RefreshPublicName, retrying on
+				// transient DB failure. Discarding the error here
+				// would leave reg's in-memory NodeKey populated but
+				// the DB row (which hub-info reads) at the stale-
+				// blank state — peers would never learn the right
+				// NodeKey.
+				if !persistSelfNodeKey(ctx, reg, logger) {
+					return
+				}
+				if logger != nil {
+					logger.Debug("captured host tailscaled NodeKey for Hub self-row", "nodekey", nk)
+				}
+				return
+			}
+		}
+		attempts++
+		if attempts == 30 && !warned && logger != nil {
+			logger.Warn("host tailscaled NodeKey still unavailable after 60s; switching to slow-poll. Hub→peer calls will be rejected as Guest until the OS tailscaled LocalAPI starts answering")
+			warned = true
+		}
+		var delay time.Duration
+		if attempts < 30 {
+			delay = 2 * time.Second
+		} else {
+			delay = 60 * time.Second
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+	}
+}
+
+// persistSelfNodeKey retries reg.RefreshPublicName until the DB
+// write succeeds or ctx is cancelled. The OS NodeKey capture has
+// already updated reg's in-memory cache; without successful
+// persistence, hub-info (which reads the DB row, not the in-memory
+// value) would keep advertising the stale-blank NodeKey and peer
+// Discovery would loop forever waiting for a non-empty value.
+// Returns true on success, false on ctx cancellation.
+func persistSelfNodeKey(ctx context.Context, reg *peer.Registrar, logger *slog.Logger) bool {
+	const maxAttempts = 30
+	for i := 0; i < maxAttempts; i++ {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		refreshCtx, refreshCancel := context.WithTimeout(ctx, 5*time.Second)
+		err := reg.RefreshPublicName(refreshCtx)
+		refreshCancel()
+		if err == nil {
+			return true
+		}
+		if logger != nil {
+			logger.Warn("Hub self-row NodeKey persist failed; retrying", "attempt", i+1, "err", err)
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if logger != nil {
+		logger.Warn("Hub self-row NodeKey persist gave up; hub-info will advertise empty NodeKey")
+	}
+	return false
+}
+
 // captureSelfNodeKeyFromTailscale polls LocalClient.Status() until
-// Self.NodeKey is populated, then stamps it on the Server AND on
-// the Registrar so peer_registry's self-row carries node_key (the
-// value other peers store and use to authenticate Hub-inbound
-// requests via tsnet identity).
+// Self.NodeKey is populated, then stamps it on the Server (and,
+// when reg is non-nil, on the Registrar so peer_registry's self-row
+// carries node_key — peer mode wires it this way; Hub mode passes
+// nil because the value advertised via hub-info has to be the
+// host's tailscaled NodeKey, not tsnet's, see
+// captureOSSelfNodeKeyForRegistrar).
 func captureSelfNodeKeyFromTailscale(ctx context.Context, lc tailscaleLocalClient, srv *server.Server, reg *peer.Registrar, logger *slog.Logger) {
 	const maxAttempts = 30
 	for i := 0; i < maxAttempts; i++ {
