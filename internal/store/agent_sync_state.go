@@ -55,10 +55,19 @@ type AgentSyncState struct {
 	// see them so target can mirror the deletion. A
 	// COALESCE-style "live max only" would silently drop
 	// tombstones whose updated_at exceeds the latest live row.
-	MaxMemoryEntryUpdatedAt int64  `json:"max_memory_entry_updated_at"`
-	AgentETag               string `json:"agent_etag,omitempty"`
-	PersonaETag             string `json:"persona_etag,omitempty"`
-	MemoryETag              string `json:"memory_etag,omitempty"`
+	MaxMemoryEntryUpdatedAt int64 `json:"max_memory_entry_updated_at"`
+	// NOTE: workspace files (agent_workspace_files) intentionally do
+	// NOT have a max-updated-at cursor here. They are tiny per-agent
+	// singletons (≤ 2 rows: user.md, checkin.md), so the bytes saved
+	// by an incremental delta are negligible — and incremental mode
+	// risks SILENT data loss across peer clock skew (source's
+	// updated_at is behind target's cursor → the delta skips the
+	// edit). The orchestrator always full-ships workspace files; the
+	// DELETE-then-INSERT in syncWorkspaceFilesTx covers the
+	// tombstone-bump case without needing a cursor.
+	AgentETag   string `json:"agent_etag,omitempty"`
+	PersonaETag string `json:"persona_etag,omitempty"`
+	MemoryETag  string `json:"memory_etag,omitempty"`
 }
 
 // GetAgentSyncState reads the per-agent high-water marks the

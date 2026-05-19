@@ -51,7 +51,18 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
 
-	args := b.buildClaudeArgs(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers, opts.AutomatedTrigger)
+	// SystemPromptExtra is appended by the manager before reaching us — see
+	// Manager.ChatOneShot. The backend treats systemPrompt as the final
+	// system prompt to pass to --system-prompt, with the cacheable prefix
+	// already placed at offset 0.
+	args := b.buildClaudeArgs(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers, opts.AutomatedTrigger, opts.SessionKey)
+
+	// Expected session ID for THIS branch, used as the recovery fallback if
+	// Claude exits before result.streamSessionID is set. Without this anchor,
+	// recoverFromSession would pick the most-recently-modified JSONL in the
+	// project dir — which under concurrent Slack threads can be a different
+	// thread's file, causing cross-thread text contamination.
+	expectedSessionID := expectedClaudeSessionID(agent.ID, opts.SessionKey, opts.OneShot)
 
 	cmd := exec.CommandContext(ctx, claudePath, args...)
 	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
@@ -151,8 +162,19 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		// Last resort: recover from Claude session JSONL when the stream
 		// produced no usable text. Only used as fallback, never overrides
 		// text that was successfully captured from the stream.
-		if finalText == "" {
-			if sessionText := recoverFromSession(agent.ID, result.streamSessionID, b.logger); sessionText != "" {
+		//
+		// Prefer streamSessionID (authoritative — Claude told us which
+		// file it wrote to). When unavailable (process died before the
+		// result event), fall back to the deterministic UUID computed
+		// for this branch. Never fall through to "" because findSessionFile
+		// then picks the most-recently-modified JSONL, which under
+		// concurrent Slack threads can be a sibling thread's file.
+		recoverSessionID := result.streamSessionID
+		if recoverSessionID == "" {
+			recoverSessionID = expectedSessionID
+		}
+		if finalText == "" && recoverSessionID != "" {
+			if sessionText := recoverFromSession(agent.ID, recoverSessionID, b.logger); sessionText != "" {
 				b.logger.Info("recovered text from session log",
 					"agent", agent.ID,
 					"sessionLen", len(sessionText))
@@ -193,7 +215,11 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 }
 
 // buildClaudeArgs constructs the CLI arguments for a Claude chat invocation.
-func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir string, oneShot bool, mcpServers map[string]mcpServerEntry, automatedTrigger bool) []string {
+//
+// sessionKey, when non-empty, overrides the default agent-ID-based session
+// identifier. The key hashes to a deterministic UUID so successive calls in
+// the same logical conversation (e.g. a Slack thread) land on the same JSONL.
+func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir string, oneShot bool, mcpServers map[string]mcpServerEntry, automatedTrigger bool, sessionKey string) []string {
 	args := []string{
 		"-p",
 		"--output-format", "stream-json",
@@ -250,10 +276,11 @@ func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir s
 	// sessions — then the next --continue picks whichever branch was most
 	// recent, losing the other's context.
 	//
-	// OneShot mode (e.g. Slack conversations) skips session resumption entirely,
-	// running a fresh ephemeral session each time.
-	if !oneShot {
-		sessionID := agentIDToUUID(agent.ID)
+	// OneShot mode (no SessionKey, e.g. ephemeral Discord chats) skips
+	// session resumption entirely. When SessionKey is set the call still
+	// resumes — but against the key-derived UUID, isolating that branch
+	// (Slack thread, etc.) from the agent's main session.
+	if sessionID := expectedClaudeSessionID(agent.ID, sessionKey, oneShot); sessionID != "" {
 		if sessionFileUsable(dir, sessionID, automatedTrigger, agent.ID, agent.ResumeIdleDuration(), b.logger) {
 			args = append(args, "--resume", sessionID)
 		} else {
@@ -867,6 +894,35 @@ func agentIDToUUID(agentID string) string {
 	h[6] = (h[6] & 0x0f) | 0x30 // version 3
 	h[8] = (h[8] & 0x3f) | 0x80 // variant RFC4122
 	return fmt.Sprintf("%x-%x-%x-%x-%x", h[0:4], h[4:6], h[6:8], h[8:10], h[10:16])
+}
+
+// expectedClaudeSessionID returns the deterministic Claude session UUID that
+// this invocation would resume/create, or "" when the caller has opted out of
+// session persistence (oneShot mode).
+//
+// oneShot takes precedence: a true oneShot call ALWAYS returns "" so the
+// backend skips --resume / --session-id entirely. The manager is responsible
+// for setting OneShot=false whenever a non-empty SessionKey should actually
+// resume — this preserves the canonical "OneShot means ephemeral" invariant
+// and avoids a backend-level override that would surprise callers passing
+// SessionKey for purposes other than resumption.
+//
+// When sessionKey is non-empty (e.g. per-Slack-thread isolation), the UUID is
+// derived from that key so each thread maps to its own JSONL. Otherwise the
+// agent-wide UUID is used.
+//
+// The recovery path uses this value as a fallback so that, if Claude exits
+// before emitting the result event with streamSessionID, we still recover
+// text from THIS branch's JSONL rather than whichever file was most recently
+// modified (which could belong to a concurrent Slack thread).
+func expectedClaudeSessionID(agentID, sessionKey string, oneShot bool) string {
+	if oneShot {
+		return ""
+	}
+	if sessionKey != "" {
+		return agentIDToUUID(sessionKey)
+	}
+	return agentIDToUUID(agentID)
 }
 
 // recoverFromSession reads the Claude session JSONL for the agent and

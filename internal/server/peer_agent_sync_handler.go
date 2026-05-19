@@ -105,14 +105,15 @@ type peerAgentSyncRequest struct {
 	// state map can resolve which sync to commit or roll back.
 	// Required for the two-phase protocol to be safe across
 	// concurrent retries.
-	OpID          string                     `json:"op_id"`
-	Agent         *store.AgentRecord         `json:"agent"`
-	Persona       *store.AgentPersonaRecord  `json:"persona,omitempty"`
-	Memory        *store.AgentMemoryRecord   `json:"memory,omitempty"`
-	Messages      []*store.MessageRecord     `json:"messages,omitempty"`
-	MemoryEntries []*store.MemoryEntryRecord `json:"memory_entries,omitempty"`
-	Tasks         []*store.AgentTaskRecord   `json:"tasks,omitempty"`
-	AgentToken    string                     `json:"agent_token,omitempty"`
+	OpID           string                            `json:"op_id"`
+	Agent          *store.AgentRecord                `json:"agent"`
+	Persona        *store.AgentPersonaRecord         `json:"persona,omitempty"`
+	Memory         *store.AgentMemoryRecord          `json:"memory,omitempty"`
+	Messages       []*store.MessageRecord            `json:"messages,omitempty"`
+	MemoryEntries  []*store.MemoryEntryRecord        `json:"memory_entries,omitempty"`
+	WorkspaceFiles []*store.AgentWorkspaceFileRecord `json:"workspace_files,omitempty"`
+	Tasks          []*store.AgentTaskRecord          `json:"tasks,omitempty"`
+	AgentToken     string                            `json:"agent_token,omitempty"`
 	// ClaudeSessions carry the source peer's
 	// ~/.claude/projects/<encoded-workdir>/*.jsonl files so
 	// `claude --continue` on target finds the same conversation
@@ -152,6 +153,12 @@ type peerAgentSyncRequest struct {
 	// the receiver's ON CONFLICT(id) DO UPDATE overwrites in
 	// place. When 0 the legacy full-replace path runs.
 	SinceMemoryEntryUpdatedAt int64 `json:"since_memory_entry_updated_at,omitempty"`
+	// NOTE: workspace files (agent_workspace_files) have no
+	// incremental cursor. They are tiny per-agent singletons (≤ 2
+	// rows: user.md, checkin.md) so the delta is not worth the
+	// silent-data-loss risk under peer clock skew. The orchestrator
+	// always full-ships; syncWorkspaceFilesTx's DELETE-then-INSERT
+	// is the only mode for this surface.
 }
 
 // claudeSessionWire is the JSON shape of one transferred JSONL
@@ -378,11 +385,14 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 	incrementalMemoryEntries := req.SinceMemoryEntryUpdatedAt > 0
 
 	if err := s.agents.Store().SyncAgentFromPeer(r.Context(), store.AgentSyncPayload{
-		Agent:                    req.Agent,
-		Persona:                  req.Persona,
-		Memory:                   req.Memory,
-		Messages:                 req.Messages,
-		MemoryEntries:            req.MemoryEntries,
+		Agent:         req.Agent,
+		Persona:       req.Persona,
+		Memory:        req.Memory,
+		Messages:      req.Messages,
+		MemoryEntries: req.MemoryEntries,
+		// Workspace files: always full-replace. See the
+		// peerAgentSyncRequest doc-comment for the rationale.
+		WorkspaceFiles:           req.WorkspaceFiles,
 		Tasks:                    req.Tasks,
 		IncrementalMessages:      incrementalMessages,
 		IncrementalMemoryEntries: incrementalMemoryEntries,

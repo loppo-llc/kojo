@@ -237,9 +237,15 @@ type Agent struct {
 	// during silent hours. Existing agents default to true (backward compat);
 	// new agents default to false.
 	NotifyDuringSilent *bool `json:"notifyDuringSilent,omitempty"`
-	// CronMessage overrides the trailing instruction in the periodic check-in
-	// prompt. Empty = use the default ("最近の出来事や気づきがあれば memory/...md に記録し、必要なタスクを実行してください。").
-	// The literal string "{date}" is replaced with today's date in YYYY-MM-DD form.
+	// CronMessage is DEPRECATED. The canonical source for the
+	// periodic check-in body is the agent_workspace_files row with
+	// kind="checkin" (mirrored to <agentDir>/checkin.md). Manager.Load
+	// migrates any value still present in legacy settings_json into
+	// the workspace row and clears this field, so post-migration
+	// reads always observe an empty string. The struct field is
+	// retained strictly so settings_json round-trips through
+	// agentToSettings without erroring on the unknown key for rows
+	// written by older binaries.
 	CronMessage string `json:"cronMessage,omitempty"`
 	CreatedAt   string `json:"createdAt"` // RFC3339
 	UpdatedAt   string `json:"updatedAt"` // RFC3339

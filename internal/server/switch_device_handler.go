@@ -1202,6 +1202,22 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 	req.MemoryEntries = mentries
 	req.SinceMemoryEntryUpdatedAt = sinceMemUpdatedAt
 
+	// agent_workspace_files: ALWAYS full-ship. Per-agent these are
+	// tiny singletons (≤ 2 rows: user.md, checkin.md) so the delta
+	// has no meaningful perf benefit, but an incremental cursor
+	// risks SILENT data loss across peer clock skew (source's
+	// updated_at lagging target's cursor would skip a real edit).
+	// IncludeDeleted=true keeps tombstones in the payload so a
+	// "cleared workspace file" still propagates to target; the
+	// DELETE-then-INSERT in syncWorkspaceFilesTx replaces target's
+	// state wholesale.
+	wf, werr := st.ListAgentWorkspaceFiles(ctx, agentID,
+		store.WorkspaceFileListOptions{IncludeDeleted: true})
+	if werr != nil && !errors.Is(werr, store.ErrNotFound) {
+		return nil, fmt.Errorf("list workspace_files: %w", werr)
+	}
+	req.WorkspaceFiles = wf
+
 	tasks, terr := st.ListAgentTasks(ctx, agentID, store.AgentTaskListOptions{})
 	if terr != nil {
 		return nil, fmt.Errorf("list tasks: %w", terr)

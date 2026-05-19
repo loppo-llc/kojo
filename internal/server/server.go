@@ -748,6 +748,14 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	// changes).
 	mux.HandleFunc("GET /api/v1/agents/{id}/persona", s.handleGetAgentPersona)
 	mux.HandleFunc("PUT /api/v1/agents/{id}/persona", s.handlePutAgentPersona)
+	// user.md and checkin.md workspace files. GET returns the in-memory
+	// default template when the file is absent so the settings UI can
+	// show the same body the cron / system-prompt path would run; PUT
+	// writes atomically and echoes back the persisted content.
+	mux.HandleFunc("GET /api/v1/agents/{id}/user-context", s.handleGetUserContext)
+	mux.HandleFunc("PUT /api/v1/agents/{id}/user-context", s.handleSetUserContext)
+	mux.HandleFunc("GET /api/v1/agents/{id}/checkin-file", s.handleGetCheckinFile)
+	mux.HandleFunc("PUT /api/v1/agents/{id}/checkin-file", s.handlePutCheckinFile)
 	mux.HandleFunc("POST /api/v1/agents/{id}/avatar/generated", s.handleUploadGeneratedAvatar)
 	mux.HandleFunc("POST /api/v1/agents/generate-persona", s.handleGeneratePersona)
 	mux.HandleFunc("POST /api/v1/agents/generate-name", s.handleGenerateName)

@@ -693,6 +693,17 @@ func syncAgentMemoryHeld(ctx context.Context, st *store.Store, agentID string, l
 			firstErr = err
 		}
 	}
+	// Workspace files (user.md / checkin.md) follow the same DB-canonical
+	// disk-mirror pattern as MEMORY.md; sync disk → DB so a CLI-direct
+	// edit while the daemon was down propagates into the row.
+	if err := SyncWorkspaceFilesFromDisk(ctx, st, agentID, logger); err != nil {
+		if logger != nil {
+			logger.Warn("workspace files sync failed", "agent", agentID, "err", err)
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
 	return firstErr
 }
 
@@ -998,6 +1009,15 @@ listLoop:
 			}
 			captureErr(err)
 		}
+	}
+
+	// Workspace files (user.md / checkin.md). Runs under the same
+	// memorySyncMu the caller already holds, mirroring the MEMORY.md
+	// block above. Surface errors via captureErr but don't abort —
+	// a permission glitch on user.md must not prevent the function
+	// from returning a partially-successful reconcile.
+	if err := ReconcileWorkspaceFilesDiskFromDBHeld(ctx, st, agentID, logger); err != nil {
+		captureErr(err)
 	}
 
 	return firstErr

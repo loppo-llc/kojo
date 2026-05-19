@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -48,6 +49,145 @@ func TestAgentIDToUUID(t *testing.T) {
 		c := id[19]
 		if c != '8' && c != '9' && c != 'a' && c != 'b' {
 			t.Errorf("variant nibble not 8/9/a/b: got %c in %s", c, id)
+		}
+	})
+}
+
+func TestExpectedClaudeSessionID(t *testing.T) {
+	uuidRe := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+	t.Run("oneShot without sessionKey returns empty", func(t *testing.T) {
+		if got := expectedClaudeSessionID("ag_x", "", true); got != "" {
+			t.Errorf("expected empty, got %q", got)
+		}
+	})
+
+	t.Run("oneShot with sessionKey still returns empty", func(t *testing.T) {
+		// Canonical invariant: OneShot=true means ephemeral, period. The
+		// manager is responsible for setting OneShot=false when SessionKey
+		// should resume; the backend never silently overrides that.
+		if got := expectedClaudeSessionID("ag_x", "slack:C1:T1", true); got != "" {
+			t.Errorf("oneShot must dominate; got %q", got)
+		}
+	})
+
+	t.Run("non-oneShot with sessionKey resumes by key", func(t *testing.T) {
+		got := expectedClaudeSessionID("ag_x", "slack:C1:T1", false)
+		if !uuidRe.MatchString(got) {
+			t.Errorf("not a valid UUID: %s", got)
+		}
+		if got == agentIDToUUID("ag_x") {
+			t.Errorf("key-derived UUID collides with agent-wide UUID: %s", got)
+		}
+		if got != agentIDToUUID("slack:C1:T1") {
+			t.Errorf("expected key-derived UUID, got %s", got)
+		}
+	})
+
+	t.Run("no oneShot no key uses agent-wide UUID", func(t *testing.T) {
+		got := expectedClaudeSessionID("ag_x", "", false)
+		if got != agentIDToUUID("ag_x") {
+			t.Errorf("expected agent-wide UUID, got %s", got)
+		}
+	})
+
+	t.Run("deterministic across calls", func(t *testing.T) {
+		a := expectedClaudeSessionID("ag_x", "slack:C1:T1", false)
+		b := expectedClaudeSessionID("ag_x", "slack:C1:T1", false)
+		if a != b {
+			t.Errorf("not deterministic: %s != %s", a, b)
+		}
+	})
+
+	t.Run("different keys yield different UUIDs", func(t *testing.T) {
+		a := expectedClaudeSessionID("ag_x", "slack:C1:T1", false)
+		b := expectedClaudeSessionID("ag_x", "slack:C1:T2", false)
+		if a == b {
+			t.Errorf("collision: %s == %s", a, b)
+		}
+	})
+}
+
+func TestBuildClaudeArgs_SessionKey(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := &ClaudeBackend{logger: logger}
+	tmp := t.TempDir()
+	a := &Agent{ID: "ag_test"}
+
+	t.Run("oneShot drops --resume even with sessionKey", func(t *testing.T) {
+		args := b.buildClaudeArgs(a, "", tmp, true, nil, false, "slack:C1:T1")
+		for i := range args {
+			if args[i] == "--resume" || args[i] == "--session-id" {
+				t.Errorf("oneShot must skip session flags, got %v", args)
+			}
+		}
+	})
+
+	t.Run("non-oneShot with sessionKey resumes by key-derived UUID", func(t *testing.T) {
+		args := b.buildClaudeArgs(a, "", tmp, false, nil, false, "slack:C1:T1")
+		want := agentIDToUUID("slack:C1:T1")
+		found := false
+		for i := 0; i < len(args)-1; i++ {
+			if (args[i] == "--resume" || args[i] == "--session-id") && args[i+1] == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected --resume/--session-id %s, got %v", want, args)
+		}
+	})
+
+	t.Run("non-oneShot no sessionKey uses agent-wide UUID", func(t *testing.T) {
+		args := b.buildClaudeArgs(a, "", tmp, false, nil, false, "")
+		want := agentIDToUUID("ag_test")
+		found := false
+		for i := 0; i < len(args)-1; i++ {
+			if (args[i] == "--resume" || args[i] == "--session-id") && args[i+1] == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected --resume/--session-id %s, got %v", want, args)
+		}
+	})
+}
+
+func TestBackendSupportsSessionKey(t *testing.T) {
+	t.Run("claude supports", func(t *testing.T) {
+		b := &ClaudeBackend{}
+		if !backendSupportsSessionKey(b) {
+			t.Errorf("claude should support session key")
+		}
+	})
+	t.Run("custom supports", func(t *testing.T) {
+		// custom delegates to ClaudeBackend, so it must mirror claude.
+		// Phase B Part 2 Slack threads must still resume on custom backends.
+		b := &CustomBackend{}
+		if !backendSupportsSessionKey(b) {
+			t.Errorf("custom should support session key")
+		}
+	})
+	t.Run("codex does not", func(t *testing.T) {
+		b := &CodexBackend{}
+		if backendSupportsSessionKey(b) {
+			t.Errorf("codex should not support session key")
+		}
+	})
+	t.Run("gemini does not", func(t *testing.T) {
+		b := &GeminiBackend{}
+		if backendSupportsSessionKey(b) {
+			t.Errorf("gemini should not support session key")
+		}
+	})
+	t.Run("llama does not", func(t *testing.T) {
+		b := &LlamaCppBackend{}
+		if backendSupportsSessionKey(b) {
+			t.Errorf("llama should not support session key")
+		}
+	})
+	t.Run("nil is false", func(t *testing.T) {
+		if backendSupportsSessionKey(nil) {
+			t.Errorf("nil backend should not support session key")
 		}
 	})
 }

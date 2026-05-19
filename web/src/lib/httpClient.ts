@@ -170,6 +170,36 @@ export function del<T>(path: string): Promise<T> {
 }
 
 /**
+ * PUT with optional If-Match precondition. Mirrors patchWithIfMatch /
+ * postWithIfMatch: the workspace-file endpoints (user.md / checkin.md)
+ * are PUTs with strict-mode If-Match enforcement, so callers must thread
+ * the etag they received from the matching GET response. On 412 the
+ * server signals stale-snapshot — the caller refetches and re-applies.
+ */
+export async function putWithIfMatch<T>(
+  path: string,
+  body: unknown,
+  ifMatch?: string,
+): Promise<EtaggedResponse<T>> {
+  const headers = new Headers({ "Content-Type": "application/json" });
+  if (ifMatch) headers.set("If-Match", quoteEtag(ifMatch));
+  const res = await fetch(
+    BASE + path,
+    withAuth({ method: "PUT", headers, body: JSON.stringify(body) }),
+  );
+  if (res.status === 412) {
+    const text = await res.text().catch(() => "");
+    throw new PreconditionFailedError(text || "etag mismatch");
+  }
+  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+  const etag = unquoteEtag(res.headers.get("ETag"));
+  if (res.status === 204 || res.headers.get("content-length") === "0") {
+    return { value: undefined as T, etag };
+  }
+  return { value: await res.json(), etag };
+}
+
+/**
  * POST with optional If-Match precondition. Used for non-PATCH state
  * mutations that still want optimistic locking against a specific row's
  * etag — primarily POST /messages/{msgId}/regenerate, which truncates

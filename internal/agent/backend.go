@@ -33,6 +33,55 @@ type ChatOptions struct {
 	// guard on session resets: there is no interactive conversation to
 	// preserve, so token conservation wins over continuity.
 	AutomatedTrigger bool
+
+	// SessionKey overrides the default agent-ID-based session identifier.
+	// The key is hashed into a deterministic UUID so callers can pass any
+	// stable string (e.g. "slack:<channel>:<thread>") to get an independent
+	// Claude session JSONL. Used for per-Slack-thread session resumption
+	// where each conversation thread maintains its own context, isolated
+	// from the agent's WebUI session and from other threads.
+	//
+	// Empty string means "fall back to the agent-wide session ID" — i.e.
+	// the existing single-session-per-agent behaviour. Backends that don't
+	// honor SessionKey (see backendSupportsSessionKey) must treat any
+	// non-empty value as if it were empty and degrade to OneShot=true at
+	// the call site rather than silently leaking context across keys.
+	SessionKey string
+
+	// SystemPromptExtra is appended verbatim to the systemPrompt argument
+	// AFTER the backend's normal prompt assembly. Use it to inject
+	// per-conversation context (e.g. Slack channel/thread info) without
+	// disturbing the cached system-prompt prefix shared across turns
+	// within the same session.
+	//
+	// Why a separate field instead of pre-concatenating into systemPrompt:
+	// the volatile per-turn data must land at a stable offset so the
+	// claude prompt cache treats the leading shared prompt as a cacheable
+	// prefix. Mixing channel-context tokens into the middle of the prompt
+	// would invalidate the cache for every Slack message.
+	SystemPromptExtra string
+}
+
+// backendSupportsSessionKey reports whether the backend honors
+// ChatOptions.SessionKey when building its CLI invocation. Backends that
+// ignore SessionKey (codex, gemini, llama.cpp, custom) cannot isolate a
+// per-thread session from the agent's main session, so the manager drops
+// SessionKey for them and degrades to OneShot=true — keeping the chat
+// ephemeral rather than silently mixing thread contexts.
+//
+// Keep this list in sync with the backends that actually read
+// opts.SessionKey when assembling their argv / config.
+func backendSupportsSessionKey(b ChatBackend) bool {
+	if b == nil {
+		return false
+	}
+	switch b.Name() {
+	case "claude", "custom":
+		// custom delegates to ClaudeBackend.Chat, which honors SessionKey.
+		return true
+	default:
+		return false
+	}
 }
 
 // ChatBackend abstracts a CLI tool for agent chat.

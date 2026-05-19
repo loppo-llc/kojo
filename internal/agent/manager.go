@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/atomicfile"
 	"github.com/loppo-llc/kojo/internal/blob"
 	"github.com/loppo-llc/kojo/internal/notifysource"
 	"github.com/loppo-llc/kojo/internal/notifysource/gmail"
@@ -377,6 +378,50 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 				Timestamp: last.Timestamp,
 			}
 		}
+		// One-shot migration from the legacy inline Agent.CronMessage
+		// field to the agent_workspace_files (kind=checkin) row. The
+		// store is canonical post-cutover; legacy settings_json may
+		// still carry the value for rows written before the v1 table
+		// existed. Idempotent: if a live row already exists we don't
+		// overwrite it (disk / DB wins over the stale settings copy).
+		if strings.TrimSpace(a.CronMessage) != "" {
+			migCtx, migCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			st := m.store.Store()
+			migrated := false
+			if st != nil {
+				existing, gerr := st.GetAgentWorkspaceFile(migCtx, a.ID, store.WorkspaceFileKindCheckin)
+				switch {
+				case gerr == nil && existing != nil:
+					// Live DB row already present — nothing to do
+					// beyond clearing the legacy field below.
+					migrated = true
+				case errors.Is(gerr, store.ErrNotFound):
+					if _, uerr := st.UpsertAgentWorkspaceFile(migCtx, a.ID, store.WorkspaceFileKindCheckin,
+						strings.TrimSpace(a.CronMessage), "",
+						store.AgentWorkspaceFileInsertOptions{AllowOverwrite: true}); uerr != nil {
+						logger.Warn("checkin migration: workspace upsert failed", "agent", a.ID, "err", uerr)
+					} else {
+						checkinPath := filepath.Join(agentDir(a.ID), "checkin.md")
+						if werr := atomicfile.WriteBytes(checkinPath, []byte(strings.TrimSpace(a.CronMessage)), 0o644); werr != nil {
+							logger.Warn("checkin migration: disk mirror failed", "agent", a.ID, "err", werr)
+						}
+						migrated = true
+					}
+				default:
+					logger.Warn("checkin migration: workspace probe failed", "agent", a.ID, "err", gerr)
+				}
+			}
+			migCancel()
+			// Clear the legacy field on the in-memory copy + persist
+			// the cleared settings_json so the next Load doesn't
+			// re-trigger this migration. Idempotent across restarts.
+			if migrated {
+				a.CronMessage = ""
+				if err := m.store.SaveAgentRowOnly(a); err != nil {
+					logger.Warn("checkin migration: row clear failed", "agent", a.ID, "err", err)
+				}
+			}
+		}
 		m.agents[a.ID] = a
 	}
 
@@ -700,10 +745,11 @@ func (m *Manager) syncPersona(agentID string) {
 		}
 	}
 
-	// Pre-generate persona summary in background so it's cached for next chat
-	if len([]rune(content)) > maxPersonaSummaryRunes {
-		go getPersonaSummary(agentID, content, tool, m.logger)
-	}
+	// Persona summarization is now deterministic head/tail truncation in
+	// buildSystemPrompt (truncateBootstrapFile) — no async LLM warm-up
+	// needed. Truncation is a pure function so the system prompt becomes
+	// stable the moment persona.md is written.
+	_ = tool // kept on the signature for parity with public-profile regen paths
 
 	// Regenerate or clear public profile when persona changes via file edit (unless overridden)
 	if !override {
@@ -1829,12 +1875,41 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	return callerCh, nil
 }
 
+// OneShotOpts configures a ChatOneShot invocation. All fields are optional;
+// pass OneShotOpts{} for the legacy ephemeral-session behaviour.
+type OneShotOpts struct {
+	// SessionKey, when non-empty, opts INTO Claude session resumption keyed
+	// by this string instead of staying purely ephemeral. Slack sets this
+	// to a stable hash of (agentID, channel, threadTS) so repeated DMs in
+	// the same thread land on the same JSONL — preserving Claude's context
+	// across turns within that thread, isolated from the agent's WebUI
+	// session and from other Slack threads. Empty string preserves the
+	// pre-PR-#12 "fresh ephemeral session per call" behaviour.
+	//
+	// Honored only by backends in backendSupportsSessionKey (claude). For
+	// other backends the manager drops the key and falls back to OneShot,
+	// rather than risk silently mixing thread contexts on a backend that
+	// would interpret !OneShot as "resume the agent's latest session".
+	SessionKey string
+
+	// SystemPromptExtra is appended to the system prompt for this call
+	// only. Slack uses it to inject per-channel/thread context
+	// ("You are participating in channel #foo, thread …") at a stable
+	// offset AFTER the cacheable shared prefix, so adding the block does
+	// not invalidate the prompt cache for other one-shot callers.
+	SystemPromptExtra string
+}
+
 // ChatOneShot runs a one-shot chat that does not save to the agent's
-// transcript (agent_messages) and does not resume the CLI session. Used
-// for external platform conversations (Slack, Discord) that carry their
-// own context. Memory (MEMORY.md, diary) access is still available via
-// system prompt.
-func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string) (<-chan ChatEvent, error) {
+// transcript (agent_messages). Used for external platform conversations
+// (Slack, Discord) that carry their own context. Memory (MEMORY.md, diary)
+// access is still available via system prompt.
+//
+// With opts.SessionKey set AND a supporting backend (claude), the call
+// resumes a key-derived Claude session so successive messages in the same
+// conversation (e.g. Slack thread) share context. Otherwise the chat runs
+// as a fresh ephemeral session each time, matching the legacy behaviour.
+func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error) {
 	// acquirePreparing: see Chat() for the contract — gates
 	// switching AND increments the preparing counter so Step
 	// -1's WaitChatIdle observes the in-flight prepareChat.
@@ -1873,6 +1948,19 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 			"Always include exactly one <reply> block at the end of your response.\n"
 	}
 
+	// Append per-conversation context (Slack channel/thread block, etc.)
+	// at the END of the system prompt so the leading cacheable prefix stays
+	// invariant across turns within the same session. Doing this at the
+	// manager level (rather than inside each backend) keeps the wire
+	// behaviour identical for every backend including the ones that don't
+	// read ChatOptions.SystemPromptExtra directly (gemini, llama.cpp).
+	if opts.SystemPromptExtra != "" {
+		if prep.sysPrompt != "" {
+			prep.sysPrompt += "\n\n"
+		}
+		prep.sysPrompt += opts.SystemPromptExtra
+	}
+
 	// NOTE: No appendMessage — one-shot chats are not saved to transcript.
 
 	// Prepend volatile context for the same reason as the persistent
@@ -1882,7 +1970,35 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	if prep.volatileContext != "" {
 		effectiveMessage = prep.volatileContext + userMessage
 	}
-	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{OneShot: true, MCPServers: prep.mcpServers})
+
+	// Gate SessionKey to backends that actually honor it. Other backends
+	// would interpret OneShot=false as "resume the agent's latest session"
+	// and silently mix Slack thread context with the agent's WebUI session.
+	// Drop the key and stay ephemeral instead — degrades cleanly to the
+	// pre-PR-#12 behaviour rather than corrupting cross-platform context.
+	sessionKey := opts.SessionKey
+	oneShotMode := true
+	if sessionKey != "" && backendSupportsSessionKey(prep.backend) {
+		// Resume the key-derived session: stop forcing OneShot so the
+		// claude backend issues --resume <derivedUUID>. AutomatedTrigger
+		// stays false — every SessionKey caller today (Slack) is a human
+		// reply in a thread, and the idle-window guard in sessionFileUsable
+		// must protect those just like it protects WebUI chats.
+		oneShotMode = false
+	} else {
+		sessionKey = ""
+	}
+
+	// NOTE: SystemPromptExtra was already merged into prep.sysPrompt above,
+	// so it is intentionally NOT forwarded via ChatOptions — that would
+	// cause a backend to append it a second time. The field stays on
+	// ChatOptions for future backends that want to inject it at a custom
+	// offset rather than the end of the system prompt.
+	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
+		OneShot:    oneShotMode,
+		MCPServers: prep.mcpServers,
+		SessionKey: sessionKey,
+	})
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
@@ -2179,6 +2295,71 @@ func (m *Manager) resolveBackend(agentID string, agentCopy *Agent) (ChatBackend,
 	return backend, nil
 }
 
+// CanResumeSession reports whether the next ChatOneShot for this
+// (agentID, sessionKey) pair will actually resume an existing backend
+// session. Three conditions must hold: the configured backend honors
+// ChatOptions.SessionKey for resumption, the on-disk session artifact
+// exists, AND the artifact is non-empty (a zero-byte JSONL is treated
+// as "no session" because sessionFileUsable would delete it and start
+// fresh on the next invocation anyway).
+//
+// Used by the Slack bot (Phase B Part 2) to gate one-time "inject Slack
+// thread history into the user message" behaviour: on the first message
+// in a thread we replay history, on subsequent messages we skip the
+// replay because Claude already has the prior turns in its session.
+//
+// Caveat: this does NOT check sessionResetThresholdTokens. If a
+// long-running thread's JSONL eventually exceeds the reset threshold,
+// sessionFileUsable will summarise + delete it on the next chat and
+// Claude starts a new session with --session-id. The Slack bot would
+// keep returning true (the file existed at probe time) so the new
+// session loses prior Slack context — recovery requires the user to
+// re-share context, or a future delta-injection feature. Replicating
+// sessionFileUsable's token check here would either duplicate its
+// destructive side effects (preReset summary, file removal) or require
+// splitting it into a read-only probe; we accept the rare-edge cost
+// instead.
+func (m *Manager) CanResumeSession(agentID, sessionKey string) bool {
+	if sessionKey == "" {
+		return false
+	}
+	m.mu.Lock()
+	a, ok := m.agents[agentID]
+	if !ok {
+		m.mu.Unlock()
+		return false
+	}
+	tool := a.Tool
+	m.mu.Unlock()
+
+	backend, ok := m.backends[tool]
+	if !ok {
+		return false
+	}
+	if !backendSupportsSessionKey(backend) {
+		return false
+	}
+
+	// Probe the deterministic session file. expectedClaudeSessionID is
+	// called with oneShot=false because CanResumeSession asks whether a
+	// resumable session EXISTS; the ChatOneShot call site decides the
+	// actual oneShot/sessionKey combination.
+	sessionID := expectedClaudeSessionID(agentID, sessionKey, false)
+	if sessionID == "" {
+		return false
+	}
+	dir := agentDir(agentID)
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(claudeProjectDir(absDir), sessionID+".jsonl"))
+	if err != nil {
+		return false
+	}
+	return info.Size() > 0
+}
+
 // updatePostChatIndex updates the memory index after a chat completes.
 // Skips if the agent was deleted or is being reset to avoid reopening a closed index.
 func (m *Manager) updatePostChatIndex(agentID string) {
@@ -2240,8 +2421,16 @@ func (m *Manager) Checkin(agentID string) error {
 		return fmt.Errorf("%w: %s", ErrAgentArchived, agentID)
 	}
 	timeoutMinutes := a.TimeoutMinutes
-	cronMessage := a.CronMessage
 	m.mu.Unlock()
+
+	// Manual check-ins read checkin.md just like the cron path. Surfacing
+	// the read error (rather than silently substituting the default)
+	// matches the cron behaviour and keeps the manual / cron entry points
+	// consistent for an operator who authored a custom check-in.
+	cronMessage, err := resolveCheckinMessage(agentID)
+	if err != nil {
+		return fmt.Errorf("read checkin.md: %w", err)
+	}
 
 	timeout := cronTimeout
 	if timeoutMinutes > 0 {

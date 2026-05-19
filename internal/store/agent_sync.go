@@ -27,16 +27,17 @@ func nullableJSON(v json.RawMessage) any {
 // SyncAgentFromPeer inside one transaction.
 //
 // Empty slices / nil pointers are honoured: a target that
-// receives no Persona / Memory / Messages / MemoryEntries clears
-// its corresponding rows (the agent existed on source without
-// that surface, so target should mirror).
+// receives no Persona / Memory / Messages / MemoryEntries /
+// WorkspaceFiles clears its corresponding rows (the agent existed
+// on source without that surface, so target should mirror).
 type AgentSyncPayload struct {
-	Agent         *AgentRecord
-	Persona       *AgentPersonaRecord  // nil = no persona on source
-	Memory        *AgentMemoryRecord   // nil = no MEMORY.md on source
-	Messages      []*MessageRecord     // empty = clear (full mode) OR no new rows (incremental mode)
-	MemoryEntries []*MemoryEntryRecord // empty = clear (full mode) OR no new rows (incremental mode)
-	Tasks         []*AgentTaskRecord   // empty = clear target's tasks
+	Agent          *AgentRecord
+	Persona        *AgentPersonaRecord         // nil = no persona on source
+	Memory         *AgentMemoryRecord          // nil = no MEMORY.md on source
+	Messages       []*MessageRecord            // empty = clear (full mode) OR no new rows (incremental mode)
+	MemoryEntries  []*MemoryEntryRecord        // empty = clear (full mode) OR no new rows (incremental mode)
+	Tasks          []*AgentTaskRecord          // empty = clear target's tasks
+	WorkspaceFiles []*AgentWorkspaceFileRecord // empty = clear (full mode) OR no new rows (incremental mode)
 
 	// IncrementalMessages, when true, switches syncMessagesTx
 	// from "delete-then-insert" (source-wins full replace) to
@@ -51,6 +52,13 @@ type AgentSyncPayload struct {
 
 	// IncrementalMemoryEntries is the analogue for memory_entries.
 	IncrementalMemoryEntries bool
+
+	// NOTE: workspace files (agent_workspace_files) have no
+	// incremental mode. They are tiny per-agent singletons (≤ 2 rows:
+	// user.md, checkin.md) so the bytes saved by a delta are
+	// negligible, and an updated_at cursor would risk silently
+	// dropping edits across peer clock skew. syncWorkspaceFilesTx
+	// always runs the DELETE-then-INSERT full-replace path.
 }
 
 // SyncAgentFromPeer overwrites the target's local copy of one
@@ -98,6 +106,9 @@ func (s *Store) SyncAgentFromPeer(ctx context.Context, payload AgentSyncPayload)
 		return err
 	}
 	if err := syncMemoryEntriesTx(ctx, tx, agentID, payload.MemoryEntries, payload.IncrementalMemoryEntries); err != nil {
+		return err
+	}
+	if err := syncWorkspaceFilesTx(ctx, tx, agentID, payload.WorkspaceFiles); err != nil {
 		return err
 	}
 	if err := syncAgentTasksTx(ctx, tx, agentID, payload.Tasks); err != nil {
@@ -592,6 +603,111 @@ ON CONFLICT(id) DO UPDATE SET
 		}
 		if _, err := RecordEvent(ctx, tx, "memory_entries", m.ID, etag, EventOpInsert, now); err != nil {
 			return fmt.Errorf("syncMemoryEntriesTx: index %d: record event: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// syncWorkspaceFilesTx replaces every agent_workspace_files row for
+// agentID with the supplied source set. Source-wins, full-replace only:
+// workspace files are tiny per-agent singletons (≤ 2 rows: user.md,
+// checkin.md) so the bytes saved by an incremental delta are
+// negligible, and an updated_at cursor would risk silently dropping
+// edits across peer clock skew. The orchestrator (switch_device_handler)
+// always full-ships.
+//
+// An empty/nil recs slice clears target's workspace files (matches the
+// "source has no rows here" intent — see the package-level doc on
+// AgentSyncPayload). Tombstones (deleted_at != NULL) are accepted: a
+// "cleared workspace file" arrives as a row with DeletedAt set and the
+// INSERT writes the tombstone after the DELETE. The ETag input includes
+// deleted_at so target's strong-etag shifts on receipt and cross-device
+// readers can distinguish live from cleared via 304 vs new ETag.
+func syncWorkspaceFilesTx(ctx context.Context, tx *sql.Tx, agentID string, recs []*AgentWorkspaceFileRecord) error {
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM agent_workspace_files WHERE agent_id = ?`, agentID); err != nil {
+		return fmt.Errorf("syncWorkspaceFilesTx: delete: %w", err)
+	}
+	if len(recs) == 0 {
+		return nil
+	}
+	// ON CONFLICT keys off (agent_id, kind), the table's PRIMARY KEY.
+	// Incremental retries replay cleanly; full-mode lands against an
+	// empty table (we just deleted) but keeps the same SQL one shape
+	// so a partial DELETE+INSERT under retry is idempotent too.
+	const q = `
+INSERT INTO agent_workspace_files (
+  agent_id, kind, body, body_sha256,
+  seq, version, etag, created_at, updated_at, deleted_at, peer_id
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(agent_id, kind) DO UPDATE SET
+  body         = excluded.body,
+  body_sha256  = excluded.body_sha256,
+  seq          = excluded.seq,
+  version      = excluded.version,
+  etag         = excluded.etag,
+  created_at   = excluded.created_at,
+  updated_at   = excluded.updated_at,
+  deleted_at   = excluded.deleted_at,
+  peer_id      = excluded.peer_id
+`
+	for i, w := range recs {
+		if w == nil {
+			return fmt.Errorf("syncWorkspaceFilesTx: nil record at %d", i)
+		}
+		if w.AgentID == "" {
+			return fmt.Errorf("syncWorkspaceFilesTx: index %d: agent_id required", i)
+		}
+		if w.AgentID != agentID {
+			return fmt.Errorf("syncWorkspaceFilesTx: index %d: agent_id mismatch (%q vs %q)",
+				i, w.AgentID, agentID)
+		}
+		if !IsValidWorkspaceFileKind(w.Kind) {
+			return fmt.Errorf("syncWorkspaceFilesTx: index %d: invalid kind %q", i, string(w.Kind))
+		}
+		version := w.Version
+		if version <= 0 {
+			version = 1
+		}
+		seq := w.Seq
+		if seq <= 0 {
+			seq = NextGlobalSeq()
+		}
+		now := w.UpdatedAt
+		if now <= 0 {
+			now = NowMillis()
+		}
+		created := w.CreatedAt
+		if created <= 0 {
+			created = now
+		}
+		etag := w.ETag
+		if etag == "" {
+			copy := *w
+			copy.Version = version
+			copy.UpdatedAt = now
+			computed, cerr := computeAgentWorkspaceFileETag(&copy)
+			if cerr != nil {
+				return fmt.Errorf("syncWorkspaceFilesTx: index %d: etag: %w", i, cerr)
+			}
+			etag = computed
+		}
+		var deletedAt sql.NullInt64
+		if w.DeletedAt != nil {
+			deletedAt = sql.NullInt64{Int64: *w.DeletedAt, Valid: true}
+		}
+		if _, err := tx.ExecContext(ctx, q,
+			w.AgentID, string(w.Kind), w.Body, w.BodySHA256,
+			seq, version, etag, created, now, deletedAt, nullableText(w.PeerID),
+		); err != nil {
+			return fmt.Errorf("syncWorkspaceFilesTx: index %d: %w", i, err)
+		}
+		// Event id is "<agent_id>:<kind>" so two kinds for the same
+		// agent never collide on the events stream — mirrors how the
+		// table's primary key composes the same two columns.
+		eventID := w.AgentID + ":" + string(w.Kind)
+		if _, err := RecordEvent(ctx, tx, "agent_workspace_files", eventID, etag, EventOpUpdate, now); err != nil {
+			return fmt.Errorf("syncWorkspaceFilesTx: index %d: record event: %w", i, err)
 		}
 	}
 	return nil
