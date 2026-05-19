@@ -108,15 +108,6 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		return true
 	}
 
-	// Transient diagnostic endpoint — open to every principal so a
-	// caller stamped as Guest can still surface the role they were
-	// given (otherwise the gate would 403 along with the rest of the
-	// API and the report would be uninformative). Remove together
-	// with the handler once the desktop-tvt 403 regression closes.
-	if method == http.MethodGet && path == "/api/v1/_debug/whoami" {
-		return true
-	}
-
 	// WebDAV mount surface: the handler-side `webdavGate` is the
 	// canonical authorization point here because the credential a
 	// WebDAV client presents is HTTP Basic — AuthMiddleware can't

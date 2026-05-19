@@ -430,6 +430,7 @@ func New(cfg Config) *Server {
 		publicHandler = s.sessionPeerProxyMiddleware(publicHandler)
 	}
 	publicHandler = auth.EnforceMiddleware(publicHandler)
+	publicHandler = apiNoStoreDefaultMiddleware(publicHandler)
 	publicHandler = auth.TailnetIdentityMiddleware(auth.TailnetIdentityConfig{
 		Resolver:        s.resolveNodeKey,
 		SelfNodeKeyFunc: s.currentSelfNodeKey,
@@ -470,11 +471,6 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	//     /api/v1/peers): pairing is operator workflow, not
 	//     something an agent or peer drives.
 	//   - static Web UI / dev proxy: peer hosts have no UI.
-
-	// Transient diagnostic endpoint for the desktop-tvt 403 report.
-	// Echoes the Principal stamped by the auth chain. Remove once
-	// the regression is closed.
-	mux.HandleFunc("GET /api/v1/_debug/whoami", s.handleDebugWhoAmI)
 
 	// Session routes
 	mux.HandleFunc("GET /api/v1/info", s.handleInfo)
@@ -999,6 +995,7 @@ func (s *Server) buildAuthHandler(resolver *auth.Resolver) http.Handler {
 	}
 	handler = auth.EnforceMiddleware(handler)
 	handler = auth.AuthMiddleware(resolver)(handler)
+	handler = apiNoStoreDefaultMiddleware(handler)
 	return handler
 }
 

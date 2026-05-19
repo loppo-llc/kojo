@@ -228,6 +228,17 @@ func TestServeAvatar_FallbackSVG(t *testing.T) {
 	if ct := resp.Header.Get("Content-Type"); ct != "image/svg+xml" {
 		t.Errorf("Content-Type = %q; want image/svg+xml", ct)
 	}
+	// Cache-Control must stay UNSET here so apiNoStoreDefaultMiddleware
+	// can seed `no-store` upstream. The fallback SVG is generated from
+	// a.Name; an explicit max-age leaves the previous initials cached
+	// for that duration on the stable /api/v1/agents/{id}/avatar URL
+	// after a rename or first real-avatar upload (the bug Codex
+	// flagged on the cache-control rollout). Pinning empty here so a
+	// future re-addition of `public, max-age=3600` breaks the test
+	// instead of silently regressing.
+	if cc := resp.Header.Get("Cache-Control"); cc != "" {
+		t.Errorf("Cache-Control = %q; want empty (middleware seeds no-store)", cc)
+	}
 	body := w.Body.String()
 	if !strings.Contains(body, "<svg") {
 		t.Errorf("body missing <svg> tag: %q", body[:min(80, len(body))])

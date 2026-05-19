@@ -219,9 +219,16 @@ func ServeAvatar(bs *blob.Store, w http.ResponseWriter, r *http.Request, a *Agen
 	// failure — a missing blob between Head and Open means a
 	// concurrent SaveAvatar/DeleteAvatar dropped the row, and
 	// serving the legacy initials avatar is preferable to a 500.
+	//
+	// Cache-Control is left to apiNoStoreDefaultMiddleware's
+	// `no-store` seed: the SVG is generated from a.Name, so a
+	// rename or first avatar upload would otherwise leave the
+	// previous initials cached for up to an hour on the same
+	// /api/v1/agents/{id}/avatar URL. The SVG body is a few
+	// hundred bytes — re-fetching on every request is cheaper
+	// than getting wrong content stuck in a browser cache.
 	svg := generateSVGAvatar(a.Name)
 	w.Header().Set("Content-Type", "image/svg+xml")
-	w.Header().Set("Cache-Control", "public, max-age=3600")
 	w.Write([]byte(svg))
 }
 
