@@ -9,6 +9,7 @@ import {
   getWithEtag,
   patchWithIfMatch,
   postWithIfMatch,
+  putWithIfMatch,
 } from "./httpClient";
 import { appendTokenQuery } from "./auth";
 import type { DirEntry, FileView } from "./api";
@@ -416,6 +417,50 @@ export const agentApi = {
   ) => post<TruncateMemoryResult>(`/api/v1/agents/${id}/memory/truncate`, params),
 
   checkin: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/checkin`),
+
+  // user.md workspace file (per-agent notes about the people the agent works
+  // with). GET surfaces an in-memory DefaultUserContent template when the
+  // file is absent — isDefault=true tells the UI to suppress a no-op PUT on
+  // save. PUT writes atomically and returns isDefault=false (the file now
+  // exists on disk). The settings UI binds these to a dirty-tracked
+  // textarea separate from the persona / cron message fields.
+  //
+  // Both getter and setter thread the strong etag via getWithEtag /
+  // putWithIfMatch so KOJO_REQUIRE_IF_MATCH=1 strict mode accepts our
+  // PUTs AND so a concurrent edit from another tab surfaces as a 412
+  // (PreconditionFailedError) instead of silently clobbering. The
+  // wrapper returns `{ value: { content, isDefault, etag }, etag }` —
+  // the inner `etag` mirrors the body field for consistency with the
+  // server response, the outer one comes from the ETag header.
+  getUserContext: (id: string) =>
+    getWithEtag<{ content: string; isDefault: boolean; etag?: string }>(
+      `/api/v1/agents/${id}/user-context`,
+    ),
+
+  setUserContext: (id: string, content: string, expectedEtag?: string) =>
+    putWithIfMatch<{ content: string; isDefault: boolean; etag?: string }>(
+      `/api/v1/agents/${id}/user-context`,
+      { content },
+      expectedEtag,
+    ),
+
+  // checkin.md workspace file (per-agent body for cron / manual check-in
+  // prompts). Same fallback / no-op-PUT contract as user-context: GET
+  // returns DefaultCheckinContent with isDefault=true when checkin.md is
+  // absent so the UI shows the body that the cron path would actually run.
+  // PUT with an empty body clears the file (server-side trim+remove).
+  // Same etag-threading rationale as the user-context endpoints above.
+  getCheckinFile: (id: string) =>
+    getWithEtag<{ content: string; isDefault: boolean; etag?: string }>(
+      `/api/v1/agents/${id}/checkin-file`,
+    ),
+
+  putCheckinFile: (id: string, content: string, expectedEtag?: string) =>
+    putWithIfMatch<{ content: string; isDefault: boolean; etag?: string }>(
+      `/api/v1/agents/${id}/checkin-file`,
+      { content },
+      expectedEtag,
+    ),
 
   fork: (id: string, params: { name: string; includeTranscript: boolean }) =>
     post<AgentInfo>(`/api/v1/agents/${id}/fork`, params),

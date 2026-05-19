@@ -45,7 +45,16 @@ interface Props {
 }
 
 const DEFAULT_CRON_MESSAGE_HINT =
-  "最近の出来事や気づきがあれば memory/{date}.md に記録し、必要なタスクを実行してください。";
+  "If there are recent events or observations, record them in memory/{date}.md, and execute any necessary tasks.";
+
+// CRON_MESSAGE_MAX_LEN matches the server-side workspaceFileBodyCap (1 MiB)
+// divided by 4 — UTF-8 worst-case is 4 bytes per code unit, so capping
+// the textarea at ~256 KiB code units keeps the encoded body within the
+// MaxBytesReader limit on the /checkin-file PUT regardless of the input
+// language. Far larger than realistic check-in bodies (a single line is
+// typical) but matches the back-end so the UI never produces a request
+// the server will reject.
+const CRON_MESSAGE_MAX_LEN = (1 << 20) / 4;
 
 /** Parse "HH:MM" to minutes since midnight. */
 function toMinutes(hhmm: string): number {
@@ -503,7 +512,7 @@ export function ScheduleEditor({
           value={cronMessage}
           onChange={(e) => onCronMessageChange(e.target.value)}
           rows={3}
-          maxLength={4096}
+          maxLength={CRON_MESSAGE_MAX_LEN}
           placeholder={DEFAULT_CRON_MESSAGE_HINT}
           className="w-full px-2.5 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 resize-none focus:outline-none focus:border-amber-700/60"
         />

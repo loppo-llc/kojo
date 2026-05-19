@@ -85,6 +85,14 @@ var cronPausedMigrationTestHook func()
 //   - intervalMinutes,
 //     activeStart,activeEnd   → legacy fields stripped on Save (already
 //                               migrated into cronExpr / silentStart on Load)
+//   - cronMessage             → moved to agent_workspace_files (kind=checkin).
+//                               Must be stripped on Save so a cleared
+//                               legacy field doesn't survive via the
+//                               prior-merge path below (omitempty drops
+//                               the field from m, so without this stripping
+//                               the prior settings_json's cronMessage would
+//                               leak back in and resurrect the migration on
+//                               every subsequent Load).
 //
 // cronExpr is intentionally NOT reserved — it's the canonical persisted
 // field for schedules in v1, and stripping it from settings_json would
@@ -99,6 +107,7 @@ var reservedAgentKeys = map[string]bool{
 	"intervalMinutes": true,
 	"activeStart":     true,
 	"activeEnd":       true,
+	"cronMessage":     true,
 }
 
 // loadStripKeys lists the keys settingsToAgent() must filter out before

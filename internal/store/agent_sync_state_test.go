@@ -208,6 +208,95 @@ func TestGetAgentSyncState_MemoryEntryUpdatedAtTracksTombstone(t *testing.T) {
 	}
 }
 
+func TestSyncAgentFromPeer_WorkspaceFiles_FullReplace(t *testing.T) {
+	// Target-side: target has only `user.md`. Source ships both
+	// user + checkin in full mode. After sync, target must mirror
+	// source's two rows — the prior single user row is replaced
+	// in place (DELETE-then-INSERT clears the slot first).
+	s := openTestStore(t)
+	ctx := context.Background()
+	seedAgent(t, s, "ag")
+	if _, err := s.UpsertAgentWorkspaceFile(ctx, "ag", WorkspaceFileKindUser, "target-only-user", "", AgentWorkspaceFileInsertOptions{}); err != nil {
+		t.Fatalf("seed target user: %v", err)
+	}
+	now := NowMillis()
+	wf := []*AgentWorkspaceFileRecord{
+		{
+			AgentID: "ag", Kind: WorkspaceFileKindUser, Body: "src-user",
+			BodySHA256: SHA256Hex([]byte("src-user")),
+			Seq:        100, Version: 1, ETag: "etag-u",
+			CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			AgentID: "ag", Kind: WorkspaceFileKindCheckin, Body: "src-checkin",
+			BodySHA256: SHA256Hex([]byte("src-checkin")),
+			Seq:        101, Version: 1, ETag: "etag-c",
+			CreatedAt: now, UpdatedAt: now,
+		},
+	}
+	agent, err := s.GetAgent(ctx, "ag")
+	if err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	if err := s.SyncAgentFromPeer(ctx, AgentSyncPayload{
+		Agent:          agent,
+		WorkspaceFiles: wf,
+	}); err != nil {
+		t.Fatalf("full sync: %v", err)
+	}
+	got, err := s.ListAgentWorkspaceFiles(ctx, "ag", WorkspaceFileListOptions{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len = %d; want 2 (user + checkin)", len(got))
+	}
+	user, err := s.GetAgentWorkspaceFile(ctx, "ag", WorkspaceFileKindUser)
+	if err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	if user.Body != "src-user" {
+		t.Errorf("user body = %q; want src-user", user.Body)
+	}
+	checkin, err := s.GetAgentWorkspaceFile(ctx, "ag", WorkspaceFileKindCheckin)
+	if err != nil {
+		t.Fatalf("get checkin: %v", err)
+	}
+	if checkin.Body != "src-checkin" {
+		t.Errorf("checkin body = %q; want src-checkin", checkin.Body)
+	}
+}
+
+func TestSyncAgentFromPeer_WorkspaceFiles_FullEmptyClears(t *testing.T) {
+	// Target has live workspace rows; source ships an empty
+	// WorkspaceFiles slice in full mode → target's rows must be
+	// cleared. Mirrors the AgentSyncPayload doc-comment promise
+	// that nil/empty in full mode means "source had no rows here".
+	s := openTestStore(t)
+	ctx := context.Background()
+	seedAgent(t, s, "ag")
+	if _, err := s.UpsertAgentWorkspaceFile(ctx, "ag", WorkspaceFileKindUser, "to-be-cleared", "", AgentWorkspaceFileInsertOptions{}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	agent, err := s.GetAgent(ctx, "ag")
+	if err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	if err := s.SyncAgentFromPeer(ctx, AgentSyncPayload{
+		Agent:          agent,
+		WorkspaceFiles: nil,
+	}); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	got, err := s.ListAgentWorkspaceFiles(ctx, "ag", WorkspaceFileListOptions{IncludeDeleted: true})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("want 0 rows after empty full sync; got %+v", got)
+	}
+}
+
 func TestSyncAgentFromPeer_FullModeReplacesAll(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

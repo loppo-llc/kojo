@@ -31,11 +31,33 @@ func cronPrompt(nextRun time.Time, timeoutMinutes int, customMessage string) str
 	return cronPromptAt(time.Now(), nextRun, timeoutMinutes, customMessage)
 }
 
+// resolveCheckinMessage returns the per-agent check-in body to inject into a
+// cron / manual check-in prompt. checkin.md wins when present; absent or
+// blank falls back to DefaultCheckinContent so the system prompt described
+// to the user (via ReadCheckinFileOrDefault in the settings UI) and the
+// actual cron fire stay in lockstep.
+//
+// I/O errors from readCheckinFile (anything other than ENOENT) propagate so
+// the caller can decide whether to abort the fire — silently running the
+// default when the operator authored a custom file would violate their
+// configured rules.
+func resolveCheckinMessage(agentID string) (string, error) {
+	content, err := readCheckinFile(agentID)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(content) == "" {
+		return DefaultCheckinContent, nil
+	}
+	return content, nil
+}
+
 // cronPromptAt is the time-injectable form of cronPrompt for unit testing.
-// If customMessage is non-empty it replaces the default trailing instruction;
-// the literal "{date}" inside customMessage is replaced with today's date in
-// YYYY-MM-DD form. The custom section is separated from the meta header by a
-// blank line so an injected "[system message]" prefix cannot blend in with the
+// customMessage is the resolved check-in body (caller substitutes
+// DefaultCheckinContent when checkin.md is absent). The literal "{date}"
+// inside customMessage is replaced with today's date in YYYY-MM-DD form.
+// The custom section is separated from the meta header by a blank line so
+// an injected "[system message]" prefix cannot blend in with the
 // surrounding meta text.
 func cronPromptAt(now, nextRun time.Time, timeoutMinutes int, customMessage string) string {
 	today := now.Format("2006-01-02")
@@ -52,14 +74,14 @@ func cronPromptAt(now, nextRun time.Time, timeoutMinutes int, customMessage stri
 		msg += "。完了後の次回のチェックインは最短" + formatUntil(nextRun, now) + "後 (" + nextFmt + ")"
 	}
 	msg += "）"
-	if trimmed := strings.TrimSpace(customMessage); trimmed != "" {
-		// Blank line + heading make the user-supplied section visually
-		// distinguishable from the meta header even if the value contains
-		// "[system message]" or similar prompt-bracketing.
-		msg += "\n\n--- 指示 ---\n" + strings.ReplaceAll(trimmed, "{date}", today)
-	} else {
-		msg += "最近の出来事や気づきがあれば memory/" + today + ".md に記録し、必要なタスクを実行してください。"
+	body := strings.TrimSpace(customMessage)
+	if body == "" {
+		body = DefaultCheckinContent
 	}
+	// Blank line + heading make the user-supplied section visually
+	// distinguishable from the meta header even if the body contains
+	// "[system message]" or similar prompt-bracketing.
+	msg += "\n\n--- Instructions ---\n" + strings.ReplaceAll(body, "{date}", today)
 	return msg
 }
 
@@ -71,11 +93,11 @@ func checkinPrompt(now time.Time, timeoutMinutes int, customMessage string) stri
 	today := now.Format("2006-01-02")
 	msg := "[system message] " + now.Format("2006年1月2日 15:04") + "のチェックインです。"
 	msg += fmt.Sprintf("（今回のタイムアウトは%d分）", timeoutMinutes)
-	if trimmed := strings.TrimSpace(customMessage); trimmed != "" {
-		msg += "\n\n--- 指示 ---\n" + strings.ReplaceAll(trimmed, "{date}", today)
-	} else {
-		msg += "最近の出来事や気づきがあれば memory/" + today + ".md に記録し、必要なタスクを実行してください。"
+	body := strings.TrimSpace(customMessage)
+	if body == "" {
+		body = DefaultCheckinContent
 	}
+	msg += "\n\n--- Instructions ---\n" + strings.ReplaceAll(body, "{date}", today)
 	return msg
 }
 
@@ -464,7 +486,7 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 	}
 
 	// Check silent hours and read agent config
-	var silentStart, silentEnd, cronMessage string
+	var silentStart, silentEnd string
 	var timeoutMinutes int
 	if a, ok := cs.mgr.Get(agentID); ok {
 		// Archived guard: a tick may have queued just before Archive ran
@@ -476,12 +498,21 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 		}
 		silentStart, silentEnd = a.SilentStart, a.SilentEnd
 		timeoutMinutes = a.TimeoutMinutes
-		cronMessage = a.CronMessage
 		if IsInSilentHours(silentStart, silentEnd) {
 			cs.logger.Debug("cron job skipped (silent hours)", "agent", agentID,
 				"silentStart", silentStart, "silentEnd", silentEnd)
 			return
 		}
+	}
+
+	// checkin.md is the canonical source for the per-agent check-in body.
+	// A read error other than ENOENT means the file exists but is
+	// unreadable — abort the tick so we don't silently run the default
+	// against an operator who configured custom instructions.
+	cronMessage, err := resolveCheckinMessage(agentID)
+	if err != nil {
+		cs.logger.Warn("cron job skipped (checkin.md unreadable)", "agent", agentID, "err", err)
+		return
 	}
 
 	// Reset guard: skip BEFORE the throttle stamp. Chat() would

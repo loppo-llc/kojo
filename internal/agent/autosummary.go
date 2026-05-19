@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"bufio"
 	"context"
 	"crypto/md5"
 	"encoding/json"
@@ -15,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/chathistory"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -86,8 +86,9 @@ const (
 	// transcriptMaxBytes caps how much of a session JSONL we'll read.
 	// Bounds memory + DoS exposure on the (now-validated) transcript
 	// path coming from the PreCompact hook. Generous compared to
-	// sessionTailReadBytes because PreCompactSummarize uses bufio.Scanner
-	// streaming, not a slurp.
+	// sessionTailReadBytes because PreCompactSummarize streams the file
+	// line-by-line via chathistory.ScanJSONLLines (per-line cap
+	// MaxJSONLLineBytes, no full-file slurp).
 	transcriptMaxBytes = 256 * 1024 * 1024
 )
 
@@ -982,16 +983,18 @@ func loadSessionMessages(agentID, tool string, transcriptPath string, limit int,
 	defer f.Close()
 
 	var msgs []*Message
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
-
-	for scanner.Scan() {
+	// chathistory.ScanJSONLLines reassembles lines longer than bufio's default
+	// 4 KiB buffer (claude transcripts routinely exceed that on tool_use turns)
+	// and caps each line at MaxJSONLLineBytes (10 MiB) so a corrupted or
+	// adversarial line cannot OOM the summary path. Stop scanning on
+	// ErrLineTooLarge — any earlier well-formed lines are still summarisable.
+	if err := chathistory.ScanJSONLLines(f, func(line []byte) {
 		var raw struct {
 			Type    string          `json:"type"`
 			Message json.RawMessage `json:"message"`
 		}
-		if json.Unmarshal(scanner.Bytes(), &raw) != nil {
-			continue
+		if json.Unmarshal(line, &raw) != nil {
+			return
 		}
 
 		switch raw.Type {
@@ -1000,7 +1003,7 @@ func loadSessionMessages(agentID, tool string, transcriptPath string, limit int,
 				Content json.RawMessage `json:"content"`
 			}
 			if json.Unmarshal(raw.Message, &msg) != nil {
-				continue
+				return
 			}
 			// Try as plain string
 			var text string
@@ -1016,7 +1019,7 @@ func loadSessionMessages(agentID, tool string, transcriptPath string, limit int,
 				} `json:"content"`
 			}
 			if json.Unmarshal(raw.Message, &msg) != nil {
-				continue
+				return
 			}
 			var text strings.Builder
 			for _, block := range msg.Content {
@@ -1028,6 +1031,8 @@ func loadSessionMessages(agentID, tool string, transcriptPath string, limit int,
 				msgs = append(msgs, &Message{Role: "assistant", Content: text.String()})
 			}
 		}
+	}); err != nil {
+		logger.Warn("autosummary: transcript scan stopped early", "agent", agentID, "err", err)
 	}
 
 	// Return last N messages

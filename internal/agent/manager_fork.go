@@ -174,6 +174,18 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 	if err := copyDirIfExists(filepath.Join(srcDir, "memory"), filepath.Join(dstDir, "memory")); err != nil {
 		return nil, fmt.Errorf("copy memory/: %w", err)
 	}
+	// Workspace files (user.md, checkin.md): part of the per-agent
+	// configuration the user actively maintains. Forking should carry
+	// them just like persona.md so the fork starts with the same
+	// behaviour. Migrated agents have CronMessage cleared on the
+	// row, so without this copy a fork would silently lose the
+	// custom check-in instructions and user-context notes.
+	if err := copyFileIfExists(filepath.Join(srcDir, "checkin.md"), filepath.Join(dstDir, "checkin.md")); err != nil {
+		return nil, fmt.Errorf("copy checkin.md: %w", err)
+	}
+	if err := copyFileIfExists(filepath.Join(srcDir, "user.md"), filepath.Join(dstDir, "user.md")); err != nil {
+		return nil, fmt.Errorf("copy user.md: %w", err)
+	}
 	// memory/recent.md mirrors the last conversation's pre-compaction
 	// summary and is part of the transcript-derived short-term state,
 	// not the agent's long-term memory. When the caller opts out of

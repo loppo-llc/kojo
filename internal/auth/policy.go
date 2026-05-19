@@ -372,6 +372,17 @@ func isSelfScopedRoute(method, sub string) bool {
 	case "/pre-compact":
 		// PreCompact hook fired by claude-code on the agent's own session.
 		return method == http.MethodPost
+	case "/user-context":
+		// Agent reads/writes its own user.md workspace file. GET surfaces
+		// the in-memory DefaultUserContent template for new agents (no
+		// disk persistence until the first PUT). PUT lands at the
+		// per-agent path under agentDir(id).
+		return method == http.MethodGet || method == http.MethodPut
+	case "/checkin-file":
+		// Agent reads/writes its own checkin.md workspace file. GET
+		// surfaces DefaultCheckinContent when checkin.md is absent so
+		// the settings UI shows the same body the cron path would run.
+		return method == http.MethodGet || method == http.MethodPut
 	}
 
 	// Sub-resources with their own {id} segments (messages, tasks,
