@@ -471,6 +471,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	//     something an agent or peer drives.
 	//   - static Web UI / dev proxy: peer hosts have no UI.
 
+	// Transient diagnostic endpoint for the desktop-tvt 403 report.
+	// Echoes the Principal stamped by the auth chain. Remove once
+	// the regression is closed.
+	mux.HandleFunc("GET /api/v1/_debug/whoami", s.handleDebugWhoAmI)
+
 	// Session routes
 	mux.HandleFunc("GET /api/v1/info", s.handleInfo)
 	mux.HandleFunc("GET /api/v1/sessions", s.handleListSessions)
