@@ -83,30 +83,138 @@ type agentResponse struct {
 	ETag string `json:"etag,omitempty"`
 }
 
+// agentRuntimeSnapshot bundles the runtime-derived fields that feed
+// BOTH the HTTP ETag composite (displayETag) AND the JSON body's
+// nextCronAt / cronPausedGlobal / etag. Captured ONCE per request so
+// the composite and the body observe a consistent view — see the
+// extended comment on displayETag for why mixing fresh and stale
+// reads here resurrects the stale-nextCronAt cache bug fixed by this
+// type's introduction.
+type agentRuntimeSnapshot struct {
+	rowETag    string
+	nextCron   time.Time
+	cronPaused bool
+}
+
+// snapshotAgent gathers the (etag, nextCronRun, cronPaused) tuple a
+// GET / PATCH response needs. The three reads are independent and
+// individually atomic; a cron tick landing between them is benign
+// because the composite displayETag commits to whatever NextCronRun
+// returned here. A request observing T1 in both the header and body
+// is internally consistent; the next request will see T2 and bust
+// the cache via a changed composite.
+func (s *Server) snapshotAgent(r *http.Request, agentID string) agentRuntimeSnapshot {
+	return agentRuntimeSnapshot{
+		rowETag:    s.readAgentETag(r, agentID),
+		nextCron:   s.agents.NextCronRun(agentID),
+		cronPaused: s.agents.CronPaused(),
+	}
+}
+
+// stripAgentDisplayETagSuffix removes the GET-only composite suffixes
+// that displayETag appends ("." + "p" for cron-paused, ".n" + base36
+// for nextCronAt) so an If-Match value that came from copying the
+// HTTP ETag header still matches the bare row etag stored in the v1
+// table. Anything that doesn't fit the displayETag grammar (".p" or
+// ".n[0-9a-z]+", with the two possibly concatenated in that order)
+// is left intact — over-eager stripping would silently relax
+// optimistic concurrency on a malformed etag.
+//
+// "*" is preserved unchanged so the wildcard precondition path is
+// untouched (the caller checks "ifMatch == \"*\"" separately).
+func stripAgentDisplayETagSuffix(et string) string {
+	if et == "*" {
+		return et
+	}
+	// .n<base36> always comes last in the composite (see displayETag).
+	if i := strings.LastIndex(et, ".n"); i >= 0 {
+		rest := et[i+2:]
+		if rest != "" && isBase36Lower(rest) {
+			et = et[:i]
+		}
+	}
+	if strings.HasSuffix(et, ".p") {
+		et = et[:len(et)-2]
+	}
+	return et
+}
+
+// isBase36Lower reports whether s consists entirely of 0-9a-z. Matches
+// strconv.FormatInt(_, 36) output for non-negative inputs, which is
+// what displayETag emits.
+func isBase36Lower(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'z') {
+			return false
+		}
+	}
+	return true
+}
+
+// displayETag is the HTTP ETag header composite. It builds on the
+// row etag and folds in the runtime fields that change WITHOUT
+// bumping the row — cronPausedGlobal (Dashboard toggle, kv-row
+// write) and nextCronAt (advances on every cron fire, not a write
+// at all).
+//
+// Why the suffix matters: a 304 fast path short-circuits the
+// response body. If the composite only tracked the row etag, the
+// server would happily 304 a stale cached body whose nextCronAt
+// was from before the most recent cron fire — the Settings page
+// would show "(Xm ago)" and never refresh, even with the
+// client-side refetch effect, because the conditional GET reuses
+// the browser's cached body verbatim. Including nextCron's unix
+// timestamp in the composite forces a 200-with-fresh-body the
+// moment cron advances. The CronPaused flag has the same problem
+// (toggling pause writes a kv row, not the agents row) and gets
+// the same suffix treatment.
+//
+// Returns "" when there is no row etag (in-memory-only paths,
+// remote-held agents); callers MUST treat empty as "skip the
+// ETag header / 304 fast path entirely" because an etag composed
+// purely of runtime fields would let a client cache against a
+// non-row identity and miss row mutations.
+func (snap agentRuntimeSnapshot) displayETag() string {
+	if snap.rowETag == "" {
+		return ""
+	}
+	et := snap.rowETag
+	if snap.cronPaused {
+		et += ".p"
+	}
+	if !snap.nextCron.IsZero() {
+		// base36 keeps the suffix short (~7 chars for current-era
+		// unix seconds) and avoids "-" / "+" so the etag stays
+		// inside the strong-etag character set quoteETag emits.
+		et += ".n" + strconv.FormatInt(snap.nextCron.Unix(), 36)
+	}
+	return et
+}
+
 // buildAgentResponse decorates an *agent.Agent with derived runtime
 // state (next cron run, etag) for API responses.
 //
-// etag is passed in by the caller rather than read from the store
-// here so a single response observes a consistent (header, body)
-// pair: the caller does ONE GetAgent, sets the HTTP ETag header
-// from it, and threads the same value through this builder. A
-// second SELECT inside this function would race against any write
-// landing between the two reads (most observably on GET, which
-// holds no per-agent lock) and surface a body etag that disagreed
-// with the header.
+// The caller passes a snapshot so the body and the HTTP ETag
+// composite agree on the same (etag, nextCron, cronPaused) tuple.
+// Computing nextCron / cronPaused independently here would race
+// against any write or cron tick landing between the two reads (most
+// observably on GET, which holds no per-agent lock) and surface a
+// body that disagreed with the header that just got cached — the
+// shape of the stale-nextCronAt bug this snapshot pattern fixes.
 //
-// Pass "" when the row has no etag yet (in-memory-only paths) or
-// when the endpoint deliberately does not surface one (list view,
-// directory view).
-func (s *Server) buildAgentResponse(a *agent.Agent, etag string) agentResponse {
-	resp := agentResponse{Agent: a, ETag: etag}
+// Pass a zero snapshot when the row has no etag yet (in-memory-only
+// paths) or when the endpoint deliberately does not surface one
+// (list view, directory view).
+func (s *Server) buildAgentResponse(a *agent.Agent, snap agentRuntimeSnapshot) agentResponse {
+	resp := agentResponse{Agent: a, ETag: snap.rowETag}
 	if a == nil {
 		return resp
 	}
-	if t := s.agents.NextCronRun(a.ID); !t.IsZero() {
-		resp.NextCronAt = t.Format(time.RFC3339)
+	if !snap.nextCron.IsZero() {
+		resp.NextCronAt = snap.nextCron.Format(time.RFC3339)
 	}
-	resp.CronPausedGlobal = s.agents.CronPaused()
+	resp.CronPausedGlobal = snap.cronPaused
 	return resp
 }
 
@@ -206,12 +314,11 @@ func (s *Server) agentIfMatchPrecheck(w http.ResponseWriter, r *http.Request, ag
 			"If-Match: store read failed")
 		return false
 	}
-	// Strip the GET-only ".p" suffix (composite ETag for cron-paused
-	// state, see handleGetAgent) so a client that copied the HTTP
-	// ETag header into If-Match still matches the underlying row.
-	// The row etag itself never contains "." in its on-the-wire
-	// format (it's "<version>-<hash>"), so this trim is unambiguous.
-	candidate := strings.TrimSuffix(ifMatch, ".p")
+	// Strip the GET-only composite suffixes (".p" for cron-paused,
+	// ".n<base36>" for nextCronAt — see displayETag) so a client
+	// that copied the HTTP ETag header into If-Match still matches
+	// the underlying row.
+	candidate := stripAgentDisplayETagSuffix(ifMatch)
 	if ifMatch != "*" && rec.ETag != candidate {
 		writeError(w, http.StatusPreconditionFailed, "precondition_failed",
 			"If-Match: etag mismatch")
@@ -401,8 +508,17 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 		if ra := s.agents.GetRemote(id); ra != nil {
 			p := auth.FromContext(r.Context())
 			if p.CanReadFull(id) {
+				// Remote-held agents have no local cron entry, and
+				// surfacing a row etag from the local store would
+				// expose an orphaned row's etag that no PATCH on
+				// this hub can satisfy. Construct an explicit
+				// minimal snapshot — only the global cronPaused
+				// flag carries over. The HTTP ETag header stays
+				// unset because rowETag is "" (see displayETag).
 				writeJSONResponse(w, http.StatusOK,
-					s.buildAgentResponse(ra, ""))
+					s.buildAgentResponse(ra, agentRuntimeSnapshot{
+						cronPaused: s.agents.CronPaused(),
+					}))
 			} else {
 				writeJSONResponse(w, http.StatusOK, toDirectoryView(ra))
 			}
@@ -411,32 +527,26 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
 		return
 	}
-	// Best-effort ETag: read the DB row's etag if the store backend is
-	// wired in. A failure here (store not configured, row not yet
-	// persisted, transient SQLite hiccup) drops back to a no-ETag
-	// response rather than failing the GET — clients that don't care
-	// about caching keep working, and clients that do will simply
-	// re-request next time without a precondition.
-	etag := s.readAgentETag(r, id)
-	if etag != "" {
-		// The HTTP ETag header is a composite of the agent row etag and
-		// the global cron-paused flag, because cronPausedGlobal /
-		// nextCronAt in the JSON body change without bumping the row
-		// etag (toggling Dashboard's cron pause writes a kv row, not
-		// the agents row). Without the suffix, a 304 fast-path would
-		// silently hand the client a stale cronPausedGlobal value and
-		// the Settings page would never re-render the "(paused)"
-		// indicator until something else mutated the agent.
-		//
-		// PATCH's If-Match precondition is unaffected: clients send
-		// back the body's `etag` field (the raw row etag from
-		// buildAgentResponse), not the HTTP header — see agentApi.get's
-		// "prefer body etag" branch. agentIfMatchPrecheck only ever
-		// sees the row etag, so the composite layer here is GET-only.
-		displayETag := etag
-		if s.agents.CronPaused() {
-			displayETag = etag + ".p"
-		}
+	// Best-effort runtime snapshot: row etag, current nextCronRun,
+	// cronPaused. A failure to read the etag (store not configured,
+	// row not yet persisted, transient SQLite hiccup) drops back to
+	// a no-ETag response rather than failing the GET — clients that
+	// don't care about caching keep working, and clients that do
+	// will simply re-request next time without a precondition.
+	//
+	// The snapshot is captured ONCE so the HTTP ETag composite
+	// (displayETag) and the JSON body (buildAgentResponse) agree on
+	// the same nextCron / cronPaused values — see snapshotAgent's
+	// doc for why a fresh read in each path would resurrect the
+	// stale-nextCronAt cache bug.
+	snap := s.snapshotAgent(r, id)
+	if displayETag := snap.displayETag(); displayETag != "" {
+		// PATCH's If-Match precondition is unaffected by the
+		// composite suffix: clients send back the body's `etag`
+		// field (the raw row etag from buildAgentResponse), not
+		// the HTTP header — see agentApi.get's "prefer body etag"
+		// branch. agentIfMatchPrecheck only ever sees the row
+		// etag, so the composite layer here is GET-only.
 		w.Header().Set("ETag", quoteETag(displayETag))
 		if cached, ok := extractDomainIfNoneMatch(r); ok && (cached == "*" || cached == displayETag) {
 			w.WriteHeader(http.StatusNotModified)
@@ -445,9 +555,9 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	p := auth.FromContext(r.Context())
 	if p.CanReadFull(id) {
-		// Pass the etag we just read into the body builder so header
+		// Pass the same snapshot into the body builder so header
 		// and body agree even if a write lands later in this request.
-		writeJSONResponse(w, http.StatusOK, s.buildAgentResponse(a, etag))
+		writeJSONResponse(w, http.StatusOK, s.buildAgentResponse(a, snap))
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, toDirectoryView(a))
@@ -532,24 +642,21 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	// Echo the new etag so the client can chain subsequent PATCHes
 	// without an extra GET. The per-agent patch lock above guarantees
 	// no other PATCH for this id can land between Update and this
-	// read, so the etag returned is the one our Update produced.
-	// We read once and use the same value for both the HTTP header
-	// AND the JSON body's etag field — see buildAgentResponse for
-	// why a second SELECT in the body builder would race.
-	newETag := s.readAgentETag(r, id)
-	if newETag != "" {
-		// Mirror handleGetAgent's composite ETag so a follow-up GET's
-		// If-None-Match correctly matches this PATCH response's header.
-		// The body's `etag` field stays the raw row etag (used for
-		// If-Match precondition); only the HTTP header includes the
-		// pause-state suffix.
-		displayETag := newETag
-		if s.agents.CronPaused() {
-			displayETag = newETag + ".p"
-		}
+	// snapshot, so the etag returned is the one our Update produced.
+	// We snapshot once and use the same view for both the HTTP header
+	// AND the JSON body — see snapshotAgent / buildAgentResponse for
+	// why two independent reads in the body builder would race.
+	snap := s.snapshotAgent(r, id)
+	if displayETag := snap.displayETag(); displayETag != "" {
+		// Mirror handleGetAgent's composite ETag (row etag +
+		// nextCron + cronPaused suffixes) so a follow-up GET's
+		// If-None-Match correctly matches this PATCH response's
+		// header. The body's `etag` field stays the raw row etag
+		// (used for If-Match precondition); only the HTTP header
+		// includes the runtime-field suffix.
 		w.Header().Set("ETag", quoteETag(displayETag))
 	}
-	writeJSONResponse(w, http.StatusOK, s.buildAgentResponse(a, newETag))
+	writeJSONResponse(w, http.StatusOK, s.buildAgentResponse(a, snap))
 }
 
 // handleCheckin fires a manual check-in for the agent. The check-in runs

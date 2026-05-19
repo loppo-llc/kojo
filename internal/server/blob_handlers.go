@@ -378,13 +378,14 @@ func (s *Server) tryAttachBlobPeerFallback(
 		if err != nil {
 			continue
 		}
-		if err := peer.AuthorizeOutbound(r.Context(), st, req, holder); err != nil {
-			if s.logger != nil {
-				s.logger.Debug("attach blob peer fallback: authorize failed",
-					"agent", agentID, "holder", holder, "err", err)
-			}
-			continue
-		}
+		// No Authorization header — peer⇄peer identity travels
+		// via the WireGuard tunnel and is resolved on the receiver
+		// side through tsnet WhoIs (see commit 0b6a5ff which retired
+		// the Bearer scheme). Pre-Bearer-retire code called
+		// peer.AuthorizeOutbound here; the symbol no longer exists.
+		// The holder address was already gated above by the
+		// PeerStatusOnline + NormalizeAddress check, so dialing
+		// without a token is safe within the tailnet boundary.
 		// HTTP client with NO body timeout (0 = unlimited) so a
 		// multi-GiB attachment stream isn't chopped midway. We
 		// CANNOT use peer.NoKeepAliveHTTPClient unchanged though:
