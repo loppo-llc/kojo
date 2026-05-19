@@ -857,7 +857,7 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) b
 	// chat.postMessage produces a fresh message with no streamed buffer
 	// to interact with, so the empirical conflict that forced
 	// markdown_text-alone in chat.update does not apply here. See the
-	// // Finalize block for that rationale.
+	// Finalize block for that rationale.
 	//
 	// Both fields use the raw body (escape=false) so mention tokens the LLM
 	// intentionally emits (<!channel>, <@U…>, …) resolve consistently across
