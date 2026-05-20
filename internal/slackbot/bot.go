@@ -81,9 +81,17 @@ const (
 
 	// finalizeShortTimeout is the budget for short, single-call finalize
 	// operations (StopStream, chat.update, clearAssistantStatus, and the
-	// truncation notice). Long-running chunk posting uses
+	// delivery-failure notice). Long-running chunk posting uses
 	// chunkPostTimeout* above instead.
 	finalizeShortTimeout = 5 * time.Second
+
+	// deliveryFailureNotice is shown when one or more reply chunks fail to
+	// reach Slack (chunkPostTimeout expiry, Slack API error, context cancel,
+	// etc.). The wording deliberately avoids implying a specific cause —
+	// "too long" would be misleading when a transient API/network error or
+	// rate-limit storm is to blame. Defined as a constant so the streamed
+	// finalize path and the batch-fallback path stay in lockstep.
+	deliveryFailureNotice = "_⚠️ The full response could not be delivered to Slack. Check kojo logs for details._"
 
 	// maxConcurrentChats is the maximum number of concurrent sendToAgent
 	// goroutines per Bot (i.e. per agent). This prevents resource exhaustion
@@ -657,8 +665,8 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 				//
 				// If even chunks[0] fails, do NOT post the remaining
 				// chunks — emitting chunks[1:] without their lead would
-				// just confuse the user. Skip straight to the truncation
-				// notice.
+				// just confuse the user. Skip straight to the delivery
+				// failure notice.
 				if !b.postMessage(chunkCtx, channel, threadTS, chunks[0]) {
 					deliveredAll = false
 				}
@@ -676,13 +684,13 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 				}
 			}
 			if !deliveredAll {
-				// Surface truncation to the user with a fresh context —
-				// chunkCtx may already be expired at this point. Best
-				// effort; if this also fails the log entries from
+				// Surface the delivery failure to the user with a fresh
+				// context — chunkCtx may already be expired at this point.
+				// Best effort; if this also fails the log entries from
 				// postMessage are the trail.
 				noticeCtx, noticeCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
 				b.postMessage(noticeCtx, channel, threadTS,
-					"_⚠️ The response was too long to post in full to Slack. Check kojo logs for details._")
+					deliveryFailureNotice)
 				noticeCancel()
 			}
 		} else {
@@ -724,7 +732,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		if !deliveredAll {
 			noticeCtx, noticeCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
 			b.postMessage(noticeCtx, channel, threadTS,
-				"_⚠️ The response was too long to post in full to Slack. Check kojo logs for details._")
+				deliveryFailureNotice)
 			noticeCancel()
 		}
 	} else if hasError {
@@ -839,7 +847,7 @@ func (b *Bot) clearAssistantStatus(ctx context.Context, channel, threadTS string
 // true if Slack accepted the post, false if the call ultimately failed
 // (rate-limit retries exhausted, context cancelled, or any non-rate-limit
 // error). Failure reasons are logged at Warn. Callers in the finalize
-// block use the return value to detect chunk-level truncation and
+// block use the return value to detect chunk-level delivery failures and
 // surface a user-visible notice; callers that only need best-effort
 // delivery may ignore it.
 func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) bool {
@@ -848,8 +856,8 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) b
 	// production logs) to make Slack return markdown_text_conflict, so
 	// every chat.postMessage call silently fails. This broke the
 	// finalize block: stream chunks[1:] (multi-chunk replies) and the
-	// truncation-notice fallback were both dropped, leaving the channel
-	// with only chunks[0] visible. The streaming-update path already
+	// delivery-failure notice fallback were both dropped, leaving the
+	// channel with only chunks[0] visible. The streaming-update path already
 	// went markdown_text-alone for an unrelated reason (3987158); make
 	// chat.postMessage symmetric.
 	//

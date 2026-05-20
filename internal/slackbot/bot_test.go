@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/loppo-llc/kojo/internal/agent"
@@ -261,5 +262,25 @@ func TestBotPostMessageSendsMarkdownTextOnly(t *testing.T) {
 	}
 	if got.text != "" {
 		t.Errorf("text must be empty to avoid markdown_text_conflict, got %q", got.text)
+	}
+}
+
+// TestDeliveryFailureNoticeDoesNotAttributeCause guards against regressing
+// the notice wording back to a cause-specific phrasing like "too long".
+// The notice is posted from any deliveredAll=false path in sendToAgent
+// (stream-finalize and batch-fallback), and those failures may come from
+// chunkPostTimeout expiry, transient Slack API errors, or context cancel
+// — not just oversized replies. The text must stay cause-neutral so users
+// aren't misled into thinking they hit a length limit when they didn't.
+func TestDeliveryFailureNoticeDoesNotAttributeCause(t *testing.T) {
+	forbidden := []string{"too long", "too large", "exceeded", "limit"}
+	lower := strings.ToLower(deliveryFailureNotice)
+	for _, sub := range forbidden {
+		if strings.Contains(lower, sub) {
+			t.Errorf("deliveryFailureNotice = %q must not imply specific cause %q", deliveryFailureNotice, sub)
+		}
+	}
+	if !strings.Contains(deliveryFailureNotice, "could not be delivered") {
+		t.Errorf("deliveryFailureNotice = %q should describe a generic delivery failure", deliveryFailureNotice)
 	}
 }
