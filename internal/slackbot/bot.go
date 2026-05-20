@@ -22,13 +22,24 @@ type ChatManager interface {
 	Chat(ctx context.Context, agentID, message, role string, attachments []agent.MessageAttachment, source ...agent.BusySource) (<-chan agent.ChatEvent, error)
 	ChatOneShot(ctx context.Context, agentID, message string, opts agent.OneShotOpts) (<-chan agent.ChatEvent, error)
 	// CanResumeSession reports whether the next ChatOneShot for this
-	// (agentID, sessionKey) pair is likely to resume an existing backend
-	// session. True when the backend honors SessionKey AND the on-disk
-	// session artifact exists AND is non-empty. The Slack bot uses this
-	// to gate the "skip FormatForInjection(history)" optimization: when
-	// false (backend ignores SessionKey, or the session file was removed
-	// /empty), history must be re-injected because the backend will see
-	// no prior context.
+	// (agentID, sessionKey) pair is likely to resume an existing
+	// backend session. True when the backend honors SessionKey AND
+	// the on-disk session artifact exists AND is non-empty. The
+	// Slack bot uses this to choose between two injection modes:
+	//   - false (backend runs OneShot, or the session file was removed
+	//     or empty) → inject the full thread via FormatForInjection so
+	//     the model has every prior message.
+	//   - true AND we have already replied in this conversation →
+	//     inject only a head+tail safety net via
+	//     FormatForInjectionHeadTail. The backend's resumed transcript
+	//     already carries the bulk of the conversation; the safety net
+	//     covers the mid-thread session-reset edge case documented at
+	//     Manager.CanResumeSession (sessionResetThresholdTokens) and
+	//     the user-message delta gap between the last bot reply and
+	//     this turn.
+	//   - true but no prior bot reply (first turn of a resumable
+	//     session) → still use full FormatForInjection so the seeded
+	//     session gets the complete Slack context.
 	CanResumeSession(agentID, sessionKey string) bool
 }
 
@@ -399,6 +410,29 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	// From here on, the thread handle used for posting/streaming.
 	threadTS := replyTS
 
+	// Drop the current user message from `history` before it feeds the
+	// injection formatters. FetchThreadHistory pulls the just-arrived
+	// message back from Slack, and the new-thread path above persists it
+	// via WriteMessages so a subsequent FetchChannelHistory call also
+	// surfaces it once it appears in chat_history. Meanwhile we re-emit
+	// the same text verbatim in the prompt's
+	// "[Slack @user|channel:… thread:…] text" suffix immediately below.
+	// Letting it appear in both the transcript header AND the suffix
+	// makes the model see the current turn twice on every head+tail
+	// resume — once labeled as recap, once as the live request — which
+	// was a pre-existing wart in the first-turn full-inject path but
+	// becomes the steady state once the safety net runs every turn.
+	if messageTS != "" {
+		filtered := make([]chathistory.HistoryMessage, 0, len(history))
+		for _, m := range history {
+			if m.MessageID == messageTS {
+				continue
+			}
+			filtered = append(filtered, m)
+		}
+		history = filtered
+	}
+
 	// Build a session key that maps 1:1 to the chat_history file unit
 	// (per-thread or per-channel). This gives each Slack conversation its
 	// own resumable backend session with full context across messages.
@@ -407,30 +441,54 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	// per channel, which matches the chat_history layout.
 	sessionKey := slackSessionKey(b.agentID, channel, threadTS)
 
-	// Decide whether to inject history into the user message.
+	// Decide how to inject Slack history into the user message.
 	//
-	// When the backend supports SessionKey-based resumption (claude), the
-	// first turn seeds the session with FormatForInjection(history); the
-	// backend then carries that context internally on every subsequent
-	// resume. Re-injecting on later turns duplicates every prior Slack
-	// message — once in the resumed transcript, once in the new user
-	// payload — burning context and risking confusion. So skip injection
-	// once both signals agree:
+	// Three regimes, gated by whether the backend already holds prior
+	// conversation context in its session:
 	//
-	//   (a) the chat_history records a prior bot reply (we already had a
-	//       turn in this conversation), AND
-	//   (b) the backend's session artifact for this conversation still
-	//       exists on disk (claude /clear, upgrade or manual cleanup can
-	//       remove it independently of Slack-side history, so signal (a)
-	//       alone is not safe).
+	//   1. Backend cannot resume (codex, gemini, …) OR this is the very
+	//      first turn in the thread → full FormatForInjection. The model
+	//      has no other source of Slack context, so we send everything
+	//      that fits under DefaultMaxMessages / DefaultMaxChars.
 	//
-	// For backends that don't support resume (codex, …) the
-	// ChatOneShot call falls back to OneShot:true, which carries no prior
-	// context across turns. Those backends must keep receiving injected
-	// history on every turn or they lose the conversation entirely.
-	injectHistory := true
+	//   2. Backend can resume AND it already replied at least once
+	//      → FormatForInjectionHeadTail (head + omission marker + tail).
+	//      The resumed transcript already carries the full conversation,
+	//      so we only re-inject a small safety-net excerpt: the opening
+	//      few turns (which anchor the framing) and the last few turns
+	//      (which protect against two failure modes — see below).
+	//
+	//   3. History is empty → no injection.
+	//
+	// Why the head+tail safety net instead of skipping injection entirely
+	// when the backend can resume? Two failure modes the previous
+	// skip-on-resume policy did not cover:
+	//
+	//   (a) Mid-thread session reset. When the Claude session crosses
+	//       sessionResetThresholdTokens (see manager.go), sessionFileUsable
+	//       deletes the JSONL and Claude starts fresh on the next turn.
+	//       Without injection the new session has zero Slack context until
+	//       the user re-shares it.
+	//   (b) Delta gap. User messages that arrived after the last bot
+	//       reply are not in the resumed transcript (they post-date it),
+	//       so the model sees them only as referenced text in the new
+	//       user payload. The tail covers this gap.
+	//
+	// The head/tail excerpt overlaps content the resumed session already
+	// has, but FormatForInjectionHeadTail emits at most head+tail+1 lines
+	// under a "[Chat conversation history]" header, so the duplication
+	// cost is small and the framing tells the model these are recap
+	// snippets, not new events.
+	//
+	// "Already replied" is detected via the same bot-reply heuristic as
+	// before: a chat_history entry whose UserID matches our bot user or
+	// whose MessageID has the local ".bot" suffix. CanResumeSession
+	// additionally verifies the session artifact still exists on disk —
+	// claude /clear, upgrade or manual cleanup can remove it independently
+	// of Slack-side history, so the chat_history signal alone is not safe.
+	useHeadTail := false
 	if len(history) > 0 && b.mgr.CanResumeSession(b.agentID, sessionKey) {
-		// Match our own bot replies via two reliable signals:
+		// Match our own bot replies only. Two reliable signals are OR'd:
 		//
 		//   (1) UserID == b.botUserID — set by every AppendMessages write
 		//       below, and also by Slack for modern apps that expose User
@@ -440,15 +498,15 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		//       empty User and only BotID set, where (1) would miss them.
 		//
 		// We deliberately do NOT match on IsBot alone, because unrelated
-		// bot posts in the same channel (GitHub, Datadog, …) would
-		// falsely suppress injection on the very first turn and start
-		// the resumed session with no Slack context.
+		// bot posts in the same channel (GitHub, Datadog, …) would falsely
+		// downgrade the first-turn injection from full to head+tail and
+		// start the resumed Claude session with truncated Slack context.
 		for i := range history {
 			if !history[i].IsBot {
 				continue
 			}
 			if history[i].UserID == b.botUserID || strings.HasSuffix(history[i].MessageID, ".bot") {
-				injectHistory = false
+				useHeadTail = true
 				break
 			}
 		}
@@ -456,8 +514,12 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 
 	// Build enriched message with conversation history (when needed).
 	var sb strings.Builder
-	if injectHistory && len(history) > 0 {
-		sb.WriteString(chathistory.FormatForInjection(history, b.botUserID, chathistory.DefaultMaxMessages, chathistory.DefaultMaxChars))
+	if len(history) > 0 {
+		if useHeadTail {
+			sb.WriteString(chathistory.FormatForInjectionHeadTail(history, b.botUserID, chathistory.DefaultHeadCount, chathistory.DefaultTailCount, chathistory.DefaultMaxChars))
+		} else {
+			sb.WriteString(chathistory.FormatForInjection(history, b.botUserID, chathistory.DefaultMaxMessages, chathistory.DefaultMaxChars))
+		}
 		sb.WriteString("\n---\n\n")
 	}
 	safeDisplay := sanitizeDisplayName(displayName)

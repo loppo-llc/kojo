@@ -2381,22 +2381,24 @@ func (m *Manager) resolveBackend(agentID string, agentCopy *Agent) (ChatBackend,
 // as "no session" because sessionFileUsable would delete it and start
 // fresh on the next invocation anyway).
 //
-// Used by the Slack bot (Phase B Part 2) to gate one-time "inject Slack
-// thread history into the user message" behaviour: on the first message
-// in a thread we replay history, on subsequent messages we skip the
-// replay because the backend already has the prior turns in its session.
+// Used by the Slack bot to gate the "head+tail safety net" injection
+// mode: on the first message in a thread we replay the full history,
+// on subsequent messages we send only a small head+tail recap because
+// the resumed session already carries the bulk of the conversation
+// (see slackbot.Bot.sendToAgent and chathistory.FormatForInjectionHeadTail).
 //
 // Claude caveat: this does NOT check sessionResetThresholdTokens. If a
 // long-running thread's JSONL eventually exceeds the reset threshold,
 // sessionFileUsable will summarise + delete it on the next chat and
-// Claude starts a new session with --session-id. The Slack bot would
-// keep returning true (the file existed at probe time) so the new
-// session loses prior Slack context — recovery requires the user to
-// re-share context, or a future delta-injection feature. Replicating
+// Claude starts a new session with --session-id. CanResumeSession would
+// keep returning true (the file existed at probe time) so the resumed
+// session loses prior Slack context. The head+tail safety net is the
+// primary mitigation: even when this caveat fires, the next turn still
+// re-injects the opening and most-recent slices of the thread, which
+// re-seeds the new session with enough framing to continue. Replicating
 // sessionFileUsable's token check here would either duplicate its
 // destructive side effects (preReset summary, file removal) or require
-// splitting it into a read-only probe; we accept the rare-edge cost
-// instead.
+// splitting it into a read-only probe; we accept that instead.
 func (m *Manager) CanResumeSession(agentID, sessionKey string) bool {
 	if sessionKey == "" {
 		return false
