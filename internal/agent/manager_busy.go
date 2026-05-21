@@ -61,8 +61,8 @@ func (m *Manager) Subscribe(agentID string) (startedAt time.Time, past []ChatEve
 }
 
 // Abort cancels any running chat for an agent — both the user
-// chat (busy entry) AND any in-flight one-shot chats (notify /
-// Slack / group-DM responders). The §3.7 switch-device
+// chat (busy entry) AND any in-flight one-shot chats (Slack /
+// group-DM responders). The §3.7 switch-device
 // orchestrator relies on this dual cancel: WaitChatIdle's drain
 // waits on both `busy` and `oneShotCancels`, so a bare Abort
 // that only signaled the user chat would let one-shots run past
@@ -97,9 +97,9 @@ func (m *Manager) Abort(agentID string) {
 //   - resetting:  ResetData / Fork / Archive / ResetSession
 //                 holding the acquireResetGuard
 //   - mutating:   non-chat state writers (persona / settings /
-//                 task / credential / avatar / OAuth token)
+//                 task / credential / avatar / slack tokens)
 //                 holding AcquireMutation
-//   - oneShotCancels: notify / Slack / group-DM one-shot chats
+//   - oneShotCancels: Slack / group-DM one-shot chats
 //                 cancelled by switch_device_handler's Abort
 //
 // Without all six checks the §3.7 quiesce window would race a
@@ -120,7 +120,7 @@ func (m *Manager) WaitChatIdle(ctx context.Context, agentID string) error {
 // the busy entry it would otherwise wait on, so the busy check
 // would deadlock until the orchestration context timed out.
 // Skipping busy lets every OTHER concurrent writer (preparing,
-// notify/Slack one-shots, editing, resetting, mutating,
+// Slack one-shots, editing, resetting, mutating,
 // profileGen) still drain before the snapshot.
 //
 // preparing is intentionally NOT skipped: prepareChat exits
@@ -171,7 +171,7 @@ func (m *Manager) waitChatIdle(ctx context.Context, agentID string, skipBusy boo
 }
 
 // CancelOneShotsForAgent cancels every in-flight one-shot chat
-// (notify / Slack / Discord / group-DM responder) for the agent
+// (Slack / group-DM responder) for the agent
 // WITHOUT touching the busy entry. The §3.7 device-switch
 // orchestrator calls this on the agent-self-call path where
 // Abort()'s busy-cancel would kill the curl that initiated the
@@ -298,9 +298,8 @@ func (m *Manager) IsSwitching(agentID string) bool {
 //
 // Common entry guard for every agent-state mutation surface
 // that does NOT route through prepareChat (persona / settings
-// / notify-sources / slackbot / tasks / credentials / avatar /
-// OAuth tokens). The release callback is idempotent and safe
-// to defer.
+// / slackbot / tasks / credentials / avatar / slack tokens).
+// The release callback is idempotent and safe to defer.
 //
 // Threadsafe; nil-safe for hand-rolled test fixtures.
 func (m *Manager) AcquireMutation(agentID string) (func(), error) {

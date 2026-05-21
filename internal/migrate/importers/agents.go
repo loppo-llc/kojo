@@ -52,6 +52,10 @@ var settingsKeysToStrip = map[string]struct{}{
 	// would couple Settings to a concept the v1 model already covers
 	// via LatestMessage().
 	"lastMessage": {},
+	// notifySources backed the Gmail notify-source subsystem in v0/v1; that
+	// feature was removed before v2, so strip the key during migration to
+	// avoid carrying it forward as an unknown field in settings_json.
+	"notifySources": {},
 }
 
 func (agentsImporter) Run(ctx context.Context, st *store.Store, opts migrate.Options) error {

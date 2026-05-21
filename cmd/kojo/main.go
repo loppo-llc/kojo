@@ -810,18 +810,17 @@ func main() {
 		}
 	}
 
-	// Phase D barrier: start cron + notify poller AFTER blob hydrate
-	// so a tick that fires immediately doesn't spawn the agent's CLI
-	// in an empty CWD (books/, outputs/, etc. would not yet be on
-	// disk). NewManager used to call StartSchedulers internally; the
-	// split lets cmd/kojo interpose the hydrate.
+	// Phase D barrier: start cron AFTER blob hydrate so a tick that
+	// fires immediately doesn't spawn the agent's CLI in an empty
+	// CWD (books/, outputs/, etc. would not yet be on disk).
+	// NewManager used to call StartSchedulers internally; the split
+	// lets cmd/kojo interpose the hydrate.
 	//
 	// Peer mode (`--peer`) skips agent schedulers entirely: a daemon-
-	// only peer hosts no agent runtime, runs no Slack / notify
-	// producers, and has no Owner-facing API. Letting StartSchedulers
-	// fire on the peer would tick cron jobs / notify pollers with no
-	// listener to dispatch them to and risk duplicate work on the
-	// Hub that owns the agent lock.
+	// only peer hosts no agent runtime, runs no Slack producers, and
+	// has no Owner-facing API. Letting StartSchedulers fire on the
+	// peer would tick cron jobs with no listener to dispatch them
+	// to and risk duplicate work on the Hub that owns the agent lock.
 	if agentMgr != nil && !*peerMode {
 		agentMgr.StartSchedulers()
 	}

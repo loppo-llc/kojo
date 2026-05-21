@@ -101,7 +101,6 @@ export interface AgentInfo {
   allowedTools?: string[];
   allowProtectedPaths?: string[];
   thinkingMode?: string;
-  notifySources?: NotifySourceConfig[];
   lastMessage?: {
     content: string;
     role: string;
@@ -211,27 +210,6 @@ export interface Credential {
   totpPeriod?: number;
   createdAt: string;
   updatedAt: string;
-}
-
-export interface NotifySourceConfig {
-  id: string;
-  type: string;
-  enabled: boolean;
-  intervalMinutes: number;
-  query?: string;
-  options?: Record<string, string>;
-}
-
-export interface OAuthClientInfo {
-  provider: string;
-  configured: boolean;
-}
-
-export interface NotifySourceType {
-  type: string;
-  name: string;
-  description: string;
-  authType: string;
 }
 
 export interface OTPEntry {
@@ -663,102 +641,6 @@ export const agentApi = {
       ),
   },
 
-  notifySources: {
-    list: (agentId: string) =>
-      get<{ sources: NotifySourceConfig[] }>(
-        `/api/v1/agents/${agentId}/notify-sources`,
-      ).then((r) => r.sources ?? []),
-
-    // create/update/delete accept an optional `agentEtag` (the parent
-    // agent's etag) and return the new agent etag from the response
-    // ETag header. Callers can chain mutations without an extra GET as
-    // long as nothing else races them. 412 → PreconditionFailedError;
-    // omit `agentEtag` for unconditional (legacy) writes.
-    create: async (
-      agentId: string,
-      cfg: { type: string; intervalMinutes?: number; query?: string },
-      agentEtag?: string,
-    ): Promise<{ source: NotifySourceConfig; agentEtag: string | null }> => {
-      if (agentEtag) {
-        const r = await postWithIfMatch<{ source: NotifySourceConfig }>(
-          `/api/v1/agents/${agentId}/notify-sources`,
-          cfg,
-          agentEtag,
-        );
-        return { source: r.value.source, agentEtag: r.etag };
-      }
-      const r = await post<{ source: NotifySourceConfig }>(
-        `/api/v1/agents/${agentId}/notify-sources`,
-        cfg,
-      );
-      return { source: r.source, agentEtag: null };
-    },
-
-    update: async (
-      agentId: string,
-      sourceId: string,
-      data: Partial<NotifySourceConfig>,
-      agentEtag?: string,
-    ): Promise<{ source: NotifySourceConfig; agentEtag: string | null }> => {
-      if (agentEtag) {
-        const r = await patchWithIfMatch<{ source: NotifySourceConfig }>(
-          `/api/v1/agents/${agentId}/notify-sources/${sourceId}`,
-          data,
-          agentEtag,
-        );
-        return { source: r.value.source, agentEtag: r.etag };
-      }
-      const r = await patch<{ source: NotifySourceConfig }>(
-        `/api/v1/agents/${agentId}/notify-sources/${sourceId}`,
-        data,
-      );
-      return { source: r.source, agentEtag: null };
-    },
-
-    delete: async (
-      agentId: string,
-      sourceId: string,
-      agentEtag?: string,
-    ): Promise<{ agentEtag: string | null }> => {
-      if (agentEtag) {
-        const r = await delWithIfMatch<unknown>(
-          `/api/v1/agents/${agentId}/notify-sources/${sourceId}`,
-          agentEtag,
-        );
-        return { agentEtag: r.etag };
-      }
-      await del<unknown>(`/api/v1/agents/${agentId}/notify-sources/${sourceId}`);
-      return { agentEtag: null };
-    },
-
-    // Returns both authUrl AND the OAuth `state` nonce minted for
-    // this popup. The editor tracks state so a same-source double-
-    // click race (popup A still in flight when popup B opens) can
-    // discriminate which popup's postMessage is current. Without
-    // state, both popups would carry the same sourceId and the
-    // older one's late callback could overwrite the newer's banner.
-    startAuth: (agentId: string, sourceId: string) =>
-      get<{ authUrl: string; state: string }>(
-        `/api/v1/agents/${agentId}/notify-sources/${sourceId}/auth`,
-      ),
-  },
-
-  oauthClients: {
-    list: () =>
-      get<{ clients: OAuthClientInfo[] }>("/api/v1/oauth-clients").then(
-        (r) => r.clients ?? [],
-      ),
-
-    set: (provider: string, clientId: string, clientSecret: string) =>
-      post<{ ok: boolean }>(`/api/v1/oauth-clients/${provider}`, {
-        clientId,
-        clientSecret,
-      }),
-
-    delete: (provider: string) =>
-      del<unknown>(`/api/v1/oauth-clients/${provider}`),
-  },
-
   apiKeys: {
     get: (provider: string) =>
       get<{ provider: string; configured: boolean; hasFallback?: boolean; embeddingModel?: string }>(`/api/v1/api-keys/${provider}`),
@@ -776,11 +658,6 @@ export const agentApi = {
     list: () =>
       get<{ models: string[] }>(`/api/v1/embedding-models`).then((r) => r.models ?? []),
   },
-
-  notifySourceTypes: () =>
-    get<{ types: NotifySourceType[] }>("/api/v1/notify-source-types").then(
-      (r) => r.types ?? [],
-    ),
 
   slackBot: {
     get: (agentId: string) =>

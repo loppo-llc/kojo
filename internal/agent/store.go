@@ -108,6 +108,10 @@ var reservedAgentKeys = map[string]bool{
 	"activeStart":     true,
 	"activeEnd":       true,
 	"cronMessage":     true,
+	// notifySources was the legacy notify-source subsystem (Gmail). The
+	// feature is gone; strip the key so a Save migrates the row off the
+	// stale field on the next write.
+	"notifySources": true,
 }
 
 // loadStripKeys lists the keys settingsToAgent() must filter out before

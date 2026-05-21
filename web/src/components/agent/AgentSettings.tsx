@@ -6,7 +6,6 @@ import { useTTSCapability } from "../../hooks/useTTS";
 import { ttsApi, pickBestFormat } from "../../lib/ttsApi";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
-import { NotifySourcesEditor } from "./NotifySourcesEditor";
 import { SlackBotSettings } from "./SlackBotSettings";
 import { defaultModelForTool, modelsForTool, effortLevelsForModel, defaultEffortForModel, supportsEffort, type EffortLevel } from "../../lib/toolModels";
 import { buildAgentSavePayload } from "./agentSettingsPayload";
@@ -1362,17 +1361,6 @@ export function AgentSettings() {
           >
             {saving ? "Saving..." : "Save TTS Settings"}
           </button>
-        </section>
-
-        {/* ── Notifications ── */}
-        <section className="rounded-xl border border-neutral-800 p-5">
-          <NotifySourcesEditor
-            agentId={id!}
-            agentEtag={agent?.etag ?? null}
-            onAgentEtagChange={(etag) =>
-              setAgent((a) => (a ? { ...a, etag: etag ?? a.etag } : a))
-            }
-          />
         </section>
 
         {/* ── Slack Bot ── */}

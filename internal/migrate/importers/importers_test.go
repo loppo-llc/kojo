@@ -76,7 +76,7 @@ func TestImporterOrder(t *testing.T) {
 	for _, imp := range importerOrder() {
 		got = append(got, imp.Domain())
 	}
-	want := []string{"agents", "messages", "groupdms", "tasks", "sessions", "notify_cursors", "vapid", "push_subscriptions", "external_chat_cursors", "compactions", "blobs"}
+	want := []string{"agents", "messages", "groupdms", "tasks", "sessions", "vapid", "push_subscriptions", "external_chat_cursors", "compactions", "blobs"}
 	if len(got) != len(want) {
 		t.Fatalf("importerOrder = %v, want %v", got, want)
 	}
@@ -338,41 +338,6 @@ func TestImportersRoundTrip(t *testing.T) {
 		}
 	}
 
-	// notify_cursors — resolvable cursors get a v1 composite id with
-	// type segment; orphans (source not declared in agents.json) and
-	// empty cursors are skipped. Imported rows are listed under the
-	// owning agent in id-asc order.
-	ncs, err := st.ListNotifyCursorsByAgent(ctx, "ag_1")
-	if err != nil {
-		t.Fatalf("list notify_cursors ag_1: %v", err)
-	}
-	gotNC := map[string]string{}
-	for _, r := range ncs {
-		gotNC[r.ID] = r.Source + "|" + r.Cursor
-	}
-	wantNC := map[string]string{
-		"ag_1:gmail:src_gmail": "gmail|gmail-cursor-1",
-		"ag_1:slack:src_slack": "slack|slack-cursor-1",
-	}
-	if len(gotNC) != len(wantNC) {
-		t.Errorf("notify_cursors = %v, want %v", gotNC, wantNC)
-	}
-	for k, v := range wantNC {
-		if gotNC[k] != v {
-			t.Errorf("notify_cursors[%s] = %q, want %q", k, gotNC[k], v)
-		}
-	}
-	// Orphan / empty-cursor rows must NOT appear under any composite
-	// id — confirms the warn-skip rather than silent miscategorization.
-	for _, want := range []string{
-		"ag_1:orphan_src", "ag_1:src_empty",
-		"ag_1::orphan_src", "ag_1::src_empty",
-	} {
-		if _, err := st.GetNotifyCursor(ctx, want); err == nil {
-			t.Errorf("orphan / empty cursor leaked into store: %q", want)
-		}
-	}
-
 	// push_subscriptions — well-formed rows are imported with
 	// vapid_public_key copied from vapid.json; malformed rows (missing
 	// endpoint or auth) are dropped via the warn-skip path. ListActive
@@ -504,7 +469,7 @@ func TestImportersRoundTrip(t *testing.T) {
 	// file. The value is pinned across a re-run below so the audit
 	// trail is stable.
 	checksumBefore := map[string]string{}
-	for _, dom := range []string{"agents", "messages", "groupdms", "tasks", "sessions", "notify_cursors", "vapid", "push_subscriptions", "external_chat_cursors", "compactions", "blobs"} {
+	for _, dom := range []string{"agents", "messages", "groupdms", "tasks", "sessions", "vapid", "push_subscriptions", "external_chat_cursors", "compactions", "blobs"} {
 		ph, err := migrate.PhaseOf(ctx, st, dom)
 		if err != nil {
 			t.Fatalf("phase %s: %v", dom, err)
@@ -1070,10 +1035,9 @@ func TestImportVAPIDRejectsExistingMismatchedRow(t *testing.T) {
 //     missing agents.json, JSONL with no trailing newline, _channel.jsonl
 //     exclusion → permissive: importer ends in "imported" with the
 //     deterministic row count below, never aborts the migration.
-//   - malformed / empty agents.json → fatal: matches the same posture
-//     used by notify_cursors. Returning an empty agent set in those cases
-//     would silently drop every cursor for every agent, which is worse
-//     than surfacing the corruption.
+//   - malformed / empty agents.json → fatal: returning an empty agent
+//     set in those cases would silently drop every cursor for every
+//     agent, which is worse than surfacing the corruption.
 func TestImportExternalChatCursorsEdgeCases(t *testing.T) {
 	mustWrite := func(t *testing.T, p string, body []byte) {
 		t.Helper()
@@ -1502,24 +1466,6 @@ func writeV0Fixtures(t *testing.T, v0 string) {
 	}
 	mustWrite(filepath.Join(v0, "sessions.json"), sessionsJSON)
 
-	// notify_cursors.json — exercises every branch of the importer:
-	//   - "ag_1:src_slack" / "ag_1:src_gmail": resolvable via agents.json
-	//     → mapped to "ag_1:slack:src_slack" / "ag_1:gmail:src_gmail"
-	//   - "ag_1:orphan_src": no matching NotifySources entry → orphan,
-	//     skipped with a warn log (must not abort the whole import)
-	//   - "ag_1:src_empty" with empty cursor → skipped (haven't-polled-yet
-	//     sentinel from v0; no value to migrate)
-	cursorsJSON, err := json.Marshal(map[string]string{
-		"ag_1:src_slack":  "slack-cursor-1",
-		"ag_1:src_gmail":  "gmail-cursor-1",
-		"ag_1:orphan_src": "orphan-cursor",
-		"ag_1:src_empty":  "",
-	})
-	if err != nil {
-		t.Fatalf("marshal notify_cursors.json: %v", err)
-	}
-	mustWrite(filepath.Join(v0, "notify_cursors.json"), cursorsJSON)
-
 	// vapid.json — provides the public-key column for push_subscriptions.
 	// The private key is recorded but not used by the push importer
 	// (envelope-encrypted vapid kv import is a separate slice).
@@ -1561,15 +1507,6 @@ func writeV0Fixtures(t *testing.T, v0 string) {
 			"intervalMinutes": 30,
 			"createdAt":       "2026-04-01T10:00:00+09:00",
 			"updatedAt":       "2026-04-02T10:00:00+09:00",
-			// notifySources feeds the notify_cursors importer's
-			// (agentID, sourceID) → sourceType lookup. Two declared
-			// sources → matching cursor entries below get an inferred
-			// type; a third cursor with an unknown sourceID exercises
-			// the orphan-skip path.
-			"notifySources": []map[string]any{
-				{"id": "src_slack", "type": "slack", "enabled": true, "intervalMinutes": 5},
-				{"id": "src_gmail", "type": "gmail", "enabled": true, "intervalMinutes": 10},
-			},
 		},
 		{
 			"id":        "ag_2",

@@ -25,7 +25,6 @@ import (
 	"github.com/loppo-llc/kojo/internal/filebrowser"
 	gitpkg "github.com/loppo-llc/kojo/internal/git"
 	"github.com/loppo-llc/kojo/internal/notify"
-	gmailpkg "github.com/loppo-llc/kojo/internal/notifysource/gmail"
 	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/session"
 	"github.com/loppo-llc/kojo/internal/slackbot"
@@ -154,8 +153,6 @@ type Server struct {
 	authMu          sync.Mutex
 	devMode         bool
 	version         string
-	oauth2Mgr       *gmailpkg.OAuth2Manager
-	oauth2Once      sync.Once
 	idempSweepOnce  sync.Once // guards StartIdempotencySweep
 	webdavSweepOnce sync.Once // guards StartWebDAVTokenSweep
 	// nodeKeyResolver maps an HTTP request's RemoteAddr to the
@@ -832,19 +829,6 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/v1/agents/{id}/slackbot", s.handleDeleteSlackBot)
 	mux.HandleFunc("POST /api/v1/agents/{id}/slackbot/test", s.handleTestSlackBot)
 
-	// Notify sources
-	mux.HandleFunc("GET /api/v1/agents/{id}/notify-sources", s.handleListNotifySources)
-	mux.HandleFunc("POST /api/v1/agents/{id}/notify-sources", s.handleCreateNotifySource)
-	mux.HandleFunc("PATCH /api/v1/agents/{id}/notify-sources/{sourceId}", s.handleUpdateNotifySource)
-	mux.HandleFunc("DELETE /api/v1/agents/{id}/notify-sources/{sourceId}", s.handleDeleteNotifySource)
-	mux.HandleFunc("GET /api/v1/agents/{id}/notify-sources/{sourceId}/auth", s.handleNotifySourceAuth)
-	mux.HandleFunc("GET /oauth2/callback", s.handleOAuth2Callback)
-
-	// OAuth client configuration
-	mux.HandleFunc("GET /api/v1/oauth-clients", s.handleListOAuthClients)
-	mux.HandleFunc("POST /api/v1/oauth-clients/{provider}", s.handleSetOAuthClient)
-	mux.HandleFunc("DELETE /api/v1/oauth-clients/{provider}", s.handleDeleteOAuthClient)
-
 	// API keys
 	mux.HandleFunc("GET /api/v1/api-keys/{provider}", s.handleGetAPIKey)
 	mux.HandleFunc("PUT /api/v1/api-keys/{provider}", s.handleSetAPIKey)
@@ -853,9 +837,6 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	// Embedding model setting
 	mux.HandleFunc("PUT /api/v1/embedding-model", s.handleSetEmbeddingModel)
 	mux.HandleFunc("GET /api/v1/embedding-models", s.handleListEmbeddingModels)
-
-	// Notify source types
-	mux.HandleFunc("GET /api/v1/notify-source-types", s.handleListNotifySourceTypes)
 
 	// MCP tool server (Streamable HTTP transport)
 	mcpHandler := newMCPHandler(s.agents, s.logger)

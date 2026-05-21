@@ -3,11 +3,9 @@ import { useNavigate } from "react-router";
 import { ApiKeysSection } from "./globalsettings/ApiKeysSection";
 import { ArchivedAgentsSection } from "./globalsettings/ArchivedAgentsSection";
 import { ChatPreferencesSection } from "./globalsettings/ChatPreferencesSection";
-import { OAuthClientsSection } from "./globalsettings/OAuthClientsSection";
 import { PeersSection } from "./globalsettings/PeersSection";
 import { useEmbeddingModel } from "./globalsettings/useEmbeddingModel";
 import { useGeminiApiKey } from "./globalsettings/useGeminiApiKey";
-import { useOAuthClients } from "./globalsettings/useOAuthClients";
 import { useEnterSends } from "../lib/preferences";
 
 // How long the "Saved" banner stays visible after a successful mutation.
@@ -35,7 +33,6 @@ export function GlobalSettings() {
     setError,
     flashSuccess,
   );
-  const oauth = useOAuthClients(setError, flashSuccess);
 
   return (
     <div className="min-h-full bg-neutral-950 text-neutral-200">
@@ -51,7 +48,6 @@ export function GlobalSettings() {
 
       <main className="p-4 space-y-5 max-w-md mx-auto">
         <ApiKeysSection gemini={gemini} embedding={embedding} />
-        <OAuthClientsSection oauth={oauth} />
         <ChatPreferencesSection enterSends={enterSends} setEnterSends={setEnterSends} />
         <PeersSection setError={setError} flashSuccess={flashSuccess} />
         <ArchivedAgentsSection setError={setError} flashSuccess={flashSuccess} />

@@ -13,8 +13,6 @@ import (
 
 	"github.com/loppo-llc/kojo/internal/atomicfile"
 	"github.com/loppo-llc/kojo/internal/blob"
-	"github.com/loppo-llc/kojo/internal/notifysource"
-	"github.com/loppo-llc/kojo/internal/notifysource/gmail"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -79,8 +77,8 @@ type Manager struct {
 	switching map[string]bool
 
 	// mutating tracks the per-agent in-flight count of state
-	// mutations (persona / settings / notify / slackbot / task
-	// / credential / avatar / OAuth token) that don't route
+	// mutations (persona / settings / slackbot / task /
+	// credential / avatar / slack token) that don't route
 	// through Chat → busy. Every mutation entry uses
 	// AcquireMutation to bump the counter under busyMu (which
 	// also refuses when switching is set), and defers
@@ -119,9 +117,6 @@ type Manager struct {
 	// memIndexes caches open MemoryIndex instances per agent.
 	memIndexes   map[string]*MemoryIndex
 	memIndexesMu sync.Mutex
-
-	// notifyPoller polls external notification sources.
-	notifyPoller *notifyPoller
 
 	// OnChatDone is called when an agent finishes its response.
 	OnChatDone func(agent *Agent, message *Message)
@@ -178,10 +173,8 @@ type Manager struct {
 	patchMus   map[string]*sync.Mutex
 
 	// startSchedulersOnce guards StartSchedulers from double-firing
-	// the cron / notify-poller boot. schedulersStarted gates
-	// Shutdown so it short-circuits when the schedulers were never
-	// started (the notifyPoller.Stop path would otherwise wait on
-	// a never-launched goroutine).
+	// the cron boot. schedulersStarted gates Shutdown so it
+	// short-circuits when the schedulers were never started.
 	startSchedulersOnce sync.Once
 	schedulersStarted   bool
 }
@@ -355,12 +348,6 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 	m.cron = newCronScheduler(m, logger)
 	m.cronPaused = m.store.LoadCronPaused()
 
-	// Initialize notify poller
-	m.notifyPoller = newNotifyPoller(m, logger)
-	m.notifyPoller.RegisterFactory("gmail", func(cfg notifysource.Config, tokens notifysource.TokenAccessor) (notifysource.Source, error) {
-		return gmail.New(cfg, tokens)
-	})
-
 	// Load persisted agents
 	agents, err := m.store.Load()
 	if err != nil {
@@ -428,19 +415,16 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 	return m, nil
 }
 
-// StartSchedulers boots the cron loop and the notify poller and
-// schedules every non-archived agent's interval / notify sources.
-// Split out of NewManager (Phase G follow-up to codex review) so
-// cmd/kojo can interpose Phase D's HydrateAgentBlobsAtLoad between
-// agent load and scheduler start — without the gap, a cron tick
-// that fires before hydrate finishes would spawn the CLI process
-// in an empty CWD (books/, outputs/, etc. not yet on disk).
+// StartSchedulers boots the cron loop and schedules every non-archived
+// agent's interval. Split out of NewManager (Phase G follow-up to codex
+// review) so cmd/kojo can interpose Phase D's HydrateAgentBlobsAtLoad
+// between agent load and scheduler start — without the gap, a cron tick
+// that fires before hydrate finishes would spawn the CLI process in an
+// empty CWD (books/, outputs/, etc. not yet on disk).
 //
 // Idempotent: a sync.Once guard pins the boot to a single execution
-// regardless of how many callers race here, so a stray double Start
-// can't double-launch the notify poller goroutine. Shutdown
-// short-circuits when StartSchedulers never ran (would otherwise
-// hang on notifyPoller.Stop's wait-for-loop-exit).
+// regardless of how many callers race here. Shutdown short-circuits when
+// StartSchedulers never ran.
 func (m *Manager) StartSchedulers() {
 	if m == nil {
 		return
@@ -463,17 +447,6 @@ func (m *Manager) StartSchedulers() {
 				if err := m.cron.Schedule(a.ID, expr); err != nil {
 					m.logger.Warn("failed to schedule cron", "agent", a.ID, "err", err)
 				}
-			}
-		}
-
-		// Notify poller: rebuild sources for all agents (skip archived).
-		m.notifyPoller.Start()
-		for _, a := range agents {
-			if a.Archived {
-				continue
-			}
-			if len(a.NotifySources) > 0 {
-				m.notifyPoller.RebuildSources(a.ID, a.NotifySources)
 			}
 		}
 		m.schedulersStarted = true
@@ -1400,7 +1373,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	m.mu.Unlock()
 
 	if oldExpr != newExpr {
-		// Pre-check + post-check pattern (mirrors UpdateNotifySources).
+		// Pre-check + post-check pattern.
 		// We must NOT hold m.mu across cron.Schedule because cron callbacks
 		// reach back into the manager (runCronJob → Manager.Get) and would
 		// deadlock if Schedule's internal cs.mu happened to hold across a
@@ -1448,65 +1421,6 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 
 	return cp, nil
-}
-
-// UpdateNotifySources updates the notification source configs for an agent
-// and rebuilds the poller's source instances.
-func (m *Manager) UpdateNotifySources(id string, sources []notifysource.Config) error {
-	releaseMut, err := m.AcquireMutation(id)
-	if err != nil {
-		return err
-	}
-	defer releaseMut()
-	return m.updateNotifySourcesUnguarded(id, sources)
-}
-
-// UpdateNotifySourcesAlreadyGuarded is the no-guard variant for
-// callers that already hold AcquireMutation for the agent
-// (e.g. handleDeleteNotifySource, which needs to wrap both
-// UpdateNotifySources + DeleteTokensBySource in one mutation
-// hold so a switching flip between them can't escape §3.7
-// quiesce). MUST NOT be called without an outer AcquireMutation.
-func (m *Manager) UpdateNotifySourcesAlreadyGuarded(id string, sources []notifysource.Config) error {
-	return m.updateNotifySourcesUnguarded(id, sources)
-}
-
-func (m *Manager) updateNotifySourcesUnguarded(id string, sources []notifysource.Config) error {
-	m.mu.Lock()
-	a, ok := m.agents[id]
-	if !ok {
-		m.mu.Unlock()
-		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
-	}
-	a.NotifySources = sources
-	a.UpdatedAt = time.Now().Format(time.RFC3339)
-	archived := a.Archived
-	m.mu.Unlock()
-
-	m.save()
-
-	// Pre-check + post-check pattern. RebuildSources MUST NOT be called under
-	// m.mu — the poller's tick goroutine takes p.mu first and then calls
-	// Manager.Get (acquiring m.mu), so holding m.mu while taking p.mu would
-	// deadlock against an in-flight tick.
-	if archived {
-		return nil
-	}
-	m.notifyPoller.RebuildSources(id, sources)
-
-	// Defensive re-check: a concurrent Archive may have run between the
-	// snapshot above and the RebuildSources call. If so, undo the rebuild —
-	// DetachAgent and RebuildSources are both safe to call repeatedly.
-	m.mu.Lock()
-	racedArchive := false
-	if a, ok := m.agents[id]; ok && a.Archived {
-		racedArchive = true
-	}
-	m.mu.Unlock()
-	if racedArchive {
-		m.notifyPoller.DetachAgent(id)
-	}
-	return nil
 }
 
 // UpdateSlackBot updates the Slack bot configuration for an agent.
@@ -1844,7 +1758,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	}
 
 	// Start chat. role=="system" marks automated triggers (cron, groupdm,
-	// notify poller) where there is no interactive user waiting on the
+	// Slack one-shot) where there is no interactive user waiting on the
 	// previous turn — backends may drop idle-window protections and prefer
 	// aggressive session reset for token conservation.
 	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
@@ -2962,19 +2876,16 @@ func (m *Manager) BackendAvailability() map[string]bool {
 	return result
 }
 
-// Shutdown stops all cron jobs, notify polling, and cancels active chats.
+// Shutdown stops all cron jobs and cancels active chats.
 //
 // Short-circuits when StartSchedulers never ran (e.g. an early-exit
 // CLI subcommand path that built a Manager but didn't reach the
-// post-hydrate scheduler boot). Without this guard, notifyPoller.
-// Stop would block on a never-launched poller goroutine and hang
-// the shutdown sequence.
+// post-hydrate scheduler boot).
 func (m *Manager) Shutdown() {
 	if !m.schedulersStarted {
 		return
 	}
 	m.cron.Stop()
-	m.notifyPoller.Stop()
 
 	m.busyMu.Lock()
 	for _, entry := range m.busy {
@@ -3058,18 +2969,6 @@ func copyAgent(a *Agent) *Agent {
 	if a.TTS != nil {
 		t := *a.TTS
 		cp.TTS = &t
-	}
-	if len(a.NotifySources) > 0 {
-		cp.NotifySources = make([]notifysource.Config, len(a.NotifySources))
-		for i, ns := range a.NotifySources {
-			cp.NotifySources[i] = ns
-			if ns.Options != nil {
-				cp.NotifySources[i].Options = make(map[string]string, len(ns.Options))
-				for k, v := range ns.Options {
-					cp.NotifySources[i].Options[k] = v
-				}
-			}
-		}
 	}
 	return &cp
 }

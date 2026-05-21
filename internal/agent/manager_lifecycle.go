@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/loppo-llc/kojo/internal/notifysource"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -197,12 +196,12 @@ func (m *Manager) ResetData(id string) error {
 
 // Archive marks an agent as archived without deleting most of its data.
 //
-// All runtime activity is stopped: cron is unscheduled, the notify poller
-// is detached, in-flight one-shot chats are cancelled, the cached memory
-// index is closed. The agent stays in the in-memory map (with Archived=true)
-// and on disk — credentials, notify tokens, messages, memory, persona,
-// avatar, tasks are all retained. Inbound chats route through prepareChat,
-// which refuses archived agents with ErrAgentArchived.
+// All runtime activity is stopped: cron is unscheduled, in-flight one-shot
+// chats are cancelled, the cached memory index is closed. The agent stays
+// in the in-memory map (with Archived=true) and on disk — credentials,
+// slack tokens, messages, memory, persona, avatar, tasks are all retained.
+// Inbound chats route through prepareChat, which refuses archived agents
+// with ErrAgentArchived.
 //
 // EXCEPTION: group DM memberships are removed (and 2-person groups are
 // dissolved). A dormant member silently sitting in a chat room is more
@@ -216,11 +215,7 @@ func (m *Manager) ResetData(id string) error {
 // Idempotent: calling Archive on an already-archived agent is a no-op.
 //
 // Takes Manager.LockPatch to serialize against in-flight PATCH-style
-// mutations (notably handleOAuth2Callback's source-exists-check +
-// token-save + Enable trio). Without it, an Archive that landed mid-
-// callback could leave us with persisted OAuth tokens against an
-// archived source — callers see a "success" HTML page for an agent
-// that's already retired. Lock order is LockPatch → acquireResetGuard
+// mutations on the same agent. Lock order is LockPatch → acquireResetGuard
 // → m.mu; PATCH handlers already take LockPatch first too.
 func (m *Manager) Archive(id string) error {
 	release := m.LockPatch(id)
@@ -248,9 +243,9 @@ func (m *Manager) Archive(id string) error {
 		return err
 	}
 
-	// Set the Archived flag FIRST so any concurrent Update / UpdateNotifySources
-	// path that re-checks under m.mu sees the archived state and skips its
-	// schedule / rebuild side-effects. The runtime stoppage below then cleans
+	// Set the Archived flag FIRST so any concurrent Update path that
+	// re-checks under m.mu sees the archived state and skips its
+	// schedule side-effects. The runtime stoppage below then cleans
 	// up anything those paths managed to slip in before we took the lock.
 	now := time.Now().Format(time.RFC3339)
 	m.mu.Lock()
@@ -262,9 +257,6 @@ func (m *Manager) Archive(id string) error {
 	m.mu.Unlock()
 
 	m.cron.Remove(id)
-	// DetachAgent (not RemoveAgent) keeps cursors / lastPoll so unarchive
-	// resumes from the last delivered position instead of replaying history.
-	m.notifyPoller.DetachAgent(id)
 	m.cancelOneShots(id)
 	// Wait for in-flight one-shot chats (Slack, Discord, Group DM) to drain
 	// before touching group DM membership. Best-effort: if they don't drain
@@ -291,24 +283,22 @@ func (m *Manager) Archive(id string) error {
 	return nil
 }
 
-// Unarchive restores a previously archived agent: clears the Archived flag,
-// re-schedules its cron, and rebuilds notify sources. Slack bot re-arming is
-// the handler's responsibility (server owns slackHub lifecycle).
+// Unarchive restores a previously archived agent: clears the Archived flag
+// and re-schedules its cron. Slack bot re-arming is the handler's
+// responsibility (server owns slackHub lifecycle).
 //
 // Idempotent: calling Unarchive on a non-archived agent is a no-op.
 //
 // Serializes against Archive via acquireResetGuard so an Archive/Unarchive
-// race can't interleave flag flips with cron/poller operations. The
-// idempotency check happens INSIDE the guard so we can't observe a stale
+// race can't interleave flag flips with cron operations. The idempotency
+// check happens INSIDE the guard so we can't observe a stale
 // "not archived" state while a concurrent Archive is mid-flight (the guard
 // blocks until that Archive's cleanup() releases it).
 func (m *Manager) Unarchive(id string) error {
 	// LockPatch parity with Archive/Delete — keeps the per-agent
-	// lifecycle ordering consistent across all three transitions
-	// even though Unarchive doesn't itself race with the OAuth
-	// callback in the same way (it can't make a deleted source
-	// reappear). Cheap to take; avoids future surprises if a new
-	// caller starts depending on the lock covering Unarchive too.
+	// lifecycle ordering consistent across all three transitions.
+	// Cheap to take; avoids future surprises if a new caller starts
+	// depending on the lock covering Unarchive too.
 	release := m.LockPatch(id)
 	defer release()
 
@@ -342,18 +332,12 @@ func (m *Manager) Unarchive(id string) error {
 	a.ArchivedAt = ""
 	a.UpdatedAt = time.Now().Format(time.RFC3339)
 	expr := a.CronExpr
-	// Copy notify sources outside the lock window so the poller call below
-	// doesn't reach into manager state.
-	sources := append([]notifysource.Config(nil), a.NotifySources...)
 	m.mu.Unlock()
 
 	if expr != "" {
 		if err := m.cron.Schedule(id, expr); err != nil {
 			m.logger.Warn("failed to re-schedule cron on unarchive", "agent", id, "err", err)
 		}
-	}
-	if len(sources) > 0 {
-		m.notifyPoller.RebuildSources(id, sources)
 	}
 
 	m.save()
@@ -364,8 +348,7 @@ func (m *Manager) Unarchive(id string) error {
 // Delete removes an agent and its data.
 //
 // Takes Manager.LockPatch to serialize against in-flight PATCH-style
-// mutations (see Archive's comment for the OAuth callback rationale).
-// Lock order: LockPatch → acquireResetGuard → m.mu.
+// mutations. Lock order: LockPatch → acquireResetGuard → m.mu.
 func (m *Manager) Delete(id string) error {
 	release := m.LockPatch(id)
 	defer release()
@@ -400,21 +383,22 @@ func (m *Manager) Delete(id string) error {
 		return fmt.Errorf("tombstone agent in store: %w", err)
 	}
 
-	// Remove credentials and notify tokens outside lock (DB I/O). After
-	// the tombstone these are best-effort orphan cleanup; the eventual
-	// operator-driven hard-delete pass (planned `--clean` target; not
-	// yet implemented) rescues the leftovers if either call fails here.
+	// Remove credentials and per-agent encrypted tokens (Slack app/bot
+	// tokens live in the notify_tokens table) outside lock (DB I/O).
+	// After the tombstone these are best-effort orphan cleanup; the
+	// eventual operator-driven hard-delete pass (planned `--clean`
+	// target; not yet implemented) rescues the leftovers if either
+	// call fails here.
 	if m.creds != nil {
 		if err := m.creds.DeleteAllForAgent(id); err != nil {
 			m.logger.Warn("failed to delete credentials post-tombstone", "agent", id, "err", err)
 		}
 		if err := m.creds.DeleteTokensByAgent(id); err != nil {
-			m.logger.Warn("failed to delete notify tokens", "agent", id, "err", err)
+			m.logger.Warn("failed to delete agent tokens", "agent", id, "err", err)
 		}
 	}
 
 	m.cron.Remove(id)
-	m.notifyPoller.RemoveAgent(id)
 	m.cancelOneShots(id)
 
 	// Remove agent from group DMs
@@ -455,7 +439,7 @@ func (m *Manager) Delete(id string) error {
 	// waiters sit on the old mutex breaks the serialization
 	// invariant; the leak is bounded by total ids ever created).
 
-	// Remove agent data directory (best-effort: credentials/cron/notify already cleaned up)
+	// Remove agent data directory (best-effort: credentials/cron/tokens already cleaned up)
 	dir := agentDir(id)
 	if err := os.RemoveAll(dir); err != nil {
 		m.logger.Warn("failed to remove agent dir", "agent", id, "err", err)
@@ -521,8 +505,8 @@ func (m *Manager) ReloadAgentFromStore(agentID string) error {
 }
 
 // ActivateAgentRuntime wires the in-memory cached *Agent into this peer's
-// runtime side channels: cron schedule and notify poller. Called by the
-// §3.7 device-switch finalize hook (NOT by phase-1 sync) so an agent that
+// runtime side channels: the cron schedule. Called by the §3.7
+// device-switch finalize hook (NOT by phase-1 sync) so an agent that
 // landed but hasn't yet been claimed by this peer can't fire schedules
 // before AgentLockGuard adopts it.
 //
@@ -530,10 +514,10 @@ func (m *Manager) ReloadAgentFromStore(agentID string) error {
 // run yet — the boot loop registers everything from the same in-memory
 // snapshot, so a redundant call here would just race.
 //
-// Archived agents always have their cron entry and notify sources torn
-// down here, even when they were already detached by Archive(): a Reload
-// that flipped an active agent to archived underneath us must still
-// surface as "stopped" on the runtime side.
+// Archived agents always have their cron entry torn down here, even when
+// it was already detached by Archive(): a Reload that flipped an active
+// agent to archived underneath us must still surface as "stopped" on the
+// runtime side.
 func (m *Manager) ActivateAgentRuntime(agentID string) {
 	if m == nil || agentID == "" {
 		return
@@ -549,9 +533,6 @@ func (m *Manager) ActivateAgentRuntime(agentID string) {
 		if m.cron != nil {
 			m.cron.Remove(agentID)
 		}
-		if m.notifyPoller != nil {
-			m.notifyPoller.DetachAgent(agentID)
-		}
 		return
 	}
 	if m.cron != nil {
@@ -562,9 +543,6 @@ func (m *Manager) ActivateAgentRuntime(agentID string) {
 		} else {
 			m.cron.Remove(agentID)
 		}
-	}
-	if m.notifyPoller != nil {
-		m.notifyPoller.RebuildSources(agentID, a.NotifySources)
 	}
 
 	// §3.7 device-switch skill: install the SKILL.md so the newly-
@@ -694,10 +672,10 @@ func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string
 
 // arrivalChatRetryAttempts × arrivalChatRetryBackoff bounds the total
 // wait the arrival prompt accepts before giving up. ActivateAgentRuntime
-// schedules cron / notify side channels right before the arrival fires;
-// if a cron tick or a notify poll grabs the busy slot first, m.Chat
-// returns ErrAgentBusy and the arrival would otherwise be lost — visible
-// to the user as "auto-continue didn't fire on return."
+// schedules the cron side channel right before the arrival fires; if a
+// cron tick grabs the busy slot first, m.Chat returns ErrAgentBusy and
+// the arrival would otherwise be lost — visible to the user as
+// "auto-continue didn't fire on return."
 //
 // Codex flagged that a 3s budget can't outlast a real cron-triggered
 // chat (which can run for minutes). The compromise: bump the budget to
@@ -717,8 +695,8 @@ func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string
 const arrivalChatRetryAttempts = 60
 
 // arrivalChatRetryBackoff is the inter-attempt sleep. 2s × 60 = 120s of
-// total wait, far enough to outlast the typical cron/notify-triggered
-// claude turn that might transiently hold busy.
+// total wait, far enough to outlast the typical cron-triggered claude
+// turn that might transiently hold busy.
 const arrivalChatRetryBackoff = 2 * time.Second
 
 // chatWithArrivalRetry wraps m.Chat with a bounded retry loop for the
@@ -859,7 +837,7 @@ func kvArrivedProxyKey(agentID string) string { return "arrived_proxy/" + agentI
 // ctx expires. A single PutKV failure is almost always transient
 // (SQLite BUSY under contention, brief disk pressure). The marker is
 // critical: without it on disk, a daemon restart on the source side
-// would resurrect schedulers / cron / notify-poller for an agent
+// would resurrect schedulers / cron for an agent
 // target now owns. The caller (releaseAgentLocallyCore) hands in a
 // markReleasedCtxBudget-wide ctx so transient SQLite BUSY gets many
 // shots inside that window.
@@ -1279,35 +1257,34 @@ func markerTimestamp(rec *store.KVRecord) int64 {
 
 // ReleaseAgentLocally tears down every in-memory side channel that
 // could fire local writes for the agent on THIS peer: cron schedule,
-// notify poller, in-flight one-shots, cached memory index, group-DM
-// membership, and the agents map entry itself. The on-disk DB rows
-// + persona / blob bodies remain so a future agent-sync back to this
-// peer can re-hydrate via ReloadAgentFromStore.
+// in-flight one-shots, cached memory index, group-DM membership, and
+// the agents map entry itself. The on-disk DB rows + persona / blob
+// bodies remain so a future agent-sync back to this peer can
+// re-hydrate via ReloadAgentFromStore.
 //
 // Called by the §3.7 source-release hook after a successful complete
 // + finalize: target now holds agent_locks, and source must stop
-// firing cron / poller / internal Chat against this agentID. Without
-// this teardown, source's cron scheduler keeps the entry and
-// runCronJob proceeds through the agents.Get hit; the resulting Chat
-// would write transcript / JSONL that target never sees.
+// firing cron / internal Chat against this agentID. Without this
+// teardown, source's cron scheduler keeps the entry and runCronJob
+// proceeds through the agents.Get hit; the resulting Chat would write
+// transcript / JSONL that target never sees.
 //
 // Safe to call multiple times — every step is no-op-on-missing.
 // Threadsafe.
 func (m *Manager) ReleaseAgentLocally(agentID string) {
-	// withDBCleanup=true: notify_cursors and group_dm_members rows
-	// are deleted from this peer's kojo.db. Semantically correct
-	// for a §3.7 source-release — the agent's runtime is moving
-	// to target, so the source's local cursors / memberships
-	// belong to the prior incarnation and have no surviving
-	// consumer here.
+	// withDBCleanup=true: group_dm_members rows are deleted from
+	// this peer's kojo.db. Semantically correct for a §3.7
+	// source-release — the agent's runtime is moving to target, so
+	// the source's local memberships belong to the prior incarnation
+	// and have no surviving consumer here.
 	m.releaseAgentLocallyCore(agentID, true /*withDBCleanup*/, true /*markReleased*/)
 }
 
 // TeardownAgentRuntime stops every in-memory runtime side channel
-// (cron, notify, slack, in-flight one-shots, agents map entry)
-// WITHOUT writing the §3.7 source-release marker and WITHOUT
-// touching DB rows the orchestrator is about to overwrite (notify
-// cursors, group-DM members). Used by the inter-peer state-probe
+// (cron, slack, in-flight one-shots, agents map entry) WITHOUT
+// writing the §3.7 source-release marker and WITHOUT touching DB
+// rows the orchestrator is about to overwrite (group-DM members).
+// Used by the inter-peer state-probe
 // self-heal path: the orchestrator is retrying a device-switch
 // against this host, so this peer has to stop driving the agent
 // before the new agent-sync lands, but the released marker would
@@ -1324,12 +1301,11 @@ func (m *Manager) TeardownAgentRuntime(agentID string) {
 // implies a prior ReleaseAgentLocally already ran (with full
 // cleanup), so we only need to tear down the in-memory side
 // channels that NewManager just rebuilt on this fresh boot. We do
-// NOT re-issue notifyPoller.RemoveAgent / groupdms.RemoveAgent
-// because their DB-row deletes have already happened, and a stale-
-// marker reconciliation case (operator-driven re-handoff) where the
-// guard above lets us through would re-do destructive deletes
-// against rows that may legitimately belong to the (now re-arrived)
-// agent.
+// NOT re-issue groupdms.RemoveAgent because its DB-row deletes have
+// already happened, and a stale-marker reconciliation case
+// (operator-driven re-handoff) where the guard above lets us through
+// would re-do destructive deletes against rows that may legitimately
+// belong to the (now re-arrived) agent.
 func (m *Manager) detachAgentInMemory(agentID string) {
 	m.releaseAgentLocallyCore(agentID, false /*withDBCleanup*/, false /*markReleased*/)
 }
@@ -1349,7 +1325,7 @@ func (m *Manager) releaseAgentLocallyCore(agentID string, withDBCleanup, markRel
 	// Retried + bounded inside MarkAgentReleasedHere. On
 	// exhaustion we log ERROR (operator-visible) and PROCEED with
 	// teardown — refusing to tear down here would leave source
-	// continuing to write cron/notify/internal-chat against rows
+	// continuing to write cron/internal-chat against rows
 	// target now owns, which is strictly worse than restart
 	// resurrection. The startup eviction path also reads
 	// agent_locks.holder for belt-and-suspenders, so a missing
@@ -1383,13 +1359,6 @@ func (m *Manager) releaseAgentLocallyCore(agentID string, withDBCleanup, markRel
 	}
 	if m.cron != nil {
 		m.cron.Remove(agentID)
-	}
-	if m.notifyPoller != nil {
-		if withDBCleanup {
-			m.notifyPoller.RemoveAgent(agentID)
-		} else {
-			m.notifyPoller.DetachAgent(agentID)
-		}
 	}
 	m.cancelOneShots(agentID)
 	// Stop any in-flight arrival chat. It runs under
@@ -1437,9 +1406,8 @@ func (m *Manager) releaseAgentLocallyCore(agentID string, withDBCleanup, markRel
 // agent we previously §3.7-released as source. Used at daemon boot
 // so a switched-away agent that left this peer doesn't resurrect:
 // NewManager loads ALL persisted agent rows regardless of holder,
-// and StartSchedulers would otherwise schedule cron / notify pollers
-// against them — landing writes on a peer that no longer owns the
-// lock.
+// and StartSchedulers would otherwise schedule cron jobs against
+// them — landing writes on a peer that no longer owns the lock.
 //
 // Eviction policy:
 //
@@ -1466,7 +1434,7 @@ func (m *Manager) releaseAgentLocallyCore(agentID string, withDBCleanup, markRel
 //
 // MUST be called BEFORE AgentLockGuard.Start (so the released agents'
 // IDs aren't fed back into the guard's desired set) and BEFORE
-// StartSchedulers (so cron / poller never see them). selfPeerID == ""
+// StartSchedulers (so cron never sees them). selfPeerID == ""
 // is a no-op — the caller is single-peer / pre-§3.7 and there's
 // nothing to filter against.
 //
@@ -1537,7 +1505,7 @@ func (m *Manager) EvictNonLocalAgentsAtStartup(ctx context.Context, selfPeerID s
 				"agent", id, "holder", holderForLog, "self", selfPeerID)
 		}
 		// In-memory only: the durable side of the release
-		// (notify_cursors / group_dm_members deletes) already ran
+		// (group_dm_members deletes) already ran
 		// at the original ReleaseAgentLocally call site that wrote
 		// the marker; re-running them on every restart would
 		// either no-op (rows already gone) or clobber rows that

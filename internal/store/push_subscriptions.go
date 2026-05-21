@@ -47,14 +47,11 @@ type PushSubscriptionInsertOptions struct {
 
 // BulkInsertPushSubscriptions inserts many push_subscriptions rows in a
 // single transaction. Used by the v0→v1 importer; live subscribe/
-// unsubscribe goes through dedicated single-row APIs (not yet exposed,
-// matching slice 8a's notify_cursors posture: poller cutover comes
-// later).
+// unsubscribe goes through dedicated single-row APIs.
 //
-// Idempotency contract matches BulkInsertSessions / BulkInsertNotify-
-// Cursors: rows whose endpoint already exists are skipped via ON
-// CONFLICT DO NOTHING + a preload-set so a re-run leaves the existing
-// row untouched. Caller records are mutated in place AFTER commit with
+// Idempotency contract matches BulkInsertSessions: rows whose endpoint
+// already exists are skipped via ON CONFLICT DO NOTHING + a preload-set
+// so a re-run leaves the existing row untouched. Caller records are mutated in place AFTER commit with
 // assigned timestamps; skipped rows are left untouched so callers can
 // distinguish "imported now" (CreatedAt populated) from "already there"
 // (CreatedAt zero) without re-querying.

@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/loppo-llc/kojo/internal/notifysource"
 	"github.com/loppo-llc/kojo/internal/tts"
 )
 
@@ -320,9 +319,6 @@ type Agent struct {
 	// ThinkingMode controls reasoning/thinking for llama.cpp backend.
 	// "on" = enable, "off" = disable, "" = server default.
 	ThinkingMode string `json:"thinkingMode,omitempty"`
-
-	// NotifySources holds notification source configurations for this agent.
-	NotifySources []notifysource.Config `json:"notifySources,omitempty"`
 
 	// SlackBot holds the Slack Socket Mode bot configuration for this agent.
 	SlackBot *SlackBotConfig `json:"slackBot,omitempty"`

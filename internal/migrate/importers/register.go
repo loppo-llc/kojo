@@ -36,18 +36,6 @@ func importerOrder() []migrate.Importer {
 		// fresh re-run doesn't abandon already-imported transcripts
 		// in a partial state.
 		sessionsImporter{},
-		// notifyCursorsImporter copies <v0>/notify_cursors.json into
-		// notify_cursors. The v0 cursor key is "<agentID>:<sourceID>"
-		// and lacks the source type; the importer reads agents.json
-		// to resolve each (agentID, sourceID) → type and composes the
-		// canonical v1 id "<agent>:<type>:<source_id>". Cursors whose
-		// source isn't declared in agents.json are orphan and warn-
-		// skipped. Order: must run after agentsImporter has finished
-		// (we re-read agents.json directly, so the dependency is on
-		// the *file* not the v1 row, but placing it after agents in
-		// the list keeps the "data-domain dependencies first" rule
-		// uniform).
-		notifyCursorsImporter{},
 		// vapidImporter copies <v0>/vapid.json into kv (namespace=
 		// "notify"). The public key lands plaintext (scope=global) and
 		// the private key is envelope-sealed with the host-bound KEK
@@ -57,18 +45,14 @@ func importerOrder() []migrate.Importer {
 		// vapid.json directly today (its vapid_public_key column is
 		// stamped from the file, not the kv row), but the dependency
 		// will flip in a future slice that has push_subscriptions
-		// resolve vapid_public from kv. Placing vapid first now keeps
-		// the migration log ordering aligned with the notify domain's
-		// logical layering: pair → subscribers.
+		// resolve vapid_public from kv.
 		vapidImporter{},
 		// pushSubscriptionsImporter copies <v0>/push_subscriptions.json
 		// into push_subscriptions, filling vapid_public_key from
 		// <v0>/vapid.json. Order: independent w.r.t. agents/messages/
-		// groupdms/tasks/sessions/notify_cursors (no FK in either
-		// direction — the schema deliberately omits agent_id from this
-		// table, see 0001_initial.sql §3.3 exception). Placed after
-		// notify_cursors so the notify-domain importers run as a group
-		// in the migration log.
+		// groupdms/tasks/sessions (no FK in either direction — the schema
+		// deliberately omits agent_id from this table, see 0001_initial.sql
+		// §3.3 exception).
 		pushSubscriptionsImporter{},
 		// externalChatCursorsImporter walks each agent's
 		// <v0>/agents/<id>/chat_history/<platform>/<channel>/<thread>.jsonl

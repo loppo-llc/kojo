@@ -32,9 +32,8 @@ import (
 // numeric ts; Discord: a snowflake; etc.) and the runtime hands it back
 // unchanged on the next poll.
 //
-// external_chat_cursors has no `seq` column, mirroring notify_cursors:
-// cursor freshness ordering is implicit in updated_at and the WS invalidator
-// uses the global event log.
+// external_chat_cursors has no `seq` column: cursor freshness ordering is
+// implicit in updated_at and the WS invalidator uses the global event log.
 type ExternalChatCursorRecord struct {
 	ID        string
 	Source    string  // 'slack' | 'discord' | ...
@@ -74,10 +73,9 @@ func computeExternalChatCursorETag(r *ExternalChatCursorRecord) (string, error) 
 
 // ExternalChatCursorInsertOptions lets the v0→v1 importer preserve original
 // timestamps and override the clock for tests. PeerID is recorded on every
-// imported row for the same audit reason as notify_cursors: cursors are
-// global-scoped (other peers must see the same cursor to avoid re-fetching
-// the same external history on device switch) but the row remembers which
-// peer last advanced it.
+// imported row: cursors are global-scoped (other peers must see the same
+// cursor to avoid re-fetching the same external history on device switch)
+// but the row remembers which peer last advanced it.
 type ExternalChatCursorInsertOptions struct {
 	Now       int64
 	CreatedAt int64
@@ -91,9 +89,9 @@ type ExternalChatCursorInsertOptions struct {
 // row Upsert API which is intentionally not yet exposed — the runtime still
 // reads the JSONL file directly as of slice 11.
 //
-// Idempotency contract matches BulkInsertNotifyCursors: rows whose id
-// already exists are skipped via ON CONFLICT DO NOTHING + a preload-set so
-// a re-run leaves the existing row untouched. Caller records are mutated
+// Idempotency contract: rows whose id already exists are skipped via
+// ON CONFLICT DO NOTHING + a preload-set so a re-run leaves the existing
+// row untouched. Caller records are mutated
 // in place AFTER commit with assigned etag/timestamps; skipped rows are
 // left untouched so callers can distinguish "imported now" from "already
 // there".

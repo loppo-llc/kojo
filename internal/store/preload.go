@@ -21,7 +21,7 @@ const preloadExistingKeysChunkSize = 500
 //
 // Used by bulk upsert paths to split a batch into insert-vs-update
 // groups while staying well under SQLite's 999-variable cap. The
-// per-table helpers in notify_cursors / sessions / push_subscriptions /
+// per-table helpers in sessions / push_subscriptions /
 // external_chat_cursors are thin wrappers around this function.
 //
 // agent_tasks has its own variant (preloadExistingTaskIDs) because it

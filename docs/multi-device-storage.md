@@ -17,7 +17,6 @@
   sessions.json                        # session metadata (PTY)
   credentials.db                       # SQLite, machine-bound 暗号化
   credentials.key                      # machine-bound encryption key
-  notify_cursors.json
   push_subscriptions.json
   vapid.json                           # VAPID private key を含む
   kojo.lock                            # 単一プロセスロック
@@ -104,7 +103,6 @@
 | `agents/<id>/autosummary_marker` | `agent_flags` (KV) | global |
 | `cron_paused` (現状 global flag) | `kv` (namespace=`scheduler`, key=`paused`) | global |
 | `agents/<id>/.cron_last` (cron 実行 throttle marker, 50秒窓) | `kv` (namespace=`scheduler`, key=`cron_last/<agentID>`, value=fire millis) | machine (per-host throttle、ピア間で同期しない) |
-| `notify_cursors.json` | `notify_cursors` | global |
 | `push_subscriptions.json` | `push_subscriptions` | global |
 | `chat_history/` の cursor | `external_chat_cursors` | global |
 | `chat_history/` 本体 | (外部から再取得可能なので) **local cache** | local。再取得不可 platform / 権限切れ時は UI に degraded 表示 |
@@ -928,7 +926,6 @@ v1 binary 起動時:
 | `agents/<id>/memory/*.md` | `memory_entries` |
 | `agents/<id>/MEMORY.md` | `kojo://global/agents/<id>/MEMORY.md` (blob) + `agent_memory` denormalized |
 | `agents/<id>/persona.md`, `persona_summary.md` | `agent_persona` (summary は再生成可能なので skip) |
-| `notify_cursors.json` | `notify_cursors` |
 | `push_subscriptions.json` | `push_subscriptions` |
 | `vapid.json` (public) | `kv` namespace=`notify` key=`vapid_public` (平文、scope=global) |
 | `vapid.json` (private) | `kv` namespace=`notify` key=`vapid_private` envelope encrypted (scope=machine、KEK は `<v1>/auth/kek.bin`、AAD=`notify/vapid_private`) |

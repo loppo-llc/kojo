@@ -238,7 +238,6 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 		{http.MethodPatch, "/api/v1/agents/ag_x/credentials/cred_1", ag, true},
 		{http.MethodGet, "/api/v1/agents/ag_x/tasks", ag, true},
 		{http.MethodPost, "/api/v1/agents/ag_x/tasks", ag, true},
-		{http.MethodGet, "/api/v1/agents/ag_x/notify-sources", ag, true},
 		{http.MethodGet, "/api/v1/agents/ag_x/slackbot", ag, true},
 		{http.MethodPut, "/api/v1/agents/ag_x/slackbot", ag, true},
 		{http.MethodPost, "/api/v1/agents/ag_x/pre-compact", ag, true},

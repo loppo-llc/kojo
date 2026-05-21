@@ -175,8 +175,10 @@ func TestCredentialsCarryForward_RefusesIfV1HasCredentialRows(t *testing.T) {
 
 func TestCredentialsCarryForward_RefusesIfV1HasNotifyTokens(t *testing.T) {
 	// The bug this guards: an earlier version of the carry-forward only
-	// counted `credentials` rows. A user who entered notify tokens via
-	// the OAuth flow before running --migrate would silently lose them.
+	// counted `credentials` rows. A user who set up Slack credentials
+	// (which land in `notify_tokens`, alongside any legacy rows still
+	// present from earlier kojo versions) before running --migrate
+	// would silently lose them.
 	root := t.TempDir()
 	v0 := filepath.Join(root, "kojo")
 	v1 := filepath.Join(root, "kojo-v1")
@@ -186,7 +188,7 @@ func TestCredentialsCarryForward_RefusesIfV1HasNotifyTokens(t *testing.T) {
 	db, _ := sql.Open("sqlite", filepath.Join(v1, "credentials.db"))
 	if _, err := db.Exec(
 		`INSERT INTO notify_tokens (provider,agent_id,source_id,key,value_enc,updated_at)
-		 VALUES ('gmail','agent1','src1','access','enc','t')`); err != nil {
+		 VALUES ('slack','agent1','','app_token','enc','t')`); err != nil {
 		t.Fatalf("seed v1 notify_tokens: %v", err)
 	}
 	db.Close()

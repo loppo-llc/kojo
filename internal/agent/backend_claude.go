@@ -721,7 +721,7 @@ const sessionResetMinIdleDuration = defaultResumeIdleDuration
 //
 // automatedTrigger disables the interactive-chat idle guard. Pass true when
 // the caller is a non-interactive trigger (cron fire, groupdm notification,
-// notify poller) — there is no human conversation to protect and the guard
+// Slack one-shot) — there is no human conversation to protect and the guard
 // would otherwise prevent resets on agents whose interval is shorter than
 // the idle window.
 //

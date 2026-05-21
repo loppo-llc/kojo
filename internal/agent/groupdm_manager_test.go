@@ -64,7 +64,7 @@ func setupGroupDMTest(t *testing.T) (*GroupDMManager, *Manager) {
 }
 
 // newTestManager creates a minimal Manager for group DM tests.
-// Does NOT start cron or notify poller.
+// Does NOT start cron.
 func newTestManager(t *testing.T) *Manager {
 	t.Helper()
 	tmp := t.TempDir()

@@ -41,8 +41,6 @@ import (
 //     can ship before the kv vapid envelope work (which needs KEK
 //     plumbing through migrate.Options).
 //   - read-once: parsed exactly once for this domain.
-//   - matches notify_cursors's pattern (it reads agents.json directly
-//     for the type lookup rather than the v1 agents table).
 //
 // A missing / empty / publicKey-less vapid.json is fatal: a row without
 // a vapid_public_key would be unrecoverable on the next rotation, and
@@ -106,11 +104,10 @@ func (pushSubscriptionsImporter) Run(ctx context.Context, st *store.Store, opts 
 	if err := json.Unmarshal(data, &subs); err != nil {
 		// Malformed file: log and mark imported with 0 rows so a re-run
 		// doesn't repeatedly fail on the same parse. Matches the posture
-		// in sessions / notify_cursors importers — a corrupt v0 file is
-		// signalled in the migration log but doesn't block the rest of
-		// the migration. Subscriptions are recoverable by re-permitting
-		// the browser on first v1 boot, unlike notify_cursors where a
-		// loss means a re-poll storm.
+		// in the sessions importer — a corrupt v0 file is signalled in
+		// the migration log but doesn't block the rest of the migration.
+		// Subscriptions are recoverable by re-permitting the browser on
+		// first v1 boot.
 		logger.Warn("push_subscriptions: skipping malformed file",
 			"path", subPath, "err", err)
 		return markImported(ctx, st, "push_subscriptions", 0, checksum)
@@ -197,8 +194,8 @@ func (pushSubscriptionsImporter) Run(ctx context.Context, st *store.Store, opts 
 //     would lack a usable vapid_public_key.
 //   - empty file (len(data)==0) → fatal: a zero-byte file on a disk
 //     that *has* the path is a truncation signal, not a v0 contract.
-//   - malformed JSON → fatal: same reasoning as agents.json in
-//     loadNotifySourceTypes.
+//   - malformed JSON → fatal: a corrupt vapid.json must surface as an
+//     operator-visible error rather than silently dropping rows.
 //   - empty publicKey field → fatal: the column is NOT NULL.
 //
 // If push_subscriptions.json is empty / absent the importer never calls

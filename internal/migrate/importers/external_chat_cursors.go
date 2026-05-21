@@ -63,11 +63,10 @@ import (
 // any segment that does contain ':' so a future plugin that violates
 // this can't smuggle a row that aliases another conversation's id.
 //
-// peer_id is stamped from opts.HomePeer for the same reason as
-// notify_cursors: cursors are global-scoped (every peer must agree on
-// the same cursor to avoid double-fetching the same external history on
-// device switch — see design doc §2.3) but the row remembers which peer
-// last advanced it.
+// peer_id is stamped from opts.HomePeer because cursors are
+// global-scoped (every peer must agree on the same cursor to avoid
+// double-fetching the same external history on device switch — see
+// design doc §2.3) but the row remembers which peer last advanced it.
 type externalChatCursorsImporter struct{}
 
 func (externalChatCursorsImporter) Domain() string { return "external_chat_cursors" }
@@ -97,15 +96,10 @@ func (externalChatCursorsImporter) Run(ctx context.Context, st *store.Store, opt
 	// purpose: the v1 cursor primary key is composite ("<agent>:<source>:
 	// <channel>"), and accepting an agent id with ':' would let two
 	// distinct (agent, source, channel) tuples collide on the composite.
-	// notify_cursors applies the same filter for the same reason, so
-	// cross-domain joins by agent_id stay consistent across the two
-	// cursor tables.
-	//
 	// Missing agents.json (os.ErrNotExist) is tolerated and returns an
 	// empty set, which downgrades every chat_history dir to "orphan agent"
-	// and yields markImported(0). Malformed JSON is fatal — same posture
-	// as notify_cursors: we'd rather surface the corruption than silently
-	// drop every cursor.
+	// and yields markImported(0). Malformed JSON is fatal: we'd rather
+	// surface the corruption than silently drop every cursor.
 	validAgents, err := loadValidV0AgentIDs(opts.V0Dir)
 	if err != nil {
 		return fmt.Errorf("load valid agent ids: %w", err)
@@ -144,9 +138,9 @@ func (externalChatCursorsImporter) Run(ctx context.Context, st *store.Store, opt
 	// "rows in v1 that this domain owns" total, which is what
 	// migration_status.imported_count should reflect even after a crash-
 	// resume cycle re-walks the v0 tree and finds every row already
-	// committed. The single-batch importers (notify_cursors etc.) collapse
-	// these two counts because their bulk call is atomic; this importer
-	// commits in chunks, so reporting freshlyInserted alone would under-
+	// committed. Other single-batch importers collapse these two counts
+	// because their bulk call is atomic; this importer commits in chunks,
+	// so reporting freshlyInserted alone would under-
 	// count after a partial-progress crash.
 	freshlyInserted := 0
 	importable := 0
@@ -391,11 +385,10 @@ func isNumericTSChars(id string) bool {
 // <thread>"), and accepting an agent id with ':' would let two distinct
 // (agent, source, channel, thread) tuples collide on the composite.
 //
-// Reads agents.json directly rather than the v1 agents table for the
-// same reason as notify_cursors' loadNotifySourceTypes — it makes the
-// importer self-contained and side-steps any subtle differences between
-// the on-disk file and the v1 row that crept in through a future bulk-
-// insert tweak.
+// Reads agents.json directly rather than the v1 agents table to keep
+// the importer self-contained and side-step any subtle differences
+// between the on-disk file and the v1 row that crept in through a
+// future bulk-insert tweak.
 //
 // Skip rules:
 //   - missing agents.json (os.ErrNotExist) → empty set (every agent
@@ -418,8 +411,8 @@ func loadValidV0AgentIDs(v0Dir string) (map[string]bool, error) {
 		return nil, err
 	}
 	if len(data) == 0 {
-		// Mirror loadNotifySourceTypes: zero-byte agents.json on a disk
-		// that *has* the file is a truncation signal, not v0 contract.
+		// Zero-byte agents.json on a disk that *has* the file is a
+		// truncation signal, not a v0 contract.
 		return nil, fmt.Errorf("agents.json is empty")
 	}
 	var raw []map[string]any

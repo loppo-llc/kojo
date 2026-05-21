@@ -98,7 +98,7 @@ func EnforceMiddleware(next http.Handler) http.Handler {
 //      reset-session. Permitted for self by Agent, or for any target by
 //      PrivAgent.
 //
-// Owner-only routes (sessions, git, files browser, oauth, embedding,
+// Owner-only routes (sessions, git, files browser, embedding,
 // push, custom-models, group DM mutate-as-owner, fork, /privilege,
 // generate-*) fall through and 403. Note: POST /api/v1/groupdms
 // (group creation) is exposed to Agent / PrivAgent below — the handler
@@ -378,8 +378,6 @@ func isSelfScopedRoute(method, sub string) bool {
 		return method == http.MethodGet || method == http.MethodPost
 	case "/credentials":
 		return method == http.MethodGet || method == http.MethodPost
-	case "/notify-sources":
-		return method == http.MethodGet || method == http.MethodPost
 	case "/slackbot":
 		return method == http.MethodGet || method == http.MethodPut || method == http.MethodDelete
 	case "/groups":
@@ -404,7 +402,7 @@ func isSelfScopedRoute(method, sub string) bool {
 	}
 
 	// Sub-resources with their own {id} segments (messages, tasks,
-	// credentials, notify-sources). Match conservatively.
+	// credentials). Match conservatively.
 	switch {
 	case strings.HasPrefix(sub, "/messages/"):
 		return method == http.MethodPatch || method == http.MethodDelete || method == http.MethodPost
@@ -412,8 +410,6 @@ func isSelfScopedRoute(method, sub string) bool {
 		return method == http.MethodPatch || method == http.MethodDelete
 	case strings.HasPrefix(sub, "/credentials/"):
 		return method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete || method == http.MethodPost
-	case strings.HasPrefix(sub, "/notify-sources/"):
-		return method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete
 	}
 	return false
 }

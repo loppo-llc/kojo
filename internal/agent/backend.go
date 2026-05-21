@@ -28,7 +28,7 @@ type ChatOptions struct {
 	MCPServers map[string]mcpServerEntry
 
 	// AutomatedTrigger marks the chat as a non-interactive system fire
-	// (cron, groupdm notification, notify poller, etc.) rather than a
+	// (cron, groupdm notification, Slack one-shot, etc.) rather than a
 	// human-driven turn. Backends use this to disable the idle-window
 	// guard on session resets: there is no interactive conversation to
 	// preserve, so token conservation wins over continuity.

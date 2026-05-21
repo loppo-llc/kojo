@@ -29,8 +29,8 @@ type ForkOptions struct {
 // per-row ids so the destination's primary keys don't collide with
 // the source's.
 //
-// External integrations are intentionally NOT copied: SlackBot, NotifySources,
-// and credentials all require per-agent tokens that cannot be safely shared.
+// External integrations are intentionally NOT copied: SlackBot and
+// credentials all require per-agent tokens that cannot be safely shared.
 // CLI local state (.claude/, .gemini/) is also skipped so the fork starts a
 // fresh session. WorkDir is cleared so the fork does not share external output
 // storage with the source.
@@ -87,7 +87,6 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 	fork.HasAvatar = false
 	fork.AvatarHash = ""
 	fork.SlackBot = nil
-	fork.NotifySources = nil
 	fork.LegacyIntervalMinutes = 0
 	// Forking an archived agent must produce an *active* fork. Otherwise the
 	// new agent would be born dormant and silently inherit ArchivedAt from

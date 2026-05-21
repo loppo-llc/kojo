@@ -2,8 +2,6 @@ package agent
 
 import (
 	"testing"
-
-	"github.com/loppo-llc/kojo/internal/notifysource"
 )
 
 func TestResolvePublicProfile(t *testing.T) {
@@ -148,9 +146,6 @@ func TestCopyAgent(t *testing.T) {
 		LastMessage: &MessagePreview{
 			Content: "hello", Role: "user", Timestamp: "2024-01-01T00:00:00Z",
 		},
-		NotifySources: []notifysource.Config{
-			{Type: "gmail", Options: map[string]string{"key": "val"}},
-		},
 	}
 	cp := copyAgent(orig)
 
@@ -168,16 +163,12 @@ func TestCopyAgent(t *testing.T) {
 	// Mutate copy, verify original is unchanged
 	cp.Name = "Changed"
 	cp.LastMessage.Content = "changed"
-	cp.NotifySources[0].Options["key"] = "changed"
 
 	if orig.Name != "Test" {
 		t.Error("original Name should be unchanged")
 	}
 	if orig.LastMessage.Content != "hello" {
 		t.Error("original LastMessage.Content should be unchanged")
-	}
-	if orig.NotifySources[0].Options["key"] != "val" {
-		t.Error("original NotifySources options should be unchanged")
 	}
 }
 

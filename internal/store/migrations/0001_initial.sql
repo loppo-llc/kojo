@@ -271,23 +271,8 @@ CREATE INDEX idx_sessions_agent_status ON sessions(agent_id, status);
 CREATE INDEX idx_sessions_status ON sessions(status);
 
 -- ---------------------------------------------------------------------------
--- Domain: notify / chat history cursors
+-- Domain: chat history cursors
 -- ---------------------------------------------------------------------------
-
-CREATE TABLE notify_cursors (
-  id          TEXT PRIMARY KEY,               -- composite source identifier (e.g. "agent:slack:Cxxx")
-  source      TEXT NOT NULL,                  -- slack|discord|...
-  agent_id    TEXT,
-  cursor      TEXT NOT NULL,                  -- opaque to kojo
-  -- common --
-  version     INTEGER NOT NULL DEFAULT 1,
-  etag        TEXT NOT NULL,
-  created_at  INTEGER NOT NULL,
-  updated_at  INTEGER NOT NULL,
-  deleted_at  INTEGER,
-  peer_id     TEXT
-);
-CREATE INDEX idx_notify_cursors_agent ON notify_cursors(agent_id);
 
 CREATE TABLE external_chat_cursors (
   id          TEXT PRIMARY KEY,
