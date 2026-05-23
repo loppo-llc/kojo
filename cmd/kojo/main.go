@@ -538,20 +538,28 @@ func main() {
 			startCancel()
 			// Peer-count lookup feeds SyncDeviceSwitchSkill (in
 			// agent.Manager.prepareChat) so the kojo-switch-device
-			// SKILL.md is only installed when there's at least one
-			// OTHER ONLINE peer registered.
+			// SKILL.md is installed iff at least one non-self
+			// peer_registry row exists.
 			//
 			// Gated on registrar success: if the registrar didn't
-			// start, the self row may be missing or stale and the
-			// remote rows we'd be counting could be orphans from a
-			// prior boot. Suppressing the skill there avoids
-			// teasing the agent into a switch that always 4xxs.
+			// start, the self row may be missing and a remote row
+			// we'd be counting could be an orphan from a prior
+			// boot of an unrelated host. Suppressing the skill
+			// there avoids teasing the agent on a misconfigured
+			// boot.
 			//
-			// Status filter is "online" only. degraded rows are
-			// excluded — they're tracked by the offline sweeper
-			// for visibility, but a degraded target's handoff
-			// pull leg is likely to time out and surface a
-			// confusing partial-state outcome to the user.
+			// No status filter: the gate only checks row presence
+			// (any status, any last_seen). Online/freshness
+			// enforcement lives in switch_device_handler.go, which
+			// 409s a switch dispatched at a peer that isn't
+			// currently online. Surfacing "target offline" from
+			// the skill body is better UX than the skill missing
+			// entirely. The previous online-only gate caused the
+			// skill to flicker on/off at chat time as peers
+			// cycled in and out of the online status, leaving
+			// agents whose last chat happened during a brief
+			// offline window without the skill until the next
+			// chat.
 			if peerRegistrar != nil {
 				selfID := peerIdentity.DeviceID
 				agent.SetPeerCountLookup(func() int {
@@ -564,26 +572,13 @@ func main() {
 					}
 					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 					defer cancel()
-					rows, err := lookupStore.ListPeers(ctx, store.ListPeersOptions{Status: store.PeerStatusOnline})
+					rows, err := lookupStore.ListPeers(ctx, store.ListPeersOptions{})
 					if err != nil {
 						return 0
 					}
-					// Boot-stale guard: a row that was online at the
-					// last shutdown sits with status=online + a stale
-					// last_seen until the OfflineSweeper's first tick
-					// (SweepInterval after Start). Until that tick the
-					// status filter alone would count peers that
-					// haven't been seen since the previous boot.
-					// Re-validate freshness inline against
-					// OfflineThreshold so the skill gate is robust
-					// across daemon restarts.
-					cutoffMillis := time.Now().Add(-peer.OfflineThreshold).UnixMilli()
 					count := 0
 					for _, r := range rows {
 						if r.DeviceID == selfID {
-							continue
-						}
-						if r.LastSeen <= 0 || r.LastSeen < cutoffMillis {
 							continue
 						}
 						count++

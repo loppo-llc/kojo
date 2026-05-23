@@ -231,15 +231,16 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 			"target must not equal the local peer")
 		return
 	}
-	// Freshness guard. peerCountLookup (cmd/kojo/main.go)
-	// already filters online + last_seen-fresh peers for the
-	// skill install gate, but the handler must enforce the same
-	// rule server-side: a stale online row that survived a
-	// daemon restart but hasn't been touched since
-	// peer.OfflineThreshold ago is almost certainly unreachable.
-	// Failing fast here saves a 5-minute switch attempt that
-	// would time out in the pull leg and surface a confusing
-	// abort_failed outcome.
+	// Freshness guard. peerCountLookup (cmd/kojo/main.go) only
+	// checks for the existence of a non-self peer_registry row —
+	// it intentionally does NOT filter on online status so the
+	// skill stays installed across transient peer offlines.
+	// Online/freshness enforcement lives HERE, server-side: a row
+	// that's not currently online (or that survived a daemon
+	// restart with a stale last_seen past peer.OfflineThreshold)
+	// is almost certainly unreachable. Failing fast saves a
+	// 5-minute switch attempt that would time out in the pull leg
+	// and surface a confusing abort_failed outcome.
 	if targetRec.Status != store.PeerStatusOnline {
 		writeError(w, http.StatusConflict, "target_offline",
 			"target peer is not online: status="+targetRec.Status)
