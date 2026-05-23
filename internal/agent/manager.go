@@ -1076,12 +1076,17 @@ func validateUpdateConfigPure(cfg *AgentUpdateConfig) (nextCronMessage string, c
 	if cfg.Effort != nil && !ValidEffort(*cfg.Effort) {
 		return "", false, fmt.Errorf("unsupported effort level: %q", *cfg.Effort)
 	}
+	// Absolute-path shape is a pure check that belongs here so a
+	// malformed payload is rejected before AcquireMutation lets us
+	// reach the agent-existence lookup. The filesystem existence
+	// probe (os.Stat / MkdirAll) is intentionally NOT here — it runs
+	// after the agent-existence check in Update() so a PATCH for a
+	// missing agent doesn't side-effect a directory creation, and
+	// so the §3.7 default-workspace MkdirAll has an agentID it has
+	// already confirmed belongs to a live agent on this peer.
 	if cfg.WorkDir != nil && *cfg.WorkDir != "" {
 		if !filepath.IsAbs(*cfg.WorkDir) {
 			return "", false, fmt.Errorf("workDir must be an absolute path: %s", *cfg.WorkDir)
-		}
-		if info, ierr := os.Stat(*cfg.WorkDir); ierr != nil || !info.IsDir() {
-			return "", false, fmt.Errorf("workDir does not exist or is not a directory: %s", *cfg.WorkDir)
 		}
 	}
 	if cfg.ThinkingMode != nil && !ValidThinkingMode(*cfg.ThinkingMode) {
@@ -1188,6 +1193,20 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		return nil, fmt.Errorf("customBaseURL is required for %s tool", prospTool)
 	}
 	m.mu.Unlock()
+
+	// WorkDir filesystem check runs HERE (post agent-existence
+	// lookup) so a PATCH for a non-existent agent never side-effects
+	// a MkdirAll, and so the §3.7 default-workspace self-heal sees
+	// an agentID that's confirmed live on this peer. Absolute-path
+	// shape was already rejected in validateUpdateConfigPure.
+	if cfg.WorkDir != nil && *cfg.WorkDir != "" {
+		if merr := EnsureAgentWorkspaceDirIfDefault(*cfg.WorkDir, id); merr != nil {
+			return nil, fmt.Errorf("create agent workspace dir: %w", merr)
+		}
+		if info, ierr := os.Stat(*cfg.WorkDir); ierr != nil || !info.IsDir() {
+			return nil, fmt.Errorf("workDir does not exist or is not a directory: %s", *cfg.WorkDir)
+		}
+	}
 
 	// Persona write: disk + DB row in one personaSyncMu critical section.
 	//

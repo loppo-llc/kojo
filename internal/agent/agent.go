@@ -595,6 +595,13 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		if !filepath.IsAbs(cfg.WorkDir) {
 			return nil, fmt.Errorf("workDir must be an absolute path: %s", cfg.WorkDir)
 		}
+		// Self-heal the portable default workspace path (§3.7
+		// device-switch target) so a fresh agent created against
+		// that path doesn't 400 on the os.Stat below. No-op for
+		// any other workDir.
+		if merr := EnsureAgentWorkspaceDirIfDefault(cfg.WorkDir, id); merr != nil {
+			return nil, fmt.Errorf("create agent workspace dir: %w", merr)
+		}
 		if info, err := os.Stat(cfg.WorkDir); err != nil || !info.IsDir() {
 			return nil, fmt.Errorf("workDir does not exist or is not a directory: %s", cfg.WorkDir)
 		}

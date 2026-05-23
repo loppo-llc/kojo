@@ -255,6 +255,18 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 			"agent record with id required")
 		return
 	}
+	// Path-safety gate: agent.id flows into filepath.Join for the
+	// portable workspace path, AgentDir, claude session JSONL paths
+	// and persona/memory file lookups. An id containing path
+	// separators or `..` would let a malicious peer-sync payload
+	// steer those writes outside their intended subtrees, and
+	// Settings["workDir"] would store the escaped path for later
+	// reuse. Reject at the boundary before any of those callers run.
+	if !agent.IsPathSafeAgentID(req.Agent.ID) {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"agent.id contains characters not safe for on-disk paths")
+		return
+	}
 	if s.peerID != nil && req.SourceDeviceID == s.peerID.DeviceID {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"source_device_id must not equal the local peer")
@@ -297,6 +309,10 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 		req.Agent.Settings = map[string]any{}
 	}
 	req.Agent.Settings["workDir"] = targetWorkDir
+	// MkdirAll for the portable default workDir runs AFTER the
+	// base64 decode loop below so a 400 on malformed claude_sessions
+	// doesn't leave a stub directory behind on target. The
+	// Settings["workDir"] rewrite above is purely in-memory.
 
 	// Pre-decode claude_sessions BEFORE the DB sync runs. A
 	// malformed base64 payload caught here returns 400 with
@@ -320,6 +336,18 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 				Content:   body,
 			})
 		}
+	}
+
+	// Materialise the portable default workDir on disk so a
+	// subsequent Settings save (validateUpdateConfigPure absolute
+	// path check + the post-existence stat in Update) doesn't 400
+	// with "workDir does not exist" on the first edit after the
+	// switch. Deferred to here so the base64 decode 400 path above
+	// short-circuits before we touch the filesystem.
+	if merr := agent.EnsureAgentWorkspaceDirIfDefault(targetWorkDir, req.Agent.ID); merr != nil {
+		writeError(w, http.StatusInternalServerError, "internal",
+			"create target workDir: "+merr.Error())
+		return
 	}
 
 	// Two-phase sync to make sessions + DB atomic-ish across

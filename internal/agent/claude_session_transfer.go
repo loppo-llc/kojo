@@ -4,7 +4,30 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 )
+
+// pathSafeAgentIDPattern restricts the agentID character set to one
+// that cannot embed path separators, `.` (so no `..` segments) or
+// other shell metacharacters. The default workspace path joins the
+// home dir with `.kojo/agent-workspaces/<id>`, and the agentID also
+// rides along into other on-disk paths (AgentDir etc.), so a
+// peer-sync payload supplying an id of `../../etc` would otherwise
+// let MkdirAll / cmd.Dir escape the intended subtree. Deliberately
+// looser than generatePrefixedID's exact shape (`ag_` + hex) so
+// legacy test fixtures like `ag_alice` and historical IDs that may
+// not match the current generator are still admitted — the guarantee
+// we need here is path-safety, not "matches today's generator".
+// Mirrors internal/auth/store.go agentIDPattern.
+var pathSafeAgentIDPattern = regexp.MustCompile(`^[A-Za-z0-9_\-]{1,128}$`)
+
+// IsPathSafeAgentID reports whether id is safe to embed in an
+// on-disk path or filename. Exported so HTTP handlers can reject
+// peer-sync payloads with a malformed agent.id at the boundary,
+// returning 400 instead of letting the value flow to filepath.Join.
+func IsPathSafeAgentID(id string) bool {
+	return pathSafeAgentIDPattern.MatchString(id)
+}
 
 // claude session JSONL transfer for §3.7 device switch.
 //
@@ -310,6 +333,9 @@ func DefaultAgentWorkDir(agentID string) (string, error) {
 	if agentID == "" {
 		return "", fmt.Errorf("agent.DefaultAgentWorkDir: agent_id required")
 	}
+	if !pathSafeAgentIDPattern.MatchString(agentID) {
+		return "", fmt.Errorf("agent.DefaultAgentWorkDir: invalid agent_id %q", agentID)
+	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		// Fall back to kojo's per-agent state dir; not as nice
@@ -318,6 +344,41 @@ func DefaultAgentWorkDir(agentID string) (string, error) {
 		return AgentDir(agentID), nil
 	}
 	return filepath.Join(home, ".kojo", "agent-workspaces", agentID), nil
+}
+
+// EnsureAgentWorkspaceDirIfDefault MkdirAll's workDir when it matches
+// DefaultAgentWorkDir(agentID), and otherwise is a no-op. Used by the
+// peer sync handler and the agent create/update validators so the
+// portable default path doesn't trip the "workDir does not exist"
+// check on the first save after a §3.7 device switch — only kojo
+// itself can produce that exact path, so auto-creating it doesn't
+// expand the surface for arbitrary attacker-supplied paths.
+// Non-matching workDir values still go through the normal os.Stat
+// existence check at the call site.
+//
+// Hardening: agentID is gated through agentIDDirPattern before it ever
+// reaches filepath.Join, so a peer-sync payload claiming an id of
+// `../../etc` can't steer MkdirAll outside the agent-workspaces
+// subtree. The MkdirAll target is the cleaned default path (not the
+// caller-supplied workDir) — equality on cleaned paths guarantees the
+// two resolve identically, and using the canonical form keeps a
+// `.../foo/.` style input from leaving a trailing-dot artifact on disk.
+func EnsureAgentWorkspaceDirIfDefault(workDir, agentID string) error {
+	if workDir == "" || agentID == "" {
+		return nil
+	}
+	// DefaultAgentWorkDir validates agentID against pathSafeAgentIDPattern
+	// internally, so a malformed id surfaces as err here and we skip
+	// MkdirAll. Caller's downstream stat check still rejects the workDir.
+	def, err := DefaultAgentWorkDir(agentID)
+	if err != nil {
+		return nil
+	}
+	defClean := filepath.Clean(def)
+	if filepath.Clean(workDir) != defClean {
+		return nil
+	}
+	return os.MkdirAll(defClean, 0o755)
 }
 
 // claudeSessionMaxBytes caps an individual JSONL file the
