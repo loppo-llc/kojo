@@ -64,7 +64,7 @@ type ChatOptions struct {
 
 // backendSupportsSessionKey reports whether the backend honors
 // ChatOptions.SessionKey when building its CLI invocation. Backends that
-// ignore SessionKey (codex, llama.cpp, custom) cannot isolate a
+// ignore SessionKey (codex, grok, llama.cpp, custom) cannot isolate a
 // per-thread session from the agent's main session, so the manager drops
 // SessionKey for them and degrades to OneShot=true — keeping the chat
 // ephemeral rather than silently mixing thread contexts.
@@ -90,7 +90,7 @@ type ChatBackend interface {
 	// The channel is closed when the response is complete.
 	Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error)
 
-	// Name returns the tool identifier (e.g. "claude", "codex").
+	// Name returns the tool identifier (e.g. "claude", "codex", "grok").
 	Name() string
 
 	// Available returns true if the CLI tool is installed and accessible.
@@ -204,6 +204,11 @@ func filterEnv(removePrefixes []string, agentID, dataDir string) []string {
 // terminated due to context cancellation. The ErrorMessage distinguishes
 // timeout (context.DeadlineExceeded) from user-initiated abort
 // (context.Canceled), so the transcript does not mislabel aborts as timeouts.
+//
+// The send is ctx-aware so a receiver that has already disengaged
+// (channel buffer full + reader gone after ctx.Done) does not deadlock
+// the backend goroutine and leak post-stream cleanup work like temp
+// file removal.
 func emitCancelDone(ctx context.Context, ch chan<- ChatEvent, content, thinking string, toolUses []ToolUse, usage *Usage) {
 	msg := newAssistantMessage()
 	msg.Content = content
@@ -214,11 +219,28 @@ func emitCancelDone(ctx context.Context, ch chan<- ChatEvent, content, thinking 
 	if ctx.Err() == context.Canceled {
 		errMsg = ErrMsgCancelled
 	}
-	ch <- ChatEvent{
+	ev := ChatEvent{
 		Type:         "done",
 		Message:      msg,
 		Usage:        usage,
 		ErrorMessage: errMsg,
+	}
+	// Try a non-blocking send first so a live receiver with buffer
+	// space always wins over the (already-signaled) ctx.Done case
+	// — select with two ready cases would otherwise pick randomly
+	// and drop the event for an active consumer.
+	select {
+	case ch <- ev:
+		return
+	default:
+	}
+	select {
+	case ch <- ev:
+	case <-ctx.Done():
+		// Receiver already gave up and the buffer stayed full.
+		// Drop the partial done event rather than block forever —
+		// the goroutine still needs to close(ch) and run deferred
+		// cleanup.
 	}
 }
 

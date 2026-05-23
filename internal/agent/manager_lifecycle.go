@@ -122,6 +122,7 @@ func (m *Manager) ResetData(id string) error {
 
 	// Clear global CLI session stores
 	clearClaudeSession(id)
+	clearGrokSession(id)
 
 	// Recreate empty memory directory and MEMORY.md (required for agent to function).
 	// Capture the error rather than returning so we always release
@@ -1559,6 +1560,8 @@ func (m *Manager) ResetSession(agentID string) error {
 		clearClaudeSession(agentID)
 	case "custom":
 		clearClaudeSession(agentID)
+	case "grok":
+		clearGrokSession(agentID)
 	}
 	// Codex uses ephemeral sessions — no persistent state to clear
 

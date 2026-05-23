@@ -288,7 +288,7 @@ func main() {
 	// tmux is required for user tool sessions on Unix
 	if runtime.GOOS != "windows" {
 		if _, err := exec.LookPath("tmux"); err != nil {
-			logger.Warn("tmux not found in PATH; user tool sessions (claude, codex) will not work")
+			logger.Warn("tmux not found in PATH; user tool sessions (claude, codex, grok) will not work")
 		}
 	}
 

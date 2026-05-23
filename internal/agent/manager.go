@@ -325,6 +325,7 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		backends: map[string]ChatBackend{
 			"claude":    NewClaudeBackend(logger),
 			"codex":     NewCodexBackend(logger),
+			"grok":      NewGrokBackend(logger),
 			"custom":    NewCustomBackend(logger),
 			"llama.cpp": NewLlamaCppBackend(logger),
 		},

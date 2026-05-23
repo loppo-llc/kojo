@@ -147,6 +147,10 @@ func NormalizeThinkingMode(mode string) string {
 // xhighModels lists models that support the "xhigh" effort level.
 var xhighModels = map[string]bool{
 	"opus": true, "claude-opus-4-7": true,
+	// grok's --effort flag accepts low/medium/high/xhigh/max for
+	// every model it ships (only grok-build today). Keep this in
+	// sync with web/src/lib/toolModels.ts xhighModels.
+	"grok-build": true,
 }
 
 // ValidModelEffort returns true if the model+effort combination is valid.
@@ -217,8 +221,8 @@ type Agent struct {
 	Name    string `json:"name"`
 	Persona string `json:"persona"`           // persona description (markdown)
 	Model   string `json:"model"`             // e.g. "sonnet", "opus"
-	Effort  string `json:"effort,omitempty"`  // claude only: "low", "medium", "high", "xhigh", "max"
-	Tool    string `json:"tool"`              // CLI tool: "claude", "codex"
+	Effort  string `json:"effort,omitempty"`  // claude/grok only: "low", "medium", "high", "xhigh", "max"
+	Tool    string `json:"tool"`              // CLI tool: "claude", "codex", "grok"
 	WorkDir string `json:"workDir,omitempty"` // file storage directory (empty = agentDir)
 	// CronExpr is a 5-field standard cron expression (M H DOM Mon DOW).
 	// Empty = scheduling disabled. Validated via ValidateCronExpr; rejected

@@ -20,6 +20,10 @@ export const toolModels: Record<string, ToolModelConfig> = {
       "gpt-5.2",
     ],
   },
+  grok: {
+    default: "grok-build",
+    models: ["grok-build"],
+  },
   custom: {
     default: "",
     models: [],
@@ -45,10 +49,10 @@ export const effortLevels = ["low", "medium", "high", "xhigh", "max"] as const;
 export type EffortLevel = (typeof effortLevels)[number];
 
 /** Models that support the xhigh effort level. */
-const xhighModels = new Set(["opus", "claude-opus-4-7"]);
+const xhighModels = new Set(["opus", "claude-opus-4-7", "grok-build"]);
 
 export function supportsEffort(tool: string): boolean {
-  return tool === "claude";
+  return tool === "claude" || tool === "grok";
 }
 
 /** Return available effort levels for a given model. */
