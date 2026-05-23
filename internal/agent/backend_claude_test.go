@@ -870,6 +870,353 @@ func TestPrepareClaudeSettings_BashCaptureHook(t *testing.T) {
 		}
 	})
 
+	t.Run("preserves user-authored mcpServers across rewrites", func(t *testing.T) {
+		// Drive the exact "user added mcp-remote to settings.local.json"
+		// path that motivated this change: kojo must not nuke the
+		// mcpServers block on subsequent Chat invocations.
+		userAgentID := "ag_user_mcp_test"
+		if err := os.MkdirAll(filepath.Join(agentDir(userAgentID), ".claude"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		settingsPath := filepath.Join(agentDir(userAgentID), ".claude", "settings.local.json")
+		userSettings := map[string]any{
+			"mcpServers": map[string]any{
+				"bitstar": map[string]any{
+					"command": "npx",
+					"args":    []any{"mcp-remote", "https://example.com/mcp"},
+				},
+			},
+			"enabledMcpjsonServers": []any{"bitstar"},
+			"env":                   map[string]any{"FOO": "bar"},
+		}
+		raw, err := json.MarshalIndent(userSettings, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(settingsPath, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		PrepareClaudeSettings(userAgentID, "https://kojo.example/api", []string{"claude"}, logger)
+
+		raw, err = os.ReadFile(settingsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			t.Fatalf("settings is not valid JSON: %v\n%s", err, raw)
+		}
+
+		// User keys survived.
+		mcp, _ := parsed["mcpServers"].(map[string]any)
+		if _, ok := mcp["bitstar"]; !ok {
+			t.Errorf("mcpServers.bitstar was wiped: %s", raw)
+		}
+		enabled, _ := parsed["enabledMcpjsonServers"].([]any)
+		if len(enabled) != 1 || enabled[0] != "bitstar" {
+			t.Errorf("enabledMcpjsonServers was modified: %v", enabled)
+		}
+		env, _ := parsed["env"].(map[string]any)
+		if env["FOO"] != "bar" {
+			t.Errorf("env.FOO was modified: %v", env)
+		}
+
+		// kojo-managed keys are present.
+		if parsed["persona"] != "agent-managed" {
+			t.Errorf("persona not forced: %v", parsed["persona"])
+		}
+		perms, _ := parsed["permissions"].(map[string]any)
+		if perms["defaultMode"] != "bypassPermissions" {
+			t.Errorf("defaultMode not forced: %v", perms["defaultMode"])
+		}
+		allow, _ := perms["allow"].([]any)
+		want := "Edit(**/.claude/**)"
+		found := false
+		for _, item := range allow {
+			if item == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("kojo allow rule %q missing from %v", want, allow)
+		}
+		hooks, _ := parsed["hooks"].(map[string]any)
+		if _, ok := hooks["PreToolUse"]; !ok {
+			t.Errorf("PreToolUse missing: %s", raw)
+		}
+		if _, ok := hooks["PreCompact"]; !ok {
+			t.Errorf("PreCompact missing: %s", raw)
+		}
+	})
+
+	t.Run("preserves user-authored hooks under different matchers", func(t *testing.T) {
+		hooksAgentID := "ag_user_hooks_test"
+		if err := os.MkdirAll(filepath.Join(agentDir(hooksAgentID), ".claude"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		settingsPath := filepath.Join(agentDir(hooksAgentID), ".claude", "settings.local.json")
+		userSettings := map[string]any{
+			"hooks": map[string]any{
+				"PreToolUse": []any{
+					map[string]any{
+						"matcher": "Edit",
+						"hooks": []any{
+							map[string]any{"type": "command", "command": "/usr/local/bin/user-edit-hook"},
+						},
+					},
+				},
+				"PostToolUse": []any{
+					map[string]any{
+						"matcher": "Bash",
+						"hooks": []any{
+							map[string]any{"type": "command", "command": "/usr/local/bin/user-post-bash"},
+						},
+					},
+				},
+			},
+		}
+		raw, err := json.MarshalIndent(userSettings, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(settingsPath, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		PrepareClaudeSettings(hooksAgentID, "https://kojo.example/api", nil, logger)
+
+		raw, err = os.ReadFile(settingsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			t.Fatalf("settings is not valid JSON: %v\n%s", err, raw)
+		}
+		hooks, _ := parsed["hooks"].(map[string]any)
+
+		// User's PreToolUse[matcher=Edit] survives alongside kojo's Bash entry.
+		preToolUse, _ := hooks["PreToolUse"].([]any)
+		var sawUserEdit, sawKojoBash bool
+		for _, item := range preToolUse {
+			entry, _ := item.(map[string]any)
+			m, _ := entry["matcher"].(string)
+			inner, _ := entry["hooks"].([]any)
+			if m == "Edit" {
+				sawUserEdit = true
+			}
+			if m == "Bash" {
+				// Sanity check: it's the kojo entry pointing at our hook script.
+				if len(inner) == 1 {
+					h, _ := inner[0].(map[string]any)
+					if cmd, _ := h["command"].(string); strings.Contains(cmd, "bash-capture.sh") {
+						sawKojoBash = true
+					}
+				}
+			}
+		}
+		if !sawUserEdit {
+			t.Errorf("user PreToolUse[Edit] hook was dropped: %s", raw)
+		}
+		if !sawKojoBash {
+			t.Errorf("kojo PreToolUse[Bash] hook was not installed: %s", raw)
+		}
+
+		// User's entire PostToolUse event group is untouched.
+		postToolUse, ok := hooks["PostToolUse"].([]any)
+		if !ok || len(postToolUse) != 1 {
+			t.Errorf("PostToolUse was modified: %v", hooks["PostToolUse"])
+		}
+	})
+
+	t.Run("user allow entries survive and kojo rules dedupe", func(t *testing.T) {
+		allowAgentID := "ag_user_allow_test"
+		if err := os.MkdirAll(filepath.Join(agentDir(allowAgentID), ".claude"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		settingsPath := filepath.Join(agentDir(allowAgentID), ".claude", "settings.local.json")
+		userSettings := map[string]any{
+			"permissions": map[string]any{
+				"defaultMode": "ask", // will be forced back to bypassPermissions
+				"allow": []any{
+					"WebFetch(domain:example.com)",
+					"Edit(**/.claude/**)", // duplicate of kojo rule
+				},
+			},
+		}
+		raw, _ := json.MarshalIndent(userSettings, "", "  ")
+		if err := os.WriteFile(settingsPath, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		PrepareClaudeSettings(allowAgentID, "", []string{"claude"}, logger)
+
+		raw, _ = os.ReadFile(settingsPath)
+		var parsed map[string]any
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			t.Fatalf("settings is not valid JSON: %v\n%s", err, raw)
+		}
+		perms, _ := parsed["permissions"].(map[string]any)
+		if perms["defaultMode"] != "bypassPermissions" {
+			t.Errorf("defaultMode not forced back to bypassPermissions: %v", perms["defaultMode"])
+		}
+		allow, _ := perms["allow"].([]any)
+
+		var userRuleFound int
+		var kojoRuleFound int
+		for _, item := range allow {
+			switch item {
+			case "WebFetch(domain:example.com)":
+				userRuleFound++
+			case "Edit(**/.claude/**)":
+				kojoRuleFound++
+			}
+		}
+		if userRuleFound != 1 {
+			t.Errorf("user allow rule lost: %v", allow)
+		}
+		if kojoRuleFound != 1 {
+			t.Errorf("kojo allow rule duplicated or missing: %v", allow)
+		}
+	})
+
+	t.Run("PreCompact wildcard user entries are deduped with kojo entry", func(t *testing.T) {
+		// Claude Code treats matcher "", missing matcher, and matcher "*"
+		// all as "match every PreCompact event". If a user writes one of
+		// those forms by hand, the kojo PreCompact entry must replace
+		// (not coexist with) it — otherwise the PreCompact hook fires
+		// twice on every compact event.
+		dupAgentID := "ag_precompact_dedupe_test"
+		if err := os.MkdirAll(filepath.Join(agentDir(dupAgentID), ".claude"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		settingsPath := filepath.Join(agentDir(dupAgentID), ".claude", "settings.local.json")
+		userSettings := map[string]any{
+			"hooks": map[string]any{
+				"PreCompact": []any{
+					// matcher missing — wildcard per claude semantics
+					map[string]any{
+						"hooks": []any{
+							map[string]any{"type": "command", "command": "/usr/local/bin/user-precompact-a"},
+						},
+					},
+					// matcher explicit "*" — also wildcard
+					map[string]any{
+						"matcher": "*",
+						"hooks": []any{
+							map[string]any{"type": "command", "command": "/usr/local/bin/user-precompact-b"},
+						},
+					},
+				},
+			},
+		}
+		raw, _ := json.MarshalIndent(userSettings, "", "  ")
+		if err := os.WriteFile(settingsPath, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		PrepareClaudeSettings(dupAgentID, "https://kojo.example/api", nil, logger)
+
+		raw, _ = os.ReadFile(settingsPath)
+		var parsed map[string]any
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			t.Fatalf("settings is not valid JSON: %v\n%s", err, raw)
+		}
+		hooks, _ := parsed["hooks"].(map[string]any)
+		preCompact, _ := hooks["PreCompact"].([]any)
+		if len(preCompact) != 1 {
+			t.Errorf("expected exactly 1 PreCompact entry after dedupe, got %d: %s", len(preCompact), raw)
+		}
+		entry, _ := preCompact[0].(map[string]any)
+		if m, _ := entry["matcher"].(string); m != "" {
+			t.Errorf("expected kojo entry with matcher \"\", got %q", m)
+		}
+	})
+
+	t.Run("unreadable existing settings is left untouched", func(t *testing.T) {
+		// A read error other than ENOENT (e.g. permission denied,
+		// transient I/O failure) must NOT trigger regeneration from an
+		// empty map — that would clobber user keys we couldn't read.
+		// Skip on Windows: chmod 0o000 doesn't reliably block the owner's
+		// reads on Windows file semantics.
+		if hostOS == "windows" {
+			t.Skip("permission-denied read semantics not portable on windows")
+		}
+		// Running as root makes chmod 0o000 a no-op for reads, so the
+		// branch we're trying to exercise never fires. Skip in that case.
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses file permissions; cannot simulate read failure")
+		}
+
+		unreadableAgentID := "ag_unreadable_settings_test"
+		if err := os.MkdirAll(filepath.Join(agentDir(unreadableAgentID), ".claude"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		settingsPath := filepath.Join(agentDir(unreadableAgentID), ".claude", "settings.local.json")
+		userSettings := map[string]any{
+			"mcpServers": map[string]any{"bitstar": map[string]any{"command": "npx"}},
+		}
+		raw, _ := json.MarshalIndent(userSettings, "", "  ")
+		if err := os.WriteFile(settingsPath, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(settingsPath, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(settingsPath, 0o644) })
+
+		PrepareClaudeSettings(unreadableAgentID, "https://kojo.example/api", nil, logger)
+
+		// Restore read permission and verify on-disk content is unchanged.
+		if err := os.Chmod(settingsPath, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(settingsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal(got, &parsed); err != nil {
+			t.Fatalf("settings is not valid JSON after read failure: %v\n%s", err, got)
+		}
+		// User key must survive — kojo did not regenerate.
+		mcp, _ := parsed["mcpServers"].(map[string]any)
+		if _, ok := mcp["bitstar"]; !ok {
+			t.Errorf("user mcpServers was clobbered by read-error fallback: %s", got)
+		}
+		// And critically, kojo did not write its own keys either.
+		if _, ok := parsed["persona"]; ok {
+			t.Errorf("kojo wrote into an unreadable file: %s", got)
+		}
+	})
+
+	t.Run("malformed existing settings is replaced gracefully", func(t *testing.T) {
+		brokenAgentID := "ag_broken_settings_test"
+		if err := os.MkdirAll(filepath.Join(agentDir(brokenAgentID), ".claude"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		settingsPath := filepath.Join(agentDir(brokenAgentID), ".claude", "settings.local.json")
+		if err := os.WriteFile(settingsPath, []byte("{not valid json"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		PrepareClaudeSettings(brokenAgentID, "", nil, logger)
+
+		raw, err := os.ReadFile(settingsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			t.Fatalf("settings is not valid JSON after recovery: %v\n%s", err, raw)
+		}
+		if parsed["persona"] != "agent-managed" {
+			t.Errorf("persona missing after recovery: %v", parsed)
+		}
+	})
+
 	t.Run("windows skips PreToolUse hook", func(t *testing.T) {
 		// Fresh agent dir to avoid carryover from previous subtests.
 		winAgentID := "ag_bash_capture_test_win"

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -1078,11 +1079,11 @@ func normalizeAllowProtectedPaths(paths []string) []string {
 
 // buildProtectedPathAllowRules emits permissions.allow rule strings for the
 // given protected directory names (e.g. "claude" → Edit/Write/MultiEdit for
-// any **/.claude/** path). Returns a JSON array body (without the surrounding
-// brackets) suitable for inlining into settings.local.json.
-func buildProtectedPathAllowRules(paths []string) string {
+// any **/.claude/** path). Returns one rule per slice element (no JSON
+// encoding), so callers can merge them into an existing allow list.
+func buildProtectedPathAllowRules(paths []string) []string {
 	if len(paths) == 0 {
-		return ""
+		return nil
 	}
 	var rules []string
 	for _, name := range paths {
@@ -1090,10 +1091,10 @@ func buildProtectedPathAllowRules(paths []string) string {
 			continue
 		}
 		for _, tool := range []string{"Edit", "Write", "MultiEdit"} {
-			rules = append(rules, fmt.Sprintf(`"%s(**/.%s/**)"`, tool, name))
+			rules = append(rules, fmt.Sprintf("%s(**/.%s/**)", tool, name))
 		}
 	}
-	return strings.Join(rules, ",")
+	return rules
 }
 
 // bashCaptureHookScript is the PreToolUse hook installed for every claude
@@ -1217,6 +1218,28 @@ func writeBashCaptureHook(claudeDir, captureDir string) (string, error) {
 	return hookPath, nil
 }
 
+// settingsLocks serializes PrepareClaudeSettings calls per agent ID. The
+// kojo settings merge is read-modify-write on settings.local.json, so two
+// concurrent calls can race: caller A reads the file, caller B reads the
+// same file, A writes, B writes — B's write erases keys A added (or vice
+// versa). A process-wide map of per-agent mutexes keeps callers single-file
+// per agent without blocking unrelated agents.
+//
+// LoadOrStore guarantees only one mutex per agent ID even under racing
+// first-time access. We never delete entries, so the map grows with active
+// agent count — acceptable: an agent's lock is a sync.Mutex (8 bytes plus
+// map overhead) and agents are bounded by the kojo deployment.
+var settingsLocks sync.Map
+
+// lockSettingsForAgent acquires the per-agent settings lock and returns an
+// unlock function. Callers must defer the returned closure.
+func lockSettingsForAgent(agentID string) func() {
+	m, _ := settingsLocks.LoadOrStore(agentID, &sync.Mutex{})
+	mu := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
 // atomicWriteFile writes data to path via a temp+rename, ensuring concurrent
 // readers never observe a partial write.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
@@ -1250,10 +1273,20 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
-// PrepareClaudeSettings writes .claude/settings.local.json with persona
-// override, the bash-capture PreToolUse hook (always installed), and
-// (when apiBase is available) a PreCompact hook that calls kojo's API to
-// save a conversation summary before Claude compacts context.
+// PrepareClaudeSettings ensures .claude/settings.local.json carries kojo's
+// required configuration without clobbering user-authored keys. It performs
+// a key-level merge instead of rewriting the whole file:
+//
+//   - kojo-managed keys are forced to canonical values every call:
+//     persona, permissions.defaultMode, permissions.allow (kojo-derived
+//     rules are union-appended), hooks.PreToolUse[matcher=="Bash"],
+//     hooks.PreCompact[matcher==""].
+//   - Every other key (mcpServers, enabledMcpjsonServers, env, model,
+//     user-authored hooks with different matchers, …) is left untouched.
+//
+// This lets agents persist their own MCP server definitions (e.g. via
+// `mcpServers`) without each kojo Chat invocation wiping them.
+//
 // Called from Manager.Chat before backend.Chat to ensure settings are in
 // place before the Claude process reads them.
 func PrepareClaudeSettings(agentID, apiBase string, allowProtectedPaths []string, logger *slog.Logger) {
@@ -1291,86 +1324,238 @@ func PrepareClaudeSettings(agentID, apiBase string, allowProtectedPaths []string
 		}
 	}
 
-	allowRules := buildProtectedPathAllowRules(allowProtectedPaths)
-	bashHookBlock := ""
-	if hookPath != "" {
-		// hookPath is an absolute path under agentDir, no embedded quotes.
-		bashHookBlock = fmt.Sprintf(`    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": %q
-          }
-        ]
-      }
-    ]`, hookPath)
+	settingsPath := filepath.Join(claudeDir, "settings.local.json")
+
+	// Serialize concurrent PrepareClaudeSettings calls for the same agent so
+	// the read-modify-write doesn't lose user edits to mcpServers / hooks /
+	// env on the next overlapping Chat. ChatOneShot can fire concurrently
+	// for the same agent (see capture-prune comment above), and without the
+	// lock two callers can race on read so the second write overwrites the
+	// first's not-yet-flushed changes.
+	unlock := lockSettingsForAgent(agentID)
+	defer unlock()
+
+	// Load existing settings (if any) so user-authored keys survive the
+	// merge. A missing file falls back to an empty object — we just create
+	// a fresh settings.local.json. A malformed file is a recoverable case:
+	// log the parse error and regenerate.
+	// A read error other than "not exist" (e.g. permission denied,
+	// transient I/O failure) is NOT recoverable: regenerating from an
+	// empty map would clobber user-authored keys that we couldn't read.
+	// Bail out instead and leave the on-disk file alone.
+	existing := map[string]any{}
+	if raw, err := os.ReadFile(settingsPath); err == nil {
+		if err := json.Unmarshal(raw, &existing); err != nil {
+			logger.Warn("existing settings.local.json is not valid JSON, regenerating from scratch", "agent", agentID, "err", err)
+			existing = map[string]any{}
+		}
+	} else if !os.IsNotExist(err) {
+		logger.Warn("failed to read existing settings.local.json, leaving on-disk file untouched to avoid clobbering user keys", "agent", agentID, "err", err)
+		return
 	}
 
-	var preCompactBlock string
+	merged := mergeClaudeSettings(existing, hookPath, apiBase, agentID, allowProtectedPaths)
+
+	data, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		logger.Warn("failed to marshal claude settings", "agent", agentID, "err", err)
+		return
+	}
+	data = append(data, '\n')
+
+	// Atomic write — claude reads settings.local.json on startup, and a
+	// concurrent Chat overwriting it could surface a partial JSON to a
+	// claude process that's also booting.
+	if err := atomicWriteFile(settingsPath, data, 0o644); err != nil {
+		logger.Warn("failed to write claude settings", "agent", agentID, "err", err)
+	}
+}
+
+// kojoBashHookMatcher is the matcher value claude uses to dispatch the
+// bash-capture hook. mergeClaudeSettings keys ownership off this string —
+// any PreToolUse entry with this matcher is considered kojo-owned and gets
+// replaced (or removed) on every call.
+const kojoBashHookMatcher = "Bash"
+
+// kojoPreCompactMatcher is the empty-string matcher claude uses for hooks
+// that run on every PreCompact event. mergeClaudeSettings replaces the
+// entry with this matcher; entries with non-empty matchers (if claude ever
+// gains matcher dispatch for PreCompact) are left alone.
+const kojoPreCompactMatcher = ""
+
+// mergeClaudeSettings produces the next settings.local.json content by
+// taking `existing` (the current on-disk JSON, possibly empty) and
+// imposing kojo's required fields onto it. Non-kojo keys are preserved
+// verbatim so users may persist their own MCP servers, env, model
+// preferences, and even additional hooks (provided they use matchers
+// kojo doesn't claim).
+//
+// Pure function — no I/O — so it can be exhaustively unit-tested.
+func mergeClaudeSettings(existing map[string]any, hookPath, apiBase, agentID string, allowProtectedPaths []string) map[string]any {
+	out := map[string]any{}
+	for k, v := range existing {
+		out[k] = v
+	}
+
+	// 1. persona — always forced to "agent-managed". This flag flips
+	//    claude into kojo's headless mode; user override is unsupported.
+	out["persona"] = "agent-managed"
+
+	// 2. permissions — defaultMode forced; allow merged.
+	permsRaw, _ := out["permissions"].(map[string]any)
+	if permsRaw == nil {
+		permsRaw = map[string]any{}
+	}
+	perms := map[string]any{}
+	for k, v := range permsRaw {
+		perms[k] = v
+	}
+	perms["defaultMode"] = "bypassPermissions"
+	perms["allow"] = mergeAllowList(perms["allow"], buildProtectedPathAllowRules(allowProtectedPaths))
+	out["permissions"] = perms
+
+	// 3. hooks — replace kojo-owned entries (Bash PreToolUse, "" PreCompact)
+	//    in-place, leave everything else alone. If kojo no longer wants
+	//    its entry installed (hookPath/apiBase empty), it removes the
+	//    matching entry instead.
+	hooksRaw, _ := out["hooks"].(map[string]any)
+	if hooksRaw == nil {
+		hooksRaw = map[string]any{}
+	}
+	hooks := map[string]any{}
+	for k, v := range hooksRaw {
+		hooks[k] = v
+	}
+
+	var kojoBashEntry map[string]any
+	if hookPath != "" {
+		kojoBashEntry = map[string]any{
+			"matcher": kojoBashHookMatcher,
+			"hooks": []any{
+				map[string]any{
+					"type":    "command",
+					"command": hookPath,
+				},
+			},
+		}
+	}
+	hooks["PreToolUse"] = replaceHookEntry(hooks["PreToolUse"], kojoBashHookMatcher, kojoBashEntry)
+
+	var kojoPreCompactEntry map[string]any
 	if apiBase != "" {
 		curlFlags := "-s"
 		if strings.HasPrefix(apiBase, "https://") {
 			curlFlags = "-sk"
 		}
-		// Hook payload: claude pipes a JSON object to stdin describing the
-		// triggering event. The fields kojo cares about are
-		// `transcript_path` (so we read the exact session being compacted
-		// instead of guessing) and `trigger` (manual vs auto, useful for
-		// telemetry but not yet used for branching). We pass that through
-		// verbatim with `--data-binary @-`. Older builds sent `-d '{}'`
-		// which dropped the payload, forcing the API to probe for the
-		// session file by mtime.
 		// $KOJO_AGENT_TOKEN is injected into the PTY by filterEnv. The
 		// auth listener requires it on every /api/v1/* call; without
 		// the X-Kojo-Token header the PreCompact hook would 403 from
 		// the agent perspective.
-		preCompactBlock = fmt.Sprintf(`    "PreCompact": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "curl %s -X POST '%s/api/v1/agents/%s/pre-compact' -H 'Content-Type: application/json' -H \"X-Kojo-Token: $KOJO_AGENT_TOKEN\" --data-binary @- --max-time 120"
-          }
-        ]
-      }
-    ]`, curlFlags, apiBase, agentID)
+		cmd := fmt.Sprintf(
+			`curl %s -X POST '%s/api/v1/agents/%s/pre-compact' -H 'Content-Type: application/json' -H "X-Kojo-Token: $KOJO_AGENT_TOKEN" --data-binary @- --max-time 120`,
+			curlFlags, apiBase, agentID,
+		)
+		kojoPreCompactEntry = map[string]any{
+			"matcher": kojoPreCompactMatcher,
+			"hooks": []any{
+				map[string]any{
+					"type":    "command",
+					"command": cmd,
+				},
+			},
+		}
+	}
+	hooks["PreCompact"] = replaceHookEntry(hooks["PreCompact"], kojoPreCompactMatcher, kojoPreCompactEntry)
+
+	// Drop empty hook arrays so the produced file mirrors today's "no
+	// PreCompact when apiBase is empty" shape and keeps existing tests
+	// happy. If the user populated other matchers under the same event
+	// name, those are kept.
+	for ev, val := range hooks {
+		if arr, ok := val.([]any); ok && len(arr) == 0 {
+			delete(hooks, ev)
+		}
 	}
 
-	hookBlocks := []string{}
-	if bashHookBlock != "" {
-		hookBlocks = append(hookBlocks, bashHookBlock)
-	}
-	if preCompactBlock != "" {
-		hookBlocks = append(hookBlocks, preCompactBlock)
-	}
-
-	var settings string
-	if len(hookBlocks) == 0 {
-		settings = fmt.Sprintf(`{"persona":"agent-managed","permissions":{"defaultMode":"bypassPermissions","allow":[%s]}}`, allowRules) + "\n"
+	if len(hooks) == 0 {
+		delete(out, "hooks")
 	} else {
-		settings = fmt.Sprintf(`{
-  "persona": "agent-managed",
-  "permissions": {
-    "defaultMode": "bypassPermissions",
-    "allow": [%s]
-  },
-  "hooks": {
-%s
-  }
-}
-`, allowRules, strings.Join(hookBlocks, ",\n"))
+		out["hooks"] = hooks
 	}
 
-	settingsPath := filepath.Join(claudeDir, "settings.local.json")
-	// Atomic write — claude reads settings.local.json on startup, and a
-	// concurrent Chat overwriting it could surface a partial JSON to a
-	// claude process that's also booting.
-	if err := atomicWriteFile(settingsPath, []byte(settings), 0o644); err != nil {
-		logger.Warn("failed to write claude settings", "agent", agentID, "err", err)
+	return out
+}
+
+// mergeAllowList merges kojo-derived allow rules into the existing
+// permissions.allow array (if any). Pre-existing string entries are
+// preserved verbatim, and kojo rules are appended unless already present.
+// Non-string entries in the existing list are dropped because claude
+// expects strings — this also normalizes legacy/malformed input.
+func mergeAllowList(existing any, kojoRules []string) []any {
+	out := []any{}
+	seen := map[string]bool{}
+	if arr, ok := existing.([]any); ok {
+		for _, item := range arr {
+			s, ok := item.(string)
+			if !ok || seen[s] {
+				continue
+			}
+			seen[s] = true
+			out = append(out, s)
+		}
 	}
+	for _, rule := range kojoRules {
+		if seen[rule] {
+			continue
+		}
+		seen[rule] = true
+		out = append(out, rule)
+	}
+	return out
+}
+
+// replaceHookEntry takes the current event-level hook array (e.g. the
+// value of hooks.PreToolUse), removes any entry whose matcher matches
+// `matcher`, and appends `replacement` if non-nil. Non-array input is
+// treated as empty. Returns an []any (possibly empty) so the caller can
+// assign it back into the hooks map.
+//
+// Matcher equality: when `matcher` is "" (kojo's wildcard ownership, used
+// for PreCompact), the function also removes entries with a missing
+// matcher key or matcher == "*", because Claude Code treats all three
+// shapes as "always match". Without this normalization a user-written
+// `{ "hooks": [...] }` (no matcher) would survive alongside kojo's
+// `{ "matcher": "", ... }`, causing the same event to fire twice. For
+// non-wildcard kojo matchers (e.g. "Bash") only exact string equality is
+// honored so user-authored wildcard hooks under different intent are
+// preserved.
+func replaceHookEntry(existing any, matcher string, replacement map[string]any) []any {
+	out := []any{}
+	if arr, ok := existing.([]any); ok {
+		for _, item := range arr {
+			entry, ok := item.(map[string]any)
+			if !ok {
+				// Unknown shape — preserve as-is to avoid eating
+				// future hook schema additions.
+				out = append(out, item)
+				continue
+			}
+			rawMatcher, hasMatcher := entry["matcher"]
+			m, _ := rawMatcher.(string)
+			if matcher == "" {
+				if !hasMatcher || m == "" || m == "*" {
+					continue
+				}
+			} else if m == matcher {
+				continue
+			}
+			out = append(out, entry)
+		}
+	}
+	if replacement != nil {
+		out = append(out, replacement)
+	}
+	return out
 }
 
 // isRealUserEntry returns true if the session JSONL "user" entry
