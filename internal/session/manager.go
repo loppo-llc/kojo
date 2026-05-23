@@ -57,6 +57,7 @@ const (
 var userTools = map[string]bool{
 	"claude": true,
 	"codex":  true,
+	"grok":   true,
 	"custom": true,
 }
 
@@ -713,6 +714,63 @@ func buildRestartArgs(tool string, origArgs []string, toolSessionID string) []st
 			return []string{"resume", toolSessionID}
 		}
 		return []string{"resume", "--last"}
+
+	case "grok":
+		// Strip any prior --continue/-c and --resume/-r (including
+		// "--resume=<id>" / "-r=<id>") from origArgs so we can re-
+		// apply a deterministic restart flag. Grok's -r/--resume
+		// takes an OPTIONAL argument: the next positional is its
+		// value only when it doesn't look like another flag.
+		//
+		// preservedResumeID captures an explicit resume target the
+		// user originally passed to `grok`. kojo's PTY layer does
+		// not capture grok session IDs from interactive output, so
+		// toolSessionID is virtually always "" — without preserving
+		// the user's original ID the restart would silently degrade
+		// to --continue and pick whichever session grok last
+		// touched in this cwd, defeating the explicit resume.
+		args := make([]string, 0, len(origArgs)+2)
+		skipNext := false
+		var preservedResumeID string
+		for i, a := range origArgs {
+			if skipNext {
+				skipNext = false
+				continue
+			}
+			if a == "--continue" || a == "-c" {
+				continue
+			}
+			if a == "--resume" || a == "-r" {
+				if i+1 < len(origArgs) && !strings.HasPrefix(origArgs[i+1], "-") {
+					preservedResumeID = origArgs[i+1]
+					skipNext = true
+				}
+				continue
+			}
+			if v, ok := strings.CutPrefix(a, "--resume="); ok {
+				preservedResumeID = v
+				continue
+			}
+			if v, ok := strings.CutPrefix(a, "-r="); ok {
+				preservedResumeID = v
+				continue
+			}
+			args = append(args, a)
+		}
+		// Re-apply the resume target as --resume=<id> (joined form)
+		// rather than --resume <id> (split form). Reason: grok's
+		// --resume takes an OPTIONAL argument, so a split-form value
+		// that happens to start with "-" (e.g. a malformed/stored
+		// "-r=foo") would be parsed as the NEXT flag rather than the
+		// resume target. The joined form is unambiguous.
+		switch {
+		case toolSessionID != "":
+			return append(args, "--resume="+toolSessionID)
+		case preservedResumeID != "":
+			return append(args, "--resume="+preservedResumeID)
+		default:
+			return append(args, "--continue")
+		}
 
 	default:
 		// Internal tools (tmux/shell) use platform-specific restart args

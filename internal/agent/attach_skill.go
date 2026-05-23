@@ -29,7 +29,7 @@ import (
 //
 // We deliberately use a magic directory instead of a parse marker
 // inside the agent's chat text: it keeps the user-visible reply
-// clean, works identically for claude / codex / llama.cpp
+// clean, works identically for claude / codex / grok / llama.cpp
 // (none of them have to mutate the streamed text), and lets the
 // agent stage many files atomically by writing then renaming into
 // place.

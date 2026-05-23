@@ -942,7 +942,7 @@ export function AgentSettings() {
         <div>
           <label className="block text-sm text-neutral-400 mb-2">Tool</label>
           <div className="flex flex-wrap gap-2">
-            {["claude", "codex", "custom", "llama.cpp"].map((t) => (
+            {["claude", "codex", "grok", "custom", "llama.cpp"].map((t) => (
               <button
                 key={t}
                 onClick={() => {

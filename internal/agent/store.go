@@ -1005,7 +1005,7 @@ func (st *agentStore) SaveCronPaused(paused bool) error {
 //
 //   - the FTS index dir (index/)
 //   - the persona.md / MEMORY.md / memory/*.md disk mirrors that
-//     the CLI subprocess (claude / codex) reads at chat time
+//     the CLI subprocess (claude / codex / grok) reads at chat time
 //   - persona_summary.md (regeneratable cache)
 //   - the per-agent CLI workspace (.claude/ and .codex/ if the
 //     codex CLI happens to create one — codex's primary session
