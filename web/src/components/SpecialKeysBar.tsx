@@ -3,10 +3,11 @@ import { SPECIAL_KEYS, CTRL_LETTERS } from "../lib/keys";
 interface SpecialKeysBarProps {
   ctrlMode: boolean;
   shiftMode: boolean;
+  altMode?: boolean;
   onKeyPress: (code: string) => void;
 }
 
-export function SpecialKeysBar({ ctrlMode, shiftMode, onKeyPress }: SpecialKeysBarProps) {
+export function SpecialKeysBar({ ctrlMode, shiftMode, altMode = false, onKeyPress }: SpecialKeysBarProps) {
   return (
     <div className="flex flex-col border-t border-neutral-800 shrink-0">
       {ctrlMode && (
@@ -30,7 +31,9 @@ export function SpecialKeysBar({ ctrlMode, shiftMode, onKeyPress }: SpecialKeysB
             onPointerDown={(e) => e.preventDefault()}
             onClick={() => onKeyPress(key.code)}
             className={`px-4 py-2.5 text-sm rounded font-mono whitespace-nowrap ${
-              (key.code === "ctrl" && ctrlMode) || (key.code === "shift" && shiftMode)
+              (key.code === "ctrl" && ctrlMode) ||
+              (key.code === "shift" && shiftMode) ||
+              (key.code === "alt" && altMode)
                 ? "bg-blue-900 text-blue-300"
                 : "bg-neutral-800 text-neutral-400 active:bg-neutral-600"
             }`}

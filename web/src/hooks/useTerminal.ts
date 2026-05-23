@@ -20,6 +20,11 @@ interface UseTerminalOptions {
    *   sent via onInput so tmux can handle per-pane scrolling (for Terminal tab)
    */
   touchMode?: "scroll" | "mouse";
+  /**
+   * xterm.js scrollback line count. Set to 0 to disable scrollback entirely
+   * (fixed-height terminal, no internal scrollbar). Defaults to xterm's 1000.
+   */
+  scrollback?: number;
   /** Dependency array for recreating the terminal (e.g. [sessionId]) */
   deps?: React.DependencyList;
 }
@@ -39,6 +44,7 @@ export function useTerminal({
   onInput,
   onResize,
   touchMode = "scroll",
+  scrollback,
   deps = [],
 }: UseTerminalOptions): UseTerminalReturn {
   const termRef = useRef<Terminal>(null);
@@ -111,6 +117,7 @@ export function useTerminal({
       cursorBlink: true,
       fontSize: 14,
       fontFamily: "Menlo, Monaco, 'Courier New', monospace",
+      ...(scrollback !== undefined ? { scrollback } : {}),
       theme: {
         background: "#0a0a0a",
         foreground: "#e5e5e5",
@@ -288,6 +295,16 @@ export function useTerminal({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [containerRef, onInput, safeFit, touchMode, ...deps]);
+
+  // Apply scrollback changes at runtime so we don't have to recreate the
+  // terminal (which would drop already-written output) when the value is
+  // determined after session metadata loads. xterm.js accepts runtime mutation
+  // of `options.scrollback`.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term || scrollback === undefined) return;
+    term.options.scrollback = scrollback;
+  }, [scrollback]);
 
   return { termRef, fitRef, autoScrollRef, safeFit, immediateFit };
 }

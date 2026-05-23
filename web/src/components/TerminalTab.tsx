@@ -70,7 +70,7 @@ export function TerminalTab({ parentSessionId, workDir, visible, peerId }: Termi
     deps: [parentSessionId],
   });
 
-  const { ctrlMode, shiftMode, handleKeyPress, wrapInput } = useSpecialKeys(sendInput, autoScrollRef);
+  const { ctrlMode, shiftMode, altMode, handleKeyPress, wrapInput } = useSpecialKeys(sendInput, autoScrollRef);
   wrapInputRef.current = wrapInput;
 
   // Connect WebSocket to a tmux session
@@ -286,7 +286,7 @@ export function TerminalTab({ parentSessionId, workDir, visible, peerId }: Termi
       )}
 
       {/* Special keys */}
-      <SpecialKeysBar ctrlMode={ctrlMode} shiftMode={shiftMode} onKeyPress={handleKeyPress} />
+      <SpecialKeysBar ctrlMode={ctrlMode} shiftMode={shiftMode} altMode={altMode} onKeyPress={handleKeyPress} />
     </div>
   );
 }

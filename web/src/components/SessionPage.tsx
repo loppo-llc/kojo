@@ -71,10 +71,22 @@ export function SessionPage() {
   const sendResizeRef = useRef<(cols: number, rows: number) => void>(() => {});
   const wrapInputRef = useRef<(data: string) => string>((d) => d);
 
+  // Non-claude CLIs (grok build, codex, ...) get a fixed-height terminal with no
+  // scrollback — they don't rely on internal scrollback navigation and the
+  // visible scrollbar is just noise. Claude keeps the default 1000-line buffer.
+  // The scrollback value is applied at runtime in useTerminal (no recreate),
+  // so output that arrives before session metadata loads isn't dropped.
+  // Gate on `session.id === id`: after navigating between sessions the React
+  // state still holds the previous session for a tick, and we must not apply
+  // its scrollback to the new terminal — otherwise switching grok → claude
+  // could pin scrollback at 0 and drop history before the new metadata loads.
+  const sessionMatches = session?.id === id;
+  const isClaude = sessionMatches && session?.tool === "claude";
   const { termRef: xtermRef, autoScrollRef, safeFit, immediateFit } = useTerminal({
     containerRef: termContainerRef,
     onInput: useCallback((data: string) => sendInputRef.current(wrapInputRef.current(data)), []),
     onResize: useCallback((cols: number, rows: number) => sendResizeRef.current(cols, rows), []),
+    scrollback: sessionMatches ? (isClaude ? 1000 : 0) : undefined,
     deps: [id],
   });
 
@@ -136,7 +148,7 @@ export function SessionPage() {
   sendInputRef.current = sendInput;
   sendResizeRef.current = sendResize;
 
-  const { ctrlMode, shiftMode, handleKeyPress, wrapInput } = useSpecialKeys(sendInput, autoScrollRef);
+  const { ctrlMode, shiftMode, altMode, handleKeyPress, wrapInput } = useSpecialKeys(sendInput, autoScrollRef);
   wrapInputRef.current = wrapInput;
 
   // Clean up yolo timer on unmount and session switch
@@ -272,17 +284,19 @@ export function SessionPage() {
           )
         ) : (
           <>
-            <button
-              onClick={handleYoloToggle}
-              className={`px-2.5 py-1.5 text-xs rounded min-h-[44px] min-w-[44px] flex items-center justify-center ${
-                session?.yoloMode
-                  ? "bg-yellow-900 text-yellow-300"
-                  : "bg-neutral-800 text-neutral-500"
-              }`}
-              title="Yolo Mode"
-            >
-              &#x26A1;
-            </button>
+            {isClaude && (
+              <button
+                onClick={handleYoloToggle}
+                className={`px-2.5 py-1.5 text-xs rounded min-h-[44px] min-w-[44px] flex items-center justify-center ${
+                  session?.yoloMode
+                    ? "bg-yellow-900 text-yellow-300"
+                    : "bg-neutral-800 text-neutral-500"
+                }`}
+                title="Yolo Mode"
+              >
+                &#x26A1;
+              </button>
+            )}
             <button
               onClick={handleStop}
               className="px-2.5 py-1.5 text-xs bg-neutral-800 hover:bg-red-900 text-neutral-400 hover:text-red-300 rounded min-h-[44px] min-w-[44px] flex items-center justify-center"
@@ -331,7 +345,7 @@ export function SessionPage() {
         >
           <div className="relative flex-1 min-h-0">
             <div ref={termContainerRef} className="absolute inset-0" style={{ touchAction: "none" }} />
-            {!exited && (
+            {!exited && isClaude && (
               <button
                 ref={yoloOverlayRef}
                 style={{ display: "none" }}
@@ -352,7 +366,7 @@ export function SessionPage() {
           {/* Controls — only when running */}
           {!exited && (
             <>
-              <SpecialKeysBar ctrlMode={ctrlMode} shiftMode={shiftMode} onKeyPress={handleKeyPress} />
+              <SpecialKeysBar ctrlMode={ctrlMode} shiftMode={shiftMode} altMode={altMode} onKeyPress={handleKeyPress} />
               <div className="flex items-end gap-2 px-2 py-2 border-t border-neutral-800 shrink-0">
                 <button
                   onClick={handleFileAttach}
