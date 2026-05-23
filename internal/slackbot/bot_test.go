@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/chathistory"
@@ -282,5 +284,111 @@ func TestDeliveryFailureNoticeDoesNotAttributeCause(t *testing.T) {
 	}
 	if !strings.Contains(deliveryFailureNotice, "could not be delivered") {
 		t.Errorf("deliveryFailureNotice = %q should describe a generic delivery failure", deliveryFailureNotice)
+	}
+}
+
+// TestPostMessageRateLimitNoExtraSleepOnFinalAttempt guards against the
+// rate-limit retry loop sleeping after the last permitted attempt fails.
+// Before the fix, an attempt == maxRateLimitRetry that hit a 429 still
+// spent attempt+1 seconds in time.After before exiting the loop, eating
+// chunkPostTimeout budget for no subsequent retry. After the fix the loop
+// must:
+//   - perform exactly maxRateLimitRetry+1 PostMessage calls
+//   - sleep at most maxRateLimitRetry times (one per gap between attempts)
+//   - return false promptly when the final attempt is also rate-limited
+func TestPostMessageRateLimitNoExtraSleepOnFinalAttempt(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/chat.postMessage" {
+			calls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var sleeps atomic.Int32
+	bot := &Bot{
+		api:    api,
+		logger: testLogger,
+		ctx:    ctx,
+		// Use a synchronous "instant fire" sleeper so the test does not
+		// depend on real wall-clock waits while still counting how many
+		// times the loop tried to sleep.
+		rateLimitSleep: func(d time.Duration) <-chan time.Time {
+			sleeps.Add(1)
+			ch := make(chan time.Time, 1)
+			ch <- time.Now()
+			return ch
+		},
+	}
+
+	if bot.postMessage(context.Background(), "C1", "", "hello") {
+		t.Fatal("postMessage should return false when all attempts are rate limited")
+	}
+
+	if got := calls.Load(); got != int32(maxRateLimitRetry+1) {
+		t.Errorf("PostMessage call count = %d, want %d (maxRateLimitRetry+1)", got, maxRateLimitRetry+1)
+	}
+	if got := sleeps.Load(); got != int32(maxRateLimitRetry) {
+		t.Errorf("rateLimitSleep invocations = %d, want %d (one per inter-attempt gap; no sleep after final attempt)", got, maxRateLimitRetry)
+	}
+}
+
+// TestAppendStreamRateLimitNoExtraSleepOnFinalAttempt mirrors the
+// postMessage guard for appendStream's identical retry loop. Both sites
+// must stop sleeping once attempt == maxRateLimitRetry — a stray sleep
+// there delays the entire stream-finalize path with no follow-up
+// AppendStream call to justify the wait.
+func TestAppendStreamRateLimitNoExtraSleepOnFinalAttempt(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Slack streaming sends chat.appendStream — return 429 on any
+		// path that isn't an irrelevant info call so the test stays
+		// resilient to URL routing changes in slack-go.
+		if strings.Contains(r.URL.Path, "appendStream") {
+			calls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var sleeps atomic.Int32
+	bot := &Bot{
+		api:    api,
+		logger: testLogger,
+		ctx:    ctx,
+		rateLimitSleep: func(d time.Duration) <-chan time.Time {
+			sleeps.Add(1)
+			ch := make(chan time.Time, 1)
+			ch <- time.Now()
+			return ch
+		},
+	}
+
+	bot.appendStream(context.Background(), "C1", "stream-ts", "delta")
+
+	if got := calls.Load(); got != int32(maxRateLimitRetry+1) {
+		t.Errorf("AppendStream call count = %d, want %d (maxRateLimitRetry+1)", got, maxRateLimitRetry+1)
+	}
+	if got := sleeps.Load(); got != int32(maxRateLimitRetry) {
+		t.Errorf("rateLimitSleep invocations = %d, want %d (one per inter-attempt gap; no sleep after final attempt)", got, maxRateLimitRetry)
 	}
 }

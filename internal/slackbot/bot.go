@@ -63,6 +63,11 @@ type Bot struct {
 
 	// sem limits the number of concurrent sendToAgent goroutines.
 	sem chan struct{}
+
+	// rateLimitSleep is overridable in tests to bypass real wall-clock
+	// waits in the postMessage / appendStream rate-limit backoff. nil
+	// means use time.After (production default).
+	rateLimitSleep func(d time.Duration) <-chan time.Time
 }
 
 const (
@@ -644,6 +649,12 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 				updateOpts = append(updateOpts, slack.MsgOptionTS(threadTS))
 			}
 
+			deliveredAll := true
+			_, _, _, updateErr := b.api.UpdateMessageContext(finCtx, channel, streamTS, updateOpts...)
+			if updateErr != nil {
+				b.logger.Warn("failed to update stream message with final text", "err", updateErr)
+			}
+
 			// chunks[1:] (and any postMessage fallback for chunks[0]) need
 			// their own context — finCtx only has finalizeShortTimeout
 			// covering StopStream + chat.update + clearAssistantStatus, and
@@ -651,12 +662,15 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			// chunkPostTimeout scales with chunk count and caps at
 			// chunkPostTimeoutMax so huge replies don't hold the goroutine
 			// open for several minutes.
+			//
+			// Allocate AFTER UpdateMessageContext returns so a slow
+			// chat.update round-trip doesn't eat into the chunk-posting
+			// budget. (chat.update itself uses finCtx and has its own
+			// short timeout.)
 			chunkCtx, chunkCancel := context.WithTimeout(context.Background(), chunkPostTimeout(len(chunks)))
 			defer chunkCancel()
 
-			deliveredAll := true
-			if _, _, _, err := b.api.UpdateMessageContext(finCtx, channel, streamTS, updateOpts...); err != nil {
-				b.logger.Warn("failed to update stream message with final text", "err", err)
+			if updateErr != nil {
 				// Fallback: post the first chunk as a fresh message so the
 				// final reply still reaches the user. Without this, a
 				// chat.update failure leaves the channel with whatever
@@ -808,12 +822,24 @@ func (b *Bot) appendStream(ctx context.Context, channel, streamTS, text string) 
 		}
 		var rlErr *slack.RateLimitedError
 		if errors.As(err, &rlErr) {
+			// No retries left — return without sleeping. Sleeping
+			// past the final attempt has no follow-up call to wait
+			// for and just delays the rest of the stream finalize
+			// path. Mirrors the same guard in postMessage so both
+			// retry sites stay in lockstep.
+			if attempt == maxRateLimitRetry {
+				return
+			}
 			delay := rlErr.RetryAfter
 			if delay == 0 {
 				delay = time.Duration(attempt+1) * time.Second
 			}
+			sleep := b.rateLimitSleep
+			if sleep == nil {
+				sleep = time.After
+			}
 			select {
-			case <-time.After(delay):
+			case <-sleep(delay):
 				continue
 			case <-ctx.Done():
 				return
@@ -886,24 +912,38 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) b
 		}
 		var rlErr *slack.RateLimitedError
 		if errors.As(err, &rlErr) {
+			// No retries left — return immediately. Sleeping here
+			// would burn 1+ s of chunkPostTimeout for no subsequent
+			// attempt, exceeding the documented 1+2+3 s backoff
+			// chain and risking a cascade where later chunks lose
+			// their budget too.
+			if attempt == maxRateLimitRetry {
+				b.logger.Warn("failed to post slack message after rate limit retries", "channel", channel)
+				return false
+			}
 			wait := rlErr.RetryAfter
 			if wait <= 0 {
 				wait = time.Duration(attempt+1) * time.Second
 			}
 			b.logger.Debug("slack rate limited, waiting", "retryAfter", wait)
+			sleep := b.rateLimitSleep
+			if sleep == nil {
+				sleep = time.After
+			}
 			select {
 			case <-ctx.Done():
 				b.logger.Warn("slack post cancelled while waiting on rate limit",
 					"channel", channel, "err", ctx.Err())
 				return false
-			case <-time.After(wait):
+			case <-sleep(wait):
 				continue
 			}
 		}
 		b.logger.Warn("failed to post slack message", "channel", channel, "err", err)
 		return false
 	}
-	b.logger.Warn("failed to post slack message after rate limit retries", "channel", channel)
+	// Unreachable: the rate-limited branch above returns on the final
+	// attempt rather than falling through. Kept to satisfy the compiler.
 	return false
 }
 
