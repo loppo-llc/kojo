@@ -389,6 +389,122 @@ func (s *CredentialStore) DeleteAllForAgent(agentID string) error {
 	return err
 }
 
+// ExportCredentials returns every stored credential for an agent with
+// password and TOTP secret DECRYPTED. Intended for the §3.7 device-
+// switch peer-sync path: credentials.db is per-peer (encrypted with a
+// peer-local key), so cross-peer transport has to be in plaintext.
+// The wire side is bounded by tsnet peer auth + HTTPS; the receiver
+// re-encrypts with its own credentials.key before persisting.
+//
+// Returns an empty slice (NOT nil) when the agent has no credentials,
+// so callers can range over the result and a JSON-omitempty marshal
+// drops the field for the common no-credential case.
+func (s *CredentialStore) ExportCredentials(agentID string) ([]*Credential, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(
+		`SELECT id, label, username, password_enc, totp_secret_enc,
+		        totp_algorithm, totp_digits, totp_period, created_at, updated_at
+		 FROM credentials WHERE agent_id = ? ORDER BY datetime(created_at)`,
+		agentID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]*Credential, 0)
+	for rows.Next() {
+		c, err := s.scanAndDecrypt(rows)
+		if err != nil {
+			return nil, err
+		}
+		// Skip the local-timezone rewrite normalizeTimestamp does for
+		// UI surfaces. Peer-sync needs the canonical DB string so the
+		// receiver can persist it verbatim and produce a stable
+		// CreatedAt across peers; otherwise a source/target timezone
+		// mismatch would mutate the value just by transporting it.
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ReplaceCredentials atomically replaces every credential for agentID
+// with the supplied set. Source-wins, full-replace — matches the §3.7
+// device-switch semantics of agent_messages / memory_entries / etc:
+// the source peer is authoritative for the agent's runtime state, so
+// the target's prior view (if any) is discarded wholesale.
+//
+// Each supplied record's plaintext Password / TOTPSecret is re-encrypted
+// with the target's credentials.key (since the source's key is not
+// transported). IDs and timestamps are preserved verbatim so the UI's
+// stable ordering and "createdAt" surface stays the same across peers.
+//
+// A nil/empty creds slice CLEARS the agent's credentials on target —
+// mirrors AgentSyncPayload's "empty = clear" promise for the rest of
+// the surfaces. Idempotent under retry: the DELETE inside the tx
+// re-runs cleanly; the INSERT writes the same rows.
+func (s *CredentialStore) ReplaceCredentials(agentID string, creds []*Credential) error {
+	if agentID == "" {
+		return errors.New("agent_id required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec(`DELETE FROM credentials WHERE agent_id=?`, agentID); err != nil {
+		return fmt.Errorf("delete: %w", err)
+	}
+	for i, c := range creds {
+		if c == nil {
+			return fmt.Errorf("nil credential at index %d", i)
+		}
+		if c.ID == "" {
+			return fmt.Errorf("index %d: credential id required", i)
+		}
+		pwEnc, err := s.encryptChecked(c.Password)
+		if err != nil {
+			return fmt.Errorf("index %d: encrypt password: %w", i, err)
+		}
+		totpEnc, err := s.encryptChecked(c.TOTPSecret)
+		if err != nil {
+			return fmt.Errorf("index %d: encrypt totp: %w", i, err)
+		}
+		createdAt := c.CreatedAt
+		if createdAt == "" {
+			createdAt = time.Now().Format(time.RFC3339)
+		}
+		updatedAt := c.UpdatedAt
+		if updatedAt == "" {
+			updatedAt = createdAt
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO credentials (id, agent_id, label, username, password_enc, totp_secret_enc,
+			 totp_algorithm, totp_digits, totp_period, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			c.ID, agentID, c.Label, c.Username,
+			pwEnc, totpEnc,
+			c.TOTPAlgorithm, c.TOTPDigits, c.TOTPPeriod,
+			createdAt, updatedAt,
+		); err != nil {
+			return fmt.Errorf("index %d: insert: %w", i, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
 // RevealPassword returns the plaintext password for a credential.
 func (s *CredentialStore) RevealPassword(agentID, credID string) (string, error) {
 	s.mu.RLock()

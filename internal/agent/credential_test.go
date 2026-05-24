@@ -276,6 +276,190 @@ func TestCredentialStore_AddWithInvalidTOTP(t *testing.T) {
 	}
 }
 
+// TestCredentialStore_ExportDecryptsAll mirrors the §3.7 peer-sync
+// source side: ExportCredentials must return decrypted password +
+// TOTP secret, ordered by created_at (same surface ListCredentials
+// uses, but with secrets revealed).
+func TestCredentialStore_ExportDecryptsAll(t *testing.T) {
+	cs := setupCredentialStore(t)
+	totp := &TOTPParams{
+		Secret:    "JBSWY3DPEHPK3PXP",
+		Algorithm: "SHA1",
+		Digits:    6,
+		Period:    30,
+	}
+	if _, err := cs.AddCredential("ag_exp", "Site", "alice", "p4ss!", totp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.AddCredential("ag_exp", "Other", "bob", "secret2", nil); err != nil {
+		t.Fatal(err)
+	}
+	// Different agent — must NOT bleed across.
+	if _, err := cs.AddCredential("ag_other", "Foo", "x", "y", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := cs.ExportCredentials("ag_exp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("expected 2 credentials, got %d", len(out))
+	}
+	// Plaintext must be revealed.
+	var sawPass bool
+	for _, c := range out {
+		if c.Username == "alice" {
+			sawPass = true
+			if c.Password != "p4ss!" {
+				t.Errorf("password not decrypted: %q", c.Password)
+			}
+			if c.TOTPSecret != "JBSWY3DPEHPK3PXP" {
+				t.Errorf("totp not decrypted: %q", c.TOTPSecret)
+			}
+		}
+	}
+	if !sawPass {
+		t.Error("expected alice's credential in export")
+	}
+
+	empty, err := cs.ExportCredentials("ag_none")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("expected empty slice for unknown agent, got %d", len(empty))
+	}
+}
+
+// TestCredentialStore_ReplaceReencrypts mirrors the §3.7 peer-sync
+// receiver side: ReplaceCredentials wipes the agent's prior rows and
+// inserts the supplied set re-encrypted under the target's key, with
+// stable id / createdAt preservation.
+func TestCredentialStore_ReplaceReencrypts(t *testing.T) {
+	cs := setupCredentialStore(t)
+
+	// Stale prior row that must be discarded.
+	if _, err := cs.AddCredential("ag_rep", "Stale", "old", "oldpw", nil); err != nil {
+		t.Fatal(err)
+	}
+	// Another agent's rows must be left alone.
+	if _, err := cs.AddCredential("ag_other", "Keep", "k", "kpw", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	incoming := []*Credential{
+		{
+			ID:        "cred_remote1",
+			Label:     "Synced",
+			Username:  "alice",
+			Password:  "fresh!",
+			CreatedAt: "2026-01-01T00:00:00Z",
+			UpdatedAt: "2026-01-02T00:00:00Z",
+		},
+		{
+			ID:            "cred_remote2",
+			Label:         "WithTOTP",
+			Username:      "bob",
+			Password:      "pw2",
+			TOTPSecret:    "JBSWY3DPEHPK3PXP",
+			TOTPAlgorithm: "SHA1",
+			TOTPDigits:    6,
+			TOTPPeriod:    30,
+			CreatedAt:     "2026-01-03T00:00:00Z",
+			UpdatedAt:     "2026-01-03T00:00:00Z",
+		},
+	}
+	if err := cs.ReplaceCredentials("ag_rep", incoming); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := cs.ExportCredentials("ag_rep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 credentials, got %d", len(got))
+	}
+	byID := map[string]*Credential{}
+	for _, c := range got {
+		byID[c.ID] = c
+	}
+	c1, ok := byID["cred_remote1"]
+	if !ok {
+		t.Fatal("cred_remote1 missing")
+	}
+	if c1.Password != "fresh!" {
+		t.Errorf("password not re-encrypted/decrypted correctly: %q", c1.Password)
+	}
+	if c1.CreatedAt != "2026-01-01T00:00:00Z" {
+		t.Errorf("createdAt not preserved: %q", c1.CreatedAt)
+	}
+	c2, ok := byID["cred_remote2"]
+	if !ok {
+		t.Fatal("cred_remote2 missing")
+	}
+	if c2.TOTPSecret != "JBSWY3DPEHPK3PXP" {
+		t.Errorf("totp secret not preserved: %q", c2.TOTPSecret)
+	}
+
+	// Stale row must be gone.
+	for _, c := range got {
+		if c.Username == "old" {
+			t.Error("stale credential still present after replace")
+		}
+	}
+
+	// Other agent's row must remain.
+	other, err := cs.ListCredentials("ag_other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(other) != 1 {
+		t.Fatalf("ag_other rows tampered with: got %d", len(other))
+	}
+
+	// Replace with empty set clears the agent.
+	if err := cs.ReplaceCredentials("ag_rep", nil); err != nil {
+		t.Fatal(err)
+	}
+	cleared, err := cs.ExportCredentials("ag_rep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cleared) != 0 {
+		t.Errorf("expected cleared after empty replace, got %d", len(cleared))
+	}
+}
+
+// TestCredentialStore_ReplaceRejectsMalformed defends the wire-side
+// boundary: a peer-sync payload with a malformed credential record
+// must fail loud (rolling back the whole tx) rather than silently
+// dropping the bad row and applying the rest.
+func TestCredentialStore_ReplaceRejectsMalformed(t *testing.T) {
+	cs := setupCredentialStore(t)
+	if _, err := cs.AddCredential("ag_rb", "Stay", "u", "p", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	err := cs.ReplaceCredentials("ag_rb", []*Credential{
+		{ID: "cred_ok", Label: "ok", Username: "u", Password: "p"},
+		{ID: "", Label: "broken"},
+	})
+	if err == nil {
+		t.Fatal("expected error for missing credential id")
+	}
+
+	// Tx rolled back — original row must still be present.
+	list, err := cs.ListCredentials("ag_rb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Username != "u" {
+		t.Errorf("rollback failed: list=%+v", list)
+	}
+}
+
 func TestCredentialStore_KeyCorruption(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)

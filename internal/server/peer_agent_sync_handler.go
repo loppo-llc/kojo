@@ -171,6 +171,30 @@ type peerAgentSyncRequest struct {
 	// silent-data-loss risk under peer clock skew. The orchestrator
 	// always full-ships; syncWorkspaceFilesTx's DELETE-then-INSERT
 	// is the only mode for this surface.
+
+	// Credentials carries the agent's stored ID/password (and TOTP)
+	// rows in PLAINTEXT. credentials.db is per-peer (encrypted with a
+	// peer-local AES key), so cross-peer transport has to roundtrip
+	// through plaintext. The receiver re-encrypts with its own key
+	// before persisting.
+	//
+	// Pointer (NOT bare slice) so the wire distinguishes three states:
+	//   - nil pointer / field absent → source is NOT authoritative
+	//     (older binary, missing credentials.key, init failure). Target
+	//     LEAVES its existing rows alone. Without this gate, a downgrade
+	//     on source would silently clear target's credentials.
+	//   - non-nil pointer to empty slice → source IS authoritative AND
+	//     has no credentials for this agent. Target clears its rows
+	//     to mirror — matches the "source wins, full-replace" semantics
+	//     used elsewhere in this payload.
+	//   - non-nil pointer to non-empty slice → source ships these rows;
+	//     target replaces wholesale.
+	//
+	// There is no incremental cursor: credentials are tiny per-agent
+	// (typically ≤ a few rows) and an updated_at delta would risk
+	// silently dropping edits across peer clock skew, same rationale
+	// as workspace_files.
+	Credentials *[]*agent.Credential `json:"credentials,omitempty"`
 }
 
 // agentRecordTool extracts the agent's backend CLI name from an
@@ -552,6 +576,53 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 	}
 	if grokCommit != nil {
 		grokCommit()
+	}
+
+	// Credentials sync: re-encrypt and replace target's credentials
+	// for this agent. credentials.db lives in a separate SQLite file
+	// with a peer-local AES key, so this can't ride inside the
+	// SyncAgentFromPeer tx — it runs after the main DB commit
+	// succeeded. A failure here returns 500 so the orchestrator
+	// retries; ReplaceCredentials is idempotent (DELETE-then-INSERT
+	// inside its own tx) so the retry lands cleanly. The retry path
+	// also re-applies the main DB rows via SyncAgentFromPeer's UPSERTs,
+	// keeping the two SQLite files convergent.
+	//
+	// req.Credentials==nil means source is NOT authoritative (legacy
+	// binary, missing credentials store, init failure). Skip the
+	// replace entirely — clearing target on the absence of a field
+	// would let a source-side downgrade silently wipe target's rows.
+	// req.Credentials!=nil but len==0 IS authoritative and clears
+	// target.
+	if req.Credentials != nil {
+		creds := *req.Credentials
+		if s.agents == nil || !s.agents.HasCredentials() {
+			// Source has authority and shipped rows (or an
+			// authoritative empty), but target has no store. Surface
+			// loud rather than silently dropping them — operator
+			// needs to see that credentials.key is missing on target
+			// before the switch can be considered successful.
+			// releaseMemSync MUST fire before the early return — the
+			// per-agent memory-sync lock was acquired above and is
+			// released after the disk reconcile on the success path;
+			// leaking it here would wedge every future agent-sync
+			// retry for this agentID.
+			releaseMemSync()
+			s.logger.Error("peer agent-sync: credentials present but target has no credential store",
+				"agent", req.Agent.ID, "count", len(creds))
+			writeError(w, http.StatusServiceUnavailable, "unavailable",
+				"target credential store unavailable; cannot land synced credentials")
+			return
+		}
+		if cerr := s.agents.Credentials().ReplaceCredentials(req.Agent.ID, creds); cerr != nil {
+			// Same lock-leak risk as the no-store branch above.
+			releaseMemSync()
+			s.logger.Error("peer agent-sync: credentials replace failed",
+				"agent", req.Agent.ID, "err", cerr)
+			writeError(w, http.StatusInternalServerError, "internal",
+				"replace credentials: "+cerr.Error())
+			return
+		}
 	}
 
 	// Reconcile target's MEMORY.md + memory/* tree against the

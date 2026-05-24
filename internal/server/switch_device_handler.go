@@ -552,6 +552,18 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 				syncRawLen, peerAgentSyncMaxBody))
 		return
 	}
+	if int64(len(syncWireBody)) > int64(peerAgentSyncMaxWireBody) {
+		// Wire-size preflight. The receiver's MaxBytesReader is
+		// keyed off the compressed bytes, so a high-entropy payload
+		// (random passwords / TOTP secrets / claude session blobs)
+		// can compress poorly and exceed the wire cap even when the
+		// raw JSON fits the decompressed cap above. Bail before
+		// begin so handoff_pending stays clean.
+		writeError(w, http.StatusRequestEntityTooLarge, "agent_too_large",
+			fmt.Sprintf("agent state too large for single agent-sync (gzipped %d bytes > wire cap %d); chunked sync not yet supported in v1",
+				len(syncWireBody), peerAgentSyncMaxWireBody))
+		return
+	}
 
 	// Step 1: begin.
 	beginResp, err := s.runHandoffOp(ctx, agentID, "begin", req.TargetPeerID)
@@ -1226,6 +1238,25 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 		return nil, fmt.Errorf("list tasks: %w", terr)
 	}
 	req.Tasks = tasks
+
+	// Credentials: decrypt with source's credentials.key and ship in
+	// plaintext (the receiver re-encrypts with its own). credentials.db
+	// is per-peer so the encrypted bytes can't cross peer boundaries.
+	//
+	// Ship the field as a NON-NIL pointer only when source actually
+	// has the credential store — that signals "source is authoritative,
+	// here is the full set (possibly empty)". A nil pointer (field
+	// omitted on the wire) tells target "source is not authoritative,
+	// don't touch your rows" so a broken credentials.key / older binary
+	// can't silently wipe target's credentials. Mirrors how the
+	// best-effort LookupAgentToken below behaves on missing state.
+	if s.agents != nil && s.agents.HasCredentials() {
+		creds, cerr := s.agents.Credentials().ExportCredentials(agentID)
+		if cerr != nil {
+			return nil, fmt.Errorf("export credentials: %w", cerr)
+		}
+		req.Credentials = &creds
+	}
 
 	// claude session JSONLs — claude's cwd is AgentDir(agentID),
 	// NOT Settings.workDir (workDir is the user's project files
