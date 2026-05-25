@@ -136,6 +136,12 @@ export interface AgentInfo {
   // §3.7 device-switch target has gone offline. Empty when holderPeer
   // is empty.
   holderPeerStatus?: "online" | "offline" | "degraded";
+  // isSwitching is true while a §3.7 device-switch is mid-flight on
+  // this peer (between SetSwitching(true) and (false)). Surfaced by
+  // the server so the UI can disable mutating controls (credentials
+  // add/edit/delete, etc.) that would 409 with agent_busy and show a
+  // banner instead.
+  isSwitching?: boolean;
 }
 
 // TTSConfig mirrors internal/agent.TTSConfig in the Go backend.

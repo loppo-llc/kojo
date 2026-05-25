@@ -81,6 +81,13 @@ type agentResponse struct {
 	// Empty when the v1 store has no row yet (legacy paths, in-flight
 	// create). Same shape as handleGetAgent's ETag header.
 	ETag string `json:"etag,omitempty"`
+	// IsSwitching is true while a §3.7 device-switch is mid-flight
+	// on this peer (Manager.SetSwitching(true) → false). Surfaced
+	// so the UI can render a "デバイス転移中" banner and disable
+	// mutating controls (credentials / persona / settings edits)
+	// that would 409 with agent_busy: device switch in progress.
+	// Runtime-only — never persisted, never accepted on PATCH.
+	IsSwitching bool `json:"isSwitching,omitempty"`
 }
 
 // agentRuntimeSnapshot bundles the runtime-derived fields that feed
@@ -215,6 +222,9 @@ func (s *Server) buildAgentResponse(a *agent.Agent, snap agentRuntimeSnapshot) a
 		resp.NextCronAt = snap.nextCron.Format(time.RFC3339)
 	}
 	resp.CronPausedGlobal = snap.cronPaused
+	if s.agents != nil {
+		resp.IsSwitching = s.agents.IsSwitching(a.ID)
+	}
 	return resp
 }
 

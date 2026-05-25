@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useParams, useNavigate } from "react-router";
-import { agentApi, type Credential, type OTPEntry } from "../../lib/agentApi";
+import { agentApi, type AgentInfo, type Credential, type OTPEntry } from "../../lib/agentApi";
 
 function TOTPDisplay({ agentId, credId }: { agentId: string; credId: string }) {
   const [code, setCode] = useState<string | null>(null);
@@ -235,11 +235,13 @@ function QRImportModal({
 function CredentialEdit({
   agentId,
   credential,
+  isSwitching,
   onSave,
   onCancel,
 }: {
   agentId: string;
   credential: Credential;
+  isSwitching: boolean;
   onSave: (updated: Credential) => void;
   onCancel: () => void;
 }) {
@@ -327,7 +329,8 @@ function CredentialEdit({
         />
         <button
           onClick={() => setShowQR(true)}
-          className="px-3 py-2 bg-neutral-800 hover:bg-neutral-700 rounded text-xs whitespace-nowrap"
+          disabled={isSwitching}
+          className="px-3 py-2 bg-neutral-800 hover:bg-neutral-700 rounded text-xs whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed"
         >
           QR
         </button>
@@ -338,8 +341,9 @@ function CredentialEdit({
       <div className="flex gap-2">
         <button
           onClick={handleSave}
-          disabled={saving || !label.trim() || !username.trim()}
-          className="flex-1 py-2 bg-neutral-700 hover:bg-neutral-600 rounded text-sm font-medium disabled:opacity-40"
+          disabled={saving || isSwitching || !label.trim() || !username.trim()}
+          title={isSwitching ? "デバイス転移中。完了するまで保存できない。" : undefined}
+          className="flex-1 py-2 bg-neutral-700 hover:bg-neutral-600 rounded text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
         >
           {saving ? "Saving..." : "Save"}
         </button>
@@ -366,6 +370,9 @@ export function AgentCredentials() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [credentials, setCredentials] = useState<Credential[]>([]);
+  const [agent, setAgent] = useState<AgentInfo | null>(null);
+  const [listError, setListError] = useState("");
+  const [loading, setLoading] = useState(true);
   const [label, setLabel] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -380,13 +387,91 @@ export function AgentCredentials() {
   const [showAddQR, setShowAddQR] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
 
-  useEffect(() => {
+  // Monotonic generation counter so a stale in-flight reload() that
+  // resolves after unmount or after a newer reload() was issued cannot
+  // overwrite fresh state. Stored in a ref so the closure captured by
+  // the .then() callback observes the latest value at resolve time.
+  const reloadGen = useRef(0);
+
+  const reload = useCallback(() => {
     if (!id) return;
-    agentApi.credentials
-      .list(id)
-      .then(setCredentials)
-      .catch(() => navigate("/"));
-  }, [id, navigate]);
+    const myGen = ++reloadGen.current;
+    setLoading(true);
+    setListError("");
+    Promise.allSettled([agentApi.credentials.list(id), agentApi.get(id)]).then(
+      ([credsRes, agentRes]) => {
+        if (myGen !== reloadGen.current) return; // superseded / unmounted
+        if (credsRes.status === "fulfilled") {
+          setCredentials(credsRes.value);
+        } else {
+          const err = credsRes.reason;
+          setListError(err instanceof Error ? err.message : String(err));
+        }
+        if (agentRes.status === "fulfilled") {
+          setAgent(agentRes.value);
+        } else if (credsRes.status === "fulfilled") {
+          // creds loaded but agent record didn't — surface so the user
+          // sees that the isSwitching indicator is unknown (UI defaults
+          // to enabled, which is wrong if a switch is actually running).
+          const err = agentRes.reason;
+          setListError(
+            "agent record fetch failed: " +
+              (err instanceof Error ? err.message : String(err)),
+          );
+        }
+        setLoading(false);
+      },
+    );
+  }, [id]);
+
+  useEffect(() => {
+    reload();
+    return () => {
+      // Invalidate any in-flight reload — its .then() will no-op when
+      // it observes a bumped generation.
+      reloadGen.current++;
+    };
+  }, [reload]);
+
+  // Poll the agent record while a §3.7 device-switch is in flight so the
+  // banner / disabled buttons clear automatically once SetSwitching(false)
+  // lands on the server. Self-rescheduling setTimeout (NOT setInterval)
+  // so a slow GET doesn't stack overlapping requests / reorder responses.
+  // When isSwitching transitions true → false we also refresh the
+  // credential list because the agent has moved to a remote peer and
+  // future reads proxy there — the local snapshot may now be stale.
+  const isSwitching = !!agent?.isSwitching;
+  const prevSwitchingRef = useRef(isSwitching);
+  useEffect(() => {
+    if (prevSwitchingRef.current && !isSwitching) {
+      // Transition true → false: refresh creds against the new holder.
+      reload();
+    }
+    prevSwitchingRef.current = isSwitching;
+  }, [isSwitching, reload]);
+
+  useEffect(() => {
+    if (!id || !isSwitching) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const tick = async () => {
+      try {
+        const fresh = await agentApi.get(id);
+        if (cancelled) return;
+        setAgent(fresh);
+      } catch {
+        /* keep prior state on transient failures */
+      }
+      if (!cancelled) {
+        timer = setTimeout(tick, 5_000);
+      }
+    };
+    timer = setTimeout(tick, 5_000);
+    return () => {
+      cancelled = true;
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, [id, isSwitching]);
 
   const handleAdd = async () => {
     if (!id || !label.trim() || !username.trim() || (!password && !totpSecret.trim())) return;
@@ -472,13 +557,33 @@ export function AgentCredentials() {
         </div>
         <button
           onClick={() => { setShowForm((v) => !v); setEditingId(null); }}
-          className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-sm"
+          disabled={isSwitching}
+          title={isSwitching ? "デバイス転移中。完了するまで追加できない。" : undefined}
+          className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-sm disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-neutral-800"
         >
           {showForm ? "Cancel" : "+ Add"}
         </button>
       </header>
 
       <main className="p-4 space-y-3 max-w-md mx-auto">
+        {isSwitching && (
+          <div className="p-3 bg-amber-950 border border-amber-800 rounded-lg text-sm text-amber-200">
+            デバイス転移中。完了するまで credential は編集できない。
+          </div>
+        )}
+
+        {listError && (
+          <div className="p-3 bg-red-950 border border-red-800 rounded-lg text-sm text-red-300 flex items-center justify-between gap-2">
+            <span className="break-all">{listError}</span>
+            <button
+              onClick={reload}
+              className="px-2 py-1 bg-red-900 hover:bg-red-800 rounded text-xs whitespace-nowrap"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
         {/* Add form */}
         {showForm && (
           <div className="p-4 bg-neutral-900 border border-neutral-700 rounded-lg space-y-3">
@@ -514,7 +619,8 @@ export function AgentCredentials() {
               />
               <button
                 onClick={() => setShowAddQR(true)}
-                className="px-3 py-2 bg-neutral-800 hover:bg-neutral-700 rounded text-xs whitespace-nowrap"
+                disabled={isSwitching}
+                className="px-3 py-2 bg-neutral-800 hover:bg-neutral-700 rounded text-xs whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 QR
               </button>
@@ -522,9 +628,10 @@ export function AgentCredentials() {
             <button
               onClick={handleAdd}
               disabled={
-                adding || !label.trim() || !username.trim() || (!password && !totpSecret.trim())
+                adding || isSwitching || !label.trim() || !username.trim() || (!password && !totpSecret.trim())
               }
-              className="w-full py-2 bg-neutral-700 hover:bg-neutral-600 rounded text-sm font-medium disabled:opacity-40"
+              title={isSwitching ? "デバイス転移中。完了するまで追加できない。" : undefined}
+              className="w-full py-2 bg-neutral-700 hover:bg-neutral-600 rounded text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {adding ? "Adding..." : "Add"}
             </button>
@@ -538,6 +645,7 @@ export function AgentCredentials() {
               key={cred.id}
               agentId={id}
               credential={cred}
+              isSwitching={isSwitching}
               onSave={handleEditSave}
               onCancel={() => setEditingId(null)}
             />
@@ -569,13 +677,17 @@ export function AgentCredentials() {
                   </button>
                   <button
                     onClick={() => { setEditingId(cred.id); setShowForm(false); }}
-                    className="text-xs text-neutral-500 hover:text-neutral-300 px-2 py-1 rounded hover:bg-neutral-800"
+                    disabled={isSwitching}
+                    title={isSwitching ? "デバイス転移中。完了するまで編集できない。" : undefined}
+                    className="text-xs text-neutral-500 hover:text-neutral-300 px-2 py-1 rounded hover:bg-neutral-800 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
                   >
                     Edit
                   </button>
                   <button
                     onClick={() => handleDelete(cred.id)}
-                    className="text-xs text-neutral-600 hover:text-red-400 px-2 py-1 rounded hover:bg-neutral-800"
+                    disabled={isSwitching}
+                    title={isSwitching ? "デバイス転移中。完了するまで削除できない。" : undefined}
+                    className="text-xs text-neutral-600 hover:text-red-400 px-2 py-1 rounded hover:bg-neutral-800 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
                   >
                     Delete
                   </button>
@@ -590,7 +702,7 @@ export function AgentCredentials() {
           ),
         )}
 
-        {credentials.length === 0 && !showForm && (
+        {!loading && !listError && credentials.length === 0 && !showForm && (
           <div className="text-sm text-neutral-600 text-center py-12">
             No credentials registered
           </div>
