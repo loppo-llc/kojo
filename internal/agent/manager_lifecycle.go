@@ -539,6 +539,15 @@ func (m *Manager) ActivateAgentRuntime(agentID string) {
 	if !ok {
 		return
 	}
+	// 帰還 (holder==self) のタイミング — Hub が remote 期間中に蓄積した
+	// remote_message_mirror 行は今この瞬間から stale。canonical な
+	// agent_messages が再びこの peer にあるので mirror を破棄する。
+	// peer 側 (Hub 以外) で初めて adopt するケースは mirror が元々空なので no-op。
+	// ベストエフォート: 失敗しても runtime 起動は継続。
+	if err := m.DeleteMirrorForAgent(agentID); err != nil && m.logger != nil {
+		m.logger.Warn("failed to clear remote message mirror on activate",
+			"agent", agentID, "err", err)
+	}
 	if a.Archived {
 		if m.cron != nil {
 			m.cron.Remove(agentID)
@@ -1389,6 +1398,17 @@ func (m *Manager) releaseAgentLocallyCore(agentID string, withDBCleanup, markRel
 	if withDBCleanup && m.groupdms != nil {
 		m.groupdms.RemoveAgent(agentID)
 	}
+	// remote_message_mirror を agent_id 単位に掃除。release / teardown /
+	// startup eviction いずれの経路でも、この peer はもう agent の holder
+	// ではないか canonical な runtime も無いので mirror の保持義務はない。
+	// 削除は冪等で副作用無し。crash recovery: release marker 書込後・
+	// mirror delete 前に死んでも、再起動時の EvictNonLocalAgentsAtStartup
+	// 経由で detachAgentInMemory → ここに来て掃除されるため stale が
+	// 永続化しない。
+	if err := m.DeleteMirrorForAgent(agentID); err != nil && m.logger != nil {
+		m.logger.Warn("failed to clear remote message mirror on release",
+			"agent", agentID, "err", err)
+	}
 	m.mu.Lock()
 	delete(m.agents, agentID)
 	m.mu.Unlock()
@@ -1524,6 +1544,90 @@ func (m *Manager) EvictNonLocalAgentsAtStartup(ctx context.Context, selfPeerID s
 		// marker is stale.
 		m.detachAgentInMemory(id)
 	}
+}
+
+// PruneToOwnedAgentsForPeer は --peer mode 起動時に、NewManager が DB から
+// 全行ロードした m.agents から「この peer が実際に所有している」ID 以外を
+// detach する。所有判定は arrived markers ∪ agent_locks.holder == self、
+// マイナス released markers。これを呼ばないと StartSchedulers が
+// 永続 agent 行全件に cron を載せ、他 peer と二重発火する。
+//
+// EvictNonLocalAgentsAtStartup は released marker のついた行しか落とさ
+// ないため、未finalize / orphan 行は残る。--peer は信頼できる "owned"
+// 集合を arrived + lock holder から再構築できるので、Hub よりも厳しく
+// pruning できる。
+//
+// MUST be called AFTER EvictNonLocalAgentsAtStartup and BEFORE
+// StartSchedulers。selfPeerID == "" / store nil / Manager nil は no-op で
+// true を返す。
+//
+// 戻り値: ok=true は seed 構築成功 (部分的でも安全側に pruning できた)。
+// ok=false は seed 3 read のいずれかが err = m.agents から正当所有を
+// 切り分けられない状態。呼出側は ok=false なら fail-closed として
+// StartSchedulers の起動を skip する想定。
+func (m *Manager) PruneToOwnedAgentsForPeer(ctx context.Context, selfPeerID string) (ok bool) {
+	if m == nil || selfPeerID == "" {
+		return true
+	}
+	st := m.Store()
+	if st == nil {
+		return true
+	}
+	// Seed の 3 つの read はいずれも destructive detach の前提なので、
+	// どれか 1 つでも失敗したら prune を中止し ok=false を返す。
+	// 部分集合 seed で進めると正当な arrived agent を落としたり、released
+	// agent を残したりする恐れがある。Fencing middleware と
+	// AgentLockGuard が後段で誤所属の書込を弾くので、prune skip → 上位で
+	// StartSchedulers skip という fail-closed が safe。
+	arrived, aerr := m.ListArrivedAgents(ctx)
+	if aerr != nil {
+		if m.logger != nil {
+			m.logger.Warn("PruneToOwnedAgentsForPeer: aborted (arrived markers read failed)", "err", aerr)
+		}
+		return false
+	}
+	locks, lerr := st.ListAgentLocksByHolder(ctx, selfPeerID)
+	if lerr != nil {
+		if m.logger != nil {
+			m.logger.Warn("PruneToOwnedAgentsForPeer: aborted (lock holders read failed)", "err", lerr)
+		}
+		return false
+	}
+	released, rerr := m.ListReleasedAgents(ctx)
+	if rerr != nil {
+		if m.logger != nil {
+			m.logger.Warn("PruneToOwnedAgentsForPeer: aborted (released markers read failed)", "err", rerr)
+		}
+		return false
+	}
+
+	seed := make(map[string]struct{})
+	for _, id := range arrived {
+		seed[id] = struct{}{}
+	}
+	for _, l := range locks {
+		seed[l.AgentID] = struct{}{}
+	}
+	for id := range released {
+		delete(seed, id)
+	}
+
+	m.mu.Lock()
+	ids := make([]string, 0, len(m.agents))
+	for id := range m.agents {
+		ids = append(ids, id)
+	}
+	m.mu.Unlock()
+	for _, id := range ids {
+		if _, ok := seed[id]; ok {
+			continue
+		}
+		if m.logger != nil {
+			m.logger.Info("--peer prune: detaching unowned agent in-memory", "agent", id)
+		}
+		m.detachAgentInMemory(id)
+	}
+	return true
 }
 
 // ResetSession clears the CLI session (e.g. Claude JSONL) for an agent

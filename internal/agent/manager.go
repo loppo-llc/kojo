@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -2640,6 +2641,138 @@ func (m *Manager) Messages(agentID string, limit int) ([]*Message, error) {
 // MessagesPaginated returns messages with cursor-based pagination.
 func (m *Manager) MessagesPaginated(agentID string, limit int, before string) ([]*Message, bool, error) {
 	return loadMessagesPaginated(agentID, limit, before)
+}
+
+// MirrorMessagesPaginated は §3.7 device-switch で他 peer に転移している
+// agent の remote_message_mirror から messages を読む。
+// holder peer が offline のときの read fallback として server 層が呼ぶ。
+// canonical な agent_messages とは独立 — Hub が直前に proxy 成功した時の
+// スナップショット。MessagesPaginated と同じ envelope (oldest-first slice +
+// hasMore) を返す。
+func (m *Manager) MirrorMessagesPaginated(agentID string, limit int, before string) ([]*Message, bool, error) {
+	st := m.Store()
+	if st == nil {
+		return nil, false, errStoreNotReady
+	}
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+	rows, hasMore, err := st.ListRemoteMirrorMessages(ctx, agentID, limit, before)
+	if err != nil {
+		return nil, false, err
+	}
+	out := make([]*Message, 0, len(rows))
+	for _, r := range rows {
+		msg := &Message{
+			ID:        r.ID,
+			Role:      r.Role,
+			Content:   r.Content,
+			Thinking:  r.Thinking,
+			Timestamp: r.Timestamp,
+		}
+		if len(r.ToolUses) > 0 {
+			_ = json.Unmarshal(r.ToolUses, &msg.ToolUses)
+		}
+		if len(r.Attachments) > 0 {
+			_ = json.Unmarshal(r.Attachments, &msg.Attachments)
+		}
+		if len(r.Usage) > 0 {
+			var u Usage
+			if json.Unmarshal(r.Usage, &u) == nil {
+				msg.Usage = &u
+			}
+		}
+		out = append(out, msg)
+	}
+	return out, hasMore, nil
+}
+
+// UpsertMirrorFromMessages は proxy 経由で peer から取得した messages を
+// Hub の remote_message_mirror に upsert する。message_id で dedup される。
+// holder peer が offline になった瞬間でも、直前の成功 proxy 分は mirror に
+// 残るため、read fallback でそのまま返せる。
+func (m *Manager) UpsertMirrorFromMessages(agentID, holderPeer string, msgs []*Message) error {
+	st := m.Store()
+	if st == nil {
+		return errStoreNotReady
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
+	rows := make([]store.RemoteMirrorMessage, 0, len(msgs))
+	for _, msg := range msgs {
+		if msg == nil || msg.ID == "" || msg.Timestamp == "" {
+			continue
+		}
+		role := msg.Role
+		if role == "" {
+			continue
+		}
+		row := store.RemoteMirrorMessage{
+			ID:        msg.ID,
+			Role:      role,
+			Content:   msg.Content,
+			Thinking:  msg.Thinking,
+			Timestamp: msg.Timestamp,
+		}
+		if len(msg.ToolUses) > 0 {
+			if b, err := json.Marshal(msg.ToolUses); err == nil {
+				row.ToolUses = b
+			}
+		}
+		if len(msg.Attachments) > 0 {
+			if b, err := json.Marshal(msg.Attachments); err == nil {
+				row.Attachments = b
+			}
+		}
+		if msg.Usage != nil {
+			if b, err := json.Marshal(msg.Usage); err == nil {
+				row.Usage = b
+			}
+		}
+		rows = append(rows, row)
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+	// レース対策: agent が proxy 中に Hub 側へ戻ってきた (force-reclaim /
+	// finalize で holder==self) ケースを救う。in-flight な proxy 応答が
+	// ActivateAgentRuntime の DeleteMirrorForAgent 直後に到達して stale
+	// 行を再挿入する race を、store 層の単一 BEGIN IMMEDIATE 内 (holder
+	// check + upsert) で閉じる。
+	return st.UpsertRemoteMirrorMessagesIfHolder(ctx, agentID, holderPeer, rows)
+}
+
+// MirrorMessageExists は (agentID, messageID) が remote_message_mirror に
+// 存在するかだけを返す。serveRemoteMessagesMerged が paginated 取得時の
+// cursor 出所 source を切り分けるために使う。store 不在 / 読取失敗は
+// false + nil で返す (失敗時は local fallback に倒すのが安全)。
+func (m *Manager) MirrorMessageExists(agentID, messageID string) (bool, error) {
+	st := m.Store()
+	if st == nil {
+		return false, nil
+	}
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+	ok, err := st.RemoteMirrorMessageExists(ctx, agentID, messageID)
+	if err != nil {
+		return false, nil
+	}
+	return ok, nil
+}
+
+// DeleteMirrorForAgent は agent の mirror 行を全削除する。
+// 帰還 (holder==self になった瞬間) と ReleaseAgentLocally で呼ぶ。
+func (m *Manager) DeleteMirrorForAgent(agentID string) error {
+	st := m.Store()
+	if st == nil {
+		return nil
+	}
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+	_, err := st.DeleteRemoteMirrorForAgent(ctx, agentID)
+	return err
 }
 
 // UpdateMessageContent replaces the content of a single message in the transcript.

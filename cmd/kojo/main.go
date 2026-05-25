@@ -524,6 +524,11 @@ func main() {
 	var peerSubscriber *peer.Subscriber
 	var peerSubscriberTargetsCtx context.Context
 	var peerSubscriberTargetsCancel context.CancelFunc
+	// --peer の PruneToOwnedAgentsForPeer 結果。失敗 (false) 時は下の
+	// StartSchedulers を fail-closed で skip して cron 二重発火を防ぐ。
+	// 既定 true: 非 --peer や peerIdentity nil の経路では prune 自体を
+	// 走らせないが、StartSchedulers は走らせたいため。
+	peerPruneOK := true
 	if peerIdentity != nil && agentMgr != nil {
 		if st := agentMgr.Store(); st != nil {
 			peerEvents = peer.NewEventBus()
@@ -645,14 +650,35 @@ func main() {
 			// to fire. Eviction needs only peerIdentity + store,
 			// neither of which depends on the registrar succeeding,
 			// so a registrar failure must not bypass the eviction.
-			// Hub-mode only: --peer hosts no agent runtime at all
-			// and never feeds the list to schedulers.
-			if !*peerMode {
-				evictCtx, evictCancel := context.WithTimeout(
+			// --peer も device-switch 着地点になり得るので、
+			// released marker のついた行を schedulers 起動前に落とす
+			// 必要がある。さもないと StartSchedulers が peer の m.agents
+			// 全件 (released 込み) に cron を載せ、他 peer と二重発火する。
+			// 既に他 peer に release した行を evict するロジック自体は
+			// mode 非依存なので peer でもそのまま流用できる。
+			evictCtx, evictCancel := context.WithTimeout(
+				context.Background(), 30*time.Second)
+			agentMgr.EvictNonLocalAgentsAtStartup(
+				evictCtx, peerIdentity.DeviceID)
+			evictCancel()
+			// --peer 限定の追加 prune: released marker が無い orphan 行
+			// (未finalize / 過去 incarnation の残骸) も schedulers 起動前
+			// に detach する。owned 判定は arrived markers ∪ agent_locks
+			// holder == self − released markers で再構築。
+			// Prune が失敗 (kv 読取エラー等) した場合、m.agents の正当
+			// 所有を切り分けられないので fail-closed として StartSchedulers
+			// 自体を skip する。さもないと orphan 全件に cron が乗って
+			// 他 peer と二重発火する。Operator は警告ログを見て kv 修復後
+			// 再起動。
+			if *peerMode {
+				pruneCtx, pruneCancel := context.WithTimeout(
 					context.Background(), 30*time.Second)
-				agentMgr.EvictNonLocalAgentsAtStartup(
-					evictCtx, peerIdentity.DeviceID)
-				evictCancel()
+				peerPruneOK = agentMgr.PruneToOwnedAgentsForPeer(
+					pruneCtx, peerIdentity.DeviceID)
+				pruneCancel()
+				if !peerPruneOK {
+					logger.Warn("--peer prune failed; skipping StartSchedulers to avoid cross-peer double-fire. fix kv and restart.")
+				}
 			}
 			if peerRegistrar != nil {
 				// Run on Hub AND on --peer. Hub starts with its
@@ -734,9 +760,23 @@ func main() {
 						ids = append(ids, id)
 					}
 				}
-				lockCtx, lockCancel := context.WithTimeout(context.Background(), 30*time.Second)
-				agentLockGuard.Start(lockCtx, ids)
-				lockCancel()
+				// --peer prune が失敗していたら ids は部分集合 (内部の
+				// kv 読取も同じ store を使うので同じく degraded のはず)。
+				// 部分 seed で Start すると stale ID を AcquireAgentLock し
+				// 直してしまい、本来所有していない agent の lock を奪う恐れ
+				// がある。fail-closed で Start も skip し、guard 自体を
+				// nil に戻す — 後続の finalize / force-reclaim hook が
+				// capturedGuard.AddAgent を呼んで refresh loop の無い lock
+				// を取得するのを防ぐため。Hub mode は peerPruneOK 常に true
+				// なので影響なし。
+				if !*peerMode || peerPruneOK {
+					lockCtx, lockCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					agentLockGuard.Start(lockCtx, ids)
+					lockCancel()
+				} else {
+					logger.Warn("--peer prune failed; skipping AgentLockGuard.Start and disabling guard hooks to avoid stale lock re-acquire")
+					agentLockGuard = nil
+				}
 
 				// Restore agent_locks.allowed_proxy_peer for every
 				// seeded ID. AgentLockGuard.Stop wipes the lock rows
@@ -811,12 +851,16 @@ func main() {
 	// NewManager used to call StartSchedulers internally; the split
 	// lets cmd/kojo interpose the hydrate.
 	//
-	// Peer mode (`--peer`) skips agent schedulers entirely: a daemon-
-	// only peer hosts no agent runtime, runs no Slack producers, and
-	// has no Owner-facing API. Letting StartSchedulers fire on the
-	// peer would tick cron jobs with no listener to dispatch them
-	// to and risk duplicate work on the Hub that owns the agent lock.
-	if agentMgr != nil && !*peerMode {
+	// `--peer` host も device-switch の着地点になり得る
+	// (ActivateAgentRuntime が arrival 時に呼ばれる)。
+	// StartSchedulers を呼ばないと schedulersStarted=false のままで
+	// ActivateAgentRuntime が早期 return し、転移先 peer で cron が
+	// 永久に未登録になる。boot 直後の peer は agent 0 件なので、
+	// StartSchedulers は空 iterate するだけで副作用なし。
+	// 例外: --peer で PruneToOwnedAgentsForPeer が失敗した場合は、
+	// 正当所有を切り分けられないため schedulers 起動自体を skip
+	// (peerPruneOK==false)。
+	if agentMgr != nil && peerPruneOK {
 		agentMgr.StartSchedulers()
 	}
 

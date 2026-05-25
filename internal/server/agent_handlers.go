@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1141,9 +1142,175 @@ func (s *Server) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 		if s.proxyPeerGetMessages(w, r, id, remote.HolderPeer) {
 			return
 		}
-		// Proxy failed — fall through to local store snapshot.
+		// Proxy 失敗 (peer 一時 offline 等) — remote_message_mirror
+		// (proxy 成功時のスナップショット) と local agent_messages
+		// (転移前の canonical transcript) を merge して返す。mirror が
+		// Dashboard の limit=1 polling で 1 行だけ入っていた場合に
+		// local の長い履歴を隠さないようにするのが merge の目的。
+		s.serveRemoteMessagesMerged(w, r, id)
+		return
 	}
 	s.serveLocalMessages(w, r, id)
+}
+
+// serveRemoteMessagesMerged は remote agent が peer offline のときの
+// read fallback。
+//
+// before == "" (最初のページ): remote_message_mirror と local agent_messages
+// を独立に取得し、message_id で dedup → timestamp DESC sort → limit trim →
+// oldest-first で返す。Dashboard polling で mirror に 1 行だけ入ったとき
+// local の長い履歴が隠れるのを防ぐのが目的。
+//
+// before != "" (older 取得): cursor が属する source 単独で paginate する。
+// 両 source に同じ before ID を渡すと、片側に cursor が無いとき「cursor 無し
+// = 最新ページ」を返してしまい、古いページに最新の mirror が再注入される
+// 不整合が出るため。cursor が指す message は UI が既に表示している最古行
+// なので、その出所と同じ source で遡るのが自然。
+func (s *Server) serveRemoteMessagesMerged(w http.ResponseWriter, r *http.Request, id string) {
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	before := r.URL.Query().Get("before")
+
+	if before != "" {
+		// cursor が mirror に居るなら mirror で続行、居なければ local
+		// (canonical の loadMessagesPaginated が ErrNotFound を「cursor
+		// 無し」扱いで吸収する挙動と整合する)。
+		inMirror, _ := s.agents.MirrorMessageExists(id, before)
+		var (
+			page    []*agent.Message
+			hasMore bool
+			pErr    error
+		)
+		if inMirror {
+			page, hasMore, pErr = s.agents.MirrorMessagesPaginated(id, limit, before)
+			// mirror 側が limit 未満かつ枯渇 (hasMore=false) なら、
+			// それより古い行は local agent_messages (転移前の canonical
+			// transcript) に存在する可能性。残り枠を local の最新ページで
+			// fill して older 履歴に到達可能にする。dedup は ID で行う。
+			if pErr == nil && !hasMore && len(page) < limit {
+				localPage, localHasMore, lErr := s.agents.MessagesPaginated(id, limit-len(page), "")
+				if lErr == nil {
+					seen := make(map[string]struct{}, len(page))
+					for _, m := range page {
+						if m != nil {
+							seen[m.ID] = struct{}{}
+						}
+					}
+					// local は oldest-first。mirror page も oldest-first。
+					// mirror の最古行より古いものだけを採用する。
+					oldestMirrorTS := ""
+					if len(page) > 0 && page[0] != nil {
+						oldestMirrorTS = page[0].Timestamp
+					}
+					fill := make([]*agent.Message, 0, len(localPage))
+					for _, m := range localPage {
+						if m == nil {
+							continue
+						}
+						if _, dup := seen[m.ID]; dup {
+							continue
+						}
+						if oldestMirrorTS != "" && !timestampBefore(m.Timestamp, oldestMirrorTS) {
+							continue
+						}
+						fill = append(fill, m)
+					}
+					// fill (oldest-first) → mirror page (oldest-first) と
+					// 結合して全体 oldest-first を維持する。
+					if len(fill) > 0 {
+						merged := make([]*agent.Message, 0, len(fill)+len(page))
+						merged = append(merged, fill...)
+						merged = append(merged, page...)
+						page = merged
+					}
+					hasMore = localHasMore
+				}
+			}
+		} else {
+			page, hasMore, pErr = s.agents.MessagesPaginated(id, limit, before)
+		}
+		s.writeRemoteMessagesPage(w, id, page, hasMore, pErr)
+		return
+	}
+
+	// 最初のページ: 両 source を merge
+	mirrorMsgs, mirrorHasMore, mErr := s.agents.MirrorMessagesPaginated(id, limit, "")
+	if mErr != nil && s.logger != nil {
+		s.logger.Debug("serveRemoteMessagesMerged: mirror read failed", "agent", id, "err", mErr)
+	}
+	localMsgs, localHasMore, lErr := s.agents.MessagesPaginated(id, limit, "")
+	if lErr != nil && s.logger != nil {
+		s.logger.Debug("serveRemoteMessagesMerged: local read failed", "agent", id, "err", lErr)
+	}
+	if mErr != nil && lErr != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", lErr.Error())
+		return
+	}
+
+	// dedup-by-id, mirror 優先 (proxy 由来の最新を local 由来の古い同 id
+	// が上書きしないように)
+	byID := make(map[string]*agent.Message, len(mirrorMsgs)+len(localMsgs))
+	for _, m := range localMsgs {
+		if m != nil {
+			byID[m.ID] = m
+		}
+	}
+	for _, m := range mirrorMsgs {
+		if m != nil {
+			byID[m.ID] = m
+		}
+	}
+	merged := make([]*agent.Message, 0, len(byID))
+	for _, m := range byID {
+		merged = append(merged, m)
+	}
+	// timestamp DESC で sort (同 ts は id 降順で tie-break)。
+	// timezone offset 違いの RFC3339 ("...Z" vs "...+09:00") を文字列比較
+	// すると時系列が崩れるので time.Parse で比較。両方 parse 失敗時のみ
+	// 文字列 fallback。
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].Timestamp == merged[j].Timestamp {
+			return merged[i].ID > merged[j].ID
+		}
+		return timestampAfter(merged[i].Timestamp, merged[j].Timestamp)
+	})
+	trimmed := merged
+	hasMore := mirrorHasMore || localHasMore
+	if len(trimmed) > limit {
+		trimmed = trimmed[:limit]
+		hasMore = true
+	}
+	// oldest-first に反転 (serveLocalMessages / MessagesPaginated と同じ wire)
+	for i, j := 0, len(trimmed)-1; i < j; i, j = i+1, j-1 {
+		trimmed[i], trimmed[j] = trimmed[j], trimmed[i]
+	}
+	if trimmed == nil {
+		trimmed = []*agent.Message{}
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"messages": trimmed, "hasMore": hasMore})
+}
+
+// writeRemoteMessagesPage は paginate 結果を serveLocalMessages と同じ
+// envelope で書く。serveRemoteMessagesMerged の paginated branch から共有。
+func (s *Server) writeRemoteMessagesPage(w http.ResponseWriter, id string, msgs []*agent.Message, hasMore bool, err error) {
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Debug("writeRemoteMessagesPage: read failed", "agent", id, "err", err)
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	if msgs == nil {
+		msgs = []*agent.Message{}
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"messages": msgs, "hasMore": hasMore})
 }
 
 // serveLocalMessages reads messages from this peer's local store.
@@ -1229,10 +1396,32 @@ func (s *Server) proxyPeerGetMessages(w http.ResponseWriter, r *http.Request, ag
 		return false
 	}
 
-	// Stream the upstream response body to the client.
+	// Body をバッファに読み込んで mirror upsert + client への echo を行う。
+	// 直接 io.Copy で stream すると mirror に残せないため、32 MiB 上限で
+	// バッファリング。decode 失敗は client への echo を諦めて fallback。
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Debug("proxyPeerGetMessages: read body failed", "agent", agentID, "peer", holderDeviceID, "err", err)
+		}
+		return false
+	}
+	// holder peer が一時 offline になった瞬間でも、ここで mirror に書いた
+	// スナップショットが Hub UI の Dashboard / Chat の read fallback で
+	// 引かれる。decode 失敗は raw body をそのまま echo して mirror upsert を
+	// 諦める (UI には影響しない)。
+	var parsed struct {
+		Messages []*agent.Message `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &parsed); err == nil && len(parsed.Messages) > 0 {
+		if uerr := s.agents.UpsertMirrorFromMessages(agentID, holderDeviceID, parsed.Messages); uerr != nil && s.logger != nil {
+			s.logger.Debug("proxyPeerGetMessages: mirror upsert failed",
+				"agent", agentID, "peer", holderDeviceID, "err", uerr)
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	io.Copy(w, io.LimitReader(resp.Body, 32<<20))
+	_, _ = w.Write(body)
 	return true
 }
 
@@ -1280,7 +1469,18 @@ func (s *Server) enrichRemoteAgentsLatestActivity(ctx context.Context, all []*ag
 			defer wg.Done()
 			ts, role, content, ok := s.fetchRemoteLatestMessage(ctx, j.agent.ID, j.agent.HolderPeer)
 			if !ok || ts == "" {
-				return
+				// holder offline 等で fetch 失敗 — 直前の成功 proxy
+				// 時に書いた remote_message_mirror から最新行を引いて
+				// 代用する。空ならそのまま fallthrough (local DB の
+				// 転移前 LastMessage を残す)。
+				msgs, _, merr := s.agents.MirrorMessagesPaginated(j.agent.ID, 1, "")
+				if merr != nil || len(msgs) == 0 {
+					return
+				}
+				m := msgs[len(msgs)-1]
+				ts = m.Timestamp
+				role = m.Role
+				content = m.Content
 			}
 			// Update both sort keys. UpdatedAt drives the dashboard's
 			// primary sort; LastMessage.Timestamp is the displayed "ago".
@@ -1333,12 +1533,10 @@ func (s *Server) fetchRemoteLatestMessage(ctx context.Context, agentID, holderDe
 	if resp.StatusCode != http.StatusOK {
 		return "", "", "", false
 	}
+	// agent.Message full shape で decode して mirror upsert にも回す。
+	// ?limit=1 だが Dashboard が頻繁に叩くので、増分的に mirror に積もる。
 	var body struct {
-		Messages []struct {
-			Role      string `json:"role"`
-			Content   string `json:"content"`
-			Timestamp string `json:"timestamp"`
-		} `json:"messages"`
+		Messages []*agent.Message `json:"messages"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
 		return "", "", "", false
@@ -1346,8 +1544,37 @@ func (s *Server) fetchRemoteLatestMessage(ctx context.Context, agentID, holderDe
 	if len(body.Messages) == 0 {
 		return "", "", "", false
 	}
+	if uerr := s.agents.UpsertMirrorFromMessages(agentID, holderDeviceID, body.Messages); uerr != nil && s.logger != nil {
+		s.logger.Debug("fetchRemoteLatestMessage: mirror upsert failed",
+			"agent", agentID, "peer", holderDeviceID, "err", uerr)
+	}
 	m := body.Messages[len(body.Messages)-1]
+	if m == nil {
+		return "", "", "", false
+	}
 	return m.Timestamp, m.Role, m.Content, true
+}
+
+// timestampAfter は a > b を時刻として判定する。両方 parse 失敗時のみ
+// 文字列比較 fallback。同値判定は呼出側 (sort closure) が tie-break する。
+func timestampAfter(a, b string) bool {
+	at, aerr := time.Parse(time.RFC3339, a)
+	bt, berr := time.Parse(time.RFC3339, b)
+	if aerr == nil && berr == nil {
+		return at.After(bt)
+	}
+	return a > b
+}
+
+// timestampBefore は a < b を時刻として判定する。両方 parse 失敗時のみ
+// 文字列比較 fallback。
+func timestampBefore(a, b string) bool {
+	at, aerr := time.Parse(time.RFC3339, a)
+	bt, berr := time.Parse(time.RFC3339, b)
+	if aerr == nil && berr == nil {
+		return at.Before(bt)
+	}
+	return a < b
 }
 
 // isRFC3339After reports whether a is strictly after b. Empty b is
