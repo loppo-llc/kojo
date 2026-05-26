@@ -52,7 +52,7 @@ const (
 type Principal struct {
 	Role    Role
 	AgentID string // populated for RoleAgent / RolePrivAgent
-	PeerID  string // populated for RolePeer (device_id from peer_registry)
+	PeerID  string // populated for RolePeer (device_id from peer_registry); also stamped on RoleOwner when the Hub-public TailnetIdentityMiddleware's WhoIs lookup matches a paired peer, so events handlers can identify which paired-peer connection they're on without re-querying the registry
 }
 
 // IsOwner returns true if the principal is the kojo user.

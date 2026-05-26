@@ -69,8 +69,15 @@ type Server struct {
 	events          *eventbus.Bus  // invalidation broadcast (Phase 4); nil disables /api/v1/events
 	peerID          *peer.Identity // local peer identity (Phase G); nil disables /api/v1/peers
 	peerEvents      *peer.EventBus // cross-peer status push bus (§3.10); nil disables /api/v1/peers/events
-	requireIfMatch  bool // 428 on missing If-Match (docs §3.5 transition)
-	webdavTokens    *auth.WebDAVTokenStore
+	// peerPresence tracks which paired peers currently hold a live
+	// /api/v1/peers/events WS against this daemon. handlePeerEventsWS
+	// Add/Removes the deviceID; OfflineSweeper consults it so a peer
+	// with an open WS is never flipped offline by sample-based aging.
+	// nil disables the presence-aware path (handler degrades to
+	// last_seen-only). Wired via Config.PeerPresence.
+	peerPresence   *peer.Presence
+	requireIfMatch bool // 428 on missing If-Match (docs §3.5 transition)
+	webdavTokens   *auth.WebDAVTokenStore
 	// onAgentSynced is fired by handlePeerAgentSync after the
 	// store rows commit. ONLY the minimum side effects that are
 	// safe even if the orchestrator later aborts the switch
@@ -226,6 +233,12 @@ type Config struct {
 	// OfflineSweeper publish to it on every status change.
 	// Nil disables the cross-peer push surface.
 	PeerEvents *peer.EventBus
+	// PeerPresence is the in-memory active-connection set the events
+	// WS handler maintains and the OfflineSweeper consults. Optional;
+	// when nil the handler still touches last_seen periodically (so
+	// the sample-based aging path keeps working) but the sweeper has
+	// no way to skip an active connection on a flaky uplink.
+	PeerPresence *peer.Presence
 	// PeerOnly switches the server into the daemon-mode shape used
 	// by `kojo --peer`. The §3.7 device-switch slice promoted this
 	// from "minimal peer surface" to a full peer: agent runtime,
@@ -319,6 +332,7 @@ func New(cfg Config) *Server {
 		events:          cfg.EventBus,
 		peerID:          cfg.PeerIdentity,
 		peerEvents:      cfg.PeerEvents,
+		peerPresence:    cfg.PeerPresence,
 		requireIfMatch:  cfg.RequireIfMatch,
 		webdavTokens:    cfg.WebDAVTokenStore,
 		pendingSyncKEK:  cfg.PendingSyncKEK,

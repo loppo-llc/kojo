@@ -112,8 +112,13 @@ func TestTailnetIdentityMiddleware_HubPromotesPairedPeerToOwner(t *testing.T) {
 	if got.Role != auth.RoleOwner {
 		t.Fatalf("role = %v, want RoleOwner (Hub trusts every tailnet caller, paired-peer included)", got.Role)
 	}
-	if got.PeerID != "" {
-		t.Fatalf("peer_id = %q, want empty (Owner has no PeerID)", got.PeerID)
+	// PeerID is stamped alongside RoleOwner when WhoIs matches a
+	// paired peer so handlers downstream (e.g. /api/v1/peers/events)
+	// can identify the connection without a second registry query.
+	// The Owner role itself is unchanged — the elevated trust still
+	// matches the documented "Tailscale reach == Owner" UX.
+	if got.PeerID == "" {
+		t.Fatalf("peer_id is empty, want the matched device_id")
 	}
 }
 

@@ -113,17 +113,17 @@ type TailnetIdentityConfig struct {
 //     returns an empty NodeKey (tsnet's view of the tailnet hasn't
 //     refreshed for this caller yet — typical for a just-joined
 //     node or one whose key was recently rotated), the request:
-//       - on Hub mode (PromoteUnknownTailnetToOwner=true) → Owner,
-//         UNLESS the error wraps ErrNodeKeyResolverNotReady. The
-//         tsnet listener is only reachable over Tailscale, so the
-//         listener boundary itself is the trust gate; a transient
-//         WhoIs blip must not 403 the operator's UI. The
-//         ErrNodeKeyResolverNotReady exception covers the startup
-//         window where SetNodeKeyResolver has not run yet — an
-//         unidentified caller there has no claim to Owner.
-//       - on Peer mode (false) → falls through as Guest so a
-//         downstream middleware (the AuthMiddleware on the
-//         auth-required listener) can resolve a Bearer instead.
+//     - on Hub mode (PromoteUnknownTailnetToOwner=true) → Owner,
+//     UNLESS the error wraps ErrNodeKeyResolverNotReady. The
+//     tsnet listener is only reachable over Tailscale, so the
+//     listener boundary itself is the trust gate; a transient
+//     WhoIs blip must not 403 the operator's UI. The
+//     ErrNodeKeyResolverNotReady exception covers the startup
+//     window where SetNodeKeyResolver has not run yet — an
+//     unidentified caller there has no claim to Owner.
+//     - on Peer mode (false) → falls through as Guest so a
+//     downstream middleware (the AuthMiddleware on the
+//     auth-required listener) can resolve a Bearer instead.
 //  3. NodeKey == SelfNodeKey → RoleOwner.
 //  4. PromoteUnknownTailnetToOwner true (Hub public listener) →
 //     RoleOwner. peer_registry is NOT consulted for the role; it
@@ -241,31 +241,47 @@ func TailnetIdentityMiddleware(cfg TailnetIdentityConfig) func(http.Handler) htt
 			// false so peer_registry hit ⇒ RolePeer for the §3.7
 			// surface.
 			//
-			// peer_registry is still touched as a side-effect when
-			// the resolved NodeKey matches a registered peer, so
-			// the Hub UI's last_seen / status stay fresh. The
-			// touch runs async on a background context — the
-			// request never waits on the store.
+			// peer_registry is also touched and the matched DeviceID
+			// stamped onto the Principal so downstream handlers (e.g.
+			// /api/v1/peers/events) can identify which paired peer is
+			// on the wire and refresh last_seen periodically without
+			// waiting for the next inbound request. Lookup is sync
+			// (same cadence as the peer-mode branch below); a miss
+			// or DB blip leaves PeerID empty but keeps the Owner
+			// stamp so operator UX is unaffected.
 			if cfg.PromoteUnknownTailnetToOwner {
+				// The Hub public listener runs this resolution on
+				// EVERY tailnet-routed API call (Dashboard polling,
+				// agent chat, file list, …). Use a tight 500ms cap
+				// so a DB-lock spike on the registry never stretches
+				// an operator UI request — the lookup is purely
+				// best-effort liveness/identity. A miss or timeout
+				// leaves PeerID empty + last_seen unchanged; the
+				// operator UI still renders (Owner stamp unaffected)
+				// and the next request retries the lookup. Liveness
+				// downstream falls back to /api/v1/peers/events's
+				// own periodic touch + the sweeper's presence path.
+				const hubLookupTimeout = 500 * time.Millisecond
+				const hubTouchTimeout = 500 * time.Millisecond
+				var peerID string
 				if cfg.Store != nil {
-					st := cfg.Store
-					nk := nodeKey
-					logger := cfg.Logger
-					go func() {
-						tctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-						defer cancel()
-						rec, err := st.GetPeerByNodeKey(tctx, nk)
-						if err != nil {
-							if logger != nil && !errors.Is(err, store.ErrNotFound) {
-								logger.Warn("tsnet identity: async liveness lookup failed",
-									"node_key", nk, "err", err)
-							}
-							return
+					lookupCtx, lookupCancel := context.WithTimeout(r.Context(), hubLookupTimeout)
+					rec, err := cfg.Store.GetPeerByNodeKey(lookupCtx, nodeKey)
+					lookupCancel()
+					switch {
+					case err == nil && rec != nil:
+						peerID = rec.DeviceID
+						touchCtx, touchCancel := context.WithTimeout(r.Context(), hubTouchTimeout)
+						_ = cfg.Store.TouchPeer(touchCtx, rec.DeviceID, store.PeerStatusOnline, time.Now().UnixMilli())
+						touchCancel()
+					case err != nil && !errors.Is(err, store.ErrNotFound) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled):
+						if cfg.Logger != nil {
+							cfg.Logger.Warn("tsnet identity: hub liveness lookup failed",
+								"node_key", nodeKey, "err", err)
 						}
-						_ = st.TouchPeer(tctx, rec.DeviceID, store.PeerStatusOnline, time.Now().UnixMilli())
-					}()
+					}
 				}
-				ctx := WithPrincipal(r.Context(), Principal{Role: RoleOwner})
+				ctx := WithPrincipal(r.Context(), Principal{Role: RoleOwner, PeerID: peerID})
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}

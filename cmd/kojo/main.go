@@ -33,8 +33,8 @@ import (
 	"github.com/loppo-llc/kojo/internal/store"
 	"github.com/loppo-llc/kojo/internal/store/secretcrypto"
 	"github.com/loppo-llc/kojo/web"
-	"tailscale.com/ipn/ipnstate"
 	localTailscale "tailscale.com/client/local"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
 
@@ -521,6 +521,12 @@ func main() {
 	// register / heartbeat / expire / shutdown events. Nil
 	// peerIdentity falls through (no bus, no route registered).
 	var peerEvents *peer.EventBus
+	// In-memory active-connection set for /api/v1/peers/events. The
+	// handler Add/Removes a deviceID per WS; the OfflineSweeper
+	// refreshes last_seen on every active peer per sweep tick so a
+	// flaky mobile uplink that drops the occasional touch keeps the
+	// peer pinned online as long as a WS holds.
+	var peerPresence *peer.Presence
 	var peerSubscriber *peer.Subscriber
 	var peerSubscriberTargetsCtx context.Context
 	var peerSubscriberTargetsCancel context.CancelFunc
@@ -532,6 +538,7 @@ func main() {
 	if peerIdentity != nil && agentMgr != nil {
 		if st := agentMgr.Store(); st != nil {
 			peerEvents = peer.NewEventBus()
+			peerPresence = peer.NewPresence()
 			peerRegistrar = peer.NewRegistrar(st, peerIdentity, logger)
 			peerRegistrar.SetEventBus(peerEvents)
 			startCtx, startCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -599,6 +606,7 @@ func main() {
 			if peerRegistrar != nil {
 				peerSweeper = peer.NewOfflineSweeper(st, peerIdentity, logger)
 				peerSweeper.SetEventBus(peerEvents)
+				peerSweeper.SetPresence(peerPresence)
 				peerSweeper.Start()
 			}
 			// Cross-peer status subscriber (§3.10). Connects to
@@ -918,6 +926,7 @@ func main() {
 		Store:          agentMgr.Store(),
 		PeerIdentity:   peerIdentity,
 		PeerEvents:     peerEvents,
+		PeerPresence:   peerPresence,
 		// docs §3.5 transition: when KOJO_REQUIRE_IF_MATCH=1, every
 		// optimistic-concurrency-aware write rejects a missing
 		// If-Match header with 428 Precondition Required. Off by

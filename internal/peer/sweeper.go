@@ -2,6 +2,7 @@ package peer
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -60,10 +61,21 @@ const sweepOpTimeout = 10 * time.Second
 // Concurrency: identical model to Registrar — one goroutine, sync.Once
 // shutdown guard, sync.WaitGroup for graceful drain.
 type OfflineSweeper struct {
-	st       *store.Store
-	id       *Identity
-	logger   *slog.Logger
-	events   *EventBus // optional pub/sub for status push
+	st     *store.Store
+	id     *Identity
+	logger *slog.Logger
+	events *EventBus // optional pub/sub for status push
+	// presence is the in-memory set of peers currently holding a
+	// live inter-peer WS against this daemon (populated by the
+	// /api/v1/peers/events handler). When non-nil, sweepOnce
+	// refreshes last_seen on every active peer BEFORE the stale-
+	// sweep UPDATE runs. SQLite serializes the touches with the
+	// subsequent UPDATE, so an active peer's row falls outside
+	// the predicate at apply time even if a missed touch on a
+	// flaky uplink would otherwise have pushed it past the
+	// threshold. nil disables the presence-aware path — the
+	// sample-based aging still works.
+	presence *Presence
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 	stopOnce sync.Once
@@ -90,6 +102,19 @@ func (s *OfflineSweeper) SetEventBus(bus *EventBus) {
 		return
 	}
 	s.events = bus
+}
+
+// SetPresence wires the in-memory active-connection set the events
+// WS handler populates. Each sweep tick refreshes last_seen for
+// every active deviceID before running the stale-sweep predicate,
+// so a peer with a live WS is held online even on a flaky uplink
+// where a missed touch tick would otherwise let the row age out.
+// Safe to call once before Start.
+func (s *OfflineSweeper) SetPresence(p *Presence) {
+	if s == nil {
+		return
+	}
+	s.presence = p
 }
 
 // Start launches the sweep goroutine. Returns nil even if the deps
@@ -140,6 +165,54 @@ func (s *OfflineSweeper) sweepOnce() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sweepOpTimeout)
 	defer cancel()
+	// Refresh last_seen for every actively-connected peer before
+	// the stale-sweep UPDATE so the SQL predicate naturally
+	// excludes them. SQLite serializes the touches with the
+	// UPDATE so this is race-free; the cost is one TouchPeer per
+	// active peer per sweep tick (cheap, single-row UPDATE keyed
+	// on the device_id PK).
+	//
+	// If ANY active-peer touch fails (DB lock, ctx timeout, …),
+	// abort the sweep entirely instead of proceeding. Without
+	// this guard a transient lock that loses one touch would let
+	// the very next UPDATE flip an actively-connected peer
+	// offline — exactly the false-positive the presence path
+	// exists to prevent. The next sweep tick (HeartbeatInterval
+	// later) retries; the cluster tolerates a one-tick delay in
+	// offline detection.
+	if s.presence != nil {
+		nowMs := store.NowMillis()
+		for _, id := range s.presence.ActiveDeviceIDs() {
+			if id == "" || id == s.id.DeviceID {
+				continue
+			}
+			err := s.st.TouchPeer(ctx, id, store.PeerStatusOnline, nowMs)
+			if err == nil {
+				continue
+			}
+			// ErrNotFound is non-fatal: the row was deleted while the
+			// WS is still being torn down (operator hit Reject /
+			// Delete, or a force-reclaim wiped the entry). The
+			// presence map still holds the deviceID until the
+			// handler's release defer fires, but the sweep itself
+			// has nothing to do for this row, so skip it and keep
+			// going. Without this skip a freshly-deleted peer would
+			// pin the sweep abort indefinitely and every OTHER peer
+			// would stop being aged.
+			if errors.Is(err, store.ErrNotFound) {
+				continue
+			}
+			// Any other error (DB lock, ctx timeout) means we cannot
+			// trust that the predicate will exclude active peers at
+			// UPDATE time. Abort the whole sweep tick; the next tick
+			// (HeartbeatInterval later) retries.
+			if s.logger != nil {
+				s.logger.Warn("peer.OfflineSweeper: active-peer touch failed; aborting sweep tick",
+					"device_id", id, "err", err)
+			}
+			return
+		}
+	}
 	cutoff := store.NowMillis() - OfflineThreshold.Milliseconds()
 	// Use the detail variant when an events bus is attached so we
 	// can publish one StatusEvent per flipped row; otherwise stick
