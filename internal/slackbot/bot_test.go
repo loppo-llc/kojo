@@ -267,6 +267,88 @@ func TestBotPostMessageSendsMarkdownTextOnly(t *testing.T) {
 	}
 }
 
+// TestFinalizeUpdateOptsSendsMarkdownTextOnly verifies that the stream-finalize
+// chat.update call wires markdown_text alone, with no text field. Pairing
+// MsgOptionText with MsgOptionMarkdownText was the root cause of the
+// "{accumulated stream buffer} + {final body}" double-render bug (see the
+// IMPORTANT comment in sendToAgent). Mirrors TestBotPostMessageSendsMarkdownTextOnly
+// but covers the chat.update path — the postMessage test alone does not
+// guard against re-adding MsgOptionText to the finalize update slice.
+func TestFinalizeUpdateOptsSendsMarkdownTextOnly(t *testing.T) {
+	type captured struct {
+		text         string
+		markdownText string
+		threadTS     string
+		called       int
+	}
+	var got captured
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/chat.update":
+			_ = r.ParseForm()
+			got.text = r.FormValue("text")
+			got.markdownText = r.FormValue("markdown_text")
+			got.threadTS = r.FormValue("thread_ts")
+			got.called++
+			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":"123.456"}`)
+		default:
+			fmt.Fprintf(w, `{"ok":true}`)
+		}
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+
+	opts := finalizeUpdateOpts("hello body", "thread.999")
+	if _, _, _, err := api.UpdateMessageContext(context.Background(), "C1", "stream.111", opts...); err != nil {
+		t.Fatalf("UpdateMessageContext failed: %v", err)
+	}
+
+	if got.called != 1 {
+		t.Fatalf("chat.update called %d times, want 1", got.called)
+	}
+	if got.markdownText != "hello body" {
+		t.Errorf("markdown_text = %q, want %q", got.markdownText, "hello body")
+	}
+	if got.text != "" {
+		t.Errorf("text must be empty to avoid double-render with the streamed buffer, got %q", got.text)
+	}
+	if got.threadTS != "thread.999" {
+		t.Errorf("thread_ts = %q, want %q", got.threadTS, "thread.999")
+	}
+}
+
+// TestFinalizeUpdateOptsOmitsThreadTSWhenEmpty guards the conditional MsgOptionTS
+// append — passing an empty threadTS would otherwise leak `ts=` to the wire and
+// chat.update would reject it.
+func TestFinalizeUpdateOptsOmitsThreadTSWhenEmpty(t *testing.T) {
+	var sawTS string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/chat.update" {
+			_ = r.ParseForm()
+			// chat.update encodes the stream ts as the "ts" field; what we care
+			// about here is the *thread_ts* field, which finalizeUpdateOpts
+			// adds via MsgOptionTS only when threadTS != "". An empty input
+			// must not surface thread_ts on the wire.
+			sawTS = r.FormValue("thread_ts")
+		}
+		fmt.Fprintf(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	opts := finalizeUpdateOpts("body", "")
+	if _, _, _, err := api.UpdateMessageContext(context.Background(), "C1", "stream.222", opts...); err != nil {
+		t.Fatalf("UpdateMessageContext failed: %v", err)
+	}
+	if sawTS != "" {
+		t.Errorf("thread_ts must be empty when input threadTS is empty, got %q", sawTS)
+	}
+}
+
 // TestDeliveryFailureNoticeDoesNotAttributeCause guards against regressing
 // the notice wording back to a cause-specific phrasing like "too long".
 // The notice is posted from any deliveredAll=false path in sendToAgent

@@ -642,12 +642,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		if response.Len() > 0 {
 			text := response.String()
 			chunks := SplitMessage(text, slackMaxMsgLen)
-			updateOpts := []slack.MsgOption{
-				slack.MsgOptionMarkdownText(chunks[0]),
-			}
-			if threadTS != "" {
-				updateOpts = append(updateOpts, slack.MsgOptionTS(threadTS))
-			}
+			updateOpts := finalizeUpdateOpts(chunks[0], threadTS)
 
 			deliveredAll := true
 			_, _, _, updateErr := b.api.UpdateMessageContext(finCtx, channel, streamTS, updateOpts...)
@@ -858,6 +853,22 @@ func (b *Bot) appendStream(ctx context.Context, channel, streamTS, text string) 
 	}
 }
 
+// finalizeUpdateOpts returns the slack.MsgOption slice used by the
+// stream-finalize chat.update call. Centralized so the wire shape
+// (markdown_text alone, no MsgOptionText) is asserted from tests
+// without invoking the full sendToAgent path. See the IMPORTANT
+// comment in sendToAgent for why MsgOptionText must not be paired
+// with MsgOptionMarkdownText on this code path.
+func finalizeUpdateOpts(text, threadTS string) []slack.MsgOption {
+	opts := []slack.MsgOption{
+		slack.MsgOptionMarkdownText(text),
+	}
+	if threadTS != "" {
+		opts = append(opts, slack.MsgOptionTS(threadTS))
+	}
+	return opts
+}
+
 // chunkPostTimeout returns the timeout budget for posting nChunks
 // messages via postMessage, capped at chunkPostTimeoutMax.
 func chunkPostTimeout(nChunks int) time.Duration {
@@ -946,13 +957,14 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) b
 			select {
 			case <-ctx.Done():
 				b.logger.Warn("slack post cancelled while waiting on rate limit",
-					"channel", channel, "err", ctx.Err())
+					"channel", channel, "threadTS", threadTS, "err", ctx.Err())
 				return false
 			case <-sleep(wait):
 				continue
 			}
 		}
-		b.logger.Warn("failed to post slack message", "channel", channel, "err", err)
+		b.logger.Warn("failed to post slack message",
+			"channel", channel, "threadTS", threadTS, "err", err)
 		return false
 	}
 	// Unreachable: the rate-limited branch above returns on the final
