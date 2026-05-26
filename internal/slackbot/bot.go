@@ -827,7 +827,15 @@ func (b *Bot) appendStream(ctx context.Context, channel, streamTS, text string) 
 			// for and just delays the rest of the stream finalize
 			// path. Mirrors the same guard in postMessage so both
 			// retry sites stay in lockstep.
+			//
+			// Log on exhaustion so a sustained 429 storm leaves a
+			// trail — without this, stream deltas stop appearing in
+			// the channel with no log entry to correlate against
+			// (non-rate-limit errors hit the Debug log below).
 			if attempt == maxRateLimitRetry {
+				b.logger.Warn("failed to append slack stream after rate limit retries",
+					"channel", channel, "streamTS", streamTS,
+					"retryAfter", rlErr.RetryAfter, "err", err)
 				return
 			}
 			delay := rlErr.RetryAfter
@@ -918,7 +926,12 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) b
 			// chain and risking a cascade where later chunks lose
 			// their budget too.
 			if attempt == maxRateLimitRetry {
-				b.logger.Warn("failed to post slack message after rate limit retries", "channel", channel)
+				// Include err and RetryAfter so production logs
+				// can distinguish a Slack hard 429 from a slow
+				// recovery — without these the Warn is opaque.
+				b.logger.Warn("failed to post slack message after rate limit retries",
+					"channel", channel, "threadTS", threadTS,
+					"retryAfter", rlErr.RetryAfter, "err", err)
 				return false
 			}
 			wait := rlErr.RetryAfter
