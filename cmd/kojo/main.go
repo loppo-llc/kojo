@@ -1054,9 +1054,29 @@ func main() {
 			// refreshes the in-memory cache; firing schedules before
 			// finalize would have target acting on an agent the
 			// orchestrator might still abort.
+			//
+			// ORDER: NotifyDeviceSwitchArrival BEFORE
+			// ActivateAgentRuntime. The arrival call SYNCHRONOUSLY
+			// bumps an arrival-pending counter (see
+			// NotifyDeviceSwitchArrival doc); cron's runCronJob
+			// reads the counter via IsArrivalPending and defers a
+			// tick when it's > 0, so the arrival goroutine's
+			// async m.Chat wins the busy slot without blocking the
+			// finalize hook on prepareChat / PTY spawn.
+			// ActivateAgentRuntime, called next, schedules cron
+			// under that gate so the very first tick after install
+			// observes the pending counter and skips. Pre-fix the
+			// order was reversed and the gate didn't exist: on the
+			// chained-switch path (A→B→C) cron's first tick on C
+			// consistently preempted the arrival goroutine,
+			// exhausting the 120-second retry budget — visible to
+			// the user as "2 つ目の転移先で auto continue が
+			// 行われない." prepareChat re-installs the device-
+			// switch SKILL.md and re-runs the memory sync, so the
+			// SKILL / mirror-clear side-effects ActivateAgentRuntime
+			// performs are NOT blocking preconditions for the
+			// arrival chat.
 			if agentMgr != nil {
-				agentMgr.ActivateAgentRuntime(agentID)
-
 				// Resolve source peer's human-readable name for the
 				// arrival prompt. Best-effort: fall back to the raw
 				// device_id on lookup failure.
@@ -1067,6 +1087,7 @@ func main() {
 					}
 				}
 				agentMgr.NotifyDeviceSwitchArrival(agentID, sourceName, opID)
+				agentMgr.ActivateAgentRuntime(agentID)
 			}
 			return nil
 		})

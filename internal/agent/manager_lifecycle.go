@@ -616,7 +616,27 @@ type arrivalDedupKey struct {
 // it can immediately resume work on this peer after a device switch.
 // Runs async — the caller doesn't need to wait for the chat to
 // finish. If the agent is already busy (e.g. a cron tick landed at
-// the same instant) the system message is skipped silently.
+// the same instant) chatWithArrivalRetry's 120-second budget covers
+// the wait.
+//
+// Cron preemption is closed by SYNCHRONOUSLY setting
+// `m.arrivalPending[agentID]` BEFORE this function returns. cron's
+// runCronJob consults the flag and defers a tick whose fire time
+// lands inside the arrival window — so even though m.Chat itself
+// still runs async on a background goroutine, the cron schedule
+// installed by the sibling ActivateAgentRuntime call cannot squeeze
+// the arrival out by grabbing busy[agentID] first. The flag also
+// keeps the finalize hook (capped at handoffOpTimeout=30s) from
+// blocking on prepareChat / backend PTY spawn — which the original
+// design relied on the async-goroutine path to avoid.
+//
+// Pre-fix the whole function was async without the pending-flag
+// guard. On a CHAINED switch (A→B→C) target C's cron.Schedule
+// landed in the same instant as the arrival goroutine spawned,
+// and the goroutine consistently lost the busy race — the cron
+// prompt fired instead, and the arrival's 120-second retry budget
+// couldn't outlast a long claude turn on a freshly-arrived agent.
+// Visible to the user as "2 つ目の転移先で auto continue が行われない."
 //
 // Idempotent across finalize retries for the SAME opID; a fresh
 // opID (a future switch back to this peer for the same agent) fires
@@ -632,6 +652,19 @@ func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string
 	if _, dup := arrivalNotified.LoadOrStore(key, struct{}{}); dup {
 		return
 	}
+	// Synchronously fence cron BEFORE returning so the sibling
+	// ActivateAgentRuntime call (which the finalize hook fires
+	// immediately after this) installs cron under an
+	// "arrival-pending" gate. cron's runCronJob consults
+	// m.IsArrivalPending; a tick whose fire time lands while
+	// the counter is > 0 is logged + skipped, leaving
+	// busy[agentID] free for the arrival goroutine's m.Chat.
+	// The counter is decremented in the goroutine's defer
+	// regardless of m.Chat outcome — a permanent stuck pending
+	// would be worse than the race it's meant to close.
+	// Counter-based so a SECOND arrival landing while the FIRST
+	// is still draining keeps the gate held until BOTH finish.
+	m.bumpArrivalPending(agentID)
 	// Build the cancel context BEFORE the goroutine spawns and
 	// register it synchronously so a teardown that fires between
 	// here and the goroutine's first instruction can still find
@@ -664,6 +697,49 @@ func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string
 		// Background context drops the deadline.
 		defer arrivalCancels.CompareAndDelete(agentID, myEntry)
 		defer cancel()
+		// Decrement the cron fence on EVERY exit (success, retry
+		// exhaustion, ctx cancellation). Counter-based so a
+		// second arrival landing while THIS one is still
+		// draining keeps the gate held until both finish —
+		// pre-fix's boolean clear let an older goroutine's defer
+		// open the gate for cron right before a newer goroutine
+		// got to m.Chat.
+		defer m.dropArrivalPending(agentID)
+
+		// Short-circuit before any side effect when either:
+		//   - A teardown (releaseAgentLocallyCore) cancelled this
+		//     ctx between Swap and goroutine start. Without the
+		//     gate m.Chat would still run prepareChat / persona
+		//     sync / system message append against an agent
+		//     we're about to drop.
+		//   - A teardown ran BETWEEN bumpArrivalPending and
+		//     arrivalCancels.Swap above. That ordering means
+		//     teardown's LoadAndDelete saw nothing to cancel, so
+		//     ctx is fresh — but m.agents[agentID] has been
+		//     deleted. m.Chat would loop on ErrAgentNotFound for
+		//     the full retry budget without progress; check
+		//     here so we exit immediately instead. A genuine
+		//     phase-1-reload race (the only other path that
+		//     produces a transient ErrAgentNotFound) does NOT
+		//     reach this check because onAgentSynced runs the
+		//     reload synchronously BEFORE the finalize hook fires
+		//     NotifyDeviceSwitchArrival.
+		if ctx.Err() != nil {
+			arrivalNotified.Delete(key)
+			if m.logger != nil {
+				m.logger.Info("device-switch arrival chat aborted before start",
+					"agent", agentID, "op_id", opID, "err", ctx.Err())
+			}
+			return
+		}
+		if _, ok := m.Get(agentID); !ok {
+			arrivalNotified.Delete(key)
+			if m.logger != nil {
+				m.logger.Info("device-switch arrival chat aborted: agent already released",
+					"agent", agentID, "op_id", opID)
+			}
+			return
+		}
 
 		prompt := "デバイス転移完了。転移元: " + sourcePeerName + "。このデバイスで作業を継続してください。直前の会話の流れを確認し、中断された作業があれば再開してください。"
 		events, err := chatWithArrivalRetry(ctx, m, agentID, prompt, opID)
@@ -688,6 +764,61 @@ func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string
 			m.logger.Info("device-switch arrival chat completed", "agent", agentID, "op_id", opID)
 		}
 	}()
+}
+
+// bumpArrivalPending increments the per-agent arrival-pending
+// counter under busyMu. cron's runCronJob reads it via
+// IsArrivalPending and skips its tick when the counter is > 0,
+// so the arrival goroutine's m.Chat can win the busy slot
+// regardless of how fast the sibling ActivateAgentRuntime call
+// schedules cron in the same finalize hook. Lazy-init for test
+// fixtures.
+func (m *Manager) bumpArrivalPending(agentID string) {
+	if m == nil || agentID == "" {
+		return
+	}
+	m.busyMu.Lock()
+	defer m.busyMu.Unlock()
+	if m.arrivalPending == nil {
+		m.arrivalPending = make(map[string]int)
+	}
+	m.arrivalPending[agentID]++
+}
+
+// dropArrivalPending decrements the counter. No-op on zero so a
+// stale double-drop (e.g. a defensive clear in releaseAgentLocallyCore
+// after the goroutine's defer already ran) doesn't drive the
+// counter negative. Counter-based (not bool) so a second arrival
+// landing while the first is still draining keeps the gate held
+// until BOTH finish — the older goroutine's defer cannot prematurely
+// clear the gate the newer one needs.
+func (m *Manager) dropArrivalPending(agentID string) {
+	if m == nil || agentID == "" {
+		return
+	}
+	m.busyMu.Lock()
+	defer m.busyMu.Unlock()
+	if m.arrivalPending == nil {
+		return
+	}
+	if n := m.arrivalPending[agentID]; n > 1 {
+		m.arrivalPending[agentID] = n - 1
+	} else {
+		delete(m.arrivalPending, agentID)
+	}
+}
+
+// IsArrivalPending reports whether a §3.7 device-switch arrival
+// chat is pending or in flight for the agent. cron / future
+// scheduled triggers consult this to defer until every in-flight
+// arrival has cleared the gate.
+func (m *Manager) IsArrivalPending(agentID string) bool {
+	if m == nil || agentID == "" {
+		return false
+	}
+	m.busyMu.Lock()
+	defer m.busyMu.Unlock()
+	return m.arrivalPending[agentID] > 0
 }
 
 // arrivalChatRetryAttempts × arrivalChatRetryBackoff bounds the total
@@ -750,6 +881,19 @@ const arrivalChatRetryBackoff = 2 * time.Second
 func chatWithArrivalRetry(ctx context.Context, m *Manager, agentID, prompt, opID string) (<-chan ChatEvent, error) {
 	var lastErr error
 	for attempt := 0; attempt < arrivalChatRetryAttempts; attempt++ {
+		// Hard ctx gate at every loop entry. The caller registers
+		// this ctx in arrivalCancels, and a teardown
+		// (releaseAgentLocallyCore) cancels it to stop the
+		// in-flight arrival. Without this gate the FIRST attempt
+		// would enter m.Chat with a cancelled ctx and still run
+		// prepareChat / persona sync / system message append on an
+		// agent we're about to drop — wasted I/O plus a torn
+		// transcript write. Subsequent attempts are covered by the
+		// retry-backoff select, but attempt 0 needs an explicit
+		// check.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		// Cheap pre-check: skip the expensive m.Chat → prepareChat
 		// path while the agent is observably busy. The check races
 		// with concurrent state changes but at worst we issue one
@@ -1334,6 +1478,21 @@ func (m *Manager) releaseAgentLocallyCore(agentID string, withDBCleanup, markRel
 	if m == nil || agentID == "" {
 		return
 	}
+	// Capture the arrival-cancel entry SNAPSHOT at the very top
+	// of release so a concurrent NotifyDeviceSwitchArrival from
+	// a back-to-back chained switch (e.g. A→B→A where this peer
+	// is A and switch2's target-finalize races switch1's source-
+	// release tail) doesn't have its freshly-registered cancel
+	// fired by our LoadAndDelete. The later CompareAndDelete only
+	// fires when the entry is STILL the one we captured —
+	// if a Swap landed in between, the new arrival's cancel
+	// stays untouched. The "Swap before capture" window is the
+	// irreducible residual: in that case the new arrival
+	// registers FIRST, our Load picks it up, and our cancel
+	// would mistakenly fire. Capturing at the top of the
+	// function (before MarkAgentReleasedHere, kv writes, etc.)
+	// minimises this window to a few microseconds.
+	capturedArrival, capturedArrivalOK := arrivalCancels.Load(agentID)
 	// Persist the marker FIRST when this is a real release. The
 	// runtime teardown that follows is "best-effort cleanup" —
 	// even if it half-fires, the agent stays evicted via the
@@ -1385,15 +1544,34 @@ func (m *Manager) releaseAgentLocallyCore(agentID string, withDBCleanup, markRel
 	// context.Background until WithCancel; without this it
 	// outlives every teardown path (source-release, target-
 	// purge, EvictAtStartup) and keeps writing to a transcript
-	// the agent no longer owns. Best-effort — a finished
-	// goroutine cleared the map entry itself; a concurrent
-	// newer arrival uses CompareAndDelete to keep its own
-	// cancel registered.
-	if v, ok := arrivalCancels.LoadAndDelete(agentID); ok {
-		if cfp, ok := v.(*context.CancelFunc); ok && cfp != nil && *cfp != nil {
-			(*cfp)()
+	// the agent no longer owns. CompareAndDelete (NOT LoadAndDelete)
+	// so a concurrent NotifyDeviceSwitchArrival.Swap that landed
+	// between our top-of-function capture and here leaves its
+	// NEW arrival cancel registered — the function's snapshot
+	// guarantees we only fire OUR own observed entry. A finished
+	// goroutine cleared the map entry itself, in which case the
+	// CompareAndDelete silently no-ops.
+	if capturedArrivalOK {
+		if arrivalCancels.CompareAndDelete(agentID, capturedArrival) {
+			if cfp, ok := capturedArrival.(*context.CancelFunc); ok && cfp != nil && *cfp != nil {
+				(*cfp)()
+			}
 		}
 	}
+	// NB: arrivalPending counter is NOT cleared here. The
+	// LoadAndDelete above cancelled every live arrival goroutine
+	// for THIS agent on THIS peer; each goroutine's
+	// `defer dropArrivalPending` will decrement the counter
+	// naturally when it unwinds past ctx.Err(). A defensive
+	// clear here would race with a CONCURRENT NotifyDeviceSwitchArrival
+	// from a back-to-back chained switch (A→B→A): the cleanup
+	// path of switch1's source-release would zero the counter
+	// freshly bumped by switch2's target-finalize, opening the
+	// gate for cron to preempt switch2's arrival. The
+	// "goroutine never reached its defer" failure mode (panic)
+	// is rare enough to leave as a follow-up; if it ever
+	// surfaces, the symptom is "cron muted on this agent until
+	// next release" which is recoverable.
 	m.closeIndex(agentID)
 	if withDBCleanup && m.groupdms != nil {
 		m.groupdms.RemoveAgent(agentID)

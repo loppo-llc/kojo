@@ -485,6 +485,23 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 		return
 	}
 
+	// §3.7 chained-switch fix: defer when a device-switch arrival
+	// chat is pending or in flight. NotifyDeviceSwitchArrival
+	// bumps an arrivalPending counter SYNCHRONOUSLY before the
+	// finalize hook returns; cron.Schedule lands the entry under
+	// this gate, so the very next tick observes it and skips,
+	// leaving busy free for the async arrival goroutine. Counter-
+	// based so a SECOND arrival landing while the FIRST is still
+	// draining keeps the gate held until both finish. Checked
+	// here (before Get / checkin.md read / persona sync side
+	// effects) so a skipped tick is a true no-op. The throttle
+	// stamp below isn't reached either, so the next scheduled
+	// tick after the arrival completes fires unimpeded.
+	if cs.mgr.IsArrivalPending(agentID) {
+		cs.logger.Debug("cron job skipped (device-switch arrival pending)", "agent", agentID)
+		return
+	}
+
 	// Check silent hours and read agent config
 	var silentStart, silentEnd string
 	var timeoutMinutes int

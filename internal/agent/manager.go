@@ -77,6 +77,30 @@ type Manager struct {
 	// path of switch_device_handler.
 	switching map[string]bool
 
+	// arrivalPending counts agents whose §3.7 device-switch
+	// finalize hook just spawned a NotifyDeviceSwitchArrival
+	// goroutine. Bumped SYNCHRONOUSLY by
+	// NotifyDeviceSwitchArrival (under busyMu) BEFORE the
+	// goroutine starts, and decremented by the goroutine's
+	// defer regardless of m.Chat outcome. cron's runCronJob
+	// reads via IsArrivalPending and defers a tick when the
+	// count > 0, so the arrival can win the busy slot even
+	// though m.Chat itself runs async — without this gate a
+	// cron.Schedule installed by the sibling ActivateAgentRuntime
+	// call (same finalize hook) preempted the arrival on every
+	// chained switch (A→B→C), exhausting the 120-second retry
+	// budget.
+	//
+	// Counter (not bool) so a SECOND arrival landing while the
+	// FIRST is still in flight — the arrivalCancels.Swap path
+	// supersedes the older goroutine with a fresh op_id — does
+	// not have the older goroutine's defer-clear race the new
+	// goroutine into a cron preempt window. Each Notify
+	// increments by one and each goroutine's defer decrements
+	// by one, so cron sees the gate as held until the LAST
+	// in-flight arrival finishes.
+	arrivalPending map[string]int
+
 	// mutating tracks the per-agent in-flight count of state
 	// mutations (persona / settings / slackbot / task /
 	// credential / avatar / slack token) that don't route
@@ -336,6 +360,7 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		busy:           make(map[string]busyEntry),
 		resetting:      make(map[string]bool),
 		switching:      make(map[string]bool),
+		arrivalPending: make(map[string]int),
 		preparing:      make(map[string]int),
 		mutating:       make(map[string]int),
 		editing:        make(map[string]bool),
