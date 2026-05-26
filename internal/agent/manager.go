@@ -1903,16 +1903,6 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	osID := m.trackOneShot(agentID, cancel)
 	outCh := make(chan ChatEvent, 64)
 
-	// Slack messages: instruct the agent to separate thinking from reply.
-	if strings.Contains(userMessage, "[Slack @") {
-		prep.sysPrompt += "\n\n## Slack Response Format\n\n" +
-			"This message is from Slack. Your text output will be posted to Slack.\n" +
-			"Wrap ONLY your final reply in <reply>...</reply> tags.\n" +
-			"Text outside these tags is your internal workspace — use it freely to think, reason, plan, and execute tools.\n" +
-			"Only the content inside <reply> will be shown to the Slack user.\n" +
-			"Always include exactly one <reply> block at the end of your response.\n"
-	}
-
 	// Append per-conversation context (Slack channel/thread block, etc.)
 	// at the END of the system prompt so the leading cacheable prefix stays
 	// invariant across turns within the same session. Doing this at the

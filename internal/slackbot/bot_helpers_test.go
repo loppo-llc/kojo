@@ -5,63 +5,6 @@ import (
 	"testing"
 )
 
-func TestExtractReply_Basic(t *testing.T) {
-	in := "thinking...\n<reply>hello world</reply>"
-	if got := extractReply(in); got != "hello world" {
-		t.Fatalf("got %q, want %q", got, "hello world")
-	}
-}
-
-func TestExtractReply_NoTags_ReturnsSentinel(t *testing.T) {
-	// Fallback contract (updated): when no <reply> tag is present at
-	// all, return a conservative sentinel rather than the raw input —
-	// the system prompt designates non-<reply> text as the agent's
-	// internal workspace and we MUST NOT leak it to Slack.
-	in := "  bare reply with no tags — would leak workspace if returned raw  "
-	if got := extractReply(in); got != "[no reply produced]" {
-		t.Fatalf("got %q, want %q", got, "[no reply produced]")
-	}
-}
-
-func TestExtractReply_OpenButNoClose(t *testing.T) {
-	// Truncated turn: opening tag present but no </reply>. Return
-	// everything after the opening tag so the partial reply still
-	// reaches the user.
-	in := "thought\n<reply>partial answer"
-	if got := extractReply(in); got != "partial answer" {
-		t.Fatalf("got %q, want %q", got, "partial answer")
-	}
-}
-
-func TestExtractReply_MultipleBlocks_LastWins(t *testing.T) {
-	// Agent emitted multiple <reply> blocks (malformed turn). The last
-	// one is typically the agent's corrected final answer.
-	in := "<reply>first attempt</reply>\nactually wait\n<reply>real answer</reply>"
-	if got := extractReply(in); got != "real answer" {
-		t.Fatalf("got %q, want %q", got, "real answer")
-	}
-}
-
-func TestExtractReply_Empty(t *testing.T) {
-	if got := extractReply(""); got != "" {
-		t.Fatalf("got %q, want empty", got)
-	}
-}
-
-func TestExtractReply_EmptyReplyBlock(t *testing.T) {
-	if got := extractReply("thinking\n<reply></reply>"); got != "" {
-		t.Fatalf("got %q, want empty", got)
-	}
-}
-
-func TestExtractReply_MultilineContent(t *testing.T) {
-	in := "<reply>line one\nline two\n\nline four</reply>"
-	want := "line one\nline two\n\nline four"
-	if got := extractReply(in); got != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
-}
-
 func TestSlackSessionKey_Deterministic(t *testing.T) {
 	// Same inputs produce the same key — Manager hashes this to a stable
 	// session UUID, so any drift breaks --resume across turns.

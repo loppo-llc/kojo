@@ -461,26 +461,15 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		return
 	}
 
-	var response strings.Builder // full raw response text (before <reply> extraction)
-	var streamTS string          // ts of the streaming message (empty = not started or fallback)
-	var lastStatusUpdate time.Time
+	var response strings.Builder     // full response text
+	var pendingDelta strings.Builder // text not yet flushed via AppendStream
+	var streamTS string              // ts of the streaming message (empty = not started or fallback)
+	var lastAppend time.Time
 	hasError := false
 	streamFailed := false // true if StartStream failed, use fallback
-	toolUseCount := 0     // surfaced tool_use indicators; capped to avoid runaway updates
 
-	// IMPORTANT: text deltas are NOT streamed visibly. The agent's raw
-	// output includes <reply>...</reply> wrappers AND thinking/workspace
-	// text outside those tags, per the Slack-mode addition in
-	// Manager.ChatOneShot's system prompt. Streaming that raw text would
-	// leak the agent's internal workspace into Slack until the final
-	// chat.update lands (and forever if that update fails). Instead, we
-	// accumulate text into `response`, stream only tool_use progress
-	// indicators, and reveal the extracted reply atomically via the
-	// final chat.update.
-
-	// startStream initializes the Slack stream lazily on first tool_use,
-	// or as a fallback if no tool_use fires before the turn ends.
-	// Returns true if the stream is active.
+	// startStream initializes the Slack stream lazily on the first text
+	// or tool_use event. Returns true if the stream is active.
 	startStream := func() bool {
 		if streamTS != "" {
 			return true
@@ -499,57 +488,68 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			return false
 		}
 		streamTS = ts
+		lastAppend = time.Now()
 		return true
 	}
 
 	for evt := range events {
 		switch evt.Type {
 		case "text":
-			// Accumulate only; do not stream. See block comment above.
 			response.WriteString(evt.Delta)
+			pendingDelta.WriteString(evt.Delta)
 
-		case "tool_use":
-			// Throttle assistant-status updates the same way as text
-			// appends so a tool-spammy turn doesn't burn through
-			// chat:write rate limits even though each tool_use fires at
-			// most once per invocation.
-			status := toolStatusText(evt.ToolName)
-			if time.Since(lastStatusUpdate) >= streamAppendInterval {
-				_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
-					ChannelID: channel,
-					ThreadTS:  threadTS,
-					Status:    status,
-				})
-				lastStatusUpdate = time.Now()
+			// Start the stream on the first text event so the user sees
+			// the reply build live.
+			if !startStream() {
+				continue
 			}
 
-			// Append a short progress indicator to the stream so the user
-			// sees the agent is working during long multi-tool turns.
-			// Indicators bypass streamAppendInterval (tool_use fires at
-			// most once per tool invocation, not in a tight loop like
-			// text deltas) but are capped at maxToolUseIndicators to
-			// prevent a runaway tool-calling loop from spamming
-			// chat.update. The final UpdateMessage replaces the entire
-			// stream body with the extracted reply, so indicators
-			// disappear on completion either way.
-			if toolUseCount < maxToolUseIndicators && startStream() {
+			// Throttle AppendStream so a fast text-delta loop doesn't
+			// burn chat:write quota.
+			if pendingDelta.Len() > 0 && time.Since(lastAppend) >= streamAppendInterval {
+				b.appendStream(ctx, channel, streamTS, pendingDelta.String())
+				pendingDelta.Reset()
+				lastAppend = time.Now()
+			}
+
+		case "tool_use":
+			// Update assistant typing status to show which tool is running.
+			status := toolStatusText(evt.ToolName)
+			_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
+				ChannelID: channel,
+				ThreadTS:  threadTS,
+				Status:    status,
+			})
+
+			// Append a tool-use indicator to the stream so the user sees
+			// progress during long tool executions. The final chat.update
+			// replaces the stream body with the clean reply, so the
+			// indicator disappears on completion.
+			//
+			// Indicators bypass streamAppendInterval: tool_use fires at
+			// most once per tool invocation (not in a tight loop like
+			// text deltas), and a user staring at a long-running tool has
+			// no other signal that the agent is still working.
+			if startStream() {
+				// Flush any pending text delta first so the indicator
+				// appears after whatever text the agent has produced so
+				// far.
+				if pendingDelta.Len() > 0 {
+					b.appendStream(ctx, channel, streamTS, pendingDelta.String())
+					pendingDelta.Reset()
+				}
 				b.appendStream(ctx, channel, streamTS, "\n\n_⏳ "+status+"_")
-				toolUseCount++
+				lastAppend = time.Now()
 			}
 
 		case "tool_result":
-			// Revert assistant status to "Thinking…" while the agent
+			// Revert the assistant status to "Thinking…" while the agent
 			// processes the tool result and decides the next action.
-			// Same throttle as tool_use — these alternate, so without a
-			// throttle a chain of small tool calls doubles the call rate.
-			if time.Since(lastStatusUpdate) >= streamAppendInterval {
-				_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
-					ChannelID: channel,
-					ThreadTS:  threadTS,
-					Status:    typingStatus,
-				})
-				lastStatusUpdate = time.Now()
-			}
+			_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
+				ChannelID: channel,
+				ThreadTS:  threadTS,
+				Status:    typingStatus,
+			})
 
 		case "error":
 			hasError = true
@@ -557,33 +557,27 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		}
 	}
 
-	// Use a separate context for finalization so that cleanup API calls
+	// Use a separate context for finalization so cleanup API calls
 	// (StopStream, UpdateMessage, etc.) complete even if the Bot's context
 	// was cancelled (e.g. during shutdown or reconfiguration).
 	finCtx, finCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer finCancel()
 
-	// Extract just the <reply>...</reply> block for the final message —
-	// content outside <reply> is the agent's thinking/workspace per the
-	// Slack-mode system prompt addition in Manager.ChatOneShot, and only
-	// the contents of <reply> should land in chat as the user-visible
-	// response. extractReply tolerates the legacy "no tags" case by
-	// returning the trimmed raw text so an agent that ignored the
-	// instruction still gets posted instead of going silent.
-	finalReply := extractReply(response.String())
+	// Flush any remaining text delta before finalizing.
+	if streamTS != "" && pendingDelta.Len() > 0 {
+		b.appendStream(finCtx, channel, streamTS, pendingDelta.String())
+		pendingDelta.Reset()
+	}
 
-	// Finalize
 	if streamTS != "" {
-		// Stop stream (no text — just finalize the typing indicator)
+		// Stop stream (no text — just finalize the typing indicator).
 		if _, _, err := b.api.StopStreamContext(finCtx, channel, streamTS); err != nil {
 			b.logger.Warn("failed to stop slack stream", "err", err)
 		}
 
-		// Replace stream content with the extracted final reply via
-		// chat.update. This guarantees complete text even if some
-		// AppendStream calls were lost (rate limiting, stream timeout,
-		// transient errors) AND it strips the <reply> tags + any thinking
-		// content that the user shouldn't see.
+		// Replace stream content with the full response via chat.update.
+		// This guarantees complete text even if AppendStream calls were
+		// lost to rate limiting, stream timeout, or transient errors.
 		//
 		// We send markdown_text (full-Markdown renderer matching
 		// chat.appendStream — supports tables, headings, etc.) AND the
@@ -592,8 +586,9 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		// text instead, so without the fallback those surfaces would
 		// show "no preview" for every bot reply. Slack uses markdown_text
 		// for in-channel rendering when both are set.
-		if finalReply != "" {
-			chunks := SplitMessage(finalReply, slackMaxMsgLen)
+		if response.Len() > 0 {
+			text := response.String()
+			chunks := SplitMessage(text, slackMaxMsgLen)
 			updateOpts := []slack.MsgOption{
 				slack.MsgOptionText(chunks[0], false),
 				slack.MsgOptionMarkdownText(chunks[0]),
@@ -607,43 +602,47 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 				// the final reply still reaches the user. Without this,
 				// a chat.update failure leaves the channel with whatever
 				// partial AppendStream output happened to land, possibly
-				// truncated and including <reply> tags + thinking.
+				// truncated.
 				b.postMessage(finCtx, channel, threadTS, chunks[0])
 			}
-			// Remaining chunks: post as follow-up messages
+			// Remaining chunks: post as follow-up messages.
 			for _, chunk := range chunks[1:] {
 				b.postMessage(finCtx, channel, threadTS, chunk)
 			}
 		} else {
 			// Stream was started — usually by the first tool_use event —
-			// but the assistant never produced any reply text inside
-			// <reply>...</reply>. Surface the failure as a new threaded
-			// message rather than overwriting the stream via chat.update,
-			// which would erase the tool-use indicators that show how far
-			// the turn got (the most useful debugging artifact when this
-			// path triggers). StopStream above is best-effort; Slack
-			// auto-finalizes the stream via TTL if it failed.
+			// but the assistant never produced any reply text. Keep the
+			// stream content (tool-use indicators) intact so the user can
+			// see how far the turn got — which tool_use was emitted is
+			// the most useful debugging artifact when this path triggers.
+			// Surface the failure as a new threaded message rather than
+			// overwriting the stream via chat.update (which would erase
+			// the execution trail). StopStream above is best-effort;
+			// Slack auto-finalizes the stream via TTL if it failed.
 			b.postMessage(finCtx, channel, threadTS,
 				"Sorry, something went wrong while processing your request.")
 		}
-	} else if finalReply != "" {
-		// Fallback: traditional batch post (StartStream failed or no streaming support).
-		chunks := SplitMessage(finalReply, slackMaxMsgLen)
+	} else if response.Len() > 0 {
+		// Fallback: traditional batch post (StartStream failed or no
+		// streaming support).
+		chunks := SplitMessage(response.String(), slackMaxMsgLen)
 		for _, chunk := range chunks {
 			b.postMessage(finCtx, channel, threadTS, chunk)
 		}
-	} else if hasError {
+	} else if hasError || streamFailed {
+		// Either an explicit agent error, or StartStream failed and the
+		// turn produced no text. Surface a generic failure rather than
+		// going silent on the user.
 		b.postMessage(finCtx, channel, threadTS, "Sorry, something went wrong while processing your request.")
 	}
 
-	// Clear typing indicator (auto-clears on message post, but explicit clear as safety net)
+	// Clear typing indicator (auto-clears on message post, but explicit
+	// clear as safety net).
 	b.clearAssistantStatus(finCtx, channel, threadTS)
 
 	// Save bot response to thread history so shouldAutoReply can detect
 	// that the last message was from the bot on subsequent thread messages.
-	// Persist the extracted reply (not the raw thinking) so future history
-	// injections show the user-visible bot output rather than its workspace.
-	if finalReply != "" && threadTS != "" && b.agentDataDir != "" {
+	if response.Len() > 0 && threadTS != "" && b.agentDataDir != "" {
 		botMsg := chathistory.HistoryMessage{
 			Platform:  platformSlack,
 			ChannelID: channel,
@@ -651,7 +650,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			MessageID: fmt.Sprintf("%d.bot", time.Now().Unix()),
 			UserID:    b.botUserID,
 			UserName:  "assistant",
-			Text:      finalReply,
+			Text:      response.String(),
 			Timestamp: time.Now().Format(time.RFC3339),
 			IsBot:     true,
 		}
@@ -662,15 +661,6 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	}
 
 }
-
-// maxToolUseIndicators caps the number of "_⏳ Using X…_" lines appended
-// to the streaming message. Without a cap, an agent that calls many tools
-// in a single turn could trigger dozens of chat.update calls per turn and
-// hit Slack rate limits. The final chat.update replaces the entire stream
-// body with the extracted reply, so the visible cost of the cap is just
-// that the streaming message stops growing after maxToolUseIndicators —
-// the user still gets the complete reply at the end.
-const maxToolUseIndicators = 8
 
 // slackSessionKey computes the deterministic SessionKey for a Slack
 // conversation. The key is opaque to the backend (Manager / claude
@@ -714,7 +704,7 @@ func slackSessionKey(agentID, channel, threadTS string) string {
 func buildSlackSystemPromptExtra(channel, threadTS, displayName, userID string) string {
 	var sb strings.Builder
 	sb.WriteString("## Slack Conversation Context\n\n")
-	sb.WriteString("This message was received via Slack. Your response inside <reply>...</reply> will be posted to the Slack thread automatically — do NOT use Slack MCP tools (slack_post_message, slack_reply_to_thread, etc.) to reply to this conversation. Slack MCP tools remain available for OTHER actions: posting to a different channel, adding reactions, uploading files, listing channels/users.\n\n")
+	sb.WriteString("This message was received via Slack. Your text response will be automatically posted to the Slack thread — just respond normally. Do NOT use Slack MCP tools (slack_post_message, slack_reply_to_thread, etc.) to reply to this conversation. Slack MCP tools remain available for OTHER actions: posting to a different channel, adding reactions, uploading files, listing channels/users.\n\n")
 	if threadTS != "" {
 		sb.WriteString(fmt.Sprintf("You are participating in Slack channel %s, thread %s.\n", channel, threadTS))
 	} else {
@@ -768,50 +758,6 @@ func sanitizeDisplayName(name string) string {
 		return "(redacted)"
 	}
 	return out
-}
-
-// extractReply pulls the contents of the LAST <reply>...</reply> block
-// from raw. If the agent emitted multiple blocks (malformed turn), the
-// last one wins — it's typically the agent's corrected final answer.
-//
-// Fallback contract (changed from the "graceful raw passthrough" of an
-// earlier slice): when no <reply> tag is found AT ALL, return a
-// conservative error sentinel rather than the raw output. The system
-// prompt explicitly designates text outside <reply>...</reply> as the
-// agent's internal workspace (tool notes, reasoning), so passing raw
-// straight to Slack would leak that workspace to the user. Surfacing a
-// short "no reply produced" line lets the user notice the failure and
-// re-ask, instead of being flooded with internal context.
-//
-// If raw has an opening <reply> but no close (truncated / in-progress),
-// everything after the opening tag is returned — the agent's partial
-// final answer still reaches the user without the workspace prefix.
-// Empty input passes through as "" so the caller's existing "no
-// content, skip post" branch still triggers.
-func extractReply(raw string) string {
-	const openTag = "<reply>"
-	const closeTag = "</reply>"
-
-	if raw == "" {
-		return ""
-	}
-
-	lastOpen := strings.LastIndex(raw, openTag)
-	if lastOpen < 0 {
-		// No <reply> tag — conservative sentinel rather than the raw
-		// workspace dump. See doc comment above.
-		return "[no reply produced]"
-	}
-	start := lastOpen + len(openTag)
-	// Look for the matching close AFTER the last open. Searching from
-	// `start` avoids matching a close tag that appears before the last
-	// open (which would happen if the agent emitted </reply><reply>… ).
-	closeIdx := strings.Index(raw[start:], closeTag)
-	if closeIdx < 0 {
-		// No close tag — return everything after the open tag.
-		return strings.TrimSpace(raw[start:])
-	}
-	return strings.TrimSpace(raw[start : start+closeIdx])
 }
 
 // toolStatusText returns a human-readable status string for the given tool name.
