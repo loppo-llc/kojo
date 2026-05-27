@@ -79,21 +79,11 @@ var cronLockKVCASTestHook func()
 //
 // Race posture (cross-peer): kv rows in this namespace are
 // scope=machine — peer A and peer B do NOT replicate the row to
-// each other, so the CAS does NOT serialise across peers. That
-// dedup is a DESIGN ASSUMPTION delegated to agent_locks
-// (§3.5–3.7): a single peer holds the lease per agent, only the
-// lease holder is supposed to schedule cron ticks, and the
-// fencing token rejects writes from a stale ex-holder.
-//
-// IMPORTANT: as of slice 12 the cron scheduler does NOT yet
-// consult agent_locks before firing. Every peer with a copy of
-// the agent runs cron schedules independently. In practice
-// today's deployment is single-peer-per-agent (the multi-device
-// runtime hasn't shipped), so the assumption holds; the gap is
-// flagged here so a future slice that turns on multi-peer
-// failover knows to add a "is this peer the lease holder?"
-// check inside cs.runCronJob (or short-circuit cs.Schedule) and
-// pair the cron-fire write with a CheckFencingTx.
+// each other, so the CAS does NOT serialise across peers. Dedup
+// is delegated to agent_locks (§3.5–3.7): a single peer holds the
+// lease per agent, the manager only registers cron schedules on
+// the lease holder, and the fencing token rejects writes from a
+// stale ex-holder.
 //
 // Failure posture: any unexpected kv error (read or write) returns
 // false ("don't fire"). The throttle is defensive — at worst a

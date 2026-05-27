@@ -24,7 +24,7 @@ import (
 // Output columns:
 //   device_id (8-byte prefix for compactness)
 //   name
-//   status (online/offline/degraded)
+//   status (online/offline)
 //   last_seen (relative — "5s ago", "2m ago", "—" for never)
 //   self ("*" for the local binary's row, blank otherwise)
 //

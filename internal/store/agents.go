@@ -401,17 +401,6 @@ UPDATE agents
 	return nil
 }
 
-// HardDeleteAgent removes the row outright. Cascades to agent_persona /
-// agent_memory / agent_messages / agent_tasks / memory_entries / agent_locks /
-// cron_runs / compactions via the schema's ON DELETE CASCADE. Intended for
-// the eventual operator-driven hard-delete pass (planned `--clean` target;
-// not yet implemented) and tests; production deletes go through
-// SoftDeleteAgent + GC.
-func (s *Store) HardDeleteAgent(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM agents WHERE id = ?`, id)
-	return err
-}
-
 // rowScanner is the minimal interface satisfied by *sql.Row and *sql.Rows so
 // we can share scan code.
 type rowScanner interface {

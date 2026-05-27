@@ -13,10 +13,8 @@ import (
 // Tailscale stable NodeKey (column `node_key`), looked up via
 // tsnet.LocalClient.WhoIs on every incoming inter-peer request.
 //
-// `Status` is one of the schema's CHECK values: 'online' | 'offline' |
-// 'degraded'. The Hub flips it to 'offline' after a heartbeat-miss
-// threshold (3.7); 'degraded' is reserved for "reachable but with
-// errors" cases (sha256 scrub failures, slow disk, etc.).
+// `Status` is one of the schema's CHECK values: 'online' | 'offline'.
+// The Hub flips it to 'offline' after a heartbeat-miss threshold (3.7).
 type PeerRecord struct {
 	DeviceID string
 	// Name is the human-readable device label (OS hostname by default).
@@ -44,9 +42,8 @@ type PeerRecord struct {
 
 // PeerStatus values accepted by the schema's CHECK constraint.
 const (
-	PeerStatusOnline   = "online"
-	PeerStatusOffline  = "offline"
-	PeerStatusDegraded = "degraded"
+	PeerStatusOnline  = "online"
+	PeerStatusOffline = "offline"
 )
 
 // validPeerStatus mirrors the CHECK constraint so callers can fail
@@ -55,7 +52,7 @@ const (
 // migration's CHECK clause to match.
 func validPeerStatus(s string) bool {
 	switch s {
-	case PeerStatusOnline, PeerStatusOffline, PeerStatusDegraded:
+	case PeerStatusOnline, PeerStatusOffline:
 		return true
 	}
 	return false
@@ -360,10 +357,8 @@ func (s *Store) TouchPeer(ctx context.Context, deviceID, status string, lastSeen
 // would refresh last_seen above `before`, fall outside the WHERE,
 // and the row would correctly stay online.
 //
-// Rows already 'offline' or 'degraded' are not touched: 'offline'
-// means a peer that has been gone long enough that we already gave
-// up, and 'degraded' is reserved for "reachable with errors" cases
-// where flipping straight to offline would lose useful state.
+// Rows already 'offline' are not touched: the peer has been gone
+// long enough that we already gave up.
 //
 // `last_seen IS NULL` is treated as "never heartbeated" and *is*
 // swept (NULL < `before` is false in SQL, so we OR-include it

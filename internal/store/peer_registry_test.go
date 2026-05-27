@@ -122,11 +122,11 @@ func TestTouchPeer(t *testing.T) {
 	if got.Status != "online" {
 		t.Errorf("status changed unexpectedly: %s", got.Status)
 	}
-	if err := s.TouchPeer(ctx, "dev-1", "degraded", 10000); err != nil {
+	if err := s.TouchPeer(ctx, "dev-1", "offline", 10000); err != nil {
 		t.Fatalf("touch + status: %v", err)
 	}
 	got, _ = s.GetPeer(ctx, "dev-1")
-	if got.Status != "degraded" {
+	if got.Status != "offline" {
 		t.Errorf("status: %s", got.Status)
 	}
 	if err := s.TouchPeer(ctx, "ghost", "", 0); !errors.Is(err, ErrNotFound) {

@@ -137,12 +137,9 @@ func (s *Server) handlePeerEventsWS(w http.ResponseWriter, r *http.Request) {
 		touchCancel()
 		// Publish the recovery event ONLY when (a) the touch
 		// actually landed (no DB lock / ErrNotFound) AND (b) the
-		// previous status was specifically 'offline'. degraded→
-		// online stays unpublished so a transient flap detector
-		// (when v1.x adds the degraded producer) doesn't churn the
-		// bus, and the touch-failure check makes sure subscribers
-		// never see an online claim that we couldn't actually
-		// commit.
+		// previous status was specifically 'offline'. The
+		// touch-failure check makes sure subscribers never see an
+		// online claim that we couldn't actually commit.
 		if touchErr == nil && prevStatus == store.PeerStatusOffline {
 			s.peerEvents.Publish(peer.StatusEvent{
 				DeviceID: p.PeerID,

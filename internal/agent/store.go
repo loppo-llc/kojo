@@ -388,12 +388,7 @@ func (st *agentStore) Upsert(a *Agent) error {
 // Only the agents row is tombstoned here. agent_persona / agent_memory
 // / agent_messages rows stay live in the DB; they become unreachable
 // via the public Get/List APIs because those join against agents and
-// filter on deleted_at IS NULL. Hard cascade happens at HardDeleteAgent
-// time, at which point ON DELETE CASCADE in the schema sweeps every
-// dependent row in one transaction. HardDeleteAgent itself has no
-// caller today — it is wired for the eventual operator-driven hard-
-// delete pass (planned as a future `--clean` target alongside the
-// existing `snapshots` and `legacy` targets in cmd/kojo/clean_cmd.go).
+// filter on deleted_at IS NULL.
 func (st *agentStore) Delete(id string) error {
 	if st == nil || st.db == nil {
 		return errors.New("agentStore: not initialized")

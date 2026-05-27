@@ -3,8 +3,8 @@
 `docs/multi-device-storage.md §3.20` lists the failure scenarios that
 must be covered before v1 is considered shipped. This document maps
 each DoD row to the test (automated, where possible; manual drill,
-otherwise) that exercises it. Anything still **gap** here is a
-known TODO blocking the matrix's final sign-off.
+otherwise) that exercises it. Anything still **gap** here blocks the
+matrix's final sign-off.
 
 Status legend:
 
@@ -42,7 +42,7 @@ acceptable provided the runbook exists and is dated.
 
 | Scenario | Status | Reference |
 |---|---|---|
-| Partition | partial | Op-log replay path covers the partition→recovery half (see Op-log row). Partition detection itself is `internal/peer/registrar.go` heartbeat timeout. No dedicated automated test for the detection (TODO if a measurable bug ever emerges). |
+| Partition | partial | Op-log replay path covers the partition→recovery half (see Op-log row). Partition detection itself is `internal/peer/registrar.go` heartbeat timeout. No dedicated automated test for the detection — the heartbeat path is exercised by `TestTouchPeer` indirectly. |
 | Tailscale 全停止 | manual | All peers become localhost-only; `--local` mode is the supported fallback. |
 | 片方向疎通 | manual | Bidirectional heartbeat (§3.10) catches this. Drill: drop `iptables -A INPUT -p tcp --dport 8080 -j DROP` on the Hub. |
 | 間欠切断 | manual | Stress drill — not reproducible in CI without a network emulator. |

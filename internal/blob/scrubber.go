@@ -5,24 +5,21 @@ package blob
 // Walks every blob_refs row and verifies the on-disk body's sha256
 // matches the canonical hash recorded in the row. Outcomes:
 //
-//   - Match: last_seen_ok stamped with now. A future scrub can skip
-//     rows it has recently verified (not implemented in this slice;
-//     the loop currently re-scrubs everything).
+//   - Match: last_seen_ok stamped with now. The loop re-scrubs every
+//     row on each pass — at the default 24h cadence the CPU cost is
+//     negligible and skipping recently-verified rows would only buy
+//     value at much higher scan frequency.
 //   - File missing: logged Warn — the row references a body that's
 //     gone. Repair (re-fetch from another peer / mark missing) is
 //     left to the operator; scrub does not auto-delete the row.
 //   - Hash mismatch: the on-disk file is renamed to a sibling
 //     `<orig>.corrupt.<ts>` so a serving handler can no longer hand
 //     out a body that disagrees with its advertised etag, and the
-//     row is logged Error. The row itself is left alone for now —
-//     blob_refs has no `status='degraded'` column yet, and adding
-//     one is a separate schema migration. Operators inspect logs
-//     to find quarantined files; an automated repair path is a
-//     follow-up slice.
+//     row is logged Error. The row itself is left alone; operators
+//     inspect logs to find quarantined files.
 //
 // Wiring: cmd/kojo/main.go starts one Scrubber per binary with a
-// large interval (default 24h). A future tuneable can drive the
-// snapshot-take-time scrub the docs prescribe.
+// large interval (default 24h).
 
 import (
 	"context"

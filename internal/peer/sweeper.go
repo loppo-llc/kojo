@@ -15,12 +15,6 @@ import (
 // sweeper. The convention from docs/multi-device-storage.md §3.10 is
 // "5 missed heartbeats = expire". 5 × HeartbeatInterval (30s default)
 // = 150s.
-//
-// The comment on Registrar.HeartbeatInterval calls out 3× as the
-// "degraded" threshold; that intermediate state is not implemented in
-// v1 (peer_registry CHECK accepts 'degraded' but no producer emits
-// it). When a "reachable but flaky" detector lands, this constant
-// will become the second of two transitions, not the only one.
 const OfflineThreshold = 5 * HeartbeatInterval
 
 // SweepInterval is how often the OfflineSweeper checks for stale

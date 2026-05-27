@@ -57,11 +57,11 @@ func TestClassifyStartupMode(t *testing.T) {
 			want:  startupModeInvalid,
 		},
 		{
-			// migrateExternalCLI / migrateBackup / migrateForceRecentMtime are
-			// NOT primary modes — they're modifiers on top of --migrate.
+			// migrateExternalCLI / migrateForceRecentMtime are NOT primary
+			// modes — they're modifiers on top of --migrate.
 			// classifyStartupMode must ignore them when deciding the mode.
 			name:  "non-primary modifiers do not change classification",
-			flags: migrationFlags{migrateExternalCLI: true, migrateBackup: "/tmp/x", migrateForceRecentMtime: true},
+			flags: migrationFlags{migrateExternalCLI: true, migrateForceRecentMtime: true},
 			want:  startupModeNormal,
 		},
 	}

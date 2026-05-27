@@ -12,10 +12,7 @@ import (
 )
 
 // HeartbeatInterval is how often Registrar.heartbeatLoop calls
-// TouchPeer to refresh last_seen. The Hub's offline detection (3.7)
-// uses 3× this as the "missed heartbeats → degraded" threshold by
-// convention; tuning is operator-side via a future env var if
-// needed.
+// TouchPeer to refresh last_seen.
 const HeartbeatInterval = 30 * time.Second
 
 // shutdownTouchTimeout bounds the synchronous TouchPeer that

@@ -395,10 +395,9 @@ func (m *Manager) Delete(id string) error {
 
 	// Remove credentials and per-agent encrypted tokens (Slack app/bot
 	// tokens live in the notify_tokens table) outside lock (DB I/O).
-	// After the tombstone these are best-effort orphan cleanup; the
-	// eventual operator-driven hard-delete pass (planned `--clean`
-	// target; not yet implemented) rescues the leftovers if either
-	// call fails here.
+	// After the tombstone these are best-effort orphan cleanup;
+	// failures are warn-only and leave the rows behind until the next
+	// boot's GC or a manual sweep picks them up.
 	if m.creds != nil {
 		if err := m.creds.DeleteAllForAgent(id); err != nil {
 			m.logger.Warn("failed to delete credentials post-tombstone", "agent", id, "err", err)

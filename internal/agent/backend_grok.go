@@ -55,11 +55,8 @@ func isGrokSessionID(s string) bool {
 // MCP servers from `~/.grok/config.toml` (global) or a project-scoped
 // `<cwd>/.grok/config.toml`. Per-session inline overrides are not
 // available. When opts.MCPServers is non-empty we log a warning so
-// the caller can see that the configured servers were dropped.
-//
-// TODO: write a per-agent <agentDir>/.grok/config.toml from
-// opts.MCPServers to recover MCP support without touching the
-// operator's global config.
+// the caller can see that the configured servers were dropped — use
+// the operator's global grok config to wire MCP for now.
 type GrokBackend struct {
 	logger *slog.Logger
 }

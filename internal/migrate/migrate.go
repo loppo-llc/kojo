@@ -77,10 +77,6 @@ type Options struct {
 	// equivalently and uses the field as-is.
 	MigrateExternalCLI bool
 
-	// BackupZipPath, if non-empty, captures a read-only zip of v0 dir to the
-	// given path before importing (5.5 step 9).
-	BackupZipPath string
-
 	// HomePeer is stamped on every blob_refs row created by the blobs
 	// importer. Empty falls back to os.Hostname() inside the importer;
 	// tests pass a fixed value so source_checksum and the row stamp stay
@@ -291,13 +287,7 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		return nil, fmt.Errorf("migrate: write lock: %w", err)
 	}
 
-	// 5.5 step 4: disk space sanity (best-effort; only warn on failure).
 	warnings := []string{}
-	if w, err := checkDiskSpace(opts.V0Dir, opts.V1Dir); err != nil {
-		warnings = append(warnings, fmt.Sprintf("disk space probe failed: %v", err))
-	} else if w != "" {
-		warnings = append(warnings, w)
-	}
 
 	// 5.5 step 5: schema apply.
 	st, err := store.Open(ctx, store.Options{ConfigDir: opts.V1Dir})
@@ -326,13 +316,6 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 			return nil, fmt.Errorf("migrate: domain %q: %w", im.Domain(), err)
 		}
 		imported = append(imported, im.Domain())
-	}
-
-	// 5.5 step 9: optional backup zip.
-	if opts.BackupZipPath != "" {
-		if err := backupV0(opts.V0Dir, opts.BackupZipPath); err != nil {
-			return nil, fmt.Errorf("migrate: backup: %w", err)
-		}
 	}
 
 	// 5.5 step 10: post-import manifest verify.
@@ -946,22 +929,3 @@ func walkRecentMtime(root string, now time.Time, window time.Duration) (bool, st
 	return false, "", err
 }
 
-// checkDiskSpace is best-effort and platform-specific. Phase 1 stub returns
-// "" with no error; a real implementation lands with the v0_size × 1.2 rule.
-func checkDiskSpace(v0, v1 string) (string, error) {
-	_ = v0
-	_ = v1
-	return "", nil
-}
-
-// backupV0 captures a zip of v0 dir to dst. Phase 1 stub is a TODO; the
-// importers don't depend on backup, and shipping it broken is worse than
-// shipping it absent. Wire up via --migrate-backup once the zipper exists.
-func backupV0(v0, dst string) error {
-	// Intentionally a placeholder; the cmd layer surfaces this as
-	// "--migrate-backup not yet implemented" until phase 6.
-	if !strings.HasSuffix(dst, ".zip") {
-		return fmt.Errorf("backup path must end in .zip, got %q", dst)
-	}
-	return errors.New("migrate: --migrate-backup is not implemented yet (planned for phase 6)")
-}

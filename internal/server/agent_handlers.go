@@ -914,15 +914,6 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	// TODO(structural): a follow-up Archive/Unarchive race against
-	// SlackHub StartBot remains because lifecycle mutation and bot
-	// side-effect aren't in the same critical section. Closing it
-	// requires either a "Locked" variant of Archive/Delete that
-	// assumes the caller holds Manager.LockPatch, or a bot-aware
-	// variant that takes the SlackHub as a parameter. Both touch
-	// Manager API and are out of scope for the If-Match wiring slice;
-	// for now archived agents may transiently re-acquire a bot from
-	// a racing PUT /slackbot until this StopBot fires.
 	if s.slackHub != nil {
 		s.slackHub.StopBot(id)
 	}
@@ -991,13 +982,6 @@ func (s *Server) handleUnarchiveAgent(w http.ResponseWriter, r *http.Request) {
 	// agent. Re-Archive runs under Manager.LockPatch so the record
 	// we read here is the post-Unarchive (or post-Re-archive) state,
 	// not a torn snapshot.
-	//
-	// TODO(structural): the !a.Archived check is not atomic with the
-	// StartBot call — a concurrent Archive between Get and StartBot
-	// would still re-start the bot on an archived agent. Same fix
-	// shape as in handleDeleteAgent: a bot-aware lifecycle helper
-	// holding LockPatch around both the manager call and the bot
-	// side-effect. Out of scope for the If-Match wire-up slice.
 	if s.slackHub != nil {
 		// §3.7 race: a device-switch could have begun after
 		// Manager.Unarchive released its reset guard but before

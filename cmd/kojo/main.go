@@ -54,7 +54,6 @@ func main() {
 	migrateRestart := flag.Bool("migrate-restart", false, "discard a partially-imported v1 dir and re-import from v0 (mutually exclusive with --migrate)")
 	freshInstall := flag.Bool("fresh", false, "skip v0 import and start v1 from scratch (refuses if v1 dir already populated)")
 	migrateExternalCLI := flag.Bool("migrate-external-cli", true, "with --migrate: link external CLI transcripts (claude symlinks) so prior context is reachable")
-	migrateBackup := flag.String("migrate-backup", "", "with --migrate: write a read-only zip of v0 to PATH before importing")
 	migrateForceRecentMtime := flag.Bool("migrate-force-recent-mtime", false, "with --migrate: bypass the v0 mtime safety window (5min). Use when v0 is confirmed dead but a recent `ls`/backup-extract bumped a file's timestamp; mid-import data races silently corrupt if v0 is actually live")
 	rollbackExternal := flag.Bool("rollback-external-cli", false, "revert --migrate-external-cli changes; required before booting a v0 binary again")
 
@@ -247,7 +246,6 @@ func main() {
 			migrateRestart:          *migrateRestart,
 			fresh:                   *freshInstall,
 			migrateExternalCLI:      *migrateExternalCLI,
-			migrateBackup:           *migrateBackup,
 			migrateForceRecentMtime: *migrateForceRecentMtime,
 			rollbackExternal:        *rollbackExternal,
 		}, logger, version)

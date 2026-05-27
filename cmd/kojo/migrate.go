@@ -27,7 +27,6 @@ type migrationFlags struct {
 	migrateRestart     bool
 	fresh              bool
 	migrateExternalCLI bool
-	migrateBackup      string
 	rollbackExternal   bool
 	// migrateForceRecentMtime, when true, bypasses the v0 mtime
 	// safety window (--migrate-force-recent-mtime). Operators reach
@@ -376,7 +375,6 @@ func runMigrate(ctx context.Context, st dirState, flags migrationFlags, logger *
 		Restart:            flags.migrateRestart,
 		SkipMtimeCheck:     flags.migrateForceRecentMtime,
 		MigrateExternalCLI: flags.migrateExternalCLI,
-		BackupZipPath:      flags.migrateBackup,
 		HomePeer:           homePeer,
 		Now:                time.Now,
 		PreCompleteHook: func() error {

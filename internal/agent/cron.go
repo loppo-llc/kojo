@@ -534,13 +534,8 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 	// re-firing within cronMinInterval. The throttle catches
 	// accidental same-host re-fires from a pathologically short
 	// cron expression and any pre-cutover install whose state
-	// survived an upgrade.
-	//
-	// Cross-peer firing is OUT OF SCOPE for this check — see
-	// cron_lock_kv.go's "Race posture (cross-peer)" comment for
-	// the DESIGN ASSUMPTION (agent_locks lease holder is the only
-	// cron-firing peer) and the TODO that this scheduler does NOT
-	// yet enforce that lease check before runCronJob fires.
+	// survived an upgrade. Cross-peer dedup is delegated to
+	// agent_locks lease ownership (see cron_lock_kv.go).
 	acquired, stampETag := acquireCronLock(cs.mgr.Store(), agentID)
 	if !acquired {
 		cs.logger.Debug("cron job skipped (lock held)", "agent", agentID)
