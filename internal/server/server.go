@@ -185,6 +185,17 @@ type Server struct {
 	// thumbPurgeDone is closed on Shutdown to stop the background
 	// thumbnail-cache sweeper goroutine.
 	thumbPurgeDone chan struct{}
+
+	// chunkedAgentSyncs accumulates in-flight chunked agent-sync
+	// uploads keyed by op_id. Populated by handlePeerAgentSyncChunkedBegin,
+	// extended by handlePeerAgentSyncChunkedChunk, drained by
+	// handlePeerAgentSyncChunkedCommit. Guarded by chunkedSyncMu.
+	// A background sweeper expires entries idle past chunkedSyncEntryTTL
+	// so an abandoned upload doesn't pin memory forever.
+	chunkedAgentSyncs map[string]*chunkedSyncEntry
+	chunkedSyncMu     sync.Mutex
+	// chunkedSyncSweepDone is closed on Shutdown to stop the sweeper.
+	chunkedSyncSweepDone chan struct{}
 }
 
 type Config struct {
@@ -340,9 +351,12 @@ func New(cfg Config) *Server {
 		logger:          logger,
 		devMode:         cfg.DevMode,
 		version:         cfg.Version,
-		unsafePeer:      cfg.Unsafe,
-		thumbPurgeDone:  make(chan struct{}),
+		unsafePeer:           cfg.Unsafe,
+		thumbPurgeDone:       make(chan struct{}),
+		chunkedAgentSyncs:    make(map[string]*chunkedSyncEntry),
+		chunkedSyncSweepDone: make(chan struct{}),
 	}
+	go s.runChunkedSyncSweeper()
 	// Sweep aged thumbnail-cache entries in the background. The cache is
 	// keyed by (path, mtime, size, dimensions) so an edited image
 	// produces a new entry — without periodic purge the cache would grow
@@ -684,6 +698,16 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		// BEFORE the blob pull so target has the row state to
 		// spawn the CLI by the time blobs arrive.
 		mux.HandleFunc("POST /api/v1/peers/agent-sync", s.handlePeerAgentSync)
+		// Chunked agent-sync (begin/chunk/commit). Used when the
+		// payload exceeds peerAgentSyncMaxBody so memory pressure
+		// stays bounded by one chunk at a time. begin reserves an
+		// op_id slot, chunk appends batches of messages /
+		// memory_entries / etc., commit drains and applies via the
+		// same code path as the single-shot handler.
+		mux.HandleFunc("POST /api/v1/peers/agent-sync/chunked/begin", s.handlePeerAgentSyncChunkedBegin)
+		mux.HandleFunc("POST /api/v1/peers/agent-sync/chunked/chunk", s.handlePeerAgentSyncChunkedChunk)
+		mux.HandleFunc("POST /api/v1/peers/agent-sync/chunked/commit", s.handlePeerAgentSyncChunkedCommit)
+		mux.HandleFunc("POST /api/v1/peers/agent-sync/chunked/abort", s.handlePeerAgentSyncChunkedAbort)
 		// Incremental device-switch (§3.7). Target reports its
 		// max(agent_messages.seq) / max(memory_entries.seq) and
 		// the agent / persona / memory etags it currently holds;
@@ -1464,6 +1488,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		case <-s.thumbPurgeDone:
 		default:
 			close(s.thumbPurgeDone)
+		}
+	}
+	if s.chunkedSyncSweepDone != nil {
+		select {
+		case <-s.chunkedSyncSweepDone:
+		default:
+			close(s.chunkedSyncSweepDone)
 		}
 	}
 	return nil

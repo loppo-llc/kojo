@@ -268,59 +268,8 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Wire cap and decompressed cap are now equal (both
-	// peerAgentSyncMaxBody). To keep peak memory bounded by ONE
-	// cap (not wire + decoded simultaneously), gzip-encoded bodies
-	// are streamed: the MaxBytesReader bounds the compressed
-	// stream and gzip.NewReader decompresses on the fly. The
-	// fully-buffered `body` only holds the JSON we need to decode.
-	// Case-insensitive Content-Encoding per RFC 7230.
-	limited := http.MaxBytesReader(w, r.Body, peerAgentSyncMaxWireBody)
-	var body []byte
-	enc := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding")))
-	switch enc {
-	case "gzip":
-		// The peer auth middleware already verified the signature
-		// over the COMPRESSED bytes (whatever bytes arrived on
-		// r.Body); decompressing here is a pure transport-level
-		// translation. The LimitReader around gz caps the
-		// decompressed size so a gzip bomb can't blow up memory.
-		gz, gerr := gzip.NewReader(limited)
-		if gerr != nil {
-			writeError(w, http.StatusBadRequest, "bad_request",
-				"gzip reader: "+gerr.Error())
-			return
-		}
-		decoded, derr := io.ReadAll(io.LimitReader(gz, peerAgentSyncMaxBody+1))
-		if cerr := gz.Close(); cerr != nil && derr == nil {
-			derr = cerr
-		}
-		if derr != nil {
-			writeError(w, http.StatusBadRequest, "bad_request",
-				"gzip decompress: "+derr.Error())
-			return
-		}
-		if int64(len(decoded)) > peerAgentSyncMaxBody {
-			writeError(w, http.StatusRequestEntityTooLarge,
-				"too_large", "decompressed body exceeds cap")
-			return
-		}
-		body = decoded
-	case "":
-		// Identity-encoded: read straight from the bounded
-		// reader.
-		raw, rerr := io.ReadAll(limited)
-		if rerr != nil {
-			writeError(w, http.StatusBadRequest, "bad_request",
-				"read body: "+rerr.Error())
-			return
-		}
-		body = raw
-	default:
-		// Any other Content-Encoding is a misconfiguration; we
-		// don't want to silently treat it as identity-encoded.
-		writeError(w, http.StatusUnsupportedMediaType, "bad_request",
-			"unsupported Content-Encoding: "+enc)
+	body, kind := s.readAgentSyncWireBody(w, r)
+	if kind != agentSyncReadErrNone {
 		return
 	}
 	var req peerAgentSyncRequest
@@ -331,25 +280,123 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 			"invalid json: "+err.Error())
 		return
 	}
+	if !s.validatePeerAgentSyncRequest(w, r, &req, p) {
+		return
+	}
+	s.applyPeerAgentSync(w, r, &req)
+}
+
+// agentSyncReadErrKind classifies readAgentSyncWireBody failures so
+// chunk-handler callers can decide whether to poison the pending
+// entry. A terminal kind (kind=size) means the orchestrator shipped
+// a payload that can never fit target's caps; any follow-up commit
+// against the same op_id would apply a stale prefix, so the entry
+// must be dropped. Recoverable kinds (gzip / network) leave the
+// accumulator intact so the orchestrator can retry the same seq.
+type agentSyncReadErrKind int
+
+const (
+	agentSyncReadErrNone     agentSyncReadErrKind = iota
+	agentSyncReadErrTerminal                      // size cap busted; caller should poison
+	agentSyncReadErrRecover                       // decode / network failure; caller may retry
+)
+
+// readAgentSyncWireBody pulls the (optionally gzipped) request body off
+// the wire honouring peerAgentSyncMaxWireBody / peerAgentSyncMaxBody.
+// Returns the decompressed bytes plus an error classifier. Writes an
+// appropriate HTTP error response on failure; the caller still has to
+// consult `kind` to decide on side-effects (e.g. poisoning a pending
+// chunked-sync entry).
+//
+// Wire cap and decompressed cap are equal (both peerAgentSyncMaxBody).
+// To keep peak memory bounded by ONE cap (not wire + decoded
+// simultaneously), gzip-encoded bodies are streamed: the
+// MaxBytesReader bounds the compressed stream and gzip.NewReader
+// decompresses on the fly. The fully-buffered return value only holds
+// the JSON the caller needs to decode. Case-insensitive
+// Content-Encoding per RFC 7230.
+func (s *Server) readAgentSyncWireBody(w http.ResponseWriter, r *http.Request) ([]byte, agentSyncReadErrKind) {
+	limited := http.MaxBytesReader(w, r.Body, peerAgentSyncMaxWireBody)
+	enc := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding")))
+	switch enc {
+	case "gzip":
+		gz, gerr := gzip.NewReader(limited)
+		if gerr != nil {
+			writeError(w, http.StatusBadRequest, "bad_request",
+				"gzip reader: "+gerr.Error())
+			return nil, agentSyncReadErrRecover
+		}
+		decoded, derr := io.ReadAll(io.LimitReader(gz, peerAgentSyncMaxBody+1))
+		if cerr := gz.Close(); cerr != nil && derr == nil {
+			derr = cerr
+		}
+		// http.MaxBytesReader surfaces a wire-cap bust as an
+		// error from io.ReadAll on the inner gzip stream. Treat
+		// it as terminal — the orchestrator shipped bytes that
+		// can never land on this target.
+		if derr != nil {
+			var mbe *http.MaxBytesError
+			if errors.As(derr, &mbe) {
+				writeError(w, http.StatusRequestEntityTooLarge,
+					"too_large", "wire body exceeds cap: "+derr.Error())
+				return nil, agentSyncReadErrTerminal
+			}
+			writeError(w, http.StatusBadRequest, "bad_request",
+				"gzip decompress: "+derr.Error())
+			return nil, agentSyncReadErrRecover
+		}
+		if int64(len(decoded)) > peerAgentSyncMaxBody {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				"too_large", "decompressed body exceeds cap")
+			return nil, agentSyncReadErrTerminal
+		}
+		return decoded, agentSyncReadErrNone
+	case "":
+		raw, rerr := io.ReadAll(limited)
+		if rerr != nil {
+			var mbe *http.MaxBytesError
+			if errors.As(rerr, &mbe) {
+				writeError(w, http.StatusRequestEntityTooLarge,
+					"too_large", "wire body exceeds cap: "+rerr.Error())
+				return nil, agentSyncReadErrTerminal
+			}
+			writeError(w, http.StatusBadRequest, "bad_request",
+				"read body: "+rerr.Error())
+			return nil, agentSyncReadErrRecover
+		}
+		return raw, agentSyncReadErrNone
+	default:
+		writeError(w, http.StatusUnsupportedMediaType, "bad_request",
+			"unsupported Content-Encoding: "+enc)
+		return nil, agentSyncReadErrRecover
+	}
+}
+
+// validatePeerAgentSyncRequest enforces the cross-cutting invariants
+// shared by single-shot and chunked-commit ingestion: source identity,
+// op_id presence, agent record well-formedness, path-safe agent id,
+// and the agent_locks holder gate. Returns false (and writes an error
+// response) on any violation.
+func (s *Server) validatePeerAgentSyncRequest(w http.ResponseWriter, r *http.Request, req *peerAgentSyncRequest, p auth.Principal) bool {
 	if req.SourceDeviceID == "" {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"source_device_id required")
-		return
+		return false
 	}
 	if p.IsPeer() && p.PeerID != req.SourceDeviceID {
 		writeError(w, http.StatusForbidden, "forbidden",
 			"signer peer device_id does not match source_device_id")
-		return
+		return false
 	}
 	if req.OpID == "" {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"op_id required (orchestrator must mint a UUID per switch attempt)")
-		return
+		return false
 	}
 	if req.Agent == nil || req.Agent.ID == "" {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"agent record with id required")
-		return
+		return false
 	}
 	// Path-safety gate: agent.id flows into filepath.Join for the
 	// portable workspace path, AgentDir, claude session JSONL paths
@@ -361,14 +408,13 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 	if !agent.IsPathSafeAgentID(req.Agent.ID) {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"agent.id contains characters not safe for on-disk paths")
-		return
+		return false
 	}
 	if s.peerID != nil && req.SourceDeviceID == s.peerID.DeviceID {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"source_device_id must not equal the local peer")
-		return
+		return false
 	}
-
 	// Holder verification: if target already has an agent_locks
 	// row for this agentID, the signer MUST be the recorded
 	// holder. This blocks a stray/malicious authenticated peer
@@ -380,14 +426,21 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 	if lerr != nil && !errors.Is(lerr, store.ErrNotFound) {
 		writeError(w, http.StatusInternalServerError, "internal",
 			"lookup agent lock: "+lerr.Error())
-		return
+		return false
 	}
 	if existingLock != nil && existingLock.HolderPeer != req.SourceDeviceID {
 		writeError(w, http.StatusConflict, "wrong_holder",
 			"agent_locks.holder_peer does not match source_device_id; refusing sync")
-		return
+		return false
 	}
+	return true
+}
 
+// applyPeerAgentSync runs the DB / disk / sessions / credentials
+// pipeline shared by handlePeerAgentSync (single-shot) and
+// handlePeerAgentSyncChunkedCommit (chunked). The caller is responsible
+// for validating req via validatePeerAgentSyncRequest first.
+func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req *peerAgentSyncRequest) {
 	// Cross-platform workDir: the user-facing Settings.workDir
 	// (peer-local per docs §3.8) is rewritten to a portable
 	// default so a /Users/alice/... path from a macOS source

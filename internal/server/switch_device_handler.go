@@ -529,40 +529,53 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// pending state or drive a manual drop.
 	resp.OpID = syncReq.OpID
 
-	// Step 0.5: serialize + gzip the agent-sync wire body BEFORE
-	// begin. The receiver still enforces a decompressed-size cap
-	// (peerAgentSyncMaxBody) and a gzip-bomb LimitReader, so doing
-	// the marshal/gzip here lets us fail FAST with a clean error
-	// before flipping handoff_pending. The resulting bytes are
-	// reused by dispatchPeerAgentSync (no double work).
-	syncWireBody, syncRawLen, werr := encodeAgentSyncWire(syncReq)
-	if werr != nil {
+	// Step 0.5: decide single-shot vs chunked BEFORE the heavy
+	// encode. estimateAgentSyncRawSize walks each entity in turn
+	// (peak memory = one largest row), so an oversized payload is
+	// detected without pinning ~2× its size on source. Only when
+	// the estimate fits the single-shot cap do we run the full
+	// encodeAgentSyncWire (which itself buffers raw + gzip).
+	//
+	// When the payload busts the cap the orchestrator falls back
+	// to the chunked protocol
+	// (/api/v1/peers/agent-sync/chunked/{begin,chunk,commit}) which
+	// splits the row arrays across multiple POSTs so neither side
+	// holds the full payload in memory at once.
+	estimateRaw, estErr := estimateAgentSyncRawSize(syncReq)
+	if estErr != nil {
 		writeError(w, http.StatusInternalServerError, "internal",
-			"encode agent-sync wire: "+werr.Error())
+			"estimate agent-sync size: "+estErr.Error())
 		return
 	}
-	if int64(syncRawLen) > int64(peerAgentSyncMaxBody) {
-		// Defends against a small-gzip / huge-decompressed
-		// payload that would pass the wire preflight only to
-		// be rejected by the receiver's decompressed-size cap
-		// (and the gzip-bomb LimitReader inside the handler).
-		// Bailing before begin keeps handoff_pending clean.
-		writeError(w, http.StatusRequestEntityTooLarge, "agent_too_large",
-			fmt.Sprintf("agent state too large for single agent-sync (raw JSON %d bytes > decompressed cap %d); chunked sync not yet supported in v1",
-				syncRawLen, peerAgentSyncMaxBody))
-		return
-	}
-	if int64(len(syncWireBody)) > int64(peerAgentSyncMaxWireBody) {
-		// Wire-size preflight. The receiver's MaxBytesReader is
-		// keyed off the compressed bytes, so a high-entropy payload
-		// (random passwords / TOTP secrets / claude session blobs)
-		// can compress poorly and exceed the wire cap even when the
-		// raw JSON fits the decompressed cap above. Bail before
-		// begin so handoff_pending stays clean.
-		writeError(w, http.StatusRequestEntityTooLarge, "agent_too_large",
-			fmt.Sprintf("agent state too large for single agent-sync (gzipped %d bytes > wire cap %d); chunked sync not yet supported in v1",
-				len(syncWireBody), peerAgentSyncMaxWireBody))
-		return
+	useChunked := estimateRaw > int64(peerAgentSyncMaxBody)
+	var syncWireBody []byte
+	var syncRawLen int
+	if useChunked {
+		s.logger.Info("switch-device: agent state exceeds single-shot caps; routing through chunked agent-sync",
+			"agent", agentID, "target", req.TargetPeerID,
+			"estimated_raw_bytes", estimateRaw, "single_shot_cap", peerAgentSyncMaxBody,
+			"chunk_budget", chunkedSyncBudgetBytes)
+	} else {
+		// Within cap: encode now so dispatchPeerAgentSync gets
+		// reusable bytes. If the actual encoded raw size somehow
+		// busts the cap that the estimator missed (e.g. JSON
+		// escape blow-up on certain UTF-8 sequences), fall back
+		// to chunked mode rather than 413 against target.
+		var werr error
+		syncWireBody, syncRawLen, werr = encodeAgentSyncWire(syncReq)
+		if werr != nil {
+			writeError(w, http.StatusInternalServerError, "internal",
+				"encode agent-sync wire: "+werr.Error())
+			return
+		}
+		if int64(syncRawLen) > int64(peerAgentSyncMaxBody) ||
+			int64(len(syncWireBody)) > int64(peerAgentSyncMaxWireBody) {
+			s.logger.Warn("switch-device: post-encode size busted single-shot cap despite estimator; switching to chunked",
+				"agent", agentID, "estimate", estimateRaw,
+				"actual_raw", syncRawLen, "actual_wire", len(syncWireBody))
+			useChunked = true
+			syncWireBody = nil
+		}
 	}
 
 	// Step 1: begin.
@@ -590,14 +603,20 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// entry on target until the next sync overwrites it.
 	agentSyncAttempted := true
 	_ = agentSyncAttempted // referenced below in orchestrateAbort path
-	if err := s.dispatchPeerAgentSync(ctx, targetAddr, req.TargetPeerID, syncWireBody); err != nil {
+	var syncErr error
+	if useChunked {
+		syncErr = s.dispatchPeerAgentSyncChunked(ctx, targetAddr, req.TargetPeerID, syncReq)
+	} else {
+		syncErr = s.dispatchPeerAgentSync(ctx, targetAddr, req.TargetPeerID, syncWireBody)
+	}
+	if syncErr != nil {
 		// Mark AgentSynced=true unconditionally for the
 		// abort path so orchestrateAbort sends drop — the
 		// network error means target may have committed
 		// before its response was lost.
 		resp.AgentSynced = true
 		s.orchestrateAbort(ctx, agentID, targetAddr, req.TargetPeerID, syncReq.OpID, &resp,
-			"agent-sync dispatch: "+err.Error())
+			"agent-sync dispatch: "+syncErr.Error())
 		writeJSONResponse(w, http.StatusOK, resp)
 		return
 	}
