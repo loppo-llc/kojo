@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -125,6 +126,90 @@ var reservedAgentKeys = map[string]bool{
 	"holderPeer":       true,
 	"holderPeerName":   true,
 	"holderPeerStatus": true,
+}
+
+// lowerKeySet returns a copy of src whose keys are all canonical-lower.
+// Used to build case-insensitive lookup variants of reservedAgentKeys /
+// loadStripKeys so a settings_json row with a case-variant key (e.g.
+// "NotifySources", "HolderPeer") doesn't slip past the prior-merge /
+// load-strip filters. The original maps stay camelCase because the
+// delete-by-key loops in agentToSettings / settingsToAgent need to match
+// the canonical camelCase shape that json.Marshal(a) emits — only the
+// case-insensitive lookups need the lower variant.
+func lowerKeySet(src map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(src))
+	for k, v := range src {
+		if !v {
+			continue
+		}
+		out[strings.ToLower(k)] = true
+	}
+	return out
+}
+
+var (
+	reservedAgentKeysLower = lowerKeySet(reservedAgentKeys)
+	loadStripKeysLower     = lowerKeySet(loadStripKeys)
+)
+
+// modeledAgentKeys is the set of JSON keys declared on the Agent struct,
+// computed once via reflection at init. Used by agentToSettings to skip
+// the forward-compat prior-merge for keys this binary already models.
+//
+// Without this guard, any Agent field with `omitempty` (or a pointer field
+// reset to nil) that the user explicitly CLEARED would be dropped by
+// json.Marshal AND then resurrected from prior on the next Save — silently
+// rolling back the clear. Visible symptom: user toggles Silent Hours off,
+// UI shows the cleared state from the in-memory snapshot, but DB still
+// carries the old value and the next DB read (e.g. after kojo-switch-device
+// releases the in-memory agent on source) reverts the UI to the prior value.
+// TestAgentToSettings_StripsLegacyCronMessage documents the same shape for
+// `cronMessage`, which `reservedAgentKeys` handles ad-hoc; this map handles
+// every other modeled key uniformly.
+//
+// The forward-compat merge itself stays in place for keys NOT in this set,
+// so a row written by a successor binary that defines new fields still
+// survives a downgrade.
+var modeledAgentKeys = computeModeledAgentKeys()
+
+func computeModeledAgentKeys() map[string]bool {
+	out := make(map[string]bool)
+	t := reflect.TypeOf(Agent{})
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		// Anonymous embedded fields with a JSON-visible shape would
+		// promote the inner struct's JSON fields without appearing
+		// here, silently re-opening the resurrect window for every
+		// promoted key. Panic at init so a future Agent struct edit
+		// that adds such an embed fails loud instead of regressing
+		// the silent-rollback fix. A `json:"-"` embed (explicit
+		// opt-out of JSON exposure) is harmless — its fields never
+		// reach settings_json — so allow it through.
+		if f.Anonymous && f.Tag.Get("json") != "-" {
+			panic("agent.computeModeledAgentKeys: JSON-visible anonymous embedded field on Agent is not supported; extend the loop to walk promoted JSON keys or mark the embed with `json:\"-\"`")
+		}
+		if !f.IsExported() {
+			continue
+		}
+		tag := f.Tag.Get("json")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		name, _, _ := strings.Cut(tag, ",")
+		if name == "" {
+			name = f.Name
+		}
+		// Index by lower-case key so the prior-merge lookup in
+		// agentToSettings stays case-insensitive — settings_json
+		// written by this package is always canonical-lower, but a
+		// future binary (or a hand-edited row) could ship a key with
+		// different casing, and encoding/json itself is
+		// case-insensitive on Unmarshal. Keeping the lookup
+		// canonical-lower closes that loophole so a "SilentStart"
+		// key can't slip past the modeled-key guard and resurrect.
+		out[strings.ToLower(name)] = true
+	}
+	return out
 }
 
 // loadStripKeys lists the keys settingsToAgent() must filter out before
@@ -653,8 +738,26 @@ func agentToSettings(a *Agent, prior map[string]any) (map[string]any, error) {
 	// model on Agent. Known keys are owned by the current Agent type
 	// (m already has them); unknown keys come from prior so they survive
 	// a write by a binary that didn't define them.
+	//
+	// modeledAgentKeys guard: a field declared on Agent with `omitempty`
+	// (or a nil pointer) drops out of json.Marshal when the user clears
+	// it. A naive `if _, known := m[k]; known { continue }` would then
+	// treat the absence as "prior wins" and resurrect the cleared value
+	// — that's the silent-rollback bug behind the user-visible
+	// "Silent Hours が kojo-switch-device で巻き戻る" symptom. Skipping
+	// every modeled key keeps clears authoritative while still letting
+	// genuinely-unknown future fields survive the merge.
 	for k, v := range prior {
-		if reservedAgentKeys[k] {
+		// Canonical-lower lookup so a hand-edited / future-binary row
+		// that wrote "SilentStart" (or any case variant) is still
+		// classified as a modeled / reserved key — encoding/json
+		// itself is case-insensitive on Unmarshal, so the wire shape
+		// can vary even when this package's writes are canonical.
+		kl := strings.ToLower(k)
+		if reservedAgentKeysLower[kl] {
+			continue
+		}
+		if modeledAgentKeys[kl] {
 			continue
 		}
 		if _, known := m[k]; known {
@@ -683,7 +786,14 @@ func settingsToAgent(rec *store.AgentRecord, out *Agent) error {
 		// keys through so normalizeAgent's transient Legacy* fields can
 		// catch them and run the migration. The Save side filters them
 		// out via the broader reservedAgentKeys set.
-		if loadStripKeys[k] {
+		//
+		// Case-insensitive lookup via loadStripKeysLower: a hand-edited
+		// row (or a future binary writing different casing) could carry
+		// "HolderPeer" or "Persona" etc. encoding/json's later
+		// Unmarshal into Agent is itself case-insensitive on field
+		// match, so without folding the strip the runtime-only holder*
+		// fields could still survive into the Agent struct.
+		if loadStripKeysLower[strings.ToLower(k)] {
 			continue
 		}
 		m[k] = v
