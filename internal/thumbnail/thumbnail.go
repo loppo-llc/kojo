@@ -27,6 +27,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -290,6 +291,46 @@ func IsSupportedExt(ext string) bool {
 		return true
 	}
 	return false
+}
+
+// ServeHTTP generates (or serves from cache) a JPEG thumbnail of the
+// image at srcPath and writes it to w with appropriate cache headers.
+// Callers provide the raw HTTP request so http.ServeFile can handle
+// If-None-Match → 304.
+//
+// On success the response carries:
+//   - Content-Type: image/jpeg
+//   - Cache-Control: private, max-age=86400
+//   - ETag: <sha256 cache key>
+//
+// Returns nil on success; callers should map non-nil errors to the
+// appropriate HTTP status (ErrUnsupportedFormat → 415,
+// ErrSourceTooLarge → 413, os.IsNotExist → 404, else 500).
+// ServeHTTPCacheable is the cached variant: private, max-age=86400.
+// Use for sources whose URL changes when the content changes (e.g.
+// file-browser thumbs with a ?v=<modtime> query).
+func ServeHTTPCacheable(w http.ResponseWriter, r *http.Request, srcPath string, size int) error {
+	return serveHTTP(w, r, srcPath, size, "private, max-age=86400")
+}
+
+// ServeHTTP serves a thumbnail with Cache-Control: no-cache so the
+// browser stores the body but revalidates via ETag on every request
+// (→ 304 when unchanged). Use for sources whose URL is stable across
+// content changes (avatars, blob thumbs without a version query).
+func ServeHTTP(w http.ResponseWriter, r *http.Request, srcPath string, size int) error {
+	return serveHTTP(w, r, srcPath, size, "no-cache")
+}
+
+func serveHTTP(w http.ResponseWriter, r *http.Request, srcPath string, size int, cacheControl string) error {
+	cached, err := Generate(srcPath, size)
+	if err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", cacheControl)
+	w.Header().Set("ETag", `"`+strings.TrimSuffix(filepath.Base(cached), ".jpg")+`"`)
+	http.ServeFile(w, r, cached)
+	return nil
 }
 
 // PurgeOld removes cache entries whose mtime is older than cacheMaxAge.

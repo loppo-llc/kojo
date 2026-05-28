@@ -13,11 +13,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/blob"
+	"github.com/loppo-llc/kojo/internal/thumbnail"
 )
 
 // Sentinel errors for ValidateTempAvatarPath, allowing callers to map to
@@ -192,6 +194,18 @@ func applyAvatarMeta(a *Agent, has bool, hash string) {
 // when the system mime database has been initialized, which can't
 // be relied on across all deploy targets.
 func ServeAvatar(bs *blob.Store, w http.ResponseWriter, r *http.Request, a *Agent) {
+	// ?size=<n>: when present AND the avatar is a raster image the
+	// thumbnail package can decode, serve a cached JPEG thumbnail
+	// instead of the full blob. SVG avatars (both uploaded and the
+	// generated-fallback) skip this path — they're resolution-
+	// independent and tiny.
+	thumbSize := 0
+	if s := r.URL.Query().Get("size"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			thumbSize = n
+		}
+	}
+
 	// Hold the per-agent avatar read lock JUST across the resolve →
 	// Open → header-snapshot window so a concurrent SaveAvatar's
 	// rename → blob_refs.Put gap can't surface a fresh body with a
@@ -202,9 +216,23 @@ func ServeAvatar(bs *blob.Store, w http.ResponseWriter, r *http.Request, a *Agen
 	// Holding the read lock across the body write would let a slow
 	// HTTP client (mobile uplink, attacker-throttled) starve
 	// SaveAvatar / DeleteAvatar.
-	f, ext, etag, modTime, ok := openAvatarForServe(bs, a.ID)
+	f, ext, etag, fsPath, modTime, ok := openAvatarForServe(bs, a.ID)
 	if ok {
 		defer f.Close()
+
+		// Thumbnail path: raster image + size requested. fsPath was
+		// resolved under the avatar read lock by openAvatarForServe
+		// so it points at the same inode as f.
+		if thumbSize > 0 && fsPath != "" && thumbnail.IsSupportedExt(ext) {
+			if err := thumbnail.ServeHTTP(w, r, fsPath, thumbSize); err == nil {
+				return
+			}
+			// Generation failed — fall through to full body.
+		}
+
+		// Full-size path. Override the middleware's no-store with
+		// no-cache so the browser stores the body but revalidates
+		// via ETag on every request → 304 when unchanged.
 		ctype := contentTypeForAvatarExt(ext)
 		if ctype != "" {
 			w.Header().Set("Content-Type", ctype)
@@ -212,6 +240,7 @@ func ServeAvatar(bs *blob.Store, w http.ResponseWriter, r *http.Request, a *Agen
 		if etag != "" {
 			w.Header().Set("ETag", `"`+etag+`"`)
 		}
+		w.Header().Set("Cache-Control", "no-cache")
 		http.ServeContent(w, r, "avatar"+ext, modTime, f)
 		return
 	}
@@ -243,18 +272,22 @@ func ServeAvatar(bs *blob.Store, w http.ResponseWriter, r *http.Request, a *Agen
 // rename's it onto the target — so an inode our caller is reading
 // stays valid even after a concurrent re-Put removes the directory
 // entry. Closing the returned handle is the caller's responsibility.
-func openAvatarForServe(bs *blob.Store, agentID string) (f *os.File, ext, etag string, modTime time.Time, ok bool) {
+func openAvatarForServe(bs *blob.Store, agentID string) (f *os.File, ext, etag, fsPath string, modTime time.Time, ok bool) {
 	runlock := acquireAvatarRLock(agentID)
 	defer runlock()
 	ext, _, found := resolveAvatarBlob(bs, agentID)
 	if !found {
-		return nil, "", "", time.Time{}, false
+		return nil, "", "", "", time.Time{}, false
 	}
-	f, obj, err := bs.Open(blob.ScopeGlobal, avatarBlobPath(agentID, ext))
+	blobPath := avatarBlobPath(agentID, ext)
+	f, obj, err := bs.Open(blob.ScopeGlobal, blobPath)
 	if err != nil {
-		return nil, "", "", time.Time{}, false
+		return nil, "", "", "", time.Time{}, false
 	}
-	return f, ext, obj.ETag, time.UnixMilli(obj.ModTime), true
+	// Resolve the on-disk path while still holding the read lock so
+	// thumbnail.Generate operates on the same inode that we opened.
+	fp, _ := bs.FSPath(blob.ScopeGlobal, blobPath)
+	return f, ext, obj.ETag, fp, time.UnixMilli(obj.ModTime), true
 }
 
 // contentTypeForAvatarExt maps an avatar extension to its MIME type.

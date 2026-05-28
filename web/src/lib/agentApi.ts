@@ -492,7 +492,11 @@ export const agentApi = {
   // Avatar / preview / files URLs go straight into <img src> so the
   // token must travel as a query param — Authorization headers can't
   // be set on element-driven fetches.
-  avatarUrl: (id: string) => appendTokenQuery(`/api/v1/agents/${id}/avatar`),
+  avatarUrl: (id: string, size?: number) => {
+    const base = `/api/v1/agents/${id}/avatar`;
+    const sizeQ = size && size > 0 ? `?size=${size}` : "";
+    return appendTokenQuery(`${base}${sizeQ}`);
+  },
 
   uploadAvatar: (id: string, file: File) => {
     const form = new FormData();

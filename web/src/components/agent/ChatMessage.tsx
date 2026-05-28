@@ -195,13 +195,14 @@ function attachmentURL(path: string): string {
 }
 
 // attachmentThumbURL is the inline-grid variant of attachmentURL.
-// kojo:// URIs go to the blob store at full size (no thumb endpoint
-// over there yet). Filesystem paths with a thumb-friendly extension
-// route through /api/v1/files/thumb so a message with several
-// screenshots doesn't ship megabytes per chip.
+// Both kojo:// blob URIs and filesystem paths route through their
+// respective thumb endpoints so the browser fetches a cached
+// low-res JPEG instead of the full body.
 function attachmentThumbURL(path: string, size = 400): string {
-  const blob = api.blob.urlFromKojoURI(path);
-  if (blob) return blob;
+  // Blob path: use ?thumb=<size> on the blob endpoint.
+  const blobThumb = api.blob.thumbFromKojoURI(path, size);
+  if (blobThumb) return blobThumb;
+  // Filesystem path: use the dedicated thumb endpoint.
   return isThumbSupported(path) ? api.files.thumbUrl(path, size) : api.files.rawUrl(path);
 }
 

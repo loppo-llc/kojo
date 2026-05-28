@@ -5,12 +5,16 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/blob"
 	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/store"
+	"github.com/loppo-llc/kojo/internal/thumbnail"
 )
 
 // defaultBlobMaxPutBytes caps the bytes a single PUT can stream by
@@ -215,6 +219,35 @@ func (s *Server) handleBlobGet(w http.ResponseWriter, r *http.Request) {
 		s.blobList(w, r, scope)
 		return
 	}
+	// ?thumb=<size>: serve a cached JPEG thumbnail instead of the
+	// full blob. Only applies to image formats the thumbnail package
+	// can decode; non-images fall through to the full-body path.
+	// Explicit errors (too large, corrupt) are surfaced as HTTP
+	// errors so the client doesn't silently receive a multi-MB body
+	// it asked to avoid.
+	if thumbStr := r.URL.Query().Get("thumb"); thumbStr != "" {
+		if thumbSize, err := strconv.Atoi(thumbStr); err == nil && thumbSize > 0 {
+			ext := strings.ToLower(filepath.Ext(path))
+			if thumbnail.IsSupportedExt(ext) {
+				if fsPath, err := s.blob.FSPath(scope, path); err == nil {
+					if _, statErr := os.Stat(fsPath); statErr == nil {
+						if err := thumbnail.ServeHTTP(w, r, fsPath, thumbSize); err == nil {
+							return
+						} else if errors.Is(err, thumbnail.ErrSourceTooLarge) {
+							writeError(w, http.StatusRequestEntityTooLarge, "source_too_large", err.Error())
+							return
+						} else if errors.Is(err, thumbnail.ErrUnsupportedFormat) {
+							writeError(w, http.StatusUnsupportedMediaType, "unsupported_format", err.Error())
+							return
+						}
+						// Other generation failures (e.g. disk I/O) —
+						// fall through to full body.
+					}
+				}
+			}
+		}
+	}
+
 	f, obj, err := s.blob.Open(scope, path)
 	if err != nil {
 		// kojo-attach hub-fallback: when peer holds the agent and

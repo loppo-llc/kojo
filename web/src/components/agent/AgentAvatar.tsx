@@ -18,6 +18,19 @@ const sizes = {
   xl: "w-24 h-24",
 };
 
+// Thumbnail resolution per size tier. 2x DPR so Retina doesn't blur.
+// sm=48px → 128, md=56px → 128, lg=64px → 128, xl=96px → 256.
+const thumbRes: Record<string, number> = {
+  sm: 128,
+  md: 128,
+  lg: 128,
+  xl: 256,
+};
+
+function appendCacheBust(url: string, cb: string | number): string {
+  return `${url}${url.includes("?") ? "&" : "?"}t=${cb}`;
+}
+
 export function AgentAvatar({
   agentId,
   name,
@@ -32,21 +45,21 @@ export function AgentAvatar({
   const ref = useRef<HTMLDivElement>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
-  // avatarUrl already carries the ?token=… query when an Owner token
-  // is stored, so the cache-bust separator must be `&`, not `?`.
-  const base = agentApi.avatarUrl(agentId);
-  const src =
-    cacheBust != null
-      ? `${base}${base.includes("?") ? "&" : "?"}t=${cacheBust}`
-      : base;
+  // Icon src: low-res thumbnail via ?size=<n>
+  const thumbBase = agentApi.avatarUrl(agentId, thumbRes[size] ?? 128);
+  const thumbSrc = cacheBust != null ? appendCacheBust(thumbBase, cacheBust) : thumbBase;
 
-  // Preload natural size once
+  // Hover preview src: full resolution (no size param)
+  const fullBase = agentApi.avatarUrl(agentId);
+  const fullSrc = cacheBust != null ? appendCacheBust(fullBase, cacheBust) : fullBase;
+
+  // Preload natural size from the full image for hover layout
   useEffect(() => {
     if (!preview) return;
     const img = new Image();
     img.onload = () => setNatSize({ w: img.naturalWidth, h: img.naturalHeight });
-    img.src = src;
-  }, [src, preview]);
+    img.src = fullSrc;
+  }, [fullSrc, preview]);
 
   const handleEnter = useCallback(() => {
     if (!preview || !natSize) return;
@@ -91,7 +104,7 @@ export function AgentAvatar({
       onMouseLeave={handleLeave}
     >
       <img
-        src={src}
+        src={thumbSrc}
         alt={name}
         className={`${sizes[size]} rounded-full object-cover bg-neutral-800`}
         onError={(e) => {
@@ -105,7 +118,7 @@ export function AgentAvatar({
         >
           <div className="w-full h-full rounded-2xl overflow-hidden shadow-2xl shadow-black/60 border border-neutral-700/50 bg-neutral-900">
             <img
-              src={src}
+              src={fullSrc}
               alt={name}
               className="w-full h-full object-cover"
             />

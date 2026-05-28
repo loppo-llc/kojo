@@ -269,6 +269,17 @@ func (s *Store) fsPath(scope Scope, p string) (string, string, error) {
 	return full, cleaned, nil
 }
 
+// FSPath resolves a blob logical path to its absolute on-disk path
+// without opening it. Returns ErrInvalidScope / ErrInvalidPath for a
+// malformed request; it does NOT check that the file exists (callers
+// that need that should Stat the result). Intended for read-only
+// consumers — e.g. the thumbnail generator — that take a filesystem
+// path rather than an io.Reader.
+func (s *Store) FSPath(scope Scope, p string) (string, error) {
+	full, _, err := s.fsPath(scope, p)
+	return full, err
+}
+
 // Get opens the blob for streaming reads. The returned Object carries
 // Size / ModTime; SHA256 / ETag are populated from the blob_refs cache
 // when WithRefs is set (slice 2) and otherwise left empty (slice 1

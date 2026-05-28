@@ -204,6 +204,22 @@ export const api = {
       const url = `/api/v1/blob/${encodeURIComponent(scope)}/${pathSegs.join("/")}`;
       return appendTokenQuery(url);
     },
+    // thumbFromKojoURI is like urlFromKojoURI but appends &thumb=<size>
+    // so the blob handler returns a cached JPEG thumbnail instead of
+    // the full body. Returns null for non-kojo inputs.
+    thumbFromKojoURI: (uri: string, size: number): string | null => {
+      if (!uri.startsWith("kojo://")) return null;
+      const rest = uri.slice("kojo://".length);
+      const slash = rest.indexOf("/");
+      if (slash <= 0) return null;
+      const scope = rest.slice(0, slash);
+      const pathSegs = rest
+        .slice(slash + 1)
+        .split("/")
+        .map((s) => encodeURIComponent(decodeURIComponent(s)));
+      const url = `/api/v1/blob/${encodeURIComponent(scope)}/${pathSegs.join("/")}?thumb=${size}`;
+      return appendTokenQuery(url);
+    },
   },
 
   git: {
