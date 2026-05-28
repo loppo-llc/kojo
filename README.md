@@ -6,7 +6,7 @@
 
 > [日本語](README.ja.md)
 
-Remotely operate AI coding CLIs (Claude Code, Codex) from your mobile device — and run persistent AI agents that think, remember, and collaborate on their own.
+Remotely operate AI coding CLIs (Claude Code, Codex, Grok Build) from your mobile device — and run persistent AI agents, across one or more machines, that think, remember, and collaborate on their own.
 
 ```
 ┌───────────────────┐       Tailscale        ┌──────────────────┐
@@ -37,7 +37,7 @@ Remotely operate AI coding CLIs (Claude Code, Codex) from your mobile device —
 - Node.js 20+
 - tmux
 - [Tailscale](https://tailscale.com/)
-- Supported CLIs: `claude`, `codex` (at least one)
+- Supported CLIs: `claude`, `codex`, `grok` (Grok Build) — at least one
 
 ### Windows
 
@@ -45,7 +45,7 @@ Remotely operate AI coding CLIs (Claude Code, Codex) from your mobile device —
 - Node.js 20+
 - Windows 10 1809+ / Windows 11 (ConPTY support required)
 - [Tailscale](https://tailscale.com/)
-- Supported CLIs: `claude`, `codex` (at least one)
+- Supported CLIs: `claude`, `codex`, `grok` (Grok Build) — at least one
 
 > **Note:** On Windows, sessions run via ConPTY instead of tmux. Session persistence across kojo restarts is not available.
 
@@ -215,7 +215,7 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 
 - Manage multiple sessions simultaneously (newest first)
 - Session persistence via tmux on macOS/Linux (`~/.config/kojo/sessions.json`, auto-cleanup after 7 days). Sessions survive kojo restarts and crashes
-- Session restart with tool-specific resume (`claude --resume`, `codex resume`)
+- Session restart with tool-specific resume (`claude --resume`, `codex resume`, `grok --resume`)
 - Real-time PTY output streaming (xterm.js)
 - Text input (Enter for newline, Shift+Enter to send) and special keys (Esc, Tab, Ctrl, arrows)
 - Working directory path completion
@@ -228,8 +228,8 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 
 ### AI Agents
 
-- Create persistent AI personas with custom name, personality, avatar, and backend (Claude / Codex, plus custom Anthropic Messages API endpoints like llama-server)
-- AI-assisted persona generation (via claude/codex CLI) and avatar generation (Gemini Image API)
+- Create persistent AI personas with custom name, personality, avatar, and backend (Claude / Codex / Grok Build, plus custom Anthropic Messages API endpoints like llama-server)
+- AI-assisted persona generation (via claude/codex/grok CLI) and avatar generation (Gemini Image API)
 - Interactive chat with streaming responses, thinking display, and tool-use cards
 - Markdown rendering in agent messages
 - Scheduled autonomous execution (10 min – 24 h intervals) with auto-staggering, per-agent timeout, and cross-process dedup
@@ -237,7 +237,7 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 - Encrypted credential vault (AES-256-GCM SQLite) with TOTP 2FA support
 - Public profile and agent directory for inter-agent discovery
 - Group DM: multi-agent conversations with notification-based messaging
-- Slack integration (Socket Mode) — per-agent bot with streaming replies, per-thread conversation context, and `<reply>` tag filtering
+- Slack integration (Socket Mode) — per-agent bot with live streaming replies, per-thread session resumption, and channel/thread-aware system prompt
 - Agent data reset (clear conversations and memory while keeping settings, persona, avatar, and credentials)
 - Fork agents preserving persona and memory
 
