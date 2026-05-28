@@ -863,46 +863,70 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// operator can drive a manual finalize retry. The drop
 	// counterpart fires only on the abort paths above.
 	//
-	// Uses a fresh background ctx so a wedged target doesn't
-	// stall past switchDeviceOpTimeout — the switch is already
-	// irreversible at this point, finalize is best-effort
-	// runtime activation.
-	// Bounded retry: finalize's `lock_not_self` (target's
-	// AcquireAgentLock hit a still-live source row) is the
-	// recoverable race — the AgentLockGuard refresh loop will
-	// re-acquire as the lease expires, then a retry of finalize
-	// succeeds. Three short attempts cover the typical drain
-	// window without blocking the operator's UI indefinitely.
-	// Non-recoverable errors (network, 4xx other than
-	// lock_not_self) bail on the first attempt.
-	const finalizeAttempts = 3
-	const finalizeRetryBackoff = 500 * time.Millisecond
+	// selfCall path defers finalize into a background goroutine
+	// that first waits for source's claude to emit its
+	// post-tool-result `done` event. The captured assistant
+	// Message rides as the TailMessage payload of finalize so
+	// target appends it BEFORE NotifyDeviceSwitchArrival fires —
+	// the LLM on target then sees its own commitment text in
+	// transcript (e.g. "到着したらセキュリティチェックを実施する"),
+	// which the pre-A architecture silently dropped because the
+	// §3.7 release guard skipped persistDoneEvent on source.
+	//
+	// Non-selfCall path runs the synchronous finalize loop as
+	// before — there's no in-flight chat turn to defer for.
 	var finalizeErr error
-	for attempt := 0; attempt < finalizeAttempts; attempt++ {
-		finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-		finalizeErr = s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, req.TargetPeerID, agentID, syncReq.OpID)
-		finalizeCancel()
-		if finalizeErr == nil {
-			break
+	if selfCall {
+		// Defer finalize: response returns to claude immediately
+		// (curl unblocks → claude continues turn → done event
+		// fires → goroutine ships finalize with tail). Outcome is
+		// forced to "completed" (or completed_with_lock_failure)
+		// because the orchestrator no longer synchronously knows
+		// the finalize result; the SKILL.md tells claude to stay
+		// silent on completed so a missing finalize_error surface
+		// here doesn't leak to the user.
+		go s.runDeferredFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID)
+	} else {
+		// Uses a fresh background ctx so a wedged target doesn't
+		// stall past switchDeviceOpTimeout — the switch is already
+		// irreversible at this point, finalize is best-effort
+		// runtime activation.
+		// Bounded retry: finalize's `lock_not_self` (target's
+		// AcquireAgentLock hit a still-live source row) is the
+		// recoverable race — the AgentLockGuard refresh loop will
+		// re-acquire as the lease expires, then a retry of finalize
+		// succeeds. Three short attempts cover the typical drain
+		// window without blocking the operator's UI indefinitely.
+		// Non-recoverable errors (network, 4xx other than
+		// lock_not_self) bail on the first attempt.
+		const finalizeAttempts = 3
+		const finalizeRetryBackoff = 500 * time.Millisecond
+		for attempt := 0; attempt < finalizeAttempts; attempt++ {
+			finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
+			finalizeErr = s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, req.TargetPeerID, agentID, syncReq.OpID, nil)
+			finalizeCancel()
+			if finalizeErr == nil {
+				break
+			}
+			// Only retry the lock-not-self race; everything else is
+			// either fatal (4xx that won't fix itself) or fits the
+			// "operator manual retry / force-reclaim" path.
+			if !strings.Contains(finalizeErr.Error(), "lock_not_self") {
+				break
+			}
+			if attempt+1 < finalizeAttempts {
+				time.Sleep(finalizeRetryBackoff)
+			}
 		}
-		// Only retry the lock-not-self race; everything else is
-		// either fatal (4xx that won't fix itself) or fits the
-		// "operator manual retry / force-reclaim" path.
-		if !strings.Contains(finalizeErr.Error(), "lock_not_self") {
-			break
+		if finalizeErr != nil {
+			s.logger.Warn("switch-device: agent-sync finalize failed; operator may need to retry",
+				"agent", agentID, "target", req.TargetPeerID,
+				"op_id", syncReq.OpID, "err", finalizeErr)
+			// Surface error detail on the response so the operator
+			// does not have to grep the log; the op_id field already
+			// carries the recovery identifier.
+			resp.FinalizeError = finalizeErr.Error()
 		}
-		if attempt+1 < finalizeAttempts {
-			time.Sleep(finalizeRetryBackoff)
-		}
-	}
-	if finalizeErr != nil {
-		s.logger.Warn("switch-device: agent-sync finalize failed; operator may need to retry",
-			"agent", agentID, "target", req.TargetPeerID,
-			"op_id", syncReq.OpID, "err", finalizeErr)
-		// Surface error detail on the response so the operator
-		// does not have to grep the log; the op_id field already
-		// carries the recovery identifier.
-		resp.FinalizeError = finalizeErr.Error()
 	}
 	// Source-side guard drop runs REGARDLESS of finalize
 	// outcome. complete has already moved agent_locks +
@@ -915,6 +939,15 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// up. A future handoff back to this peer goes through the
 	// same agent-sync → AgentLockGuard.AddAgent path, so the
 	// drop is safe to make unconditional.
+	//
+	// SELFCALL ORDERING: release MUST happen AFTER the deferred-
+	// finalize goroutine is spawned (above) but the goroutine
+	// itself accesses the busy entry's accumulator, which
+	// releaseAgentLocallyCore does NOT touch (only m.agents and
+	// the cron/one-shot side channels), so the goroutine's
+	// WaitChatDone keeps working across the release. The chat
+	// goroutine that feeds the accumulator likewise survives —
+	// it exits via its own defer chain once backendCh closes.
 	if s.onAgentReleasedAsSource != nil {
 		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
 		s.onAgentReleasedAsSource(releaseCtx, agentID)
@@ -922,6 +955,13 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	}
 
 	switch {
+	case selfCall && completeResp.LockTransferred:
+		// Deferred finalize: we don't synchronously know whether
+		// finalize succeeded, so report "completed" optimistically.
+		// A failure surfaces in the server log; the SKILL.md tells
+		// claude not to act on finalize_error on the self-call
+		// path, so this doesn't regress the user-visible flow.
+		resp.Outcome = "completed"
 	case completeResp.LockTransferred && finalizeErr != nil:
 		// Lock + blobs moved successfully but target's runtime
 		// activation (token adopt + AgentLockGuard register)
@@ -947,15 +987,147 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	writeJSONResponse(w, http.StatusOK, resp)
 }
 
+// deferredFinalizeTailWaitBudget bounds how long the selfCall finalize
+// goroutine waits for source's claude to emit a `done` event before
+// shipping finalize without the tail. Set generously enough that a
+// typical claude turn (a few seconds of post-tool-result text +
+// thinking) completes within budget, but capped so a hung backend
+// can't strand target's runtime activation indefinitely.
+//
+// 30s mirrors claude's interactive-turn p95; longer-running tails
+// degrade to the no-tail finalize (target's arrival prompt then has
+// to rely on the user-instruction quoting added by buildArrivalPrompt
+// — strictly worse than the tail path but strictly better than
+// silently dropping finalize altogether).
+const deferredFinalizeTailWaitBudget = 30 * time.Second
+
+// runDeferredFinalize is the goroutine the selfCall switch path
+// spawns after /handoff/complete returns to claude. It waits for
+// source's claude to finish the in-flight turn (so the post-tool-
+// result assistant Message becomes available via the chat
+// accumulator), then POSTs /handoff/finalize to target with the
+// captured Message as the optional TailMessage payload. Target's
+// finalize handler upserts the row to agent_messages BEFORE firing
+// NotifyDeviceSwitchArrival so the LLM sees its own commitment text
+// in the arrival prompt's transcript scan.
+//
+// Failure modes (all surfaced as Warn-level logs, never propagated
+// back to the agent — the agent's claude has already disconnected
+// from the curl tool call by the time we get here):
+//
+//   - WaitChatDone returns nil within budget: finalize fires with
+//     nil tail (degraded behavior — no commitment text, but still
+//     activates target's runtime).
+//   - finalize POST fails on all attempts: target stays without
+//     runtime activation. Operator must manually retry via
+//     /api/v1/peers/agent-sync/finalize.
+//
+// Runs under context.Background so a parent-handler cancellation
+// (e.g. switchDeviceOpTimeout firing right after writeJSONResponse)
+// doesn't cut us off mid-wait.
+func (s *Server) runDeferredFinalize(targetAddr, targetDeviceID, agentID, opID string) {
+	defer func() {
+		// Goroutine-level recover: a panic here would have no
+		// supervisor to catch it (the parent handler already
+		// returned), and the daemon's net/http panic handler
+		// covers HTTP handlers, not detached goroutines.
+		if r := recover(); r != nil {
+			s.logger.Error("runDeferredFinalize: panic recovered",
+				"agent", agentID, "op_id", opID, "panic", r)
+		}
+	}()
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), deferredFinalizeTailWaitBudget)
+	var tail *store.MessageRecord
+	if s.agents != nil {
+		tail = s.agents.WaitChatDone(waitCtx, agentID)
+	}
+	waitCancel()
+	if tail != nil {
+		s.logger.Info("switch-device: captured post-tool-result tail; shipping with finalize",
+			"agent", agentID, "op_id", opID, "tail_id", tail.ID,
+			"tail_content_len", len(tail.Content))
+	} else {
+		s.logger.Warn("switch-device: source done event not observed within budget; finalizing without tail",
+			"agent", agentID, "op_id", opID, "budget", deferredFinalizeTailWaitBudget)
+	}
+
+	const finalizeAttempts = 3
+	const finalizeRetryBackoff = 500 * time.Millisecond
+	var finalizeErr error
+	for attempt := 0; attempt < finalizeAttempts; attempt++ {
+		finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
+		finalizeErr = s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, targetDeviceID, agentID, opID, tail)
+		finalizeCancel()
+		if finalizeErr == nil {
+			break
+		}
+		if !strings.Contains(finalizeErr.Error(), "lock_not_self") {
+			break
+		}
+		if attempt+1 < finalizeAttempts {
+			time.Sleep(finalizeRetryBackoff)
+		}
+	}
+	if finalizeErr != nil {
+		s.logger.Warn("switch-device: deferred finalize failed; target arrival may not fire (operator can manually retry)",
+			"agent", agentID, "op_id", opID, "err", finalizeErr)
+	}
+}
+
+// finalizeWireBodyCap mirrors the MaxBytesReader limit on target's
+// finalize handler. Source pre-checks the marshalled body against
+// this cap; an oversized tail payload (huge assistant output, deep
+// ToolUses arrays) is dropped + retransmitted as a nil-tail finalize
+// so target's runtime activation still happens. The cap MUST stay
+// in sync with the receiver-side 16<<20 in
+// peer_agent_sync_finalize_handler.go.
+const finalizeWireBodyCap = 16 << 20
+
 // dispatchPeerAgentSyncFinalize tells target to commit the
 // runtime side effects (TokenStore adopt, AgentLockGuard
 // AddAgent) that agent-sync deferred. Best-effort: a failure
 // here is logged + ignored by the caller — target still holds
 // the agent rows and the operator can manually re-call this
 // endpoint to recover.
-func (s *Server) dispatchPeerAgentSyncFinalize(ctx context.Context, targetAddr, targetDeviceID, agentID, opID string) error {
-	return s.dispatchPeerAgentSyncPhase2(ctx, targetAddr, targetDeviceID, agentID, opID,
-		"/api/v1/peers/agent-sync/finalize")
+//
+// tail is the optional post-tool-result assistant Message captured
+// from source's claude turn AFTER /handoff/complete (self-call defer
+// path). When non-nil, target upserts the row before firing the
+// arrival hook so the LLM sees its own commitment text in the
+// transcript. Nil on every non-self-call path and on self-call paths
+// where the source done-event never landed within the wait budget
+// OR where the marshalled wire body would bust target's MaxBytesReader
+// cap (oversized tail is silently dropped + finalize still proceeds,
+// preferring "target runtime activates without the commitment text"
+// over "target never activates because finalize itself 413'd").
+func (s *Server) dispatchPeerAgentSyncFinalize(ctx context.Context, targetAddr, targetDeviceID, agentID, opID string, tail *store.MessageRecord) error {
+	body := peerAgentSyncFinalizeRequest{
+		SourceDeviceID: s.peerID.DeviceID,
+		AgentID:        agentID,
+		OpID:           opID,
+		TailMessage:    tail,
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal finalize body: %w", err)
+	}
+	if int64(len(raw)) > finalizeWireBodyCap && tail != nil {
+		// Drop the tail and re-marshal. Log so the loss is
+		// operator-visible — target's arrival prompt will fall back
+		// to the no-tail path (current behavior + the user-msg
+		// quoting in buildArrivalPrompt).
+		s.logger.Warn("switch-device: finalize body with tail exceeds wire cap; dropping tail",
+			"agent", agentID, "op_id", opID,
+			"body_bytes", len(raw), "cap", finalizeWireBodyCap)
+		body.TailMessage = nil
+		raw, err = json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("re-marshal finalize body (tail dropped): %w", err)
+		}
+	}
+	return s.dispatchPeerAgentSyncPhase2Body(ctx, targetAddr, targetDeviceID, agentID, opID,
+		"/api/v1/peers/agent-sync/finalize", raw)
 }
 
 // dispatchPeerAgentSyncDrop tells target to discard any pending
@@ -976,6 +1148,15 @@ func (s *Server) dispatchPeerAgentSyncPhase2(ctx context.Context, targetAddr, ta
 	if err != nil {
 		return fmt.Errorf("marshal phase-2 body: %w", err)
 	}
+	return s.dispatchPeerAgentSyncPhase2Body(ctx, targetAddr, targetDeviceID, agentID, opID, path, body)
+}
+
+// dispatchPeerAgentSyncPhase2Body POSTs an already-marshalled body to
+// target's phase-2 endpoint (finalize or drop). targetDeviceID /
+// agentID / opID are unused at the HTTP layer (signing identity
+// carries auth, target re-derives the path) but kept for caller-site
+// symmetry and future per-request logging.
+func (s *Server) dispatchPeerAgentSyncPhase2Body(ctx context.Context, targetAddr, _, _, _, path string, body []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		targetAddr+path, bytes.NewReader(body))
 	if err != nil {

@@ -2107,6 +2107,19 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 		}
 		if event.Type == "done" && event.Message != nil {
 			receivedDone = true
+			// MarkDone runs UNCONDITIONALLY, BEFORE the §3.7
+			// release guard. The switch device handler's deferred
+			// finalize goroutine sits on accumulator.WaitDone to
+			// pick up the post-tool-result text generated AFTER
+			// the lock has moved to target (the source-release
+			// path that would otherwise skip every persist). Once
+			// captured here, the goroutine ships the message to
+			// target as the tail payload of /handoff/finalize so
+			// target's arrival prompt sees the full conversation
+			// including the agent's "I'll do X on arrival"
+			// commitment. Idempotent under sync.Once.
+			sharedAcc.MarkDone(event.Message)
+
 			// §3.7 release guard: if a source-release evicted
 			// the agent while this goroutine was mid-process
 			// (drain failed at switch), skip every downstream

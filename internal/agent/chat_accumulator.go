@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"strings"
 	"sync"
 )
@@ -31,10 +32,17 @@ type chatAccumulator struct {
 	text     strings.Builder
 	thinking strings.Builder
 	toolUses []ToolUse
+
+	// doneCh closes once MarkDone fires. WaitDone blocks on it.
+	// Allocated by newChatAccumulator so a Wait that fires BEFORE
+	// MarkDone still sees a non-nil channel under a nil-safe receiver.
+	doneCh   chan struct{}
+	doneMsg  *Message
+	doneOnce sync.Once
 }
 
 func newChatAccumulator() *chatAccumulator {
-	return &chatAccumulator{}
+	return &chatAccumulator{doneCh: make(chan struct{})}
 }
 
 // OnEvent folds a streaming event into the accumulator. Mirrors the
@@ -90,5 +98,57 @@ func (a *chatAccumulator) IsEmpty() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.text.Len() == 0 && a.thinking.Len() == 0 && len(a.toolUses) == 0
+}
+
+// MarkDone records the final assistant Message produced by the
+// backend and unblocks every WaitDone waiter. Idempotent under
+// sync.Once so a duplicate done event (rare — accumulator survives
+// processChatEvents's drain loop) does not panic on a closed channel.
+//
+// Called from processChatEvents.handleTerminal BEFORE the §3.7
+// release guard short-circuits, so the snapshot path stays useful
+// even when the source peer has been evicted mid-turn (the very
+// case A in `/handoff/switch` defers finalize for — the agent's
+// post-tool-result text is generated AFTER the lock has moved, and
+// without MarkDone there's no way to recover it for shipment to
+// target).
+func (a *chatAccumulator) MarkDone(msg *Message) {
+	if a == nil || msg == nil {
+		return
+	}
+	a.doneOnce.Do(func() {
+		a.mu.Lock()
+		cp := *msg
+		a.doneMsg = &cp
+		a.mu.Unlock()
+		close(a.doneCh)
+	})
+}
+
+// WaitDone blocks until MarkDone fires or ctx is cancelled. Returns a
+// copy of the captured assistant Message on success; nil on ctx
+// cancellation. Safe to call BEFORE MarkDone — the channel was
+// allocated at constructor time.
+//
+// Returns nil for a nil receiver so the device-switch goroutine that
+// uses this can bail without panicking when the busy entry vanished
+// between the switch handler's accumulator grab and the goroutine
+// run.
+func (a *chatAccumulator) WaitDone(ctx context.Context) *Message {
+	if a == nil {
+		return nil
+	}
+	select {
+	case <-a.doneCh:
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if a.doneMsg == nil {
+			return nil
+		}
+		cp := *a.doneMsg
+		return &cp
+	case <-ctx.Done():
+		return nil
+	}
 }
 

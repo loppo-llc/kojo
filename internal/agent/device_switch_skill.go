@@ -141,19 +141,26 @@ guess). Pick the field by outcome:
 
 Outcome catalog:
 
-- ` + "`completed`" + ` — switch succeeded; this PTY will terminate
-  shortly and the agent resumes on the target peer. Tell the
-  user the migration is done.
-- ` + "`completed_finalize_failed`" + ` — lock + blobs moved but
-  target's runtime activation hook failed. Surface
-  ` + "`finalize_error`" + ` to the user; the agent IS on target but the
-  operator may need to restart it manually.
+- ` + "`completed`" + ` / ` + "`completed_finalize_failed`" + ` — switch succeeded
+  (lock + blobs moved to target; for ` + "`completed_finalize_failed`" + `
+  only target's runtime activation hook lagged, the agent IS on
+  target). **Do not emit any further assistant text after this
+  tool result.** The source PTY tears down within seconds and the
+  sync snapshot to target was taken BEFORE the curl returned, so
+  anything you stream here is dropped — neither the source DB nor
+  target receives it. The target peer fires its own arrival prompt
+  with the full migrated state; that is where the conversation
+  continues. Treat the curl response as the end of your turn:
+  no acknowledgement, no farewell, no plan, no summary. Just stop.
 - ` + "`completed_with_lock_failure`" + ` — blob_refs migrated to
-  target but no agent_lock row existed to move. Surface ` + "`reason`" + `
-  to the user; operator inspects ` + "`agent_locks`" + ` on target and
-  may issue a manual Acquire if the agent should be locked.
+  target but no agent_lock row existed to move. Source still owns
+  the chat session, so a normal text response IS persisted:
+  surface ` + "`reason`" + ` to the user; operator inspects ` + "`agent_locks`" + `
+  on target and may issue a manual Acquire if the agent should be
+  locked.
 - ` + "`aborted` / `abort_failed` / `complete_failed` / `source_drain_failed` / `complete_errored_lock_at_target`" + ` —
-  switch did not happen (or completed only partially). Tell the
+  switch did not happen (or completed only partially). Source is
+  still the holder so your reply IS persisted normally: tell the
   user it failed, surface ` + "`reason`" + ` verbatim, and include the
   response body so they can decide whether to retry.
 `
@@ -236,19 +243,26 @@ guess). Pick the field by outcome:
 
 Outcome catalog:
 
-- ` + "`completed`" + ` — switch succeeded; this PTY will terminate
-  shortly and the agent resumes on the target peer. Tell the
-  user the migration is done.
-- ` + "`completed_finalize_failed`" + ` — lock + blobs moved but
-  target's runtime activation hook failed. Surface
-  ` + "`finalize_error`" + ` to the user; the agent IS on target but the
-  operator may need to restart it manually.
+- ` + "`completed`" + ` / ` + "`completed_finalize_failed`" + ` — switch succeeded
+  (lock + blobs moved to target; for ` + "`completed_finalize_failed`" + `
+  only target's runtime activation hook lagged, the agent IS on
+  target). **Do not emit any further assistant text after this
+  tool result.** The source PTY tears down within seconds and the
+  sync snapshot to target was taken BEFORE the curl returned, so
+  anything you stream here is dropped — neither the source DB nor
+  target receives it. The target peer fires its own arrival prompt
+  with the full migrated state; that is where the conversation
+  continues. Treat the curl response as the end of your turn:
+  no acknowledgement, no farewell, no plan, no summary. Just stop.
 - ` + "`completed_with_lock_failure`" + ` — blob_refs migrated to
-  target but no agent_lock row existed to move. Surface ` + "`reason`" + `
-  to the user; operator inspects ` + "`agent_locks`" + ` on target and
-  may issue a manual Acquire if the agent should be locked.
+  target but no agent_lock row existed to move. Source still owns
+  the chat session, so a normal text response IS persisted:
+  surface ` + "`reason`" + ` to the user; operator inspects ` + "`agent_locks`" + `
+  on target and may issue a manual Acquire if the agent should be
+  locked.
 - ` + "`aborted` / `abort_failed` / `complete_failed` / `source_drain_failed` / `complete_errored_lock_at_target`" + ` —
-  switch did not happen (or completed only partially). Tell the
+  switch did not happen (or completed only partially). Source is
+  still the holder so your reply IS persisted normally: tell the
   user it failed, surface ` + "`reason`" + ` verbatim, and include the
   response body so they can decide whether to retry.
 `
@@ -340,20 +354,27 @@ guess). Pick the field by outcome:
 
 Outcome catalog:
 
-- ` + "`completed`" + ` — switch succeeded; this grok process will
-  terminate shortly and the agent resumes on the target peer
-  via ` + "`grok --resume`" + ` against the migrated session state.
-  Tell the user the migration is done.
-- ` + "`completed_finalize_failed`" + ` — lock + blobs moved but
-  target's runtime activation hook failed. Surface
-  ` + "`finalize_error`" + ` to the user; the agent IS on target but the
-  operator may need to restart it manually.
+- ` + "`completed`" + ` / ` + "`completed_finalize_failed`" + ` — switch succeeded
+  (lock + blobs moved to target; for ` + "`completed_finalize_failed`" + `
+  only target's runtime activation hook lagged, the agent IS on
+  target). **Do not emit any further assistant text after this
+  tool result.** The source grok process tears down within seconds
+  and the sync snapshot to target was taken BEFORE the curl
+  returned, so anything you stream here is dropped — neither the
+  source DB nor target receives it. The target peer fires its own
+  arrival prompt against the migrated grok session state; that is
+  where the conversation continues. Treat the curl response as the
+  end of your turn: no acknowledgement, no farewell, no plan, no
+  summary. Just stop.
 - ` + "`completed_with_lock_failure`" + ` — blob_refs migrated to
-  target but no agent_lock row existed to move. Surface ` + "`reason`" + `
-  to the user; operator inspects ` + "`agent_locks`" + ` on target and
-  may issue a manual Acquire if the agent should be locked.
+  target but no agent_lock row existed to move. Source still owns
+  the chat session, so a normal text response IS persisted:
+  surface ` + "`reason`" + ` to the user; operator inspects ` + "`agent_locks`" + `
+  on target and may issue a manual Acquire if the agent should be
+  locked.
 - ` + "`aborted` / `abort_failed` / `complete_failed` / `source_drain_failed` / `complete_errored_lock_at_target`" + ` —
-  switch did not happen (or completed only partially). Tell the
+  switch did not happen (or completed only partially). Source is
+  still the holder so your reply IS persisted normally: tell the
   user it failed, surface ` + "`reason`" + ` verbatim, and include the
   response body so they can decide whether to retry.
 `
@@ -425,20 +446,27 @@ guess). Pick the field by outcome:
 
 Outcome catalog:
 
-- ` + "`completed`" + ` — switch succeeded; this grok process will
-  terminate shortly and the agent resumes on the target peer
-  via ` + "`grok --resume`" + ` against the migrated session state.
-  Tell the user the migration is done.
-- ` + "`completed_finalize_failed`" + ` — lock + blobs moved but
-  target's runtime activation hook failed. Surface
-  ` + "`finalize_error`" + ` to the user; the agent IS on target but the
-  operator may need to restart it manually.
+- ` + "`completed`" + ` / ` + "`completed_finalize_failed`" + ` — switch succeeded
+  (lock + blobs moved to target; for ` + "`completed_finalize_failed`" + `
+  only target's runtime activation hook lagged, the agent IS on
+  target). **Do not emit any further assistant text after this
+  tool result.** The source grok process tears down within seconds
+  and the sync snapshot to target was taken BEFORE the curl
+  returned, so anything you stream here is dropped — neither the
+  source DB nor target receives it. The target peer fires its own
+  arrival prompt against the migrated grok session state; that is
+  where the conversation continues. Treat the curl response as the
+  end of your turn: no acknowledgement, no farewell, no plan, no
+  summary. Just stop.
 - ` + "`completed_with_lock_failure`" + ` — blob_refs migrated to
-  target but no agent_lock row existed to move. Surface ` + "`reason`" + `
-  to the user; operator inspects ` + "`agent_locks`" + ` on target and
-  may issue a manual Acquire if the agent should be locked.
+  target but no agent_lock row existed to move. Source still owns
+  the chat session, so a normal text response IS persisted:
+  surface ` + "`reason`" + ` to the user; operator inspects ` + "`agent_locks`" + `
+  on target and may issue a manual Acquire if the agent should be
+  locked.
 - ` + "`aborted` / `abort_failed` / `complete_failed` / `source_drain_failed` / `complete_errored_lock_at_target`" + ` —
-  switch did not happen (or completed only partially). Tell the
+  switch did not happen (or completed only partially). Source is
+  still the holder so your reply IS persisted normally: tell the
   user it failed, surface ` + "`reason`" + ` verbatim, and include the
   response body so they can decide whether to retry.
 `

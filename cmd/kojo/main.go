@@ -1045,6 +1045,15 @@ func main() {
 			if agentMgr != nil && agentMgr.Store() != nil && peerIdentity != nil {
 				lock, lerr := agentMgr.Store().GetAgentLock(hookCtx, agentID)
 				if lerr != nil {
+					// Wrap ErrNotFound as ErrFencingMismatch so
+					// the finalize handler translates it to a
+					// 503 lock_not_self response and the
+					// source-side retry loop picks it up.
+					// Other lookup errors stay as-is (500).
+					if errors.Is(lerr, store.ErrNotFound) {
+						return fmt.Errorf("agent_lock row missing for %q: %w",
+							agentID, store.ErrFencingMismatch)
+					}
 					return fmt.Errorf("post-AddAgent lock lookup: %w", lerr)
 				}
 				if lock == nil || lock.HolderPeer != peerIdentity.DeviceID {
@@ -1052,8 +1061,14 @@ func main() {
 					if lock != nil {
 						holder = lock.HolderPeer
 					}
-					return fmt.Errorf("agent_lock did not transfer (holder=%q, self=%q); orchestrator should retry finalize",
-						holder, peerIdentity.DeviceID)
+					// Wrap with store.ErrFencingMismatch so the
+					// finalize handler can errors.Is-detect this
+					// holder-mismatch and 503 with `lock_not_self`,
+					// which the source-side retry loop already
+					// keys on (switch_device_handler.go's
+					// finalizeErr.Error() substring check).
+					return fmt.Errorf("agent_lock did not transfer (holder=%q, self=%q); orchestrator should retry finalize: %w",
+						holder, peerIdentity.DeviceID, store.ErrFencingMismatch)
 				}
 			}
 			// Activate runtime side channels (cron + notify) AFTER the
@@ -1061,19 +1076,19 @@ func main() {
 			// refreshes the in-memory cache; firing schedules before
 			// finalize would have target acting on an agent the
 			// orchestrator might still abort.
+			//
+			// NotifyDeviceSwitchArrival is deliberately NOT fired
+			// here. The finalize HTTP handler fires it AFTER the
+			// Plan A TailMessage has been applied to agent_messages
+			// (which has to happen post-hook so the lock check
+			// passes). Firing here would build the arrival prompt
+			// against a transcript missing the agent's own
+			// commitment text. See peer_agent_sync_finalize_handler.go
+			// for the new ordering: hook → UpdateAgentLockAllowedProxy
+			// → applyFinalizeTailMessage → NotifyDeviceSwitchArrival
+			// → commitPendingAgentSync.
 			if agentMgr != nil {
 				agentMgr.ActivateAgentRuntime(agentID)
-
-				// Resolve source peer's human-readable name for the
-				// arrival prompt. Best-effort: fall back to the raw
-				// device_id on lookup failure.
-				sourceName := sourceDeviceID
-				if sourceDeviceID != "" && agentMgr.Store() != nil {
-					if rec, err := agentMgr.Store().GetPeer(hookCtx, sourceDeviceID); err == nil && rec.Name != "" {
-						sourceName = rec.Name
-					}
-				}
-				agentMgr.NotifyDeviceSwitchArrival(agentID, sourceName, opID)
 			}
 			return nil
 		})

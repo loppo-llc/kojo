@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -611,6 +612,360 @@ type arrivalDedupKey struct {
 	opID    string
 }
 
+// arrivalPromptBase is the always-included header the arrival chat opens with.
+// Keep the prefix stable so the prompt cache survives across switches.
+const arrivalPromptBase = "デバイス転移完了。転移元: %s。このデバイスで作業を継続してください。"
+
+// arrivalPromptFallbackTail is appended when no unaddressed user instruction
+// is found on this peer (e.g. cron-triggered or first-ever switch).
+const arrivalPromptFallbackTail = "直前の会話の流れを確認し、中断された作業があれば再開してください。"
+
+// arrivalPromptUserInstructionPreviewLimit caps how many RUNES of the latest
+// user instruction we quote into the arrival prompt. Rune-based (not byte-
+// based) so a truncate boundary mid-multibyte never produces invalid UTF-8 —
+// the rest of the system is UTF-8 throughout and a torn rune would surface as
+// a `�` in the prompt the LLM sees. Long pasted dumps still get
+// truncated; the agent can re-read the full body from its transcript.
+const arrivalPromptUserInstructionPreviewLimit = 4000
+
+// arrivalUserHistoryScanLimit is the maximum number of recent messages the
+// arrival look-up walks before giving up on finding a user-role row. Bumped
+// well above the previous 20 so a chatty trailing run of system / assistant
+// rows (a busy cron + tool storm right before the switch) can't hide the
+// user message; arrival is fired once per device-switch so the extra read
+// is negligible.
+const arrivalUserHistoryScanLimit = 200
+
+// arrivalContext bundles the per-switch text the arrival prompt
+// quotes. UserInstruction is the latest UNADDRESSED user-role
+// message (the live "do X" ask). TailCommitment is the Plan A tail
+// — the assistant text source's claude generated AFTER the
+// kojo-switch-device curl returned, captured + shipped via
+// /handoff/finalize's TailMessage field. Both may be empty
+// independently; buildArrivalPrompt picks the quote layout from
+// which ones are present.
+type arrivalContext struct {
+	UserInstruction string
+	TailCommitment  string
+}
+
+// buildArrivalPrompt assembles the system-role text the arrival chat sends to
+// the just-arrived agent. The prompt always opens with the
+// "デバイス転移完了" header so a stable prefix benefits the prompt cache, then
+// — depending on what collectArrivalContext finds — quotes the latest
+// UNADDRESSED user instruction AND/OR the Plan A tail commitment so the
+// LLM has both anchors:
+//
+//   - The user instruction is what the human actually asked.
+//   - The tail commitment is the agent's own statement of what it
+//     intended to do post-arrival; claude --continue's JSONL on
+//     target doesn't carry this row (source wrote it after the
+//     sync read the JSONL bytes), so without quoting here the
+//     commitment is invisible to the LLM.
+//
+// Falls back to the generic "resume interrupted work" tail when both
+// are empty (cron-fired switch with no in-flight ask).
+//
+// Ctx is the same context that wraps chatWithArrivalRetry; a cancelled parent
+// here only means the look-up is skipped — the caller still issues the chat
+// with the fallback prompt so the agent at least gets the arrival
+// notification.
+func buildArrivalPrompt(ctx context.Context, m *Manager, agentID, sourcePeerName string) string {
+	head := fmt.Sprintf(arrivalPromptBase, sourcePeerName)
+	ac := collectArrivalContext(ctx, m, agentID)
+	if ac.UserInstruction == "" && ac.TailCommitment == "" {
+		return head + arrivalPromptFallbackTail
+	}
+	var b strings.Builder
+	b.WriteString(head)
+	if ac.UserInstruction != "" {
+		b.WriteString("\n\n直前のユーザー指示（自動文脈ブロックは除去済み）:\n")
+		b.WriteString(ac.UserInstruction)
+	}
+	if ac.TailCommitment != "" {
+		b.WriteString("\n\n転移直前にあなた自身が宣言した作業（claude --continue の履歴には載っていないので注意）:\n")
+		b.WriteString(ac.TailCommitment)
+	}
+	b.WriteString("\n\nまず上記の指示・宣言を確認し、未完了であればこのデバイスで実行してください。すでに完了している場合は通常の待機状態に戻ってください。")
+	return b.String()
+}
+
+// collectArrivalContext walks the recent transcript and pulls out
+// the latest unaddressed user instruction (with the kojo-injected
+// `<context>...</context>` block stripped) plus the Plan A tail
+// commitment (the assistant message immediately newer than the
+// kojo-switch snapshot, if present).
+//
+// Returns the zero arrivalContext when:
+//
+//   - the store is unavailable / context cancelled
+//   - the transcript has no user-role row in the recent scan window
+//   - the candidate user body is empty after stripping the volatile block
+//   - the latest user message has already been addressed by
+//     post-arrival work (so re-quoting it would shake old, completed
+//     work loose on every subsequent switch)
+//
+// Why this exists: the in-flight kojo-switch-device tool_use ships
+// to target as a hanging assistant turn in claude's JSONL — claude
+// --continue treats the conversation as ended at the user msg and
+// the arrival prompt becomes the next "live" instruction. Without
+// explicit quoting in the arrival prompt, claude often reads the
+// diary-notes auto-context embedded in the user msg, decides "no
+// interrupted work", and never actions the actual instruction
+// (e.g. "do a security check"). Observed in ag_f71bf5… on 2026-05-28:
+// user asked transfer + security check, target arrived and reported
+// "no interrupted work" while the security check was the whole point
+// of the switch.
+func collectArrivalContext(ctx context.Context, m *Manager, agentID string) arrivalContext {
+	if m == nil || agentID == "" {
+		return arrivalContext{}
+	}
+	st := m.Store()
+	if st == nil {
+		return arrivalContext{}
+	}
+	msgs, err := st.ListMessages(ctx, agentID, store.MessageListOptions{
+		Order: "desc",
+		Limit: arrivalUserHistoryScanLimit,
+	})
+	if err != nil {
+		if m.logger != nil {
+			m.logger.Debug("arrival prompt: ListMessages failed; falling back to generic prompt",
+				"agent", agentID, "err", err)
+		}
+		return arrivalContext{}
+	}
+	// In desc order: msgs[0] is the newest. Look for the first user-role
+	// row whose body has content after stripping the kojo-injected context
+	// block. Anything BEFORE it in the slice (i.e. with a higher seq) is a
+	// potential addresser — only a non-empty assistant counts, and the
+	// snapshot+tail unit gets carved out (see userMessageAddressed).
+	for i, msg := range msgs {
+		if msg == nil || msg.Role != "user" {
+			continue
+		}
+		body := stripArrivalContextBlock(msg.Content)
+		body = strings.TrimSpace(body)
+		if body == "" {
+			// Empty-after-strip rows (auto-checkin context with no
+			// user text) don't help and don't gate "addressed" —
+			// fall through and look at the next older user row.
+			continue
+		}
+		newer := msgs[:i]
+		if userMessageAddressed(newer) {
+			return arrivalContext{}
+		}
+		return arrivalContext{
+			UserInstruction: truncatePromptByRune(body, arrivalPromptUserInstructionPreviewLimit),
+			TailCommitment:  truncatePromptByRune(planATailContent(newer), arrivalPromptUserInstructionPreviewLimit),
+		}
+	}
+	return arrivalContext{}
+}
+
+// planATailContent returns the content of the MOST-RECENT Plan A
+// tail row in `newer` (immediately newer than the NEWEST kojo-switch
+// snapshot). The arrival prompt quotes this so the LLM on target
+// sees its own pre-transfer commitment text — which doesn't ride
+// claude --continue's JSONL because source wrote it after the sync
+// read the JSONL bytes.
+//
+// "Newest snapshot" is picked deliberately: a multi-switch
+// transcript has several snapshot+tail pairs, but only the most
+// recent one is relevant to THIS arrival. The older units belong
+// to past switches whose tails were already presented to claude
+// on those arrivals and (assuming the SKILL.md silence directive
+// works) acted on.
+//
+// Returns the empty string when no snapshot was found, when the
+// position past the snapshot is occupied by a non-tail-shaped row
+// (e.g. another snapshot, an empty assistant, a system message),
+// or when the snapshot is the very newest row (no slot for a tail).
+func planATailContent(newer []*store.MessageRecord) string {
+	// Scan from newest (index 0) toward oldest; the first snapshot
+	// we hit is the most recent.
+	for i, m := range newer {
+		if !isKojoSwitchSnapshot(m) {
+			continue
+		}
+		if i == 0 {
+			// Snapshot is the very newest row in `newer`; no
+			// slot newer than it for a tail.
+			return ""
+		}
+		cand := newer[i-1]
+		if !isPlanATailShape(cand) {
+			return ""
+		}
+		return strings.TrimSpace(cand.Content)
+	}
+	return ""
+}
+
+// userMessageAddressed reports whether any of the messages in `newer`
+// (which the caller passes as the prefix of a desc-ordered slice —
+// i.e. items with seq > the user row's seq) constitute a substantive
+// assistant reply that has actually completed the work.
+//
+// The device-switch flow lands TWO rows after the user instruction:
+//
+//  1. the in-flight snapshot (assistant with empty/short content +
+//     `kojo-switch-device` in ToolUses), and
+//  2. on Plan A, the tail commitment (assistant with non-empty
+//     content like "到着したらXを実施する", no kojo-switch ToolUses).
+//
+// Neither row counts as a real addresser — the snapshot is the
+// curl-in-flight stub; the tail is a commitment, not a completion.
+// Rows NEWER than the snapshot+tail unit ARE post-arrival activity
+// (target wrote them after claude --continue resumed), so a
+// non-empty assistant there means the work IS done and a follow-up
+// switch should NOT re-quote the original user ask.
+//
+// Algorithm (with `newer` in descending seq order — newest at index 0):
+//
+//  1. Walk `newer` and identify EVERY in-flight switch unit
+//     (snapshot row + the immediately-newer slot if it is
+//     tail-shaped). Multi-switch transcripts can carry several
+//     such units stacked on top of the same user instruction
+//     (e.g. cron-fired switch after a self-call switch); peeling
+//     just the oldest would miss the newer ones and let a tail
+//     count as an addresser.
+//  2. Items outside every unit are real assistant rows
+//     (post-arrival completion text, cron checkin responses,
+//     etc.). A non-empty assistant in that residual set means
+//     the user instruction has been addressed; the cron switch
+//     follow-up should NOT re-quote it.
+//
+// Fully empty assistant rows (no content, no thinking) never count —
+// they're the bare snapshot produced when
+// SnapshotAccumulatedMessageRecord fires before any text streams.
+func userMessageAddressed(newer []*store.MessageRecord) bool {
+	unit := planAUnitMask(newer)
+	for i, m := range newer {
+		if unit[i] {
+			continue
+		}
+		if isNonEmptyAssistant(m) {
+			return true
+		}
+	}
+	return false
+}
+
+// planAUnitMask scans `newer` and returns a per-index boolean: true
+// for indices that belong to an in-flight kojo-switch unit
+// (the snapshot itself plus the tail-shaped row immediately newer
+// than each snapshot). Used by userMessageAddressed AND
+// planATailContent so both functions share the exact same
+// "what's part of a switch unit" rule.
+func planAUnitMask(newer []*store.MessageRecord) []bool {
+	mask := make([]bool, len(newer))
+	for i, m := range newer {
+		if !isKojoSwitchSnapshot(m) {
+			continue
+		}
+		mask[i] = true
+		if i > 0 && isPlanATailShape(newer[i-1]) {
+			mask[i-1] = true
+		}
+	}
+	return mask
+}
+
+// isKojoSwitchSnapshot reports whether m is the in-flight assistant
+// snapshot the device-switch handler ships to target. Substring-scans
+// the raw ToolUses JSON for the skill dir name — the wire format
+// always emits `"name":"kojo-switch-device"` (or `"attributionSkill":"kojo-switch-device"`
+// from the Skill wrapper) so a single substring is robust against
+// either shape.
+func isKojoSwitchSnapshot(m *store.MessageRecord) bool {
+	if m == nil || m.Role != "assistant" {
+		return false
+	}
+	if len(m.ToolUses) == 0 {
+		return false
+	}
+	return bytes.Contains(m.ToolUses, []byte(deviceSwitchSkillDirName))
+}
+
+// isPlanATailShape reports whether m has the shape of the Plan A
+// deferred-finalize tail: a non-empty assistant row WITHOUT a
+// kojo-switch-device ToolUses entry. The shape isn't 100% specific
+// (any non-empty assistant directly post-snapshot fits) but combined
+// with snapshotIdx-1 positioning it's robust enough to skip the
+// commitment text without confusing it with post-arrival completion.
+func isPlanATailShape(m *store.MessageRecord) bool {
+	if m == nil || m.Role != "assistant" {
+		return false
+	}
+	if isKojoSwitchSnapshot(m) {
+		return false
+	}
+	return strings.TrimSpace(m.Content) != "" || strings.TrimSpace(m.Thinking) != ""
+}
+
+// isNonEmptyAssistant reports whether m is an assistant row with at
+// least one non-empty Content or Thinking field.
+func isNonEmptyAssistant(m *store.MessageRecord) bool {
+	if m == nil || m.Role != "assistant" {
+		return false
+	}
+	return strings.TrimSpace(m.Content) != "" || strings.TrimSpace(m.Thinking) != ""
+}
+
+// stripArrivalContextBlock removes the leading kojo-injected
+// `<context>...</context>` block from a user message body. Mirrors the
+// sentinel-gated rules of stripVolatileContext: only blocks emitted by
+// BuildVolatileContext (which embed volatileContextSentinel) are stripped,
+// so a user who legitimately opens their own message with `<context>`
+// keeps their content intact. A non-sentinel-bearing leading block — or
+// no leading `<context>` at all — passes through unchanged.
+func stripArrivalContextBlock(s string) string {
+	trimmed := strings.TrimLeft(s, " \t\r\n")
+	if !strings.HasPrefix(trimmed, "<context>") {
+		return s
+	}
+	closeIdx := strings.Index(trimmed, "</context>")
+	if closeIdx <= 0 {
+		return s
+	}
+	if !strings.Contains(trimmed[:closeIdx], volatileContextSentinel) {
+		return s
+	}
+	return strings.TrimLeft(trimmed[closeIdx+len("</context>"):], "\r\n")
+}
+
+// truncatePromptByRune caps body at `runeLimit` runes (NOT bytes), so the
+// truncation boundary never lands mid-multibyte. Falls through to the
+// original string when body already fits.
+//
+// Walks runes via `range` instead of allocating `[]rune(body)`: a 10 MiB
+// pasted body would otherwise pin ~40 MiB of int32s before the slice can
+// be truncated. The range loop tracks the byte index of each rune and
+// stops at runeLimit, so the substring slice reuses the original backing
+// array.
+func truncatePromptByRune(body string, runeLimit int) string {
+	if runeLimit <= 0 {
+		return body
+	}
+	count := 0
+	cutoff := -1 // byte offset to truncate to; -1 = no truncation needed
+	for i := range body {
+		if count == runeLimit {
+			cutoff = i
+			break
+		}
+		count++
+	}
+	if cutoff < 0 {
+		// Either body has ≤ runeLimit runes (no truncation) or
+		// exactly runeLimit (range exits before setting cutoff).
+		return body
+	}
+	return body[:cutoff] + "…（以下省略、完全な内容はトランスクリプト参照）"
+}
+
 // NotifyDeviceSwitchArrival sends a system message to the agent so
 // it can immediately resume work on this peer after a device switch.
 // Runs async — the caller doesn't need to wait for the chat to
@@ -664,7 +1019,7 @@ func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string
 		defer arrivalCancels.CompareAndDelete(agentID, myEntry)
 		defer cancel()
 
-		prompt := "デバイス転移完了。転移元: " + sourcePeerName + "。このデバイスで作業を継続してください。直前の会話の流れを確認し、中断された作業があれば再開してください。"
+		prompt := buildArrivalPrompt(ctx, m, agentID, sourcePeerName)
 		events, err := chatWithArrivalRetry(ctx, m, agentID, prompt, opID)
 		if err != nil {
 			// Clear dedup so a finalize retry for the SAME op can

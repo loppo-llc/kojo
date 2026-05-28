@@ -389,6 +389,76 @@ func (m *Manager) acquireResetGuard(agentID string) (func(), error) {
 	return cleanup, nil
 }
 
+// WaitChatDone blocks until the busy entry's chat goroutine emits a
+// terminal `done` event for the agent's in-flight turn or ctx is
+// cancelled. Returns the captured assistant Message converted to a
+// store.MessageRecord (with seq=0; caller stamps the target-side
+// allocation, ToolUses cleared — see below) or nil on ctx
+// cancellation / missing busy entry / nil accumulator.
+//
+// ToolUses is intentionally CLEARED on the returned record. The
+// done event carries the WHOLE turn — the agent's pre-tool-call
+// text, every tool_use (including the kojo-switch-device call
+// that triggered this whole flow), and every tool_result. The
+// snapshot row the orchestrator shipped during /agent-sync ALREADY
+// carries that tool_use; if the tail row carried it too, target's
+// userMessageAddressed / planATailContent would mis-classify the
+// tail as another snapshot (substring-detect of `kojo-switch-device`
+// in ToolUses) and the commitment text would not surface in the
+// arrival prompt. Stripping ToolUses leaves the tail as a pure
+// "post-tool-result completion text" row, distinct in shape from
+// the snapshot.
+//
+// Used by the device-switch self-call orchestrator's deferred
+// finalize: after /handoff/complete moves the lock to target, the
+// source's claude turn continues for a few hundred milliseconds to
+// emit a post-tool-result "I'll do X on arrival" message. Without
+// this wait the orchestrator would race ahead, ship /handoff/finalize
+// to target empty-handed, and target's arrival prompt would fire
+// against a transcript missing the agent's own commitment text. The
+// caller passes a bounded ctx so a wedged source backend can't
+// indefinitely defer target activation; on timeout the orchestrator
+// ships finalize WITHOUT the tail (current behavior — degraded but
+// not stuck).
+//
+// Snapshots the accumulator pointer under busyMu so a concurrent
+// clearBusy(agentID) that removes the entry doesn't strand the
+// caller on a dead reference. The accumulator outlives clearBusy
+// (closed channel + capture stays live until the wait returns).
+func (m *Manager) WaitChatDone(ctx context.Context, agentID string) *store.MessageRecord {
+	if m == nil {
+		return nil
+	}
+	m.busyMu.Lock()
+	entry, ok := m.busy[agentID]
+	m.busyMu.Unlock()
+	if !ok || entry.accumulator == nil {
+		return nil
+	}
+	doneMsg := entry.accumulator.WaitDone(ctx)
+	if doneMsg == nil {
+		return nil
+	}
+	rec, err := messageToRecord(agentID, doneMsg)
+	if err != nil {
+		if m.logger != nil {
+			m.logger.Warn("WaitChatDone: messageToRecord failed", "agent", agentID, "err", err)
+		}
+		return nil
+	}
+	// Strip ToolUses so the tail's wire shape stays distinct from
+	// the snapshot's (which carries kojo-switch-device in its
+	// ToolUses). See doc-comment above.
+	rec.ToolUses = nil
+	ts := parseAgentRFC3339Millis(doneMsg.Timestamp)
+	if ts == 0 {
+		ts = store.NowMillis()
+	}
+	rec.CreatedAt = ts
+	rec.UpdatedAt = ts
+	return rec
+}
+
 // SnapshotAccumulatedMessageRecord reconstructs the in-flight
 // assistant message from the busy entry's shared accumulator and
 // returns it as a store.MessageRecord ready for inclusion in the
