@@ -6,7 +6,7 @@
 
 > [日本語](README.ja.md)
 
-Remotely operate AI coding CLIs (Claude Code, Codex, Gemini CLI) from your mobile device — and run persistent AI agents that think, remember, and collaborate on their own.
+Remotely operate AI coding CLIs (Claude Code, Codex) from your mobile device — and run persistent AI agents that think, remember, and collaborate on their own.
 
 ```
 ┌───────────────────┐       Tailscale        ┌──────────────────┐
@@ -37,7 +37,7 @@ Remotely operate AI coding CLIs (Claude Code, Codex, Gemini CLI) from your mobil
 - Node.js 20+
 - tmux
 - [Tailscale](https://tailscale.com/)
-- Supported CLIs: `claude`, `codex`, `gemini` (at least one)
+- Supported CLIs: `claude`, `codex` (at least one)
 
 ### Windows
 
@@ -45,7 +45,7 @@ Remotely operate AI coding CLIs (Claude Code, Codex, Gemini CLI) from your mobil
 - Node.js 20+
 - Windows 10 1809+ / Windows 11 (ConPTY support required)
 - [Tailscale](https://tailscale.com/)
-- Supported CLIs: `claude`, `codex`, `gemini` (at least one)
+- Supported CLIs: `claude`, `codex` (at least one)
 
 > **Note:** On Windows, sessions run via ConPTY instead of tmux. Session persistence across kojo restarts is not available.
 
@@ -85,6 +85,52 @@ kojo --port 9090
 By default, kojo listens on the Tailscale network via tsnet with HTTPS.
 Use `--local` or `--dev` to bind to localhost only.
 
+### Multi-device cluster (peer mode)
+
+A second machine joins the Hub as a peer with a single command. Any
+combination of macOS, Linux, and Windows machines is supported.
+
+```bash
+# On the peer host
+kojo --peer
+```
+
+The peer auto-discovers the Hub via Tailscale MagicDNS
+(`https://kojo.<tailnet>.ts.net:8080`), writes the Hub into its local
+peer registry, and POSTs a join request. The Hub holds the request and
+surfaces it in Settings → Peers → "Pending join requests". Click
+**Approve** to grant the peer the privileged surface (sessions, files,
+git). Reject drops the request; the peer is free to retry.
+
+Override the discovery target when needed:
+
+```bash
+kojo --peer --hub https://hub.example.ts.net:8080
+KOJO_HUB_URL=https://hub.example.ts.net:8080 kojo --peer
+```
+
+Bind the peer listener to the Tailscale interface only (refuse to fall
+back to `0.0.0.0`):
+
+```bash
+kojo --peer --tailnet-only
+```
+
+The legacy manual pairing path (`--peer-add` / `--peer-trust` /
+`--peer-remove`) still works as an escape hatch.
+
+See [docs/multi-device.md](docs/multi-device.md) for the full
+multi-device setup, agent device-switch, and Hub failover procedure.
+
+### Upgrading from an earlier release
+
+The on-disk config layout changed in v0.101.0. If you ran an earlier
+kojo release (v0.x using `~/.config/kojo/` on macOS / Linux or
+`%APPDATA%\kojo\` on Windows), see [docs/migration.md](docs/migration.md)
+for the `--migrate` flow, rollback path, and the list of features that
+did not carry over (Gemini CLI backend and Gmail notifications were
+removed).
+
 ## Tailscale HTTPS Setup
 
 kojo uses [tsnet](https://tailscale.com/kb/1244/tsnet) to join your Tailscale network directly as a node named `kojo`. All traffic is encrypted with WireGuard — no ports to open, no certificates to manage.
@@ -107,7 +153,7 @@ When you run `kojo` (without `--local`):
 ```bash
 $ kojo
 
-  kojo v0.20.0 running at:
+  kojo v0.101.0 running at:
 
     https://kojo.tail1234.ts.net
     https://100.x.y.z:8080
@@ -169,7 +215,7 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 
 - Manage multiple sessions simultaneously (newest first)
 - Session persistence via tmux on macOS/Linux (`~/.config/kojo/sessions.json`, auto-cleanup after 7 days). Sessions survive kojo restarts and crashes
-- Session restart with tool-specific resume (`claude --resume`, `codex resume`, `gemini --resume`)
+- Session restart with tool-specific resume (`claude --resume`, `codex resume`)
 - Real-time PTY output streaming (xterm.js)
 - Text input (Enter for newline, Shift+Enter to send) and special keys (Esc, Tab, Ctrl, arrows)
 - Working directory path completion
@@ -182,8 +228,8 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 
 ### AI Agents
 
-- Create persistent AI personas with custom name, personality, avatar, and backend (Claude / Codex / Gemini, plus custom Anthropic Messages API endpoints like llama-server)
-- AI-assisted persona generation (Gemini API) and avatar generation
+- Create persistent AI personas with custom name, personality, avatar, and backend (Claude / Codex, plus custom Anthropic Messages API endpoints like llama-server)
+- AI-assisted persona generation (via claude/codex CLI) and avatar generation (Gemini Image API)
 - Interactive chat with streaming responses, thinking display, and tool-use cards
 - Markdown rendering in agent messages
 - Scheduled autonomous execution (10 min – 24 h intervals) with auto-staggering, per-agent timeout, and cross-process dedup
@@ -201,7 +247,7 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 |-------|-----------|
 | Server | Go, `net/http`, `coder/websocket`, `creack/pty` (Unix) / ConPTY (Windows), tmux (Unix), `tsnet` |
 | Web UI | React 19, Vite, TypeScript, Tailwind CSS, xterm.js |
-| Agents | Claude / Codex / Gemini / Custom API backends, encrypted SQLite (credentials + FTS5 memory) |
+| Agents | Claude / Codex / Custom API backends, encrypted SQLite (credentials + FTS5 memory) |
 | Notifications | Web Push (VAPID) |
 | Network | Tailscale WireGuard P2P |
 

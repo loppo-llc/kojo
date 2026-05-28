@@ -213,7 +213,7 @@ func TestBotShouldAutoReplyEmptyDataDir(t *testing.T) {
 	}
 }
 
-// --- postMessage tests ---
+// --- postMessage / chat.update markdown_text tests ---
 
 // TestBotPostMessageSendsMarkdownTextOnly verifies that postMessage emits
 // only the markdown_text form field. Pairing it with text triggers Slack's
@@ -321,18 +321,14 @@ func TestFinalizeUpdateOptsSendsMarkdownTextOnly(t *testing.T) {
 }
 
 // TestFinalizeUpdateOptsOmitsThreadTSWhenEmpty guards the conditional MsgOptionTS
-// append — passing an empty threadTS would otherwise leak `ts=` to the wire and
-// chat.update would reject it.
+// append — passing an empty threadTS would otherwise leak `thread_ts=` to the
+// wire and chat.update would reject it.
 func TestFinalizeUpdateOptsOmitsThreadTSWhenEmpty(t *testing.T) {
 	var sawTS string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/chat.update" {
 			_ = r.ParseForm()
-			// chat.update encodes the stream ts as the "ts" field; what we care
-			// about here is the *thread_ts* field, which finalizeUpdateOpts
-			// adds via MsgOptionTS only when threadTS != "". An empty input
-			// must not surface thread_ts on the wire.
 			sawTS = r.FormValue("thread_ts")
 		}
 		fmt.Fprintf(w, `{"ok":true}`)

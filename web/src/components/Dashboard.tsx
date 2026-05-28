@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router";
 import { api, type SessionInfo } from "../lib/api";
 import { agentApi, type AgentInfo } from "../lib/agentApi";
 import { groupdmApi, type GroupDMInfo } from "../lib/groupdmApi";
+import { peersApi, type PeerInfo } from "../lib/peerApi";
 import { AgentAvatar } from "./agent/AgentAvatar";
 import { usePushNotifications } from "../hooks/usePushNotifications";
 import { timeAgo } from "../lib/utils";
@@ -18,11 +19,19 @@ interface SessionGroup {
 function groupSessions(sessions: SessionInfo[]): SessionGroup[] {
   const sorted = [...sessions]
     .filter((s) => !s.internal)
-    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    .sort((a, b) => {
+      const diff = new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+      if (diff !== 0 && !Number.isNaN(diff)) return diff;
+      return a.id.localeCompare(b.id);
+    });
 
   const map = new Map<string, SessionInfo[]>();
   for (const s of sorted) {
-    const key = `${s.tool}:${s.workDir}`;
+    // Bucket by (peer, tool, workDir) so a remote-peer claude
+    // session in /home/me doesn't merge with a local Hub claude
+    // session in the same path — different hosts, different
+    // filesystem semantics. Empty peer is the local Hub.
+    const key = `${s.peer ?? ""}:${s.tool}:${s.workDir}`;
     const list = map.get(key);
     if (list) list.push(s);
     else map.set(key, [s]);
@@ -46,7 +55,9 @@ function groupSessions(sessions: SessionInfo[]): SessionGroup[] {
     const aRunning = a.primary.status === "running" ? 1 : 0;
     const bRunning = b.primary.status === "running" ? 1 : 0;
     if (aRunning !== bRunning) return bRunning - aRunning;
-    return new Date(b.primary.createdAt).getTime() - new Date(a.primary.createdAt).getTime();
+    const diff = new Date(b.primary.createdAt).getTime() - new Date(a.primary.createdAt).getTime();
+    if (diff !== 0 && !Number.isNaN(diff)) return diff;
+    return a.key.localeCompare(b.key);
   });
 
   return groups;
@@ -72,12 +83,171 @@ export function Dashboard() {
   });
   const navigate = useNavigate();
   const { state: pushState, loading: pushLoading, subscribe: pushSubscribe } = usePushNotifications();
+  // peerCacheRef holds the last successful session list per peer.
+  // Lives outside the loadSessions effect so deleteGroup can evict
+  // entries it just removed — otherwise a delete would visibly
+  // "undo" itself on the next poll, repainting the row from cache
+  // until the owning peer responds again.
+  const peerCacheRef = useRef<Map<string, { rows: SessionInfo[]; updatedAt: number }>>(new Map());
+  // tombstonesRef gates deleted session keys against in-flight
+  // peer list calls. deleteGroup runs `api.sessions.delete` on the
+  // peer, but a concurrent loadSessions tick may have already
+  // dispatched the GET against the same peer and will return rows
+  // that still contain the about-to-be-deleted session. Without a
+  // tombstone the stale rows would land in peerCache and the
+  // deleted row would reappear until the next successful poll.
+  // Entries expire after tombstoneTTL (>= proxy timeout) so the
+  // map can't grow unbounded.
+  const tombstonesRef = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
-    const loadSessions = () => api.sessions.list().then(setSessions).catch(console.error);
-    loadSessions();
-    const interval = setInterval(loadSessions, 3000);
-    return () => clearInterval(interval);
+    // loadSessions concurrently queries every non-self peer in
+    // addition to the local Hub. A session created on peer X with
+    // NewSession's peer selector lives in X's manager; Dashboard
+    // would otherwise look empty until the user navigated directly.
+    // Stamp `peer` on the wire response so subsequent REST + WS
+    // calls (delete, restart, terminal, ws) route through the
+    // Hub→peer proxy. Failures per peer are swallowed so one
+    // unreachable host can't blank the whole list.
+    //
+    // In-flight guard: peer-routed list calls inherit the 30s
+    // proxy timeout. Without the guard a 3s poll would stack up
+    // overlapping outbound requests against a slow / offline peer
+    // and eventually exhaust the browser's per-host connection
+    // pool. The flag skips ticks while one is still resolving;
+    // the next interval just runs again.
+    //
+    // Stale-while-error: per-peer cache (peerCacheRef) keeps the
+    // last successful response for each peer. A rejected fetch
+    // (offline peer hitting the proxy timeout) leaves the previous
+    // entry in place so its sessions stay visible instead of
+    // blanking. We repaint at the top of every tick with
+    // (local + cached remote) so a single slow peer can't freeze
+    // local-row updates for 30s behind the allSettled barrier.
+    //
+    // Expiry: cached entries older than peerCacheTTL are dropped.
+    // Without this, a peer that was unpaired on the other side
+    // (or had its session genuinely deleted while we were unable
+    // to reach it) would haunt the dashboard with ghost rows
+    // forever — the rejected fetches would keep them pinned. The
+    // TTL bounds that staleness to one window.
+    const peerCacheTTL = 60_000;
+    let inflight = false;
+    let cancelled = false;
+    const peerCache = peerCacheRef.current;
+    const tombstones = tombstonesRef.current;
+
+    const sweepTombstones = () => {
+      const now = Date.now();
+      for (const [k, exp] of [...tombstones.entries()]) {
+        if (exp <= now) tombstones.delete(k);
+      }
+    };
+
+    const mergeAll = (local: SessionInfo[]) => {
+      // Dedup by (peer, id) so a Hub-self entry can't collide
+      // with a peer-side entry that happens to share an id.
+      sweepTombstones();
+      const m = new Map<string, SessionInfo>();
+      const keep = (s: SessionInfo) => {
+        const k = `${s.peer ?? ""}::${s.id}`;
+        if (tombstones.has(k)) return;
+        m.set(k, s);
+      };
+      for (const s of local) keep(s);
+      const now = Date.now();
+      for (const [k, entry] of [...peerCache.entries()]) {
+        if (now - entry.updatedAt > peerCacheTTL) {
+          peerCache.delete(k);
+          continue;
+        }
+        for (const s of entry.rows) keep(s);
+      }
+      return Array.from(m.values());
+    };
+
+    const loadSessions = async () => {
+      if (inflight) return;
+      inflight = true;
+      try {
+        const local = await api.sessions.list();
+        if (cancelled) return;
+        // Paint local + last-known remote up front. This is the
+        // line that keeps the dashboard responsive when a peer is
+        // offline: without it, every tick would block on the
+        // proxy timeout below before any setState fired, even
+        // though local rows are already in hand.
+        setSessions(mergeAll(local));
+
+        let peers: PeerInfo[] = [];
+        try {
+          peers = (await peersApi.list()).items ?? [];
+        } catch {
+          // peer registry unavailable: keep local + last cache
+          return;
+        }
+        if (cancelled) return;
+        // Don't pre-filter by p.status: a peer marked "offline"
+        // in the hub registry might still answer (heartbeat lag,
+        // or it just came back). allSettled below absorbs peers
+        // that are truly unreachable, so one offline peer never
+        // blanks the whole dashboard.
+        const remotes = peers.filter((p) => !p.isSelf);
+        // Evict cache for peers that vanished from the registry
+        // BEFORE awaiting the per-peer list calls. Otherwise an
+        // unregister stays masked behind the slowest peer's
+        // 30s proxy timeout — the registry already says the peer
+        // is gone, so its rows are stale immediately.
+        const live = new Set(remotes.map((p) => p.deviceId));
+        let evicted = false;
+        for (const k of [...peerCache.keys()]) {
+          if (!live.has(k)) {
+            peerCache.delete(k);
+            evicted = true;
+          }
+        }
+        if (evicted) setSessions(mergeAll(local));
+
+        const settled = await Promise.allSettled(
+          remotes.map((p) =>
+            // Stamp completedAt inside the .then so a fast peer's
+            // TTL clock starts when ITS response arrived, not when
+            // the slowest peer in this batch finally settled.
+            // Otherwise a 60s stale-while-error window can stretch
+            // toward 60 + slowestTimeout for the fast peer.
+            api.sessions.list(p.deviceId).then((rows) => ({
+              rows: rows.map((r) => ({ ...r, peer: r.peer || p.deviceId })),
+              completedAt: Date.now(),
+            })),
+          ),
+        );
+        if (cancelled) return;
+        // Per-peer cache update: fulfilled overwrites, rejected
+        // keeps the previous entry (stale-while-error). Filter
+        // through tombstones so a row deleted while this fetch
+        // was in flight doesn't reappear from a peer that
+        // hadn't yet observed the delete.
+        remotes.forEach((p, i) => {
+          const r = settled[i];
+          if (r.status !== "fulfilled") return;
+          const filtered = r.value.rows.filter(
+            (s) => !tombstones.has(`${s.peer ?? ""}::${s.id}`),
+          );
+          peerCache.set(p.deviceId, { rows: filtered, updatedAt: r.value.completedAt });
+        });
+        setSessions(mergeAll(local));
+      } catch (err) {
+        if (!cancelled) console.error(err);
+      } finally {
+        inflight = false;
+      }
+    };
+    void loadSessions();
+    const interval = setInterval(() => void loadSessions(), 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, []);
 
   useEffect(() => {
@@ -103,9 +273,16 @@ export function Dashboard() {
 
   const groups = groupSessions(sessions);
   const hasAnySessions = sessions.some((s) => !s.internal);
-  const sortedAgents = [...agents].sort(
-    (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
-  );
+  // updatedAt is RFC3339 with seconds resolution, so agents touched in the
+  // same second tie. Manager.List() iterates a map, so input order is random
+  // per request; a 0-return comparator would let that randomness through
+  // (Array.sort is stable, but the tie group still re-shuffles each reload).
+  // Fall back to id for a deterministic order.
+  const sortedAgents = [...agents].sort((a, b) => {
+    const diff = new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+    if (diff !== 0 && !Number.isNaN(diff)) return diff;
+    return a.id.localeCompare(b.id);
+  });
 
   const toggleExpand = (key: string) => {
     setExpanded((prev) => {
@@ -144,14 +321,39 @@ export function Dashboard() {
     });
   };
 
+  // sessionHref preserves the session's home peer so a click on a
+  // peer-routed entry lands on the right host. Empty peer → local.
+  const sessionHref = (s: SessionInfo) =>
+    s.peer ? `/session/${s.id}?peer=${encodeURIComponent(s.peer)}` : `/session/${s.id}`;
+
   const deleteGroup = async (g: SessionGroup, e: React.MouseEvent) => {
     e.stopPropagation();
     const all = [g.primary, ...g.others];
-    const results = await Promise.allSettled(all.map((s) => api.sessions.delete(s.id)));
-    const deletedIds = new Set<string>();
-    results.forEach((r, i) => { if (r.status === "fulfilled") deletedIds.add(all[i].id); });
-    if (deletedIds.size > 0) {
-      setSessions((prev) => prev.filter((s) => !deletedIds.has(s.id)));
+    const results = await Promise.allSettled(all.map((s) => api.sessions.delete(s.id, s.peer)));
+    const deletedKeys = new Set<string>();
+    results.forEach((r, i) => {
+      if (r.status === "fulfilled") deletedKeys.add(`${all[i].peer ?? ""}::${all[i].id}`);
+    });
+    if (deletedKeys.size > 0) {
+      setSessions((prev) => prev.filter((s) => !deletedKeys.has(`${s.peer ?? ""}::${s.id}`)));
+      // Evict deleted rows from the per-peer cache too. Without
+      // this, the next loadSessions tick would repaint the row
+      // from cache (because the owning peer might still be on its
+      // proxy timeout) and the deletion would visibly flicker
+      // back in until the peer responds again.
+      for (const [k, entry] of peerCacheRef.current.entries()) {
+        const next = entry.rows.filter((s) => !deletedKeys.has(`${s.peer ?? ""}::${s.id}`));
+        if (next.length !== entry.rows.length) {
+          peerCacheRef.current.set(k, { rows: next, updatedAt: entry.updatedAt });
+        }
+      }
+      // Tombstone the keys for one proxy-timeout window. A
+      // loadSessions tick that dispatched its peer GET before
+      // this delete landed will still return the row; without
+      // a tombstone it would re-enter peerCache and repaint
+      // until the next successful poll observed the delete.
+      const expiry = Date.now() + 60_000;
+      for (const k of deletedKeys) tombstonesRef.current.set(k, expiry);
     }
   };
 
@@ -202,7 +404,7 @@ export function Dashboard() {
         <section>
             <div className="flex items-center justify-between mb-2">
               <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">Agents</h2>
-              {agents.some((a) => a.intervalMinutes > 0) && (
+              {agents.some((a) => (a.cronExpr ?? "") !== "") && (
                 <button
                   onClick={() => {
                     const next = !cronPaused;
@@ -252,6 +454,32 @@ export function Dashboard() {
                         <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
                       </svg>
                     </button>
+                    {agent.holderPeer && (
+                      <button
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          if (!window.confirm(
+                            `Force-reclaim "${agent.name}" to this host?\n` +
+                            `現在のholder (${agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)}) との通信を放棄し、` +
+                            `この端末でランタイムを再起動する。`,
+                          )) return;
+                          try {
+                            await agentApi.forceReclaim(agent.id);
+                            // List poll picks the new state up on the
+                            // next 5s tick; force a refresh for snappy UX.
+                            const fresh = await agentApi.list();
+                            setAgents(fresh);
+                          } catch (err) {
+                            console.error("force-reclaim failed", err);
+                            window.alert(`Force-reclaim failed: ${(err as Error).message}`);
+                          }
+                        }}
+                        className="px-2 py-1 mr-1 bg-amber-900/60 hover:bg-amber-900 text-amber-200 rounded text-[10px] shrink-0"
+                        title="Force-reclaim: rewrite agent_locks back to this host and restart the runtime. Use when device-switch left the agent stuck on an unreachable peer."
+                      >
+                        強制復帰
+                      </button>
+                    )}
                     <button
                       onClick={() => navigate(`/agents/${agent.id}`)}
                       className={`flex-1 flex items-center gap-3 text-left min-w-0 ${isCollapsed ? "py-1.5 pr-3 pl-1" : "p-3 pl-1"}`}
@@ -262,6 +490,11 @@ export function Dashboard() {
                       {isCollapsed ? (
                         <div className="flex items-center gap-2 flex-1 min-w-0">
                           <span className="font-medium text-sm truncate">{agent.name}</span>
+                          {agent.holderPeer && (
+                            <span className="text-[10px] text-amber-400/80 shrink-0" title={agent.holderPeer}>
+                              転移中 @ {agent.holderPeerName || agent.holderPeer.slice(0, 8)}
+                            </span>
+                          )}
                           <span className="text-[10px] text-neutral-600 font-mono">{agent.tool}</span>
                           <span className="text-[10px] text-neutral-600 shrink-0 ml-auto">
                             {agent.lastMessage
@@ -280,11 +513,13 @@ export function Dashboard() {
                             </span>
                           </div>
                           <div className="text-xs text-neutral-500 truncate mt-0.5">
-                            {agent.lastMessage
-                              ? `${agent.lastMessage.role === "user" ? "You: " : ""}${agent.lastMessage.content}`
-                              : agent.persona
-                                ? agent.persona.slice(0, 60) + (agent.persona.length > 60 ? "..." : "")
-                                : "No messages yet"}
+                            {agent.holderPeer
+                              ? `転移中 @ ${agent.holderPeerName || agent.holderPeer.slice(0, 8)} — 最新発言はこの端末では未反映`
+                              : agent.lastMessage
+                                ? `${agent.lastMessage.role === "user" ? "You: " : ""}${agent.lastMessage.content}`
+                                : agent.persona
+                                  ? agent.persona.slice(0, 60) + (agent.persona.length > 60 ? "..." : "")
+                                  : "No messages yet"}
                           </div>
                           <div className="flex items-center gap-2 mt-1">
                             <span className="text-[10px] text-neutral-600 font-mono">{agent.tool}</span>
@@ -314,7 +549,11 @@ export function Dashboard() {
           )}
           <div className="space-y-2">
             {[...groupDMs]
-              .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+              .sort((a, b) => {
+                const diff = new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+                if (diff !== 0 && !Number.isNaN(diff)) return diff;
+                return a.id.localeCompare(b.id);
+              })
               .map((g) => {
                 const isCollapsed = collapsedGroupDMs.has(g.id);
                 return (
@@ -393,7 +632,7 @@ export function Dashboard() {
               return (
                 <div key={g.key} className="bg-neutral-900 rounded-lg border border-neutral-800 relative">
                   <button
-                    onClick={() => navigate(`/session/${g.primary.id}`)}
+                    onClick={() => navigate(sessionHref(g.primary))}
                     className="w-full text-left p-4 hover:bg-neutral-800 rounded-lg"
                   >
                     <div className="flex items-center gap-2 mb-1">
@@ -441,7 +680,7 @@ export function Dashboard() {
                   {runningOthers.map((s) => (
                     <button
                       key={s.id}
-                      onClick={() => navigate(`/session/${s.id}`)}
+                      onClick={() => navigate(sessionHref(s))}
                       className="w-full text-left px-4 py-2.5 hover:bg-neutral-800 border-t border-neutral-800 flex items-center gap-2 text-xs text-neutral-500"
                     >
                       <span className="inline-block w-1.5 h-1.5 rounded-full shrink-0 bg-green-500" />
@@ -461,7 +700,7 @@ export function Dashboard() {
                       {expanded.has(g.key) && stoppedOthers.map((s) => (
                         <button
                           key={s.id}
-                          onClick={() => navigate(`/session/${s.id}`)}
+                          onClick={() => navigate(sessionHref(s))}
                           className="w-full text-left px-4 py-2.5 hover:bg-neutral-800 border-t border-neutral-800 flex items-center gap-2 text-xs text-neutral-500"
                         >
                           <span className="inline-block w-1.5 h-1.5 rounded-full shrink-0 bg-neutral-600" />

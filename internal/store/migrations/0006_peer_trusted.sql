@@ -1,0 +1,18 @@
+-- 0006_peer_trusted.sql
+--
+-- Add a per-row trust flag so cross-peer session/ws/files/git
+-- routing is admitted only for peers the local operator has
+-- explicitly trusted. Without this, ANY paired RolePeer signer
+-- could create sessions or browse files on this host — the
+-- pairing CLI alone is shape-validation, not authorisation.
+--
+-- Trust direction: a Hub stamps trusted=1 on the peers it sends
+-- session-create proxies to (peers it manages remotely). A peer
+-- stamps trusted=1 on the Hub whose UI it is willing to serve
+-- — pairing UX prompts the operator to confirm this on the peer
+-- side because that's where the asymmetric access lives.
+--
+-- 0 = paired but no privileged access (default; safe for re-add
+-- of an existing row that pre-dates this migration).
+-- 1 = trusted.
+ALTER TABLE peer_registry ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0;

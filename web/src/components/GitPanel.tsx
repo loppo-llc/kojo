@@ -37,9 +37,10 @@ function parseArgs(input: string): string[] {
 interface GitPanelProps {
   embedded?: boolean;
   workDir?: string;
+  peerId?: string;
 }
 
-export function GitPanel({ embedded, workDir: propWorkDir }: GitPanelProps = {}) {
+export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelProps = {}) {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [session, setSession] = useState<SessionInfo>();
@@ -60,9 +61,9 @@ export function GitPanel({ embedded, workDir: propWorkDir }: GitPanelProps = {})
 
   useEffect(() => {
     if (!embedded && id) {
-      api.sessions.get(id).then(setSession).catch(() => navigate("/"));
+      api.sessions.get(id, peerId).then(setSession).catch(() => navigate("/"));
     }
-  }, [id, navigate, embedded]);
+  }, [id, navigate, embedded, peerId]);
 
   const LOG_LIMIT = 10;
   const refreshIdRef = useRef(0);
@@ -71,13 +72,13 @@ export function GitPanel({ embedded, workDir: propWorkDir }: GitPanelProps = {})
     if (!effectiveWorkDir) return;
     const rid = ++refreshIdRef.current;
     setError("");
-    api.git.status(effectiveWorkDir).then(setStatus).catch((e) => setError(e.message));
-    api.git.log(effectiveWorkDir, LOG_LIMIT).then((r) => {
+    api.git.status(effectiveWorkDir, peerId).then(setStatus).catch((e) => setError(e.message));
+    api.git.log(effectiveWorkDir, LOG_LIMIT, 0, peerId).then((r) => {
       if (rid !== refreshIdRef.current) return;
       setCommits(r.commits);
       setHasMore(r.hasMore);
     }).catch(() => {});
-  }, [effectiveWorkDir]);
+  }, [effectiveWorkDir, peerId]);
 
   useEffect(() => {
     if (effectiveWorkDir) refresh();
@@ -86,7 +87,7 @@ export function GitPanel({ embedded, workDir: propWorkDir }: GitPanelProps = {})
   const showDiff = async (ref?: string, label?: string) => {
     if (!effectiveWorkDir) return;
     try {
-      const d = await api.git.diff(effectiveWorkDir, ref);
+      const d = await api.git.diff(effectiveWorkDir, ref, peerId);
       setDiff(d);
       setDiffLabel(label ?? ref ?? "working tree");
       setPrevTab(tab);
@@ -105,7 +106,7 @@ export function GitPanel({ embedded, workDir: propWorkDir }: GitPanelProps = {})
     setCmdRunning(true);
     setCmdResult(null);
     try {
-      const result = await api.git.exec(effectiveWorkDir, args);
+      const result = await api.git.exec(effectiveWorkDir, args, peerId);
       setCmdResult(result);
       setCmdInput("");
       refresh();
@@ -121,7 +122,7 @@ export function GitPanel({ embedded, workDir: propWorkDir }: GitPanelProps = {})
     const rid = refreshIdRef.current;
     setLoadingMore(true);
     try {
-      const r = await api.git.log(effectiveWorkDir, LOG_LIMIT, commits.length);
+      const r = await api.git.log(effectiveWorkDir, LOG_LIMIT, commits.length, peerId);
       if (rid !== refreshIdRef.current) return;
       setCommits((prev) => {
         const seen = new Set(prev.map((c) => c.hash));

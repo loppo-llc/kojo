@@ -1,0 +1,14 @@
+-- 0012_drop_peer_trusted.sql
+--
+-- Removes peer_registry.trusted.
+--
+-- Bearer-only auth makes the column redundant: a peer can only obtain
+-- a Bearer pair by going through the operator-approved /join-request
+-- flow, so "has a valid Bearer" already implies "operator trusts this
+-- peer". The trusted bit was historically a separate axis on top of
+-- the signed-Bearer model, where a peer could be paired (key known)
+-- without being authorized on the privileged surface — that
+-- distinction has no analogue in the new model.
+--
+-- Drop is unconditional: every row gets its trust bit erased.
+ALTER TABLE peer_registry DROP COLUMN trusted;

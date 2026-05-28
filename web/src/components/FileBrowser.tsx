@@ -6,20 +6,25 @@ import { FileDataBrowser } from "./FileDataBrowser";
 interface FileBrowserProps {
   embedded?: boolean;
   initialPath?: string;
+  // peerId routes file API calls through the Hub→peer proxy so the
+  // browser shows the remote host's filesystem when a peer-routed
+  // session owns this view.
+  peerId?: string;
 }
 
-export function FileBrowser({ embedded, initialPath }: FileBrowserProps = {}) {
+export function FileBrowser({ embedded, initialPath, peerId }: FileBrowserProps = {}) {
   const navigate = useNavigate();
   const dataSource = useMemo(() => ({
     list: (path: string, hidden: boolean) =>
-      api.files.list(path || undefined, hidden).then((result) => ({
+      api.files.list(path || undefined, hidden, peerId).then((result) => ({
         path: result.path,
         absPath: result.path,
         entries: result.entries,
       })),
-    view: (path: string) => api.files.view(path),
-    rawUrl: (path: string, download?: boolean) => api.files.rawUrl(path, download),
-  }), []);
+    view: (path: string) => api.files.view(path, peerId),
+    rawUrl: (path: string, download?: boolean) => api.files.rawUrl(path, download, peerId),
+    thumbUrl: (path: string, size?: number, v?: string) => api.files.thumbUrl(path, size, v, peerId),
+  }), [peerId]);
 
   return (
     <FileDataBrowser

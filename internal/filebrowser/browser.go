@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/thumbnail"
 )
 
 // Sentinel errors for file browser operations.
@@ -245,6 +247,63 @@ func (b *Browser) ServeRaw(w http.ResponseWriter, r *http.Request, path string) 
 		return
 	}
 	http.ServeFile(w, r, absPath)
+}
+
+// ServeThumb serves a low-resolution JPEG thumbnail of the image at path.
+// Path is validated against the allowed roots just like ServeRaw. Non-image
+// extensions return 415 immediately so unsupported types don't hit the
+// decoder. `size` is the requested longer-edge in pixels (clamped by the
+// thumbnail package).
+func (b *Browser) ServeThumb(w http.ResponseWriter, r *http.Request, path string, size int) {
+	path, err := expandHome(path)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	if err := b.validatePath(absPath); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	ext := strings.ToLower(filepath.Ext(absPath))
+	if _, ok := imageExts[ext]; !ok || !thumbnail.IsSupportedExt(ext) {
+		http.Error(w, "unsupported image format", http.StatusUnsupportedMediaType)
+		return
+	}
+	cached, err := thumbnail.Generate(absPath, size)
+	if err != nil {
+		switch {
+		case errors.Is(err, thumbnail.ErrUnsupportedFormat):
+			http.Error(w, err.Error(), http.StatusUnsupportedMediaType)
+		case errors.Is(err, thumbnail.ErrSourceTooLarge):
+			// Source exceeds the byte/pixel budget — don't blow RAM
+			// decoding it. 413 lets the client decide whether to fall
+			// back to the raw image (which is then their decision to
+			// pay the bandwidth).
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+		case os.IsNotExist(err):
+			http.Error(w, "file not found", http.StatusNotFound)
+		default:
+			b.logger.Warn("thumbnail generation failed", "path", absPath, "err", err)
+			http.Error(w, "thumbnail generation failed", http.StatusInternalServerError)
+		}
+		return
+	}
+	// Generated thumbnails are content-addressed by (path, modtime, size,
+	// filesize). Let the browser cache aggressively; callers that know
+	// the source modtime should add a `v=<mtime>` query so an edit
+	// produces a fresh URL.
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "private, max-age=86400")
+	// ETag = cache file base name (hex SHA-256). http.ServeFile picks
+	// this up via ServeContent's If-None-Match handling, so a manual
+	// reload returns 304 once the browser has the bytes.
+	w.Header().Set("ETag", `"`+strings.TrimSuffix(filepath.Base(cached), ".jpg")+`"`)
+	http.ServeFile(w, r, cached)
 }
 
 // ValidatePath checks that the given path is under an allowed root directory.

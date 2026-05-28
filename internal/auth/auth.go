@@ -8,7 +8,6 @@ package auth
 
 import (
 	"context"
-	"crypto/subtle"
 	"net/http"
 	"strings"
 )
@@ -27,6 +26,24 @@ const (
 	// RolePrivAgent extends RoleAgent with the ability to delete/reset
 	// other agents (but not fork or read their full data).
 	RolePrivAgent
+	// RoleWebDAV is a scoped principal issued for the short-lived WebDAV
+	// mount token (docs §3.4 / §5.6). It has zero rights on the normal
+	// /api/v1/* API surface — every IsOwner / IsAgent gate returns false.
+	// The WebDAV handler is the only consumer; see Server.webdavGate.
+	// Stored in ctx so the WebDAV gate can accept the token alongside
+	// the OwnerOnly principal on the public listener.
+	RoleWebDAV
+	// RolePeer authenticates a request that arrived from a
+	// registered remote peer over tsnet (docs §3.10 / §3.7). The
+	// principal's PeerID names the device_id from peer_registry;
+	// the scope is the inter-peer surface plus proxied
+	// agent/session routes — every other gate returns false. Set
+	// by TailnetIdentityMiddleware on ServeAuthTsnet (peer-mode
+	// primary listener) and on the Hub's public listener via
+	// WhoIs → peer_registry; the legacy Ed25519-signed Bearer
+	// stamping path is retired. --unsafe collapses the WhoIs
+	// check and stamps RolePeer unconditionally for LAN/docker/CI.
+	RolePeer
 	// RoleOwner is the kojo user. It has full access to everything.
 	RoleOwner
 )
@@ -35,6 +52,7 @@ const (
 type Principal struct {
 	Role    Role
 	AgentID string // populated for RoleAgent / RolePrivAgent
+	PeerID  string // populated for RolePeer (device_id from peer_registry); also stamped on RoleOwner when the Hub-public TailnetIdentityMiddleware's WhoIs lookup matches a paired peer, so events handlers can identify which paired-peer connection they're on without re-querying the registry
 }
 
 // IsOwner returns true if the principal is the kojo user.
@@ -46,20 +64,41 @@ func (p Principal) IsAgent() bool {
 	return p.Role == RoleAgent || p.Role == RolePrivAgent
 }
 
+// IsWebDAV reports whether the principal was authenticated via a
+// short-lived WebDAV token. RoleWebDAV is intentionally a dead-end for
+// every other gate: a leaked token can only reach the WebDAV mount.
+func (p Principal) IsWebDAV() bool { return p.Role == RoleWebDAV }
+
+// IsPeer reports whether the principal was authenticated via
+// Tailnet identity (WhoIs over tsnet → peer_registry hit). RolePeer
+// is scoped to inter-peer endpoints (cross-subscribe status feed,
+// blob handoff fetch, device-switch orchestration) AND to proxied
+// agent requests (§3.7 remoteAgentProxy: Hub forwards browser/
+// agent requests to the holder peer over tsnet). Handler-level
+// guard methods (CanReadFull, CanMutateSelf, CanDeleteOrReset)
+// admit IsPeer because the Hub already ran Enforce before
+// proxying — re-blocking at the handler would 403 every proxied
+// request.
+func (p Principal) IsPeer() bool { return p.Role == RolePeer }
+
 // CanReadFull returns true if the principal can read the full record
 // (Persona, Token-bearing fields, etc.) for the given target agent ID.
-// Owners can read any. Agents can only read their own.
+// Owners can read any. Agents can only read their own. Peers are
+// admitted because the Hub's proxy already validated the original
+// caller's identity before forwarding.
 func (p Principal) CanReadFull(targetID string) bool {
-	if p.IsOwner() {
+	if p.IsOwner() || p.IsPeer() {
 		return true
 	}
 	return p.IsAgent() && p.AgentID == targetID
 }
 
 // CanMutateSelf returns true if the principal may issue self-scoped
-// mutations (PATCH, reset, etc.) against targetID.
+// mutations (PATCH, reset, etc.) against targetID. Peers pass through
+// because the Hub's Enforce layer already authorised the original
+// request before the proxy signed and forwarded it.
 func (p Principal) CanMutateSelf(targetID string) bool {
-	if p.IsOwner() {
+	if p.IsOwner() || p.IsPeer() {
 		return true
 	}
 	return p.IsAgent() && p.AgentID == targetID
@@ -67,8 +106,9 @@ func (p Principal) CanMutateSelf(targetID string) bool {
 
 // CanDeleteOrReset returns true for delete/reset/unarchive/checkin/
 // reset-session ops. Owner: any. PrivAgent: any. Agent: self only.
+// Peer: admitted — Hub proxy validated the original caller.
 func (p Principal) CanDeleteOrReset(targetID string) bool {
-	if p.IsOwner() || p.Role == RolePrivAgent {
+	if p.IsOwner() || p.Role == RolePrivAgent || p.IsPeer() {
 		return true
 	}
 	return p.IsAgent() && p.AgentID == targetID
@@ -90,17 +130,34 @@ func (p Principal) CanSetPrivileged() bool {
 
 // Resolver maps a Bearer token to a Principal.
 type Resolver struct {
-	tokens         *TokenStore
-	isPrivileged   func(agentID string) bool
+	tokens       *TokenStore
+	webdav       *WebDAVTokenStore
+	isPrivileged func(agentID string) bool
 }
 
 // NewResolver builds a Resolver from a TokenStore and a privilege
-// predicate (agent.Manager.IsPrivileged).
+// predicate (agent.Manager.IsPrivileged). The WebDAVTokenStore is
+// optional; pass nil when the WebDAV slice is not wired (tests / builds
+// without kv).
 func NewResolver(tokens *TokenStore, isPrivileged func(string) bool) *Resolver {
 	if isPrivileged == nil {
 		isPrivileged = func(string) bool { return false }
 	}
 	return &Resolver{tokens: tokens, isPrivileged: isPrivileged}
+}
+
+// SetWebDAVStore attaches the short-lived WebDAV token store. Safe to
+// call once at boot; callers that don't issue WebDAV tokens leave it
+// unset. Calling twice with different stores is a misuse and panics
+// (the first store would silently lose verifier coverage).
+func (r *Resolver) SetWebDAVStore(s *WebDAVTokenStore) {
+	if r == nil {
+		return
+	}
+	if r.webdav != nil && r.webdav != s {
+		panic("auth.Resolver: WebDAVTokenStore already set")
+	}
+	r.webdav = s
 }
 
 // Resolve maps a Bearer token to a Principal. Empty/unknown tokens
@@ -109,16 +166,25 @@ func (r *Resolver) Resolve(token string) Principal {
 	if r == nil || r.tokens == nil || token == "" {
 		return Principal{Role: RoleGuest}
 	}
-	if owner := r.tokens.OwnerToken(); owner != "" {
-		if subtle.ConstantTimeCompare([]byte(token), []byte(owner)) == 1 {
-			return Principal{Role: RoleOwner}
-		}
+	// Owner: hash-only comparison; we don't need the raw to verify a
+	// presented token. VerifyOwner is constant-time internally.
+	if r.tokens.VerifyOwner(token) {
+		return Principal{Role: RoleOwner}
 	}
 	if id, ok := r.tokens.LookupAgent(token); ok {
 		if r.isPrivileged(id) {
 			return Principal{Role: RolePrivAgent, AgentID: id}
 		}
 		return Principal{Role: RoleAgent, AgentID: id}
+	}
+	// WebDAV short-lived token last: its surface is intentionally
+	// minimal (the gate around /api/v1/webdav/ is the only consumer),
+	// so verifying it after owner/agent keeps the hot path for normal
+	// API traffic unchanged.
+	if r.webdav != nil {
+		if r.webdav.Verify(token) {
+			return Principal{Role: RoleWebDAV}
+		}
 	}
 	return Principal{Role: RoleGuest}
 }
@@ -143,11 +209,22 @@ func FromContext(ctx context.Context) Principal {
 
 // --- middleware ------------------------------------------------------
 
-// OwnerOnlyMiddleware unconditionally tags every request as the Owner.
-// Used on the public (Tailscale) listener that the kojo user accesses
-// from their phone — the user's UX is preserved (no token required).
+// OwnerOnlyMiddleware tags every request as the Owner UNLESS an
+// earlier middleware (e.g. TailnetIdentityMiddleware) already
+// attached a non-Guest principal. The exception keeps the
+// "Tailscale reach == Owner" UX for the kojo user from clobbering
+// a paired peer's Tailnet-identified RolePeer on the same listener.
+//
+// Used on the public (Tailscale) listener that the kojo user
+// accesses from their phone — the user's UX is preserved (no
+// token required) for everything except inter-peer requests that
+// arrive pre-stamped.
 func OwnerOnlyMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if existing := FromContext(r.Context()); existing.Role != RoleGuest {
+			h.ServeHTTP(w, r)
+			return
+		}
 		ctx := WithPrincipal(r.Context(), Principal{Role: RoleOwner})
 		h.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -156,9 +233,18 @@ func OwnerOnlyMiddleware(h http.Handler) http.Handler {
 // AuthMiddleware resolves Authorization: Bearer / X-Kojo-Token to a
 // Principal and passes it through ctx. It does NOT enforce per-route
 // policy — that is the handler's responsibility (or a separate gate).
+//
+// Skips the Bearer resolution when an earlier middleware (e.g.
+// TailnetIdentityMiddleware) already attached a non-Guest principal
+// so a paired peer's Tailnet-identified RolePeer doesn't get
+// downgraded to Guest by the absence of a Bearer.
 func AuthMiddleware(resolver *Resolver) func(http.Handler) http.Handler {
 	return func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if existing := FromContext(r.Context()); existing.Role != RoleGuest {
+				h.ServeHTTP(w, r)
+				return
+			}
 			tok := extractBearer(r)
 			p := resolver.Resolve(tok)
 			ctx := WithPrincipal(r.Context(), p)

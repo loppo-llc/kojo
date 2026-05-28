@@ -10,6 +10,10 @@ interface TerminalTabProps {
   parentSessionId: string;
   workDir: string;
   visible: boolean;
+  // peerId, when set, forwards every REST + WS call to the peer
+  // that hosts the parent session so the tmux terminal lands on
+  // the same machine as the CLI session.
+  peerId?: string;
 }
 
 const TMUX_SHORTCUTS = [
@@ -25,7 +29,7 @@ const TMUX_SHORTCUTS = [
   { label: "Kill", action: "kill-pane" },
 ];
 
-export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabProps) {
+export function TerminalTab({ parentSessionId, workDir, visible, peerId }: TerminalTabProps) {
   const termContainerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const outputBufRef = useRef<OutputBuffer | null>(null);
@@ -36,8 +40,12 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
   const [shellTool, setShellTool] = useState<string | null>(null);
 
   useEffect(() => {
-    api.info().then((info) => setShellTool(info.shellTool)).catch(() => setShellTool("tmux"));
-  }, []);
+    // shellTool reflects the host the session lives on, not the
+    // Hub. Hub-only sessions get tmux/etc. from /info; peer-routed
+    // sessions go through the peer proxy so the value comes from
+    // the remote machine's PATH probe.
+    api.info(peerId).then((info) => setShellTool(info.shellTool)).catch(() => setShellTool("tmux"));
+  }, [peerId]);
 
   const sendInput = useCallback((data: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -62,7 +70,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     deps: [parentSessionId],
   });
 
-  const { ctrlMode, shiftMode, handleKeyPress, wrapInput } = useSpecialKeys(sendInput, autoScrollRef);
+  const { ctrlMode, shiftMode, altMode, handleKeyPress, wrapInput } = useSpecialKeys(sendInput, autoScrollRef);
   wrapInputRef.current = wrapInput;
 
   // Connect WebSocket to a tmux session
@@ -79,7 +87,10 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     outputBufRef.current?.clear();
     outputBufRef.current = createOutputBuffer((data) => term.write(data));
 
-    const ws = new WebSocket(wsUrl(`/api/v1/ws?session=${tmuxSessionId}`));
+    const qs = peerId
+      ? `session=${encodeURIComponent(tmuxSessionId)}&peer=${encodeURIComponent(peerId)}`
+      : `session=${encodeURIComponent(tmuxSessionId)}`;
+    const ws = new WebSocket(wsUrl(`/api/v1/ws?${qs}`));
 
     ws.onmessage = (evt) => {
       let msg: { type: string; data?: string; exitCode?: number; live?: boolean };
@@ -123,7 +134,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     };
 
     wsRef.current = ws;
-  }, [xtermRef, autoScrollRef, immediateFit]);
+  }, [xtermRef, autoScrollRef, immediateFit, peerId]);
 
   // Clean up WebSocket and output buffer on unmount
   useEffect(() => {
@@ -136,7 +147,9 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     };
   }, []);
 
-  // Reset refs when parentSessionId changes (prevents cross-session contamination)
+  // Reset refs when parentSessionId or peerId changes (prevents
+  // cross-session contamination AND cross-peer contamination: the
+  // tmux child id minted on peer A is meaningless on peer B).
   useEffect(() => {
     sessionIdRef.current = null;
     initRef.current = false;
@@ -146,7 +159,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
       wsRef.current.close();
       wsRef.current = null;
     }
-  }, [parentSessionId]);
+  }, [parentSessionId, peerId]);
 
   // Manage session + WebSocket based on visibility
   useEffect(() => {
@@ -182,7 +195,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     const initSession = async () => {
       // Check server for existing tmux child session
       try {
-        const existing = await api.sessions.terminal(parentSessionId);
+        const existing = await api.sessions.terminal(parentSessionId, peerId);
         if (cancelled) return;
         if (existing.status === "running") {
           sessionIdRef.current = existing.id;
@@ -190,7 +203,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
           return;
         }
         // Exited — restart it (tmux -A will reattach)
-        const restarted = await api.sessions.restart(existing.id);
+        const restarted = await api.sessions.restart(existing.id, peerId);
         if (cancelled) return;
         sessionIdRef.current = restarted.id;
         connectWs(restarted.id);
@@ -207,7 +220,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
 
       // Create new terminal session linked to parent
       try {
-        const s = await api.sessions.create({ tool: shellTool, workDir, parentId: parentSessionId });
+        const s = await api.sessions.create({ tool: shellTool, workDir, parentId: parentSessionId, peerId });
         if (cancelled) return;
         sessionIdRef.current = s.id;
         connectWs(s.id);
@@ -231,7 +244,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     return () => {
       cancelled = true;
     };
-  }, [visible, parentSessionId, workDir, shellTool, connectWs, safeFit]);
+  }, [visible, parentSessionId, workDir, shellTool, peerId, connectWs, safeFit]);
 
   if (error) {
     return (
@@ -261,7 +274,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
               onPointerDown={(e) => e.preventDefault()}
               onClick={() => {
                 if (sessionIdRef.current) {
-                  api.sessions.tmux(sessionIdRef.current, { action: s.action }).catch(() => {});
+                  api.sessions.tmux(sessionIdRef.current, { action: s.action }, peerId).catch(() => {});
                 }
               }}
               className="px-3 py-2.5 text-xs rounded font-mono bg-neutral-800 text-neutral-400 active:bg-neutral-600 whitespace-nowrap"
@@ -273,7 +286,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
       )}
 
       {/* Special keys */}
-      <SpecialKeysBar ctrlMode={ctrlMode} shiftMode={shiftMode} onKeyPress={handleKeyPress} />
+      <SpecialKeysBar ctrlMode={ctrlMode} shiftMode={shiftMode} altMode={altMode} onKeyPress={handleKeyPress} />
     </div>
   );
 }

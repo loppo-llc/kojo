@@ -1,0 +1,31 @@
+-- 0007_agent_lock_allowed_proxy.sql
+--
+-- agent_locks に allowed_proxy_peer 列を追加。「この lock 行に対し
+-- /api/v1/agents/{id}/* を proxy 経由で叩ける signer」を明示的に
+-- 保存する。holder 自身が叩く場合の合法 signer (= the orchestrator
+-- that handed the runtime here) を記録するための列。
+--
+-- これを引かないと middleware は "self == holder" だけで判定する
+-- しかなく、paired-but-untrusted な任意 peer が holder 自身でない
+-- にも関わらず agent surface に届けてしまう。
+--
+-- セット路:
+--   AcquireAgentLock (初回 / lease steal): allowed = peer (= holder
+--                                          自身が同時に proxy origin)
+--   TransferAgentLock (device-switch step 6): allowed = currentPeer
+--                                            (= source / orchestrator)
+--   ForceReclaimAgentLock: allowed = peer (= self が orchestrator)
+--   RefreshAgentLock: 既存値 preserve
+--
+-- 既存行は backfill しない (空のまま)。理由:
+--   - 既存 deployed の post-device-switch 行は holder=target で
+--     source 情報を store に保持していない。holder_peer で機械的に
+--     backfill すると target=target=allowed となり、Hub からの
+--     proxy が誤って middleware にrejectされる (source ≠ target)。
+--   - allowed_proxy_peer = '' のままなら middleware は admit せず、
+--     operator が「強制復帰」ボタン (force-reclaim) で復活させる
+--     経路だけが有効になる。これは migration 跨ぎの安全な fallback。
+--   - 新規 acquire / transfer / force-reclaim / finalize 経由の
+--     row には正しい値が入る (各 path で stamp 済み)。
+ALTER TABLE agent_locks
+  ADD COLUMN allowed_proxy_peer TEXT NOT NULL DEFAULT '';

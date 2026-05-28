@@ -7,6 +7,7 @@ export const SPECIAL_KEYS: SpecialKey[] = [
   { label: "Ctrl", code: "ctrl" },
   { label: "Esc", code: "\x1b" },
   { label: "Shift", code: "shift" },
+  { label: "Alt", code: "alt" },
   { label: "Tab", code: "\t" },
   { label: "\u2191", code: "\x1b[A" },
   { label: "\u2193", code: "\x1b[B" },
@@ -74,14 +75,15 @@ const SHIFT_MAP: Record<string, string> = {
 
 /**
  * Resolves a special key press with modifier state into the escape sequence to send.
- * Returns the sequence to send, or null if the key is a modifier toggle (ctrl/shift).
+ * Returns the sequence to send, or null if the key is a modifier toggle (ctrl/shift/alt).
  */
 export function resolveKeyPress(
   code: string,
   ctrlMode: boolean,
   shiftMode: boolean,
+  altMode: boolean = false,
 ): string | null {
-  if (code === "ctrl" || code === "shift") return null;
+  if (code === "ctrl" || code === "shift" || code === "alt") return null;
 
   if (ctrlMode) {
     const char = code.charCodeAt(0);
@@ -93,6 +95,11 @@ export function resolveKeyPress(
 
   if (shiftMode) {
     return SHIFT_MAP[code] ?? code.toUpperCase();
+  }
+
+  if (altMode) {
+    // Alt+key on a terminal is ESC + key (Meta prefix).
+    return "\x1b" + code;
   }
 
   return code;

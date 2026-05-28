@@ -22,6 +22,20 @@ type Message struct {
 	Attachments []MessageAttachment `json:"attachments,omitempty"`
 	Timestamp   string              `json:"timestamp"` // RFC3339
 	Usage       *Usage              `json:"usage,omitempty"`
+	// ETag is the inner identifier of the row's strong HTTP entity
+	// tag — UNQUOTED (e.g. "v3-deadbeef") so the JSON looks natural;
+	// the matching HTTP ETag header carries the same identifier
+	// wrapped in double quotes per RFC 7232 (`"v3-deadbeef"`). The
+	// Web UI's httpClient.patchWithIfMatch quotes this raw value
+	// before putting it on the wire as If-Match.
+	//
+	// Surfaced inside the JSON so a list fetch
+	// (GET /api/v1/agents/{id}/messages) gives the Web UI per-message
+	// etags without a per-row HEAD; PATCH /messages/{msgId} then
+	// sends this value as If-Match for optimistic concurrency.
+	// Empty when the message originated outside the v1 store (legacy
+	// in-memory paths, transitional rows).
+	ETag string `json:"etag,omitempty"`
 }
 
 // ToolUse represents a single tool invocation within a message.

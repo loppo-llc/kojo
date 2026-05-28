@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -52,6 +53,139 @@ func TestAgentIDToUUID(t *testing.T) {
 	})
 }
 
+func TestExpectedClaudeSessionID(t *testing.T) {
+	uuidRe := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+	t.Run("oneShot without sessionKey returns empty", func(t *testing.T) {
+		if got := expectedClaudeSessionID("ag_x", "", true); got != "" {
+			t.Errorf("expected empty, got %q", got)
+		}
+	})
+
+	t.Run("oneShot with sessionKey still returns empty", func(t *testing.T) {
+		// Canonical invariant: OneShot=true means ephemeral, period. The
+		// manager is responsible for setting OneShot=false when SessionKey
+		// should resume; the backend never silently overrides that.
+		if got := expectedClaudeSessionID("ag_x", "slack:C1:T1", true); got != "" {
+			t.Errorf("oneShot must dominate; got %q", got)
+		}
+	})
+
+	t.Run("non-oneShot with sessionKey resumes by key", func(t *testing.T) {
+		got := expectedClaudeSessionID("ag_x", "slack:C1:T1", false)
+		if !uuidRe.MatchString(got) {
+			t.Errorf("not a valid UUID: %s", got)
+		}
+		if got == agentIDToUUID("ag_x") {
+			t.Errorf("key-derived UUID collides with agent-wide UUID: %s", got)
+		}
+		if got != agentIDToUUID("slack:C1:T1") {
+			t.Errorf("expected key-derived UUID, got %s", got)
+		}
+	})
+
+	t.Run("no oneShot no key uses agent-wide UUID", func(t *testing.T) {
+		got := expectedClaudeSessionID("ag_x", "", false)
+		if got != agentIDToUUID("ag_x") {
+			t.Errorf("expected agent-wide UUID, got %s", got)
+		}
+	})
+
+	t.Run("deterministic across calls", func(t *testing.T) {
+		a := expectedClaudeSessionID("ag_x", "slack:C1:T1", false)
+		b := expectedClaudeSessionID("ag_x", "slack:C1:T1", false)
+		if a != b {
+			t.Errorf("not deterministic: %s != %s", a, b)
+		}
+	})
+
+	t.Run("different keys yield different UUIDs", func(t *testing.T) {
+		a := expectedClaudeSessionID("ag_x", "slack:C1:T1", false)
+		b := expectedClaudeSessionID("ag_x", "slack:C1:T2", false)
+		if a == b {
+			t.Errorf("collision: %s == %s", a, b)
+		}
+	})
+}
+
+func TestBuildClaudeArgs_SessionKey(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := &ClaudeBackend{logger: logger}
+	tmp := t.TempDir()
+	a := &Agent{ID: "ag_test"}
+
+	t.Run("oneShot drops --resume even with sessionKey", func(t *testing.T) {
+		args := b.buildClaudeArgs(a, "", tmp, true, nil, false, "slack:C1:T1")
+		for i := range args {
+			if args[i] == "--resume" || args[i] == "--session-id" {
+				t.Errorf("oneShot must skip session flags, got %v", args)
+			}
+		}
+	})
+
+	t.Run("non-oneShot with sessionKey resumes by key-derived UUID", func(t *testing.T) {
+		args := b.buildClaudeArgs(a, "", tmp, false, nil, false, "slack:C1:T1")
+		want := agentIDToUUID("slack:C1:T1")
+		found := false
+		for i := 0; i < len(args)-1; i++ {
+			if (args[i] == "--resume" || args[i] == "--session-id") && args[i+1] == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected --resume/--session-id %s, got %v", want, args)
+		}
+	})
+
+	t.Run("non-oneShot no sessionKey uses agent-wide UUID", func(t *testing.T) {
+		args := b.buildClaudeArgs(a, "", tmp, false, nil, false, "")
+		want := agentIDToUUID("ag_test")
+		found := false
+		for i := 0; i < len(args)-1; i++ {
+			if (args[i] == "--resume" || args[i] == "--session-id") && args[i+1] == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected --resume/--session-id %s, got %v", want, args)
+		}
+	})
+}
+
+func TestBackendSupportsSessionKey(t *testing.T) {
+	t.Run("claude supports", func(t *testing.T) {
+		b := &ClaudeBackend{}
+		if !backendSupportsSessionKey(b) {
+			t.Errorf("claude should support session key")
+		}
+	})
+	t.Run("custom supports", func(t *testing.T) {
+		// custom delegates to ClaudeBackend, so it must mirror claude.
+		// Phase B Part 2 Slack threads must still resume on custom backends.
+		b := &CustomBackend{}
+		if !backendSupportsSessionKey(b) {
+			t.Errorf("custom should support session key")
+		}
+	})
+	t.Run("codex does not", func(t *testing.T) {
+		b := &CodexBackend{}
+		if backendSupportsSessionKey(b) {
+			t.Errorf("codex should not support session key")
+		}
+	})
+	t.Run("llama does not", func(t *testing.T) {
+		b := &LlamaCppBackend{}
+		if backendSupportsSessionKey(b) {
+			t.Errorf("llama should not support session key")
+		}
+	})
+	t.Run("nil is false", func(t *testing.T) {
+		if backendSupportsSessionKey(nil) {
+			t.Errorf("nil backend should not support session key")
+		}
+	})
+}
+
 func TestHasExistingSession(t *testing.T) {
 	t.Run("returns false for empty directory", func(t *testing.T) {
 		dir := t.TempDir()
@@ -71,7 +205,7 @@ func TestHasExistingSession(t *testing.T) {
 		t.Setenv("HOME", home)
 
 		// Use a path with dots and underscores to verify encoding
-		agentPath := filepath.Join(home, ".config", "kojo", "agents", "ag_test123")
+		agentPath := filepath.Join(home, ".config", "kojo-v1", "agents", "ag_test123")
 		os.MkdirAll(agentPath, 0o755)
 
 		absPath, _ := filepath.Abs(agentPath)
@@ -133,7 +267,7 @@ func setupRecoverTest(t *testing.T) (string, func([]map[string]any)) {
 	t.Setenv("HOME", home)
 
 	agentID := "ag_test_recover"
-	aDir := filepath.Join(home, ".config", "kojo", "agents", agentID)
+	aDir := filepath.Join(home, ".config", "kojo-v1", "agents", agentID)
 	os.MkdirAll(aDir, 0o755)
 
 	// Override agentsDir by setting HOME; agentDir uses agentsDir internally.
@@ -397,7 +531,7 @@ func TestRecoverFromSession_scannerError(t *testing.T) {
 	_ = write
 
 	home := os.Getenv("HOME")
-	aDir := filepath.Join(home, ".config", "kojo", "agents", agentID)
+	aDir := filepath.Join(home, ".config", "kojo-v1", "agents", agentID)
 	absDir, _ := filepath.Abs(aDir)
 	encoded := strings.NewReplacer(
 		string(filepath.Separator), "-",
@@ -519,7 +653,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	aDir := filepath.Join(home, ".config", "kojo", "agents", "ag_threshold_test")
+	aDir := filepath.Join(home, ".config", "kojo-v1", "agents", "ag_threshold_test")
 	os.MkdirAll(aDir, 0o755)
 
 	absDir, _ := filepath.Abs(aDir)
@@ -645,12 +779,11 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		old := time.Now().Add(-2 * sessionResetMinIdleDuration)
 		os.Chtimes(sessionFile, old, old)
 
-		var calledAgent, calledTool, calledPath string
+		var calledAgent, calledTool string
 		orig := preResetSummarize
-		preResetSummarize = func(agentID, tool, sessionPath string, _ *slog.Logger) error {
+		preResetSummarize = func(agentID, tool string, _ *slog.Logger) error {
 			calledAgent = agentID
 			calledTool = tool
-			calledPath = sessionPath
 			return nil
 		}
 		t.Cleanup(func() { preResetSummarize = orig })
@@ -663,9 +796,6 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		}
 		if calledTool != "claude" {
 			t.Errorf("summary hook called with tool=%q, want claude", calledTool)
-		}
-		if calledPath != sessionFile {
-			t.Errorf("summary hook called with sessionPath=%q, want %q", calledPath, sessionFile)
 		}
 		if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
 			t.Error("expected session file removed after successful summary")
@@ -683,7 +813,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		os.Chtimes(sessionFile, old, old)
 
 		orig := preResetSummarize
-		preResetSummarize = func(_, _, _ string, _ *slog.Logger) error {
+		preResetSummarize = func(_, _ string, _ *slog.Logger) error {
 			return fmt.Errorf("simulated summary failure")
 		}
 		t.Cleanup(func() { preResetSummarize = orig })
@@ -729,7 +859,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		// Stub the summary hook so the reset path can complete without
 		// spawning a real claude subprocess.
 		orig := preResetSummarize
-		preResetSummarize = func(_, _, _ string, _ *slog.Logger) error { return nil }
+		preResetSummarize = func(_, _ string, _ *slog.Logger) error { return nil }
 		t.Cleanup(func() { preResetSummarize = orig })
 
 		if sessionFileUsable(aDir, sessionID, false, "ag_per_agent_idle", 1*time.Minute, nil) {

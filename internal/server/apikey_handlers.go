@@ -201,7 +201,7 @@ func fetchGeminiEmbeddingModels(ctx context.Context, apiKey string) ([]string, e
 
 	var result struct {
 		Models []struct {
-			Name                     string   `json:"name"`
+			Name                       string   `json:"name"`
 			SupportedGenerationMethods []string `json:"supportedGenerationMethods"`
 		} `json:"models"`
 	}

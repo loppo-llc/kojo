@@ -18,9 +18,9 @@ var (
 	ErrNoTOTPSecret       = errors.New("no TOTP secret configured")
 	ErrInvalidTOTP        = errors.New("invalid TOTP parameters")
 
-	ErrUnsupportedTool     = errors.New("unsupported tool")
-	ErrUnsupportedInterval = errors.New("unsupported interval")
-	ErrUnsupportedTimeout  = errors.New("unsupported timeout")
+	ErrUnsupportedTool    = errors.New("unsupported tool")
+	ErrInvalidCronExpr    = errors.New("invalid cron expression")
+	ErrUnsupportedTimeout = errors.New("unsupported timeout")
 
 	ErrInvalidRegenerate = errors.New("invalid regenerate target")
 )

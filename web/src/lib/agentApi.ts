@@ -1,17 +1,39 @@
-import { get, post, del, patch, put, upload } from "./httpClient";
+import {
+  get,
+  post,
+  del,
+  delWithIfMatch,
+  patch,
+  put,
+  upload,
+  getWithEtag,
+  patchWithIfMatch,
+  postWithIfMatch,
+  putWithIfMatch,
+} from "./httpClient";
 import { appendTokenQuery } from "./auth";
 import type { DirEntry, FileView } from "./api";
 
-export const INTERVAL_PRESETS = [
-  { label: "Off", value: 0 },
-  { label: "5m", value: 5 },
-  { label: "10m", value: 10 },
-  { label: "30m", value: 30 },
-  { label: "1h", value: 60 },
-  { label: "3h", value: 180 },
-  { label: "6h", value: 360 },
-  { label: "12h", value: 720 },
-  { label: "24h", value: 1440 },
+// SCHEDULE_PRESETS surface the most common cron cadences as one-click chips.
+// The cron field uses an "@preset:N" sentinel that the backend expands at
+// Save time into a real 5-field expression with a per-agent offset baked in
+// (see internal/agent/cron_expr.go). Sending a literal "0 */3 * * *" instead
+// would have every agent fire at exactly :00 — the original per-agent
+// stagger from the IntervalMinutes era would be lost.
+//
+// "Daily 09:00" is intentionally a literal expression: a fixed wall-clock
+// time is what the user is asking for, so spreading it across agents would
+// defeat the point. Off is the empty string (= scheduling disabled).
+export const SCHEDULE_PRESETS = [
+  { label: "Off", cron: "" },
+  { label: "5m", cron: "@preset:5" },
+  { label: "10m", cron: "@preset:10" },
+  { label: "30m", cron: "@preset:30" },
+  { label: "1h", cron: "@preset:60" },
+  { label: "3h", cron: "@preset:180" },
+  { label: "6h", cron: "@preset:360" },
+  { label: "12h", cron: "@preset:720" },
+  { label: "Daily 09:00", cron: "0 9 * * *" },
 ] as const;
 
 export const TIMEOUT_PRESETS = [
@@ -49,16 +71,27 @@ export interface AgentInfo {
   tool: string;
   customBaseURL?: string;
   workDir: string;
-  intervalMinutes: number;
+  cronExpr?: string;
   timeoutMinutes: number;
   resumeIdleMinutes?: number;
   silentStart?: string;
   silentEnd?: string;
   notifyDuringSilent?: boolean;
+  cronMessage?: string;
   // RFC3339 timestamp of the next scheduled cron run, accounting for silent
   // hours. Empty/absent if cron is disabled, the agent is archived, or no
   // schedule is registered. Server-derived; never sent on update.
+  //
+  // NOTE: this is the agent's configured next-tick regardless of the
+  // global cron-paused toggle — see `cronPausedGlobal` for the live
+  // pause indicator. Hiding the time when paused made Agent Settings
+  // show "—" on every agent and read as a missing-value bug.
   nextCronAt?: string;
+  // True when the Dashboard's global cron toggle is in the paused
+  // position. Surfaced on every agent record so Settings can render
+  // "(paused)" next to nextCronAt without an extra round-trip to
+  // /api/v1/agents/cron-paused. Server-derived; never sent on update.
+  cronPausedGlobal?: boolean;
   createdAt: string;
   updatedAt: string;
   publicProfile: string;
@@ -68,7 +101,6 @@ export interface AgentInfo {
   allowedTools?: string[];
   allowProtectedPaths?: string[];
   thinkingMode?: string;
-  notifySources?: NotifySourceConfig[];
   lastMessage?: {
     content: string;
     role: string;
@@ -82,7 +114,34 @@ export interface AgentInfo {
   // agents (NOT to fork or read their full record). Owner-only mutation
   // via POST /api/v1/agents/{id}/privilege.
   privileged?: boolean;
+  // Strong HTTP entity tag of the v1 store row for this agent. Carry
+  // alongside form state so PATCH /agents/{id} can send it as If-Match;
+  // a server-side mismatch surfaces as PreconditionFailedError. Empty
+  // when the row has not yet hit the v1 store (legacy paths, brand-new
+  // create that has not flushed). Server-populated; do not send on
+  // update — use the dedicated `expectedEtag` parameter instead.
+  etag?: string;
   tts?: TTSConfig;
+  // HolderPeer is set when the agent's runtime currently lives on a remote
+  // peer (e.g. via §3.7 device-switch). Empty / absent means this server
+  // owns the runtime. The dashboard surfaces this as a "転移中" badge and
+  // hides the (necessarily stale) lastMessage preview.
+  holderPeer?: string;
+  // holderPeerName is the human-friendly label resolved server-side
+  // from peer_registry. Falls back to holderPeer (deviceID) when the
+  // registry lookup miss races a decommission.
+  holderPeerName?: string;
+  // holderPeerStatus mirrors peer_registry.status for holderPeer. Used
+  // by AgentChat to disable send + show an "offline" banner when the
+  // §3.7 device-switch target has gone offline. Empty when holderPeer
+  // is empty.
+  holderPeerStatus?: "online" | "offline" | "degraded";
+  // isSwitching is true while a §3.7 device-switch is mid-flight on
+  // this peer (between SetSwitching(true) and (false)). Surfaced by
+  // the server so the UI can disable mutating controls (credentials
+  // add/edit/delete, etc.) that would 409 with agent_busy and show a
+  // banner instead.
+  isSwitching?: boolean;
 }
 
 // TTSConfig mirrors internal/agent.TTSConfig in the Go backend.
@@ -104,12 +163,13 @@ export interface AgentConfig {
   customBaseURL?: string;
   thinkingMode?: string;
   workDir?: string;
-  intervalMinutes?: number;
+  cronExpr?: string;
   timeoutMinutes?: number;
   resumeIdleMinutes?: number;
   silentStart?: string;
   silentEnd?: string;
   notifyDuringSilent?: boolean;
+  cronMessage?: string;
 }
 
 export interface AgentUpdateParams extends Partial<AgentConfig> {
@@ -137,6 +197,10 @@ export interface AgentMessage {
   attachments?: AgentMessageAttachment[];
   timestamp: string;
   usage?: { inputTokens: number; outputTokens: number };
+  // Strong HTTP entity tag of the row backing this message; passed to
+  // PATCH /messages/{msgId} as If-Match for optimistic concurrency.
+  // Optional because legacy / transitional rows may not have one.
+  etag?: string;
 }
 
 export interface ToolUse {
@@ -157,27 +221,6 @@ export interface Credential {
   totpPeriod?: number;
   createdAt: string;
   updatedAt: string;
-}
-
-export interface NotifySourceConfig {
-  id: string;
-  type: string;
-  enabled: boolean;
-  intervalMinutes: number;
-  query?: string;
-  options?: Record<string, string>;
-}
-
-export interface OAuthClientInfo {
-  provider: string;
-  configured: boolean;
-}
-
-export interface NotifySourceType {
-  type: string;
-  name: string;
-  description: string;
-  authType: string;
 }
 
 export interface OTPEntry {
@@ -223,15 +266,25 @@ export interface SlackBotStatus {
   connected: boolean;
 }
 
-// TruncateMemoryResult mirrors the Go TruncateMemoryResult struct returned by
-// POST /api/v1/agents/:id/memory/truncate. Counts are best-effort (records the
-// server couldn't parse are kept verbatim and not counted, matching the
-// agent transcript's forgiving rewrite stance).
+// TruncateMemoryResult is the response of POST /memory/truncate. Counts are
+// best-effort — entries with malformed timestamps or unparseable JSON are
+// kept verbatim and not counted, matching the server-side stance of "never
+// lose a record just because we couldn't parse it".
 export interface TruncateMemoryResult {
   since: string;
   messagesRemoved: number;
   claudeSessionEntriesRemoved: number;
   claudeSessionFilesRemoved: number;
+  // Grok session subtrees dropped wholesale ($GROK_HOME/sessions/<encoded(agentDir)>/<uuid>/).
+  // Grok's events.jsonl has no kojo-compatible per-record timestamp so any
+  // truncate that lands inside a session drops the whole session — the next
+  // non-OneShot turn opens a fresh one.
+  //
+  // Optional because the fields were added after v0.19 — an older server
+  // peer (mid-rollout) returns the response without them, and the UI
+  // should render "0" instead of "undefined".
+  grokSessionsRemoved?: number;
+  grokSessionFilesRemoved?: number;
   diaryFilesRemoved: number;
   diaryEntriesRemoved: number;
 }
@@ -264,7 +317,29 @@ export const agentApi = {
   setCronPaused: (paused: boolean) =>
     put<{ paused: boolean }>("/api/v1/agents/cron-paused", { paused }),
 
-  get: (id: string) => get<AgentInfo>(`/api/v1/agents/${id}`),
+  // forceReclaim rewrites agent_locks back to this host and
+  // restarts the local runtime. Owner-only recovery path for
+  // agents whose post-device-switch lock points at an
+  // unreachable / dead peer. Response carries the new fencing
+  // token; UI just needs to await it and refresh the list.
+  forceReclaim: (agentId: string) =>
+    post<{ agentId: string; holderPeer: string; fencingToken: number; leaseExpiresAt: number }>(
+      `/api/v1/agents/${encodeURIComponent(agentId)}/handoff/force-reclaim`,
+      {},
+    ),
+
+  // GET /api/v1/agents/{id}. The server emits the row's strong ETag
+  // both in the HTTP header and in the JSON body's `etag` field. We
+  // prefer the body (it's threaded through React state alongside
+  // every other field, so a stale form snapshot keeps its original
+  // etag rather than picking up a newer one from a shared cache).
+  // Fall back to the header for endpoints that have not yet been
+  // taught to embed `etag` in the body.
+  get: async (id: string): Promise<AgentInfo> => {
+    const { value, etag } = await getWithEtag<AgentInfo>(`/api/v1/agents/${id}`);
+    if (!value.etag && etag) value.etag = etag;
+    return value;
+  },
 
   files: {
     list: (agentId: string, relPath: string, hidden?: boolean) => {
@@ -284,12 +359,42 @@ export const agentApi = {
       const base = `/api/v1/agents/${agentId}/files/raw?path=${encodeURIComponent(relPath)}`;
       return appendTokenQuery(download ? `${base}&download=1` : base);
     },
+    thumbUrl: (agentId: string, relPath: string, size = 256, v?: string) => {
+      const q = v ? `&v=${encodeURIComponent(v)}` : "";
+      return appendTokenQuery(
+        `/api/v1/agents/${agentId}/files/thumb?path=${encodeURIComponent(relPath)}&size=${size}${q}`,
+      );
+    },
   },
 
   create: (cfg: AgentConfig) => post<AgentInfo>("/api/v1/agents", cfg),
 
-  update: (id: string, cfg: AgentUpdateParams) =>
-    patch<AgentInfo>(`/api/v1/agents/${id}`, cfg),
+  // PATCH the agent. expectedEtag is the etag the caller's form
+  // snapshot was loaded with — typically taken from the AgentInfo
+  // that the matching GET returned. Sending it as If-Match lets the
+  // server reject stale writes with 412, surfaced as
+  // PreconditionFailedError; the caller should refetch and re-apply
+  // the user's edit on the fresh row. Omitting expectedEtag falls
+  // back to an unconditional PATCH (legacy callers, test harnesses).
+  //
+  // The Web UI deliberately threads the etag through React state
+  // rather than a global cache: a shared cache would let two
+  // simultaneously-open forms accidentally pass each other's writes
+  // (the second form's Save would pick up the first's post-write
+  // etag and succeed despite holding stale data).
+  update: async (
+    id: string,
+    cfg: AgentUpdateParams,
+    expectedEtag?: string,
+  ): Promise<AgentInfo> => {
+    const path = `/api/v1/agents/${id}`;
+    const { value, etag } = await patchWithIfMatch<AgentInfo>(path, cfg, expectedEtag);
+    // Prefer the etag baked into the response body (set by
+    // buildAgentResponse from the same store read that produced the
+    // record); fall back to the header.
+    if (!value.etag && etag) value.etag = etag;
+    return value;
+  },
 
   delete: (id: string) => del<{ ok: boolean }>(`/api/v1/agents/${id}`),
 
@@ -305,25 +410,62 @@ export const agentApi = {
 
   resetSession: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/reset-session`),
 
-  // Truncate the agent's memory at a point in time. Either `since` (RFC3339)
-  // or `fromMessageId` must be provided. Removes kojo transcript records,
-  // Claude session JSONL records (with trailing-turn trim), and daily diary
-  // bullets in memory/YYYY-MM-DD.md whose timestamp is at-or-after the
-  // threshold. Persona, MEMORY.md, project / people / topic notes, archive,
-  // credentials, and tasks are kept.
+  // truncateMemory drops everything recorded at or after the given threshold.
+  // Two ways to specify it (matches backend surface):
+  //   - { since: RFC3339 }            — absolute datetime
+  //   - { fromMessageId: "m_..." }    — use the matched message's timestamp
+  // Same auth gate as resetData; same 409 on busy / racing reset; 409 also
+  // returned when fromMessageId's pivot gets mutated underneath the call.
   truncateMemory: (
     id: string,
-    body: { since: string } | { fromMessageId: string },
-  ) =>
-    post<TruncateMemoryResult>(`/api/v1/agents/${id}/memory/truncate`, body),
+    params: { since: string } | { fromMessageId: string },
+  ) => post<TruncateMemoryResult>(`/api/v1/agents/${id}/memory/truncate`, params),
 
   checkin: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/checkin`),
 
-  getCheckinFile: (id: string) =>
-    get<{ content: string; isDefault: boolean }>(`/api/v1/agents/${id}/checkin-file`),
+  // user.md workspace file (per-agent notes about the people the agent works
+  // with). GET surfaces an in-memory DefaultUserContent template when the
+  // file is absent — isDefault=true tells the UI to suppress a no-op PUT on
+  // save. PUT writes atomically and returns isDefault=false (the file now
+  // exists on disk). The settings UI binds these to a dirty-tracked
+  // textarea separate from the persona / cron message fields.
+  //
+  // Both getter and setter thread the strong etag via getWithEtag /
+  // putWithIfMatch so KOJO_REQUIRE_IF_MATCH=1 strict mode accepts our
+  // PUTs AND so a concurrent edit from another tab surfaces as a 412
+  // (PreconditionFailedError) instead of silently clobbering. The
+  // wrapper returns `{ value: { content, isDefault, etag }, etag }` —
+  // the inner `etag` mirrors the body field for consistency with the
+  // server response, the outer one comes from the ETag header.
+  getUserContext: (id: string) =>
+    getWithEtag<{ content: string; isDefault: boolean; etag?: string }>(
+      `/api/v1/agents/${id}/user-context`,
+    ),
 
-  putCheckinFile: (id: string, content: string) =>
-    put<{ content: string; isDefault: boolean }>(`/api/v1/agents/${id}/checkin-file`, { content }),
+  setUserContext: (id: string, content: string, expectedEtag?: string) =>
+    putWithIfMatch<{ content: string; isDefault: boolean; etag?: string }>(
+      `/api/v1/agents/${id}/user-context`,
+      { content },
+      expectedEtag,
+    ),
+
+  // checkin.md workspace file (per-agent body for cron / manual check-in
+  // prompts). Same fallback / no-op-PUT contract as user-context: GET
+  // returns DefaultCheckinContent with isDefault=true when checkin.md is
+  // absent so the UI shows the body that the cron path would actually run.
+  // PUT with an empty body clears the file (server-side trim+remove).
+  // Same etag-threading rationale as the user-context endpoints above.
+  getCheckinFile: (id: string) =>
+    getWithEtag<{ content: string; isDefault: boolean; etag?: string }>(
+      `/api/v1/agents/${id}/checkin-file`,
+    ),
+
+  putCheckinFile: (id: string, content: string, expectedEtag?: string) =>
+    putWithIfMatch<{ content: string; isDefault: boolean; etag?: string }>(
+      `/api/v1/agents/${id}/checkin-file`,
+      { content },
+      expectedEtag,
+    ),
 
   fork: (id: string, params: { name: string; includeTranscript: boolean }) =>
     post<AgentInfo>(`/api/v1/agents/${id}/fork`, params),
@@ -369,14 +511,70 @@ export const agentApi = {
     ).then((r) => ({ messages: r.messages ?? [], hasMore: r.hasMore ?? false }));
   },
 
-  updateMessage: (agentId: string, msgId: string, content: string) =>
-    patch<AgentMessage>(`/api/v1/agents/${agentId}/messages/${msgId}`, { content }),
+  // PATCH a single message. The `expectedEtag` is the etag the caller
+  // believes is current — typically the value embedded in the
+  // AgentMessage object loaded from GET /messages. The server's
+  // optimistic-concurrency layer rejects stale writes with 412
+  // (PreconditionFailedError); callers should refetch the transcript
+  // and re-apply the user's edit on the fresh row rather than
+  // blindly retry. expectedEtag may be omitted for backwards-compat
+  // (e.g. test harnesses), in which case the write goes through with
+  // no precondition — but the regular Web UI should always pass it.
+  updateMessage: async (
+    agentId: string,
+    msgId: string,
+    content: string,
+    expectedEtag?: string,
+  ): Promise<AgentMessage> => {
+    const path = `/api/v1/agents/${agentId}/messages/${msgId}`;
+    const { value, etag } = await patchWithIfMatch<AgentMessage>(
+      path,
+      { content },
+      expectedEtag,
+    );
+    // Prefer the body's etag — recordToMessage populates it from the
+    // same store.UpdateMessage TX result, so it is guaranteed to
+    // describe THIS PATCH's row state. The response header etag,
+    // while set by the same handler, could theoretically diverge
+    // if a future refactor reads the row a second time. Body wins;
+    // header is a last-resort fallback for endpoints that don't
+    // embed etag in the body yet.
+    if (!value.etag && etag) value.etag = etag;
+    return value;
+  },
 
-  deleteMessage: (agentId: string, msgId: string) =>
-    del<{ ok: boolean }>(`/api/v1/agents/${agentId}/messages/${msgId}`),
+  // expectedEtag enables optimistic locking — pass the etag the UI was
+  // looking at when the user clicked delete. Two stale-state shapes can
+  // come back; both want a refetch:
+  //   - 412 (PreconditionFailedError): the row was edited under us and
+  //     its etag has advanced.
+  //   - 404 with conditional DELETE: the row already vanished
+  //     (SoftDeleteMessage maps non-empty If-Match against a missing
+  //     row to ErrNotFound rather than silent success, so a stale
+  //     client doesn't think its delete landed). Surfaces as a generic
+  //     Error with `404:` prefix; AgentChat.onDelete handles both.
+  // Omitting expectedEtag sends an unconditional DELETE (legacy
+  // behaviour, still supported).
+  deleteMessage: (agentId: string, msgId: string, expectedEtag?: string) =>
+    expectedEtag
+      ? delWithIfMatch<{ ok: boolean }>(
+          `/api/v1/agents/${agentId}/messages/${msgId}`,
+          expectedEtag,
+        ).then((r) => r.value)
+      : del<{ ok: boolean }>(`/api/v1/agents/${agentId}/messages/${msgId}`),
 
-  regenerateMessage: (agentId: string, msgId: string) =>
-    post<{ ok: boolean }>(`/api/v1/agents/${agentId}/messages/${msgId}/regenerate`),
+  // expectedEtag preconditions on the *clicked* message's etag (the row
+  // the user is regenerating from). 412 → PreconditionFailedError; the
+  // UI should refetch and let the user re-confirm rather than auto-retry,
+  // because regenerate truncates everything after the click.
+  regenerateMessage: (agentId: string, msgId: string, expectedEtag?: string) =>
+    expectedEtag
+      ? postWithIfMatch<{ ok: boolean }>(
+          `/api/v1/agents/${agentId}/messages/${msgId}/regenerate`,
+          undefined,
+          expectedEtag,
+        ).then((r) => r.value)
+      : post<{ ok: boolean }>(`/api/v1/agents/${agentId}/messages/${msgId}/regenerate`),
 
   generatePersona: (currentPersona: string, prompt: string) =>
     post<{ persona: string }>("/api/v1/agents/generate-persona", { currentPersona, prompt }),
@@ -464,49 +662,6 @@ export const agentApi = {
       ),
   },
 
-  notifySources: {
-    list: (agentId: string) =>
-      get<{ sources: NotifySourceConfig[] }>(
-        `/api/v1/agents/${agentId}/notify-sources`,
-      ).then((r) => r.sources ?? []),
-
-    create: (agentId: string, cfg: { type: string; intervalMinutes?: number; query?: string }) =>
-      post<{ source: NotifySourceConfig }>(
-        `/api/v1/agents/${agentId}/notify-sources`,
-        cfg,
-      ).then((r) => r.source),
-
-    update: (agentId: string, sourceId: string, data: Partial<NotifySourceConfig>) =>
-      patch<{ source: NotifySourceConfig }>(
-        `/api/v1/agents/${agentId}/notify-sources/${sourceId}`,
-        data,
-      ).then((r) => r.source),
-
-    delete: (agentId: string, sourceId: string) =>
-      del<unknown>(`/api/v1/agents/${agentId}/notify-sources/${sourceId}`),
-
-    startAuth: (agentId: string, sourceId: string) =>
-      get<{ authUrl: string }>(
-        `/api/v1/agents/${agentId}/notify-sources/${sourceId}/auth`,
-      ).then((r) => r.authUrl),
-  },
-
-  oauthClients: {
-    list: () =>
-      get<{ clients: OAuthClientInfo[] }>("/api/v1/oauth-clients").then(
-        (r) => r.clients ?? [],
-      ),
-
-    set: (provider: string, clientId: string, clientSecret: string) =>
-      post<{ ok: boolean }>(`/api/v1/oauth-clients/${provider}`, {
-        clientId,
-        clientSecret,
-      }),
-
-    delete: (provider: string) =>
-      del<unknown>(`/api/v1/oauth-clients/${provider}`),
-  },
-
   apiKeys: {
     get: (provider: string) =>
       get<{ provider: string; configured: boolean; hasFallback?: boolean; embeddingModel?: string }>(`/api/v1/api-keys/${provider}`),
@@ -518,29 +673,12 @@ export const agentApi = {
       del<unknown>(`/api/v1/api-keys/${provider}`),
   },
 
-  userContext: {
-    get: (agentId: string) =>
-      get<{ content: string; isDefault: boolean }>(
-        `/api/v1/agents/${agentId}/user-context`,
-      ),
-    set: (agentId: string, content: string) =>
-      put<{ content: string; isDefault: boolean }>(
-        `/api/v1/agents/${agentId}/user-context`,
-        { content },
-      ),
-  },
-
   embeddingModel: {
     set: (model: string) =>
       put<{ ok: boolean; model: string; embeddingsCleared: boolean }>(`/api/v1/embedding-model`, { model }),
     list: () =>
       get<{ models: string[] }>(`/api/v1/embedding-models`).then((r) => r.models ?? []),
   },
-
-  notifySourceTypes: () =>
-    get<{ types: NotifySourceType[] }>("/api/v1/notify-source-types").then(
-      (r) => r.types ?? [],
-    ),
 
   slackBot: {
     get: (agentId: string) =>

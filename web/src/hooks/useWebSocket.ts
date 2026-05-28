@@ -16,6 +16,11 @@ interface WSMessage {
 
 interface UseWebSocketOptions {
   sessionId: string;
+  // peerId stamps the `?peer=` query param on the WS upgrade so the
+  // Hub's session-ws router forwards the upgrade to the right peer
+  // (cross-peer session creation, NewSession's peer selector). Empty
+  // = this host; the Hub serves the WS locally.
+  peerId?: string;
   onOutput: (data: Uint8Array) => void;
   onScrollback: (data: Uint8Array) => void;
   onExit: (exitCode: number, live: boolean) => void;
@@ -24,7 +29,7 @@ interface UseWebSocketOptions {
   onConnected?: () => void;
 }
 
-export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYoloDebug, onAttachment, onConnected }: UseWebSocketOptions) {
+export function useWebSocket({ sessionId, peerId, onOutput, onScrollback, onExit, onYoloDebug, onAttachment, onConnected }: UseWebSocketOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const [connected, setConnected] = useState(false);
   const reconnectRef = useRef<ReturnType<typeof setTimeout>>(null);
@@ -41,7 +46,10 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
   const connect = useCallback(() => {
     if (!activeRef.current) return;
 
-    const ws = new WebSocket(wsUrl(`/api/v1/ws?session=${sessionId}`));
+    const qs = peerId
+      ? `session=${encodeURIComponent(sessionId)}&peer=${encodeURIComponent(peerId)}`
+      : `session=${encodeURIComponent(sessionId)}`;
+    const ws = new WebSocket(wsUrl(`/api/v1/ws?${qs}`));
 
     ws.onopen = () => {
       if (wsRef.current !== ws) return; // stale connection
@@ -98,7 +106,7 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
     };
 
     wsRef.current = ws;
-  }, [sessionId, onScrollback, onExit, onYoloDebug, onAttachment]);
+  }, [sessionId, peerId, onScrollback, onExit, onYoloDebug, onAttachment]);
 
   useEffect(() => {
     activeRef.current = true;

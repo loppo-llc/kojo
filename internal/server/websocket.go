@@ -5,9 +5,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/loppo-llc/kojo/internal/auth"
+	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/session"
 )
 
@@ -59,6 +63,19 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if sessionID == "" {
 		writeError(w, http.StatusBadRequest, "bad_request", "missing session parameter")
 		return
+	}
+
+	// Peer-routed attach: the UI carries the session's home peer
+	// in `?peer=` so the Hub knows where to forward the WS.
+	// Self / empty falls through to the local handler. Loop
+	// prevention: an inbound WS already stamped RolePeer (i.e.
+	// arrived via Tailnet identity from another peer) MUST NOT
+	// re-proxy.
+	if pid := r.URL.Query().Get("peer"); pid != "" && s.peerID != nil && pid != s.peerID.DeviceID {
+		if !isPeerWS(r) {
+			s.proxySessionWebSocket(w, r, sessionID, pid)
+			return
+		}
 	}
 
 	sess, ok := s.sessions.Get(sessionID)
@@ -280,3 +297,104 @@ func writeJSON(ctx context.Context, conn *websocket.Conn, v any) error {
 	return conn.Write(ctx, websocket.MessageText, data)
 }
 
+// isPeerWS reports whether the inbound WS upgrade carries a
+// pre-stamped RolePeer principal, so the proxy router doesn't
+// re-proxy an inter-peer request and create an unbounded chain.
+//
+// The legacy X-Kojo-Peer-Sig header check is retired: signing is
+// gone, and the listener that admits inter-peer WS upgrades
+// (ServeAuthTsnet) runs TailnetIdentityMiddleware ahead of
+// AuthMiddleware so a paired peer always reaches this point with
+// p.IsPeer() == true. Note that --unsafe stamps RoleOwner instead
+// of RolePeer, so an unsafe-mode caller is NOT recognised here —
+// the loop-prevention guarantee is conditional on the operator
+// running paired peers over tsnet; in --unsafe LAN/CI mode the
+// boundary is the listener itself, not this check.
+func isPeerWS(r *http.Request) bool {
+	return auth.FromContext(r.Context()).IsPeer()
+}
+
+// proxySessionWebSocket dials the target peer's
+// `/api/v1/ws?session=<id>` over tsnet (target's ServeAuthTsnet
+// stamps RolePeer from the WhoIs-resolved peer_registry row, so no
+// Authorization header is required) and pipes frames between the
+// inbound (UI) and outbound (peer) sockets until either side
+// closes. Mirrors proxyAgentWebSocket — same Tailnet identity
+// trust model.
+func (s *Server) proxySessionWebSocket(w http.ResponseWriter, r *http.Request, sessionID, targetDeviceID string) {
+	if s.agents == nil || s.agents.Store() == nil || s.peerID == nil {
+		writeError(w, http.StatusServiceUnavailable, "unavailable",
+			"peer routing not available on this host")
+		return
+	}
+	targetRec, err := s.agents.Store().GetPeer(r.Context(), targetDeviceID)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway",
+			"target peer not in registry: "+err.Error())
+		return
+	}
+	addr, err := peer.NormalizeAddress(targetRec.URL)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway",
+			"target peer has no usable dial address: "+err.Error())
+		return
+	}
+	targetURL, err := url.Parse(addr)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway",
+			"target address unparseable: "+err.Error())
+		return
+	}
+	switch targetURL.Scheme {
+	case "http":
+		targetURL.Scheme = "ws"
+	case "https":
+		targetURL.Scheme = "wss"
+	default:
+		writeError(w, http.StatusBadGateway, "bad_gateway",
+			"target scheme not http(s): "+targetURL.Scheme)
+		return
+	}
+	targetURL.Path = "/api/v1/ws"
+	q := targetURL.Query()
+	q.Set("session", sessionID)
+	targetURL.RawQuery = q.Encode()
+
+	upgrade, err := http.NewRequestWithContext(r.Context(),
+		http.MethodGet, targetURL.String(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+
+	targetConn, _, err := websocket.Dial(r.Context(), targetURL.String(),
+		&websocket.DialOptions{
+			HTTPHeader: upgrade.Header,
+			HTTPClient: peer.NoKeepAliveHTTPClient(10 * time.Second),
+		})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway",
+			"connect to peer: "+err.Error())
+		return
+	}
+	defer targetConn.CloseNow()
+
+	clientConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		OriginPatterns: wsOriginPatterns,
+	})
+	if err != nil {
+		s.logger.Error("session ws proxy: accept inbound failed", "session", sessionID, "err", err)
+		return
+	}
+	defer clientConn.CloseNow()
+	clientConn.SetReadLimit(256 * 1024)
+	targetConn.SetReadLimit(256 * 1024)
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); defer cancel(); copyWS(ctx, clientConn, targetConn) }()
+	go func() { defer wg.Done(); defer cancel(); copyWS(ctx, targetConn, clientConn) }()
+	wg.Wait()
+}

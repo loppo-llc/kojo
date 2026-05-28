@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/loppo-llc/kojo/internal/agent"
@@ -181,4 +182,30 @@ func (s *Server) handleRawAgentFile(w http.ResponseWriter, r *http.Request) {
 		}))
 	}
 	s.files.ServeRaw(w, r, abs)
+}
+
+// handleThumbAgentFile serves a JPEG thumbnail for an agent-scoped image.
+// Resolution + access control match handleRawAgentFile; the thumbnail
+// itself comes from Browser.ServeThumb, which re-validates the absolute
+// path under the allowed roots (so this is defence-in-depth, not the
+// primary check).
+func (s *Server) handleThumbAgentFile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	rel := r.URL.Query().Get("path")
+	_, abs, err := resolveAgentPath(id, rel)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	info, err := os.Stat(abs)
+	if err != nil || info.IsDir() {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+	size, _ := strconv.Atoi(r.URL.Query().Get("size"))
+	s.files.ServeThumb(w, r, abs, size)
 }

@@ -2,13 +2,11 @@ package agent
 
 import (
 	"fmt"
-	"hash/fnv"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/loppo-llc/kojo/internal/notifysource"
 	"github.com/loppo-llc/kojo/internal/tts"
 )
 
@@ -119,18 +117,6 @@ func IsInSilentHours(start, end string) bool {
 	return nowMinutes >= startMin || nowMinutes < endMin
 }
 
-// allowedIntervals defines the valid intervalMinutes values.
-// Sub-hourly values must divide 60; hourly values must divide 24 (in hours).
-var allowedIntervals = map[int]bool{
-	0: true, 5: true, 10: true, 30: true, 60: true,
-	180: true, 360: true, 720: true, 1440: true,
-}
-
-// ValidInterval returns true if the given interval is in the allowed set.
-func ValidInterval(minutes int) bool {
-	return allowedIntervals[minutes]
-}
-
 // allowedEfforts defines valid effort levels (claude only). Empty string is allowed (= default).
 var allowedEfforts = map[string]bool{
 	"": true, "low": true, "medium": true, "high": true, "xhigh": true, "max": true,
@@ -161,6 +147,10 @@ func NormalizeThinkingMode(mode string) string {
 // xhighModels lists models that support the "xhigh" effort level.
 var xhighModels = map[string]bool{
 	"opus": true, "claude-opus-4-7": true,
+	// grok's --effort flag accepts low/medium/high/xhigh/max for
+	// every model it ships (only grok-build today). Keep this in
+	// sync with web/src/lib/toolModels.ts xhighModels.
+	"grok-build": true,
 }
 
 // ValidModelEffort returns true if the model+effort combination is valid.
@@ -175,6 +165,23 @@ func ValidModelEffort(model, effort string) bool {
 	return true
 }
 
+// MaxCronMessageRunes caps the per-agent cron check-in custom message at
+// 4096 Unicode code points. The limit is in runes (not bytes) so Japanese
+// users can write the same number of characters as ASCII users; the resulting
+// byte size can be up to ~16 KiB worst case for 4-byte runes. The message is
+// re-injected on every cron run so an unbounded value would inflate every
+// prompt and the on-disk agent record.
+const MaxCronMessageRunes = 4096
+
+// validateCronMessage trims surrounding whitespace and rejects values that
+// exceed MaxCronMessageRunes.
+func validateCronMessage(s string) (string, error) {
+	trimmed := strings.TrimSpace(s)
+	if n := len([]rune(trimmed)); n > MaxCronMessageRunes {
+		return "", fmt.Errorf("cronMessage too long: %d runes (max %d)", n, MaxCronMessageRunes)
+	}
+	return trimmed, nil
+}
 
 // allowedTimeouts defines the valid timeoutMinutes values.
 // 0 means "use default" (10 minutes at runtime) for backward compatibility.
@@ -210,15 +217,18 @@ const defaultResumeIdleDuration = 5 * time.Minute
 
 // Agent represents a persistent AI persona (friend).
 type Agent struct {
-	ID              string `json:"id"`
-	Name            string `json:"name"`
-	Persona         string `json:"persona"`           // persona description (markdown)
-	Model           string `json:"model"`             // e.g. "sonnet", "opus"
-	Effort          string `json:"effort,omitempty"`  // claude only: "low", "medium", "high", "xhigh", "max"
-	Tool            string `json:"tool"`              // CLI tool: "claude", "codex", "gemini"
-	WorkDir         string `json:"workDir,omitempty"` // file storage directory (empty = agentDir)
-	IntervalMinutes int    `json:"intervalMinutes"`   // periodic execution interval in minutes (0 = disabled)
-	TimeoutMinutes  int    `json:"timeoutMinutes"`    // max duration per cron run in minutes (0 = default 10)
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Persona string `json:"persona"`           // persona description (markdown)
+	Model   string `json:"model"`             // e.g. "sonnet", "opus"
+	Effort  string `json:"effort,omitempty"`  // claude/grok only: "low", "medium", "high", "xhigh", "max"
+	Tool    string `json:"tool"`              // CLI tool: "claude", "codex", "grok"
+	WorkDir string `json:"workDir,omitempty"` // file storage directory (empty = agentDir)
+	// CronExpr is a 5-field standard cron expression (M H DOM Mon DOW).
+	// Empty = scheduling disabled. Validated via ValidateCronExpr; rejected
+	// expressions never reach this field.
+	CronExpr       string `json:"cronExpr"`
+	TimeoutMinutes int    `json:"timeoutMinutes"` // max duration per cron run in minutes (0 = default 10)
 	// ResumeIdleMinutes is the idle-window threshold (in minutes) below
 	// which kojo keeps an over-token-threshold claude session via --resume
 	// instead of resetting. 0 = use defaultResumeIdleDuration (5 min).
@@ -230,16 +240,24 @@ type Agent struct {
 	// during silent hours. Existing agents default to true (backward compat);
 	// new agents default to false.
 	NotifyDuringSilent *bool `json:"notifyDuringSilent,omitempty"`
-	// CronMessage overrides the trailing instruction in the periodic check-in
-	// prompt. Empty = use the default ("最近の出来事や気づきがあれば memory/...md に記録し、必要なタスクを実行してください。").
-	// The literal string "{date}" is replaced with today's date in YYYY-MM-DD form.
+	// CronMessage is DEPRECATED. The canonical source for the
+	// periodic check-in body is the agent_workspace_files row with
+	// kind="checkin" (mirrored to <agentDir>/checkin.md). Manager.Load
+	// migrates any value still present in legacy settings_json into
+	// the workspace row and clears this field, so post-migration
+	// reads always observe an empty string. The struct field is
+	// retained strictly so settings_json round-trips through
+	// agentToSettings without erroring on the unknown key for rows
+	// written by older binaries.
 	CronMessage string `json:"cronMessage,omitempty"`
 	CreatedAt   string `json:"createdAt"` // RFC3339
 	UpdatedAt   string `json:"updatedAt"` // RFC3339
 
-	// Legacy field — only used during migration from cronExpr-based configs.
-	// Not included in JSON output; consumed by store.Load migration.
-	LegacyCronExpr string `json:"cronExpr,omitempty"`
+	// LegacyIntervalMinutes is a transient field consumed by store.Load to
+	// migrate the old `intervalMinutes` JSON key into CronExpr. Cleared
+	// after normalization. Not written back: omitempty + zero value drops
+	// it from any subsequent serialization.
+	LegacyIntervalMinutes int `json:"intervalMinutes,omitempty"`
 
 	// Legacy fields — consumed by store.Load for activeStart/activeEnd →
 	// silentStart/silentEnd migration. Active hours are inverted to silent
@@ -247,9 +265,39 @@ type Agent struct {
 	LegacyActiveStart string `json:"activeStart,omitempty"`
 	LegacyActiveEnd   string `json:"activeEnd,omitempty"`
 
-	// HasAvatar indicates whether a custom avatar file exists.
+	// HasAvatar indicates whether a custom avatar blob is resolvable
+	// for this agent (kojo://global/agents/<id>/avatar.<ext>; see
+	// internal/agent/avatar.go). Populated by Manager.avatarMeta on
+	// every Load / Get / Update from the blob body's presence on
+	// disk — the value is true whenever the body file exists, even
+	// in the rare case where the blob_refs cache row is stale or
+	// missing (the slice-1 fs-only mode).
 	HasAvatar bool `json:"hasAvatar"`
-	// AvatarHash is derived from the avatar file's modtime for cache busting.
+	// AvatarHash is a cache-bust value the Web UI appends to its
+	// avatar URL (the AgentAvatar component embeds it AS-IS as
+	// ?t=<hash>; no client-side URL-encoding). An opaque cache-bust
+	// token from the API consumer's perspective; re-uploaded images
+	// bust the browser cache without changing the agent id. Two
+	// cases:
+	//
+	//   HasAvatar=true:  bare-hex sha256 of the blob body (the
+	//                    strong "sha256:<hex>" ETag from blob_refs
+	//                    with the prefix trimmed — the bare-hex
+	//                    convention preserves the historical
+	//                    AvatarHash format and keeps the query
+	//                    parameter visually clean). Falls back
+	//                    to a ModTime-derived hex when the
+	//                    blob_refs row hasn't been backfilled
+	//                    (slice-1 path / unit tests).
+	//   HasAvatar=false: agent.UpdatedAt (an RFC3339 timestamp
+	//                    that contains colons — the Web UI embeds
+	//                    those literally in ?t=<value>; colons
+	//                    are permitted in URI query values per
+	//                    RFC 3986 so no escaping is required) —
+	//                    applyAvatarMeta substitutes it so the
+	//                    URL still busts caches across persona /
+	//                    settings edits that re-render the SVG
+	//                    fallback.
 	AvatarHash string `json:"avatarHash,omitempty"`
 
 	// PublicProfile is a short outward-facing description generated from persona.
@@ -275,9 +323,6 @@ type Agent struct {
 	// ThinkingMode controls reasoning/thinking for llama.cpp backend.
 	// "on" = enable, "off" = disable, "" = server default.
 	ThinkingMode string `json:"thinkingMode,omitempty"`
-
-	// NotifySources holds notification source configurations for this agent.
-	NotifySources []notifysource.Config `json:"notifySources,omitempty"`
 
 	// SlackBot holds the Slack Socket Mode bot configuration for this agent.
 	SlackBot *SlackBotConfig `json:"slackBot,omitempty"`
@@ -309,6 +354,37 @@ type Agent struct {
 	// the API strips this field from PATCH bodies and exposes a dedicated
 	// POST /api/v1/agents/{id}/privilege handler instead.
 	Privileged bool `json:"privileged,omitempty"`
+
+	// DeviceSwitchEnabled gates whether the §3.7 device-switch skill
+	// (kojo-switch-device) gets installed into the agent's .claude/skills
+	// directory. Nil = use the default (true) — agents created before
+	// the field landed default to enabled. Operator may disable per-
+	// agent via PATCH; the skill file is removed on the next chat
+	// prepare. The toggle is checked alongside peer count: a single-
+	// node install (no other peers registered) suppresses the skill
+	// regardless of this flag because there's nothing to switch to.
+	DeviceSwitchEnabled *bool `json:"deviceSwitchEnabled,omitempty"`
+
+	// HolderPeer is set only for agents that live on a remote peer
+	// (i.e. the agent's agent_locks.holder_peer != local peer). The
+	// Manager.List path populates this for agents whose runtime was
+	// released via §3.7 device-switch; the field is empty for
+	// locally-managed agents. The UI uses it to show a "remote"
+	// indicator and route chat traffic through the WS proxy.
+	HolderPeer string `json:"holderPeer,omitempty"`
+	// HolderPeerName is the human-friendly name of HolderPeer,
+	// resolved from peer_registry at list time so the dashboard
+	// doesn't have to do its own lookup. Empty when HolderPeer is
+	// empty or the registry has no row for the holder (a race
+	// against decommission, or a freshly switched-to peer that
+	// hasn't broadcast its registration yet).
+	HolderPeerName string `json:"holderPeerName,omitempty"`
+	// HolderPeerStatus mirrors peer_registry.status for HolderPeer at
+	// list/read time so the UI can grey out chat (and surface an
+	// "offline" banner) without a second round-trip to /api/v1/peers.
+	// One of "online" / "offline" / "degraded". Empty when HolderPeer
+	// is empty or the registry has no row for the holder.
+	HolderPeerStatus string `json:"holderPeerStatus,omitempty"`
 }
 
 // ShouldNotifyDuringSilent returns whether the agent should receive DM
@@ -319,6 +395,18 @@ func (a *Agent) ShouldNotifyDuringSilent() bool {
 		return true // backward compat
 	}
 	return *a.NotifyDuringSilent
+}
+
+// IsDeviceSwitchEnabled reports whether the §3.7 device-switch skill
+// should be installed for this agent. Nil pointer = default true so
+// agents predating the field, and operators who never touched the
+// toggle, get the skill auto-installed. A peer count of zero (single-
+// node install) still suppresses the file — see SyncDeviceSwitchSkill.
+func (a *Agent) IsDeviceSwitchEnabled() bool {
+	if a == nil || a.DeviceSwitchEnabled == nil {
+		return true
+	}
+	return *a.DeviceSwitchEnabled
 }
 
 // ResumeIdleDuration returns the configured idle window for keeping an
@@ -351,22 +439,37 @@ type DirectoryEntry struct {
 
 // AgentConfig is the request body for creating an agent.
 type AgentConfig struct {
-	Name            string `json:"name"`
-	Persona         string `json:"persona"`
-	Model           string `json:"model"`
-	Effort          string `json:"effort"`
-	Tool            string `json:"tool"`
-	CustomBaseURL   string `json:"customBaseURL"`
-	ThinkingMode    string `json:"thinkingMode"`
-	WorkDir         string `json:"workDir"`
-	IntervalMinutes *int   `json:"intervalMinutes"` // nil = use default (30)
-	TimeoutMinutes  *int   `json:"timeoutMinutes"`  // nil = use default (0 = 10 min)
+	Name          string `json:"name"`
+	Persona       string `json:"persona"`
+	Model         string `json:"model"`
+	Effort        string `json:"effort"`
+	Tool          string `json:"tool"`
+	CustomBaseURL string `json:"customBaseURL"`
+	ThinkingMode  string `json:"thinkingMode"`
+	WorkDir       string `json:"workDir"`
+	// CronExpr is the 5-field cron expression for periodic check-ins.
+	// nil    = use default ("*/30 * * * *" with per-agent offset).
+	// ""     = scheduling explicitly disabled.
+	// other  = validated via ValidateCronExpr.
+	CronExpr *string `json:"cronExpr"`
+	// LegacyIntervalMinutes catches old clients still posting the pre-CronExpr
+	// `intervalMinutes` field so we can reject the request with a clear error
+	// instead of silently dropping the value (Go's default Unmarshal behaviour
+	// for unknown fields). Validated in newAgent / Manager.Update.
+	LegacyIntervalMinutes *int `json:"intervalMinutes,omitempty"`
+	TimeoutMinutes        *int `json:"timeoutMinutes"` // nil = use default (0 = 10 min)
 	// ResumeIdleMinutes overrides the per-agent claude --resume idle window.
 	// nil/0 = use defaultResumeIdleDuration (5 min).
-	ResumeIdleMinutes *int    `json:"resumeIdleMinutes"`
+	ResumeIdleMinutes  *int    `json:"resumeIdleMinutes"`
 	SilentStart        *string `json:"silentStart"`        // HH:MM or empty
 	SilentEnd          *string `json:"silentEnd"`          // HH:MM or empty
-	NotifyDuringSilent *bool `json:"notifyDuringSilent"` // nil = use default (false for new)
+	NotifyDuringSilent *bool   `json:"notifyDuringSilent"` // nil = use default (false for new)
+	CronMessage        *string `json:"cronMessage"`        // nil/empty = use default trailing instruction
+	// DeviceSwitchEnabled gates the kojo-switch-device skill. nil =
+	// default (true). Persisted into Agent.DeviceSwitchEnabled with
+	// no normalization so the "default" semantic survives schema
+	// evolution.
+	DeviceSwitchEnabled *bool `json:"deviceSwitchEnabled"`
 }
 
 // AgentUpdateConfig is the request body for PATCH updates.
@@ -380,13 +483,20 @@ type AgentUpdateConfig struct {
 	Effort                *string `json:"effort"`
 	Tool                  *string `json:"tool"`
 	WorkDir               *string `json:"workDir"`
-	IntervalMinutes       *int    `json:"intervalMinutes"`
+	CronExpr              *string `json:"cronExpr"`
+	// LegacyIntervalMinutes mirrors the AgentConfig field — catches old clients
+	// still PATCH-ing intervalMinutes so we can reject with a clear error.
+	LegacyIntervalMinutes *int    `json:"intervalMinutes,omitempty"`
 	TimeoutMinutes        *int    `json:"timeoutMinutes"`
 	ResumeIdleMinutes     *int    `json:"resumeIdleMinutes"`
-	SilentStart        *string `json:"silentStart"`
-	SilentEnd          *string `json:"silentEnd"`
-	NotifyDuringSilent *bool   `json:"notifyDuringSilent"`
-	CustomBaseURL      *string `json:"customBaseURL"`
+	SilentStart           *string `json:"silentStart"`
+	SilentEnd             *string `json:"silentEnd"`
+	NotifyDuringSilent    *bool   `json:"notifyDuringSilent"`
+	// CronMessage follows the standard *string PATCH convention used by every
+	// other field on this struct: nil/omitted = leave unchanged, "" = clear
+	// back to the built-in default trailing instruction.
+	CronMessage         *string   `json:"cronMessage"`
+	CustomBaseURL       *string   `json:"customBaseURL"`
 	ThinkingMode        *string   `json:"thinkingMode"`
 	AllowedTools        []string  `json:"allowedTools"`
 	AllowProtectedPaths *[]string `json:"allowProtectedPaths"`
@@ -394,6 +504,11 @@ type AgentUpdateConfig struct {
 	// {enabled:false} to keep the field but disable synthesis; pass a
 	// fully-populated struct to enable.
 	TTS *TTSConfig `json:"tts,omitempty"`
+	// DeviceSwitchEnabled toggles the kojo-switch-device skill. nil
+	// in the body = "not provided; leave as-is"; explicit true/false
+	// overwrites the agent's flag. The next prepareChat / skill sync
+	// installs or removes the SKILL.md accordingly.
+	DeviceSwitchEnabled *bool `json:"deviceSwitchEnabled"`
 }
 
 func generateID() string {
@@ -401,14 +516,32 @@ func generateID() string {
 }
 
 func newAgent(cfg AgentConfig) (*Agent, error) {
+	// Reject pre-CronExpr clients up front so a stale mobile build doesn't
+	// silently land an agent with the default schedule when it intended to
+	// pick a specific interval.
+	if cfg.LegacyIntervalMinutes != nil {
+		return nil, fmt.Errorf("%w: intervalMinutes is no longer supported; use cronExpr",
+			ErrInvalidCronExpr)
+	}
 	now := time.Now().Format(time.RFC3339)
-	interval := 30 // default
-	if cfg.IntervalMinutes != nil {
-		interval = *cfg.IntervalMinutes
+	id := generateID()
+
+	// Resolve cron expression. nil = pick the legacy 30-minute default with
+	// the deterministic per-agent offset; "" = scheduling disabled; else
+	// validate, then expand any "@preset:N" sentinel into a real cron
+	// expression with the per-agent offset baked in (so a 3h preset doesn't
+	// fire every agent at :00).
+	var cronExpr string
+	if cfg.CronExpr == nil {
+		cronExpr = intervalToCronExpr(30, id)
+	} else {
+		cronExpr = *cfg.CronExpr
+		if err := ValidateCronExpr(cronExpr); err != nil {
+			return nil, err
+		}
+		cronExpr = ResolveCronPreset(cronExpr, id)
 	}
-	if !ValidInterval(interval) {
-		return nil, fmt.Errorf("unsupported interval: %d minutes", interval)
-	}
+
 	timeoutMin := 0 // default (= 10 min at runtime)
 	if cfg.TimeoutMinutes != nil {
 		timeoutMin = *cfg.TimeoutMinutes
@@ -438,6 +571,14 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		f := false
 		notifyDuringSilent = &f
 	}
+	var cronMessage string
+	if cfg.CronMessage != nil {
+		v, err := validateCronMessage(*cfg.CronMessage)
+		if err != nil {
+			return nil, err
+		}
+		cronMessage = v
+	}
 	if err := ValidSilentHours(silentStart, silentEnd); err != nil {
 		return nil, err
 	}
@@ -454,28 +595,41 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		if !filepath.IsAbs(cfg.WorkDir) {
 			return nil, fmt.Errorf("workDir must be an absolute path: %s", cfg.WorkDir)
 		}
+		// Self-heal the portable default workspace path (§3.7
+		// device-switch target) so a fresh agent created against
+		// that path doesn't 400 on the os.Stat below. No-op for
+		// any other workDir.
+		if merr := EnsureAgentWorkspaceDirIfDefault(cfg.WorkDir, id); merr != nil {
+			return nil, fmt.Errorf("create agent workspace dir: %w", merr)
+		}
 		if info, err := os.Stat(cfg.WorkDir); err != nil || !info.IsDir() {
 			return nil, fmt.Errorf("workDir does not exist or is not a directory: %s", cfg.WorkDir)
 		}
 	}
 	a := &Agent{
-		ID:                generateID(),
-		Name:              cfg.Name,
-		Persona:           cfg.Persona,
-		Model:             cfg.Model,
-		Effort:            cfg.Effort,
-		Tool:              cfg.Tool,
-		CustomBaseURL:     cfg.CustomBaseURL,
-		ThinkingMode:      NormalizeThinkingMode(cfg.ThinkingMode),
-		WorkDir:           cfg.WorkDir,
-		IntervalMinutes:   interval,
-		TimeoutMinutes:    timeoutMin,
-		ResumeIdleMinutes: resumeIdleMin,
+		ID:                 id,
+		Name:               cfg.Name,
+		Persona:            cfg.Persona,
+		Model:              cfg.Model,
+		Effort:             cfg.Effort,
+		Tool:               cfg.Tool,
+		CustomBaseURL:      cfg.CustomBaseURL,
+		ThinkingMode:       NormalizeThinkingMode(cfg.ThinkingMode),
+		WorkDir:            cfg.WorkDir,
+		CronExpr:           cronExpr,
+		TimeoutMinutes:     timeoutMin,
+		ResumeIdleMinutes:  resumeIdleMin,
 		SilentStart:        silentStart,
 		SilentEnd:          silentEnd,
 		NotifyDuringSilent: notifyDuringSilent,
-		CreatedAt:         now,
-		UpdatedAt:         now,
+		CronMessage:        cronMessage,
+		// DeviceSwitchEnabled stays nil here when the caller didn't
+		// provide one — IsDeviceSwitchEnabled() returns true for nil
+		// so a fresh agent gets the skill auto-installed without
+		// stamping a sentinel into the row.
+		DeviceSwitchEnabled: cfg.DeviceSwitchEnabled,
+		CreatedAt:           now,
+		UpdatedAt:           now,
 	}
 	if a.Tool == "" {
 		a.Tool = "claude"
@@ -484,47 +638,6 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		a.Model = "sonnet"
 	}
 	return a, nil
-}
-
-// intervalToCron converts an interval in minutes and an agent ID to a cron
-// expression with a deterministic per-agent offset derived from the ID hash.
-// This spreads agents across time so they don't all fire simultaneously.
-// Only supports values in allowedIntervals. Returns "" if interval <= 0.
-func intervalToCron(intervalMinutes int, agentID string) string {
-	if intervalMinutes <= 0 {
-		return ""
-	}
-
-	// Deterministic offset from agent ID (spread across full day = 1440 min)
-	h := fnv.New32a()
-	h.Write([]byte(agentID))
-	hash := int(h.Sum32())
-
-	if intervalMinutes >= 60 {
-		hours := intervalMinutes / 60
-		minuteOfDay := hash % 1440 // 0..1439
-		minuteOffset := minuteOfDay % 60
-		hourOffset := (minuteOfDay / 60) % hours
-
-		if hours >= 24 {
-			// Once a day
-			return fmt.Sprintf("%d %d * * *", minuteOffset, minuteOfDay/60%24)
-		}
-		// Every N hours at a fixed minute
-		hourList := make([]string, 0, 24/hours)
-		for hr := hourOffset; hr < 24; hr += hours {
-			hourList = append(hourList, fmt.Sprintf("%d", hr))
-		}
-		return fmt.Sprintf("%d %s * * *", minuteOffset, strings.Join(hourList, ","))
-	}
-
-	// Sub-hourly (5, 10, 30 — all divide 60 evenly)
-	offset := hash % intervalMinutes
-	mins := make([]string, 0, 60/intervalMinutes)
-	for m := offset; m < 60; m += intervalMinutes {
-		mins = append(mins, fmt.Sprintf("%d", m))
-	}
-	return fmt.Sprintf("%s * * * *", strings.Join(mins, ","))
 }
 
 // normalizeTimestamp converts any RFC3339 timestamp to local time.

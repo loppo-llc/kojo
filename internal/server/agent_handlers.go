@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,13 +9,29 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/auth"
+	"github.com/loppo-llc/kojo/internal/peer"
+	"github.com/loppo-llc/kojo/internal/store"
 )
+
+// agentKnown returns true when the agent exists either in the local
+// in-memory manager (runtime is here) or in the store only (runtime
+// released to a remote peer via §3.7 device-switch). Read-only
+// endpoints use this instead of a bare s.agents.Get(id) so data
+// (messages, memory, credentials) is still accessible after a switch.
+func (s *Server) agentKnown(id string) bool {
+	if _, ok := s.agents.Get(id); ok {
+		return true
+	}
+	return s.agents.GetRemote(id) != nil
+}
 
 // directoryView returns a public, agent-safe view of an Agent. Used by
 // list/get handlers when the caller is not the Owner and not the agent
@@ -49,18 +66,276 @@ func toDirectoryView(a *agent.Agent) directoryView {
 type agentResponse struct {
 	*agent.Agent
 	NextCronAt string `json:"nextCronAt,omitempty"`
+	// CronPausedGlobal mirrors Manager.CronPaused at response build
+	// time so the UI can render "(paused)" next to nextCronAt when the
+	// Dashboard's global cron toggle is off. NextCronRun deliberately
+	// no longer zeroes on global pause (it would just show "—" on
+	// every agent's settings page); the indicator carries the "this
+	// time is configured but not currently firing" signal instead.
+	CronPausedGlobal bool `json:"cronPausedGlobal,omitempty"`
+	// ETag is the strong HTTP entity tag of the v1 store row backing
+	// this agent. Surfaced inside the JSON (in addition to the HTTP
+	// header) so a client can hold the etag in form state alongside
+	// the other agent fields and pass it back via If-Match without
+	// relying on a separate response-header capture path.
+	//
+	// Empty when the v1 store has no row yet (legacy paths, in-flight
+	// create). Same shape as handleGetAgent's ETag header.
+	ETag string `json:"etag,omitempty"`
+	// IsSwitching is true while a §3.7 device-switch is mid-flight
+	// on this peer (Manager.SetSwitching(true) → false). Surfaced
+	// so the UI can render a "デバイス転移中" banner and disable
+	// mutating controls (credentials / persona / settings edits)
+	// that would 409 with agent_busy: device switch in progress.
+	// Runtime-only — never persisted, never accepted on PATCH.
+	IsSwitching bool `json:"isSwitching,omitempty"`
 }
 
-// buildAgentResponse decorates an *agent.Agent with derived runtime state
-// (next cron run, etc.) for API responses.
-func (s *Server) buildAgentResponse(a *agent.Agent) agentResponse {
-	resp := agentResponse{Agent: a}
-	if a != nil {
-		if t := s.agents.NextCronRun(a.ID); !t.IsZero() {
-			resp.NextCronAt = t.Format(time.RFC3339)
+// agentRuntimeSnapshot bundles the runtime-derived fields that feed
+// BOTH the HTTP ETag composite (displayETag) AND the JSON body's
+// nextCronAt / cronPausedGlobal / etag. Captured ONCE per request so
+// the composite and the body observe a consistent view — see the
+// extended comment on displayETag for why mixing fresh and stale
+// reads here resurrects the stale-nextCronAt cache bug fixed by this
+// type's introduction.
+type agentRuntimeSnapshot struct {
+	rowETag    string
+	nextCron   time.Time
+	cronPaused bool
+}
+
+// snapshotAgent gathers the (etag, nextCronRun, cronPaused) tuple a
+// GET / PATCH response needs. The three reads are independent and
+// individually atomic; a cron tick landing between them is benign
+// because the composite displayETag commits to whatever NextCronRun
+// returned here. A request observing T1 in both the header and body
+// is internally consistent; the next request will see T2 and bust
+// the cache via a changed composite.
+func (s *Server) snapshotAgent(r *http.Request, agentID string) agentRuntimeSnapshot {
+	return agentRuntimeSnapshot{
+		rowETag:    s.readAgentETag(r, agentID),
+		nextCron:   s.agents.NextCronRun(agentID),
+		cronPaused: s.agents.CronPaused(),
+	}
+}
+
+// stripAgentDisplayETagSuffix removes the GET-only composite suffixes
+// that displayETag appends ("." + "p" for cron-paused, ".n" + base36
+// for nextCronAt) so an If-Match value that came from copying the
+// HTTP ETag header still matches the bare row etag stored in the v1
+// table. Anything that doesn't fit the displayETag grammar (".p" or
+// ".n[0-9a-z]+", with the two possibly concatenated in that order)
+// is left intact — over-eager stripping would silently relax
+// optimistic concurrency on a malformed etag.
+//
+// "*" is preserved unchanged so the wildcard precondition path is
+// untouched (the caller checks "ifMatch == \"*\"" separately).
+func stripAgentDisplayETagSuffix(et string) string {
+	if et == "*" {
+		return et
+	}
+	// .n<base36> always comes last in the composite (see displayETag).
+	if i := strings.LastIndex(et, ".n"); i >= 0 {
+		rest := et[i+2:]
+		if rest != "" && isBase36Lower(rest) {
+			et = et[:i]
 		}
 	}
+	if strings.HasSuffix(et, ".p") {
+		et = et[:len(et)-2]
+	}
+	return et
+}
+
+// isBase36Lower reports whether s consists entirely of 0-9a-z. Matches
+// strconv.FormatInt(_, 36) output for non-negative inputs, which is
+// what displayETag emits.
+func isBase36Lower(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'z') {
+			return false
+		}
+	}
+	return true
+}
+
+// displayETag is the HTTP ETag header composite. It builds on the
+// row etag and folds in the runtime fields that change WITHOUT
+// bumping the row — cronPausedGlobal (Dashboard toggle, kv-row
+// write) and nextCronAt (advances on every cron fire, not a write
+// at all).
+//
+// Why the suffix matters: a 304 fast path short-circuits the
+// response body. If the composite only tracked the row etag, the
+// server would happily 304 a stale cached body whose nextCronAt
+// was from before the most recent cron fire — the Settings page
+// would show "(Xm ago)" and never refresh, even with the
+// client-side refetch effect, because the conditional GET reuses
+// the browser's cached body verbatim. Including nextCron's unix
+// timestamp in the composite forces a 200-with-fresh-body the
+// moment cron advances. The CronPaused flag has the same problem
+// (toggling pause writes a kv row, not the agents row) and gets
+// the same suffix treatment.
+//
+// Returns "" when there is no row etag (in-memory-only paths,
+// remote-held agents); callers MUST treat empty as "skip the
+// ETag header / 304 fast path entirely" because an etag composed
+// purely of runtime fields would let a client cache against a
+// non-row identity and miss row mutations.
+func (snap agentRuntimeSnapshot) displayETag() string {
+	if snap.rowETag == "" {
+		return ""
+	}
+	et := snap.rowETag
+	if snap.cronPaused {
+		et += ".p"
+	}
+	if !snap.nextCron.IsZero() {
+		// base36 keeps the suffix short (~7 chars for current-era
+		// unix seconds) and avoids "-" / "+" so the etag stays
+		// inside the strong-etag character set quoteETag emits.
+		et += ".n" + strconv.FormatInt(snap.nextCron.Unix(), 36)
+	}
+	return et
+}
+
+// buildAgentResponse decorates an *agent.Agent with derived runtime
+// state (next cron run, etag) for API responses.
+//
+// The caller passes a snapshot so the body and the HTTP ETag
+// composite agree on the same (etag, nextCron, cronPaused) tuple.
+// Computing nextCron / cronPaused independently here would race
+// against any write or cron tick landing between the two reads (most
+// observably on GET, which holds no per-agent lock) and surface a
+// body that disagreed with the header that just got cached — the
+// shape of the stale-nextCronAt bug this snapshot pattern fixes.
+//
+// Pass a zero snapshot when the row has no etag yet (in-memory-only
+// paths) or when the endpoint deliberately does not surface one
+// (list view, directory view).
+func (s *Server) buildAgentResponse(a *agent.Agent, snap agentRuntimeSnapshot) agentResponse {
+	resp := agentResponse{Agent: a, ETag: snap.rowETag}
+	if a == nil {
+		return resp
+	}
+	if !snap.nextCron.IsZero() {
+		resp.NextCronAt = snap.nextCron.Format(time.RFC3339)
+	}
+	resp.CronPausedGlobal = snap.cronPaused
+	if s.agents != nil {
+		resp.IsSwitching = s.agents.IsSwitching(a.ID)
+	}
 	return resp
+}
+
+// readAgentETag is the canonical "fetch this agent's current etag"
+// helper used by handlers that need the value for both the HTTP
+// header and the JSON body. Best-effort: a missing row, a closed
+// store, or a context error all yield "" so callers can degrade to
+// a no-etag response rather than failing the whole request.
+//
+// Uses a 2-second timeout derived from r.Context() so the read
+// honors request cancellation but cannot dangle forever if the
+// caller's context has no deadline (e.g. a long-poll handler).
+func (s *Server) readAgentETag(r *http.Request, agentID string) string {
+	st := s.agents.Store()
+	if st == nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	rec, err := st.GetAgent(ctx, agentID)
+	if err != nil {
+		return ""
+	}
+	return rec.ETag
+}
+
+// agentIfMatchPrecheck verifies that the v1 store's agent row matches
+// the caller's If-Match precondition. ifMatchPresent=false short-
+// circuits to true (no precondition requested). On mismatch / missing
+// row / store-not-wired-in, writes the appropriate HTTP error and
+// returns false; callers MUST stop processing in that case.
+//
+// `*` is treated per RFC 7232: "any current resource exists" — we
+// still require the row to be present so a stale `*` against a
+// deleted agent doesn't silently succeed.
+//
+// Locking contract:
+//
+//   - PATCH-class callers (handleUpdateAgent, PUT /slackbot, POST
+//     /privilege) MUST hold s.agents.LockPatch(agentID) across this
+//     check and the subsequent mutation. Otherwise two concurrent
+//     PATCHes carrying the same etag could both observe the same
+//     store row, both pass the precheck, and both succeed — the
+//     cardinal sin of optimistic concurrency.
+//
+//   - Lifecycle callers (handleDeleteAgent, handleUnarchiveAgent)
+//     MUST NOT acquire LockPatch externally because Manager.Archive
+//     / Delete / Unarchive take it internally and sync.Mutex is
+//     non-reentrant. For these callers the precheck is best-effort
+//     (a concurrent PATCH between precheck and lifecycle call is
+//     accepted as a small race window), matching the docs §3.5
+//     "v1 移行期は best-effort" stance.
+//
+// Cross-process / cross-device coordination is the store-level
+// optimistic-concurrency layer's job; LockPatch only serializes
+// within one daemon process.
+//
+// The store read uses the request's bare context (no extra timeout)
+// to mirror the original inline check inside handleUpdateAgent —
+// callers needing a deadline should set one on the request before
+// dispatch.
+func (s *Server) agentIfMatchPrecheck(w http.ResponseWriter, r *http.Request, agentID, ifMatch string, ifMatchPresent bool) bool {
+	if !ifMatchPresent {
+		// Honour the docs §3.5 transition flag: callers that opt out
+		// of the precondition get 428 when the operator has
+		// promoted strict-mode. Off by default — the legacy code
+		// path returns true unchanged. The strict gate here is
+		// If-Match-only; the agents endpoints don't honour
+		// If-None-Match: * because their store layer has no
+		// create-only CAS path. The opt-in variant
+		// enforceCreateOrUpdatePrecondition is reserved for kv PUT.
+		if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+			return false
+		}
+		return true
+	}
+	st := s.agents.Store()
+	if st == nil {
+		// No store wired in (test harness without a DB) — refuse
+		// rather than silently ignore. The client asked for
+		// optimistic concurrency; we cannot honor it, so this MUST
+		// be an error rather than a quiet pass-through.
+		writeError(w, http.StatusPreconditionFailed, "precondition_failed",
+			"If-Match unsupported on this server")
+		return false
+	}
+	rec, err := st.GetAgent(r.Context(), agentID)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusPreconditionFailed, "precondition_failed",
+			"If-Match: agent not in store")
+		return false
+	case err != nil:
+		// DB hiccup, ctx canceled, etc. Don't pretend it's a
+		// precondition failure — that lies to the client.
+		writeError(w, http.StatusInternalServerError, "internal_error",
+			"If-Match: store read failed")
+		return false
+	}
+	// Strip the GET-only composite suffixes (".p" for cron-paused,
+	// ".n<base36>" for nextCronAt — see displayETag) so a client
+	// that copied the HTTP ETag header into If-Match still matches
+	// the underlying row.
+	candidate := stripAgentDisplayETagSuffix(ifMatch)
+	if ifMatch != "*" && rec.ETag != candidate {
+		writeError(w, http.StatusPreconditionFailed, "precondition_failed",
+			"If-Match: etag mismatch")
+		return false
+	}
+	return true
 }
 
 // --- Cron Pause ---
@@ -69,6 +344,15 @@ func (s *Server) handleGetCronPaused(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, map[string]any{"paused": s.agents.CronPaused()})
 }
 
+// handleSetCronPaused flips the global cron-paused flag stored in kv
+// under (namespace="scheduler", key="paused", scope=global).
+// Intentionally If-Match-free per design §3.5: the resource is a
+// singleton boolean owned by the Owner, the only "edit" is "flip
+// on/off", and there is no useful value in a 412 — a stale client
+// just sees the flag's current value on the next GET. Adding
+// optimistic concurrency here would make the UI's "Pause cron"
+// button surface PreconditionFailed errors that the user cannot
+// meaningfully act on.
 func (s *Server) handleSetCronPaused(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Paused bool `json:"paused"`
@@ -77,7 +361,15 @@ func (s *Server) handleSetCronPaused(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
-	s.agents.SetCronPaused(body.Paused)
+	if err := s.agents.SetCronPaused(body.Paused); err != nil {
+		// Persist failure — refuse to acknowledge. Otherwise the
+		// UI would show "paused" while the kv row stays at its
+		// previous value, and a daemon restart would silently
+		// resurrect the old state.
+		s.logger.Error("set cron paused failed", "paused", body.Paused, "err", err)
+		writeError(w, http.StatusInternalServerError, "store_error", "failed to persist cron pause state")
+		return
+	}
 	writeJSONResponse(w, http.StatusOK, map[string]any{"paused": body.Paused})
 }
 
@@ -113,6 +405,25 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 
 	p := auth.FromContext(r.Context())
 	all := s.agents.List()
+	// Append agents whose runtime lives on a remote peer (§3.7
+	// device-switch released them from the local manager). They
+	// still exist in the store and should appear in the list so
+	// the UI can show them with a "remote" indicator / route chat
+	// through the WS proxy. Dedup by ID: a TOCTOU race between
+	// the in-memory snapshot and the store query could surface the
+	// same agent in both sets if a concurrent Create/sync lands
+	// between the two reads.
+	if remote := s.agents.ListRemote(); len(remote) > 0 {
+		seen := make(map[string]struct{}, len(all))
+		for _, a := range all {
+			seen[a.ID] = struct{}{}
+		}
+		for _, a := range remote {
+			if _, dup := seen[a.ID]; !dup {
+				all = append(all, a)
+			}
+		}
+	}
 	if p.IsOwner() {
 		out := make([]*agent.Agent, 0, len(all))
 		for _, a := range all {
@@ -124,6 +435,16 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 			}
 			out = append(out, a)
 		}
+		// Best-effort: refresh the remote agents' lastMessage timestamp by
+		// asking each holder peer for its latest message. Without this the
+		// list reflects only what oplog has already replicated to our local
+		// store — during an active handoff that lag puts the agent in a
+		// stale sort position relative to local agents. Bounded total
+		// deadline keeps the list endpoint responsive when peers are slow.
+		// Restrict to the agents we're actually returning so we don't spend
+		// peer-signed HTTP budget enriching rows the caller never sees
+		// (archived filter, etc.).
+		s.enrichRemoteAgentsLatestActivity(r.Context(), out)
 		writeJSONResponse(w, http.StatusOK, map[string]any{"agents": out})
 		return
 	}
@@ -134,6 +455,22 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	// onlyArchived flags are silently ignored at this layer (an
 	// agent's own archived self is also filtered out — they should be
 	// asking the owner to revive them, not poking the API).
+	//
+	// Enrich only the agent's own (full-record) row — a directory view
+	// strips lastMessage/updatedAt anyway, so a peer fetch for those rows
+	// would be wasted budget.
+	var selfEnrich []*agent.Agent
+	for _, a := range all {
+		if a.Archived {
+			continue
+		}
+		if p.IsAgent() && p.AgentID == a.ID {
+			selfEnrich = append(selfEnrich, a)
+		}
+	}
+	if len(selfEnrich) > 0 {
+		s.enrichRemoteAgentsLatestActivity(r.Context(), selfEnrich)
+	}
 	out := make([]any, 0, len(all))
 	for _, a := range all {
 		if a.Archived {
@@ -175,23 +512,86 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	a, ok := s.agents.Get(id)
 	if !ok {
+		// The agent's runtime may live on a remote peer (§3.7
+		// device-switch released it from the local manager).
+		// Fall back to GetRemote so the UI can still inspect the
+		// record and show the remote indicator.
+		if ra := s.agents.GetRemote(id); ra != nil {
+			p := auth.FromContext(r.Context())
+			if p.CanReadFull(id) {
+				// Remote-held agents have no local cron entry, and
+				// surfacing a row etag from the local store would
+				// expose an orphaned row's etag that no PATCH on
+				// this hub can satisfy. Construct an explicit
+				// minimal snapshot — only the global cronPaused
+				// flag carries over. The HTTP ETag header stays
+				// unset because rowETag is "" (see displayETag).
+				writeJSONResponse(w, http.StatusOK,
+					s.buildAgentResponse(ra, agentRuntimeSnapshot{
+						cronPaused: s.agents.CronPaused(),
+					}))
+			} else {
+				writeJSONResponse(w, http.StatusOK, toDirectoryView(ra))
+			}
+			return
+		}
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
 		return
 	}
+	// Best-effort runtime snapshot: row etag, current nextCronRun,
+	// cronPaused. A failure to read the etag (store not configured,
+	// row not yet persisted, transient SQLite hiccup) drops back to
+	// a no-ETag response rather than failing the GET — clients that
+	// don't care about caching keep working, and clients that do
+	// will simply re-request next time without a precondition.
+	//
+	// The snapshot is captured ONCE so the HTTP ETag composite
+	// (displayETag) and the JSON body (buildAgentResponse) agree on
+	// the same nextCron / cronPaused values — see snapshotAgent's
+	// doc for why a fresh read in each path would resurrect the
+	// stale-nextCronAt cache bug.
+	snap := s.snapshotAgent(r, id)
+	if displayETag := snap.displayETag(); displayETag != "" {
+		// PATCH's If-Match precondition is unaffected by the
+		// composite suffix: clients send back the body's `etag`
+		// field (the raw row etag from buildAgentResponse), not
+		// the HTTP header — see agentApi.get's "prefer body etag"
+		// branch. agentIfMatchPrecheck only ever sees the row
+		// etag, so the composite layer here is GET-only.
+		w.Header().Set("ETag", quoteETag(displayETag))
+		if cached, ok := extractDomainIfNoneMatch(r); ok && (cached == "*" || cached == displayETag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
 	p := auth.FromContext(r.Context())
 	if p.CanReadFull(id) {
-		writeJSONResponse(w, http.StatusOK, s.buildAgentResponse(a))
+		// Pass the same snapshot into the body builder so header
+		// and body agree even if a write lands later in this request.
+		writeJSONResponse(w, http.StatusOK, s.buildAgentResponse(a, snap))
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, toDirectoryView(a))
 }
-
 
 func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	p := auth.FromContext(r.Context())
 	if !p.CanMutateSelf(id) {
 		writeError(w, http.StatusForbidden, "forbidden", "agents may only PATCH themselves")
+		return
+	}
+	// Optimistic concurrency: parse If-Match before any side-effects so a
+	// malformed precondition (weak etag, comma-list, missing quotes) is
+	// rejected before we read the body or run validations. `*` is treated
+	// as "any current resource exists" per RFC 7232 §3.1; explicit etags
+	// are checked against the v1 store row below.
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
 		return
 	}
 	// Defensive: refuse a payload that smuggles a "privileged" field
@@ -219,16 +619,55 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
+	// Per-agent serialization across precheck → Update → ETag echo.
+	// Without this, two concurrent PATCHes carrying the same If-Match
+	// would both observe the same store etag, both pass the precheck,
+	// and both succeed — the cardinal sin of optimistic concurrency.
+	// Manager.LockPatch is held only within this single daemon process;
+	// cross-process coordination is the store layer's job (a future
+	// slice will thread If-Match through Manager.Update →
+	// store.UpdateAgent so the check is atomic with the UPDATE).
+	release := s.agents.LockPatch(id)
+	defer release()
+
+	// If-Match precondition: when the client supplied a strong etag,
+	// verify it against the current v1 store row before mutating.
+	// Missing If-Match falls through without enforcement (the docs note
+	// this slice is best-effort until v1 clients adopt If-Match
+	// universally; see §5.5).
+	if !s.agentIfMatchPrecheck(w, r, id, ifMatch, ifMatchPresent) {
+		return
+	}
 	a, err := s.agents.Update(id, cfg)
 	if err != nil {
-		if errors.Is(err, agent.ErrAgentNotFound) {
+		switch {
+		case errors.Is(err, agent.ErrAgentNotFound):
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
-		} else {
+		case errors.Is(err, agent.ErrAgentBusy):
+			writeError(w, http.StatusConflict, "agent_busy", err.Error())
+		default:
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		}
 		return
 	}
-	writeJSONResponse(w, http.StatusOK, s.buildAgentResponse(a))
+	// Echo the new etag so the client can chain subsequent PATCHes
+	// without an extra GET. The per-agent patch lock above guarantees
+	// no other PATCH for this id can land between Update and this
+	// snapshot, so the etag returned is the one our Update produced.
+	// We snapshot once and use the same view for both the HTTP header
+	// AND the JSON body — see snapshotAgent / buildAgentResponse for
+	// why two independent reads in the body builder would race.
+	snap := s.snapshotAgent(r, id)
+	if displayETag := snap.displayETag(); displayETag != "" {
+		// Mirror handleGetAgent's composite ETag (row etag +
+		// nextCron + cronPaused suffixes) so a follow-up GET's
+		// If-None-Match correctly matches this PATCH response's
+		// header. The body's `etag` field stays the raw row etag
+		// (used for If-Match precondition); only the HTTP header
+		// includes the runtime-field suffix.
+		w.Header().Set("ETag", quoteETag(displayETag))
+	}
+	writeJSONResponse(w, http.StatusOK, s.buildAgentResponse(a, snap))
 }
 
 // handleCheckin fires a manual check-in for the agent. The check-in runs
@@ -256,59 +695,6 @@ func (s *Server) handleCheckin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSONResponse(w, http.StatusAccepted, map[string]bool{"ok": true})
-}
-
-// handleGetCheckinFile returns the checkin.md content for an agent.
-// Returns DefaultCheckinContent if the file doesn't exist.
-func (s *Server) handleGetCheckinFile(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if _, ok := s.agents.Get(id); !ok {
-		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
-		return
-	}
-	p := auth.FromContext(r.Context())
-	if !p.CanReadFull(id) {
-		writeError(w, http.StatusForbidden, "forbidden", "not allowed to read this agent's check-in file")
-		return
-	}
-	content, isDefault, err := agent.ReadCheckinFileOrDefault(id)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "failed to read checkin.md")
-		return
-	}
-	writeJSONResponse(w, http.StatusOK, map[string]any{"content": content, "isDefault": isDefault})
-}
-
-// handlePutCheckinFile writes checkin.md content for an agent.
-func (s *Server) handlePutCheckinFile(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if _, ok := s.agents.Get(id); !ok {
-		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
-		return
-	}
-	p := auth.FromContext(r.Context())
-	if !p.CanMutateSelf(id) {
-		writeError(w, http.StatusForbidden, "forbidden", "agents may only PUT their own check-in file")
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	var body struct {
-		Content string `json:"content"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
-		return
-	}
-	if err := agent.WriteCheckinFile(id, body.Content); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "failed to write checkin.md")
-		return
-	}
-	content, isDefault, err := agent.ReadCheckinFileOrDefault(id)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "failed to read checkin.md after write")
-		return
-	}
-	writeJSONResponse(w, http.StatusOK, map[string]any{"content": content, "isDefault": isDefault})
 }
 
 func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
@@ -346,10 +732,13 @@ func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleTruncateAgentMemory removes everything in the agent's memory
-// recorded at-or-after the given instant: kojo transcript records, Claude
-// session JSONL records (with trailing-turn trim), and daily diary bullets
-// in memory/YYYY-MM-DD.md. Settings, persona, MEMORY.md, project / people /
-// topic notes, archive, credentials and tasks are untouched.
+// recorded at-or-after the given instant: kojo transcript records (DB-
+// tombstoned via Store.TruncateMessagesFromCreatedAt), Claude session
+// JSONL records (with trailing-turn trim), and daily diary bullets in
+// memory/YYYY-MM-DD.md (with the matching memory_entries row updated or
+// soft-deleted in the same lock window). Settings, persona, MEMORY.md,
+// project / people / topic notes, archive, credentials and tasks are
+// untouched.
 //
 // Two ways to specify the threshold (request body):
 //   - {"since": "2026-05-09T12:00:00+09:00"}     — absolute RFC3339
@@ -406,6 +795,12 @@ func (s *Server) handleTruncateAgentMemory(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
 		case errors.Is(err, agent.ErrMessageNotFound):
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		case errors.Is(err, agent.ErrMessageETagMismatch):
+			// fromMessageId pivot got mutated under us by a regenerate /
+			// edit while we were preparing the truncate. Surface as 409
+			// (concurrent conflict) so the client retries with a refreshed
+			// pivot — 500 would imply a server bug.
+			writeError(w, http.StatusConflict, "conflict", err.Error())
 		case errors.Is(err, agent.ErrAgentBusy), errors.Is(err, agent.ErrAgentResetting):
 			writeError(w, http.StatusConflict, "conflict", err.Error())
 		default:
@@ -456,38 +851,78 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden", "agent is not allowed to delete others")
 		return
 	}
+	// Parse If-Match before any side effect. Both archive and full
+	// delete mutate the agent record so optimistic concurrency
+	// applies. `*` is rejected: DELETE on a missing resource is
+	// already idempotent, and "any current version" carries no
+	// useful semantics over the row-load below.
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
+	if ifMatchPresent && ifMatch == "*" {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"If-Match: * is not supported on DELETE /agents/{id}; send a specific etag or omit the header")
+		return
+	}
+
 	// ?archive=true keeps all on-disk data but stops runtime activity.
 	// Restored later via POST /api/v1/agents/{id}/unarchive.
 	archive := r.URL.Query().Get("archive") == "true"
 
-	// Stop Slack bot before either operation so it doesn't keep running.
+	// Manager.Archive / Manager.Delete take Manager.LockPatch
+	// internally, so we MUST NOT acquire it here — sync.Mutex is
+	// non-reentrant and a double-acquire would self-deadlock the
+	// goroutine. The precheck therefore runs outside the lock; this
+	// is the same best-effort window every Archive/Delete-class
+	// mutation has historically lived with (see docs §3.5
+	// "best-effort 許可" and the inline LockPatch comment in
+	// internal/agent/manager.go).
+	if !s.agentIfMatchPrecheck(w, r, id, ifMatch, ifMatchPresent) {
+		return
+	}
+
+	// Lifecycle mutation runs first so the agent record reaches its
+	// final state (archived / deleted) before we try to teardown the
+	// Slack bot. Reversing the order would race a concurrent PUT
+	// /slackbot: that handler also takes Manager.LockPatch, so it
+	// serializes with our Archive/Delete, but if we StopBot here the
+	// PUT would land between StopBot and Archive, see a.Archived=
+	// false (Archive hasn't run yet), reconfigure the bot, and leave
+	// it running for the about-to-be-archived agent. By archiving
+	// first, any subsequent PUT inside the same lock observes
+	// a.Archived=true and Reconfigure's `!a.Archived` guard skips
+	// StartBot; our StopBot below then catches anything the PUT had
+	// already started.
+	var opErr error
+	if archive {
+		opErr = s.agents.Archive(id)
+	} else {
+		opErr = s.agents.Delete(id)
+	}
+	if opErr != nil {
+		if errors.Is(opErr, agent.ErrAgentNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", opErr.Error())
+		} else if errors.Is(opErr, agent.ErrAgentBusy) {
+			writeError(w, http.StatusConflict, "conflict", opErr.Error())
+		} else {
+			writeError(w, http.StatusInternalServerError, "internal_error", opErr.Error())
+		}
+		return
+	}
 	if s.slackHub != nil {
 		s.slackHub.StopBot(id)
 	}
-
-	var err error
-	if archive {
-		err = s.agents.Archive(id)
-	} else {
-		err = s.agents.Delete(id)
-	}
-	if err != nil {
-		// Roll back the StopBot above on failure: the agent is still active
-		// (Archive/Delete refused), so its Slack bot must be restored to
-		// avoid a silent disconnect.
-		if s.slackHub != nil {
-			if a, ok := s.agents.Get(id); ok && !a.Archived && a.SlackBot != nil && a.SlackBot.Enabled {
-				s.slackHub.StartBot(id, *a.SlackBot)
-			}
-		}
-		if errors.Is(err, agent.ErrAgentNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", err.Error())
-		} else if errors.Is(err, agent.ErrAgentBusy) {
-			writeError(w, http.StatusConflict, "conflict", err.Error())
-		} else {
-			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
-		}
-		return
+	// Echo the new ETag for archive=true (the row still exists with
+	// a bumped etag). For full delete the row is gone — no useful
+	// etag to return. readAgentETag returns "" when the row is
+	// missing, so the same call is safe in both branches.
+	if newETag := s.readAgentETag(r, id); newETag != "" {
+		w.Header().Set("ETag", quoteETag(newETag))
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -500,6 +935,32 @@ func (s *Server) handleUnarchiveAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden", "agent is not allowed to unarchive others")
 		return
 	}
+
+	// If-Match optional, but when present checked against the current
+	// (archived) row. Unarchive mutates the agent record so the same
+	// optimistic-concurrency contract as PATCH applies. `*` rejected:
+	// the row must already exist (we 404 below if it doesn't).
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
+	if ifMatchPresent && ifMatch == "*" {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"If-Match: * is not supported on POST /agents/{id}/unarchive; send a specific etag or omit the header")
+		return
+	}
+
+	// Manager.Unarchive takes LockPatch internally — see the comment
+	// in handleDeleteAgent for why we cannot wrap it externally
+	// without self-deadlocking sync.Mutex.
+	if !s.agentIfMatchPrecheck(w, r, id, ifMatch, ifMatchPresent) {
+		return
+	}
+
 	if err := s.agents.Unarchive(id); err != nil {
 		switch {
 		case errors.Is(err, agent.ErrAgentNotFound):
@@ -513,14 +974,39 @@ func (s *Server) handleUnarchiveAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	// Re-arm Slack bot if it was configured. Manager.Unarchive can't do this
-	// — slackHub lives on the server, not the manager.
+	// Re-arm Slack bot if it was configured. Manager.Unarchive can't do
+	// this — slackHub lives on the server, not the manager. The
+	// `!a.Archived` re-check guards against a concurrent
+	// Archive/Delete that landed between Unarchive returning and our
+	// Get: without it we'd start the bot for a freshly-re-archived
+	// agent. Re-Archive runs under Manager.LockPatch so the record
+	// we read here is the post-Unarchive (or post-Re-archive) state,
+	// not a torn snapshot.
 	if s.slackHub != nil {
-		if a, ok := s.agents.Get(id); ok && a.SlackBot != nil && a.SlackBot.Enabled {
-			s.slackHub.StartBot(id, *a.SlackBot)
+		// §3.7 race: a device-switch could have begun after
+		// Manager.Unarchive released its reset guard but before
+		// this StartBot. AcquireMutation fails-closed when
+		// switching is set; we ALSO re-Get under the mutation
+		// hold so a stale snapshot (Get before AcquireMutation)
+		// doesn't carry SlackBot config that's since been
+		// cleared by a parallel release. The previous order
+		// (Get → Acquire → Start) let the agent be evicted
+		// between Get and Acquire on the source-release path,
+		// then started a bot on a released agent.
+		if rel, mutErr := s.agents.AcquireMutation(id); mutErr == nil {
+			if a, ok := s.agents.Get(id); ok && !a.Archived && a.SlackBot != nil && a.SlackBot.Enabled {
+				s.slackHub.StartBot(id, *a.SlackBot)
+			}
+			rel()
+		} else {
+			s.logger.Info("unarchive: skipped SlackBot StartBot — agent mutation refused",
+				"agent", id, "reason", mutErr.Error())
 		}
 	}
 	if a, ok := s.agents.Get(id); ok {
+		if newETag := s.readAgentETag(r, id); newETag != "" {
+			w.Header().Set("ETag", quoteETag(newETag))
+		}
 		writeJSONResponse(w, http.StatusOK, a)
 		return
 	}
@@ -533,10 +1019,19 @@ func (s *Server) handleGetAvatar(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	a, ok := s.agents.Get(id)
 	if !ok {
+		// Remote agent (§3.7 device-switch): the avatar blob is
+		// content-addressed and immutable — the local copy on disk
+		// is identical to the target's, so serve it without a
+		// network round-trip. Falls back to the generated SVG when
+		// no custom avatar exists.
+		if ra := s.agents.GetRemote(id); ra != nil {
+			agent.ServeAvatar(s.blob, w, r, ra)
+			return
+		}
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
 		return
 	}
-	agent.ServeAvatar(w, r, a)
+	agent.ServeAvatar(s.blob, w, r, a)
 }
 
 func (s *Server) handleUploadAvatar(w http.ResponseWriter, r *http.Request) {
@@ -545,17 +1040,28 @@ func (s *Server) handleUploadAvatar(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
 		return
 	}
+	releaseMut, err := s.agents.AcquireMutation(id)
+	if err != nil {
+		writeError(w, http.StatusConflict, "agent_busy", err.Error())
+		return
+	}
+	defer releaseMut()
 
-	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10MB max
-	if err := r.ParseMultipartForm(10 << 20); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, 128<<20) // 128 MiB max
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "file too large (max 10MB)")
+			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "file too large (max 128MiB)")
 		} else {
 			writeError(w, http.StatusBadRequest, "bad_request", "invalid multipart form")
 		}
 		return
 	}
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
 
 	file, header, err := r.FormFile("avatar")
 	if err != nil {
@@ -570,7 +1076,25 @@ func (s *Server) handleUploadAvatar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := agent.SaveAvatar(id, file, ext); err != nil {
+	// Serialize against Manager.Delete via LockPatch + post-lock
+	// re-check. Without this, a Delete that tombstones the agent
+	// after the initial Get above but before SaveAvatar finishes
+	// would leave an orphan blob keyed by the just-deleted agent
+	// id. The CAS in agent_locks/blob_refs doesn't catch this
+	// because the avatar blob is per-agent state; once the agent
+	// row is gone the blob would survive as cruft until the
+	// eventual operator-driven blob GC pass (planned `--clean
+	// blobs` target alongside the existing `snapshots` / `legacy`
+	// targets in cmd/kojo/clean_cmd.go; Phase 6 #18 in
+	// docs/multi-device-storage.md).
+	release := s.agents.LockPatch(id)
+	defer release()
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+
+	if err := agent.SaveAvatar(s.blob, id, file, ext); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
@@ -582,11 +1106,51 @@ func (s *Server) handleUploadAvatar(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, ok := s.agents.Get(id); !ok {
-		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+
+	// Local agent — serve from this peer's store.
+	if _, ok := s.agents.Get(id); ok {
+		s.serveLocalMessages(w, r, id)
 		return
 	}
 
+	// Remote agent (§3.7 device-switch): proxy the request to the
+	// holder peer so the Web UI sees live messages even while the
+	// agent is on another device. Falls back to the local store
+	// snapshot when the holder is unreachable or unknown.
+	remote := s.agents.GetRemote(id)
+	if remote == nil {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	if remote.HolderPeer != "" && s.peerID != nil {
+		if s.proxyPeerGetMessages(w, r, id, remote.HolderPeer) {
+			return
+		}
+		// Proxy 失敗 (peer 一時 offline 等) — remote_message_mirror
+		// (proxy 成功時のスナップショット) と local agent_messages
+		// (転移前の canonical transcript) を merge して返す。mirror が
+		// Dashboard の limit=1 polling で 1 行だけ入っていた場合に
+		// local の長い履歴を隠さないようにするのが merge の目的。
+		s.serveRemoteMessagesMerged(w, r, id)
+		return
+	}
+	s.serveLocalMessages(w, r, id)
+}
+
+// serveRemoteMessagesMerged は remote agent が peer offline のときの
+// read fallback。
+//
+// before == "" (最初のページ): remote_message_mirror と local agent_messages
+// を独立に取得し、message_id で dedup → timestamp DESC sort → limit trim →
+// oldest-first で返す。Dashboard polling で mirror に 1 行だけ入ったとき
+// local の長い履歴が隠れるのを防ぐのが目的。
+//
+// before != "" (older 取得): cursor が属する source 単独で paginate する。
+// 両 source に同じ before ID を渡すと、片側に cursor が無いとき「cursor 無し
+// = 最新ページ」を返してしまい、古いページに最新の mirror が再注入される
+// 不整合が出るため。cursor が指す message は UI が既に表示している最古行
+// なので、その出所と同じ source で遡るのが自然。
+func (s *Server) serveRemoteMessagesMerged(w http.ResponseWriter, r *http.Request, id string) {
 	limit := 50
 	if l := r.URL.Query().Get("limit"); l != "" {
 		if n, err := strconv.Atoi(l); err == nil && n > 0 {
@@ -596,7 +1160,154 @@ func (s *Server) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 	if limit > 500 {
 		limit = 500
 	}
+	before := r.URL.Query().Get("before")
 
+	if before != "" {
+		// cursor が mirror に居るなら mirror で続行、居なければ local
+		// (canonical の loadMessagesPaginated が ErrNotFound を「cursor
+		// 無し」扱いで吸収する挙動と整合する)。
+		inMirror, _ := s.agents.MirrorMessageExists(id, before)
+		var (
+			page    []*agent.Message
+			hasMore bool
+			pErr    error
+		)
+		if inMirror {
+			page, hasMore, pErr = s.agents.MirrorMessagesPaginated(id, limit, before)
+			// mirror 側が limit 未満かつ枯渇 (hasMore=false) なら、
+			// それより古い行は local agent_messages (転移前の canonical
+			// transcript) に存在する可能性。残り枠を local の最新ページで
+			// fill して older 履歴に到達可能にする。dedup は ID で行う。
+			if pErr == nil && !hasMore && len(page) < limit {
+				localPage, localHasMore, lErr := s.agents.MessagesPaginated(id, limit-len(page), "")
+				if lErr == nil {
+					seen := make(map[string]struct{}, len(page))
+					for _, m := range page {
+						if m != nil {
+							seen[m.ID] = struct{}{}
+						}
+					}
+					// local は oldest-first。mirror page も oldest-first。
+					// mirror の最古行より古いものだけを採用する。
+					oldestMirrorTS := ""
+					if len(page) > 0 && page[0] != nil {
+						oldestMirrorTS = page[0].Timestamp
+					}
+					fill := make([]*agent.Message, 0, len(localPage))
+					for _, m := range localPage {
+						if m == nil {
+							continue
+						}
+						if _, dup := seen[m.ID]; dup {
+							continue
+						}
+						if oldestMirrorTS != "" && !timestampBefore(m.Timestamp, oldestMirrorTS) {
+							continue
+						}
+						fill = append(fill, m)
+					}
+					// fill (oldest-first) → mirror page (oldest-first) と
+					// 結合して全体 oldest-first を維持する。
+					if len(fill) > 0 {
+						merged := make([]*agent.Message, 0, len(fill)+len(page))
+						merged = append(merged, fill...)
+						merged = append(merged, page...)
+						page = merged
+					}
+					hasMore = localHasMore
+				}
+			}
+		} else {
+			page, hasMore, pErr = s.agents.MessagesPaginated(id, limit, before)
+		}
+		s.writeRemoteMessagesPage(w, id, page, hasMore, pErr)
+		return
+	}
+
+	// 最初のページ: 両 source を merge
+	mirrorMsgs, mirrorHasMore, mErr := s.agents.MirrorMessagesPaginated(id, limit, "")
+	if mErr != nil && s.logger != nil {
+		s.logger.Debug("serveRemoteMessagesMerged: mirror read failed", "agent", id, "err", mErr)
+	}
+	localMsgs, localHasMore, lErr := s.agents.MessagesPaginated(id, limit, "")
+	if lErr != nil && s.logger != nil {
+		s.logger.Debug("serveRemoteMessagesMerged: local read failed", "agent", id, "err", lErr)
+	}
+	if mErr != nil && lErr != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", lErr.Error())
+		return
+	}
+
+	// dedup-by-id, mirror 優先 (proxy 由来の最新を local 由来の古い同 id
+	// が上書きしないように)
+	byID := make(map[string]*agent.Message, len(mirrorMsgs)+len(localMsgs))
+	for _, m := range localMsgs {
+		if m != nil {
+			byID[m.ID] = m
+		}
+	}
+	for _, m := range mirrorMsgs {
+		if m != nil {
+			byID[m.ID] = m
+		}
+	}
+	merged := make([]*agent.Message, 0, len(byID))
+	for _, m := range byID {
+		merged = append(merged, m)
+	}
+	// timestamp DESC で sort (同 ts は id 降順で tie-break)。
+	// timezone offset 違いの RFC3339 ("...Z" vs "...+09:00") を文字列比較
+	// すると時系列が崩れるので time.Parse で比較。両方 parse 失敗時のみ
+	// 文字列 fallback。
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].Timestamp == merged[j].Timestamp {
+			return merged[i].ID > merged[j].ID
+		}
+		return timestampAfter(merged[i].Timestamp, merged[j].Timestamp)
+	})
+	trimmed := merged
+	hasMore := mirrorHasMore || localHasMore
+	if len(trimmed) > limit {
+		trimmed = trimmed[:limit]
+		hasMore = true
+	}
+	// oldest-first に反転 (serveLocalMessages / MessagesPaginated と同じ wire)
+	for i, j := 0, len(trimmed)-1; i < j; i, j = i+1, j-1 {
+		trimmed[i], trimmed[j] = trimmed[j], trimmed[i]
+	}
+	if trimmed == nil {
+		trimmed = []*agent.Message{}
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"messages": trimmed, "hasMore": hasMore})
+}
+
+// writeRemoteMessagesPage は paginate 結果を serveLocalMessages と同じ
+// envelope で書く。serveRemoteMessagesMerged の paginated branch から共有。
+func (s *Server) writeRemoteMessagesPage(w http.ResponseWriter, id string, msgs []*agent.Message, hasMore bool, err error) {
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Debug("writeRemoteMessagesPage: read failed", "agent", id, "err", err)
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	if msgs == nil {
+		msgs = []*agent.Message{}
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"messages": msgs, "hasMore": hasMore})
+}
+
+// serveLocalMessages reads messages from this peer's local store.
+func (s *Server) serveLocalMessages(w http.ResponseWriter, r *http.Request, id string) {
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 500 {
+		limit = 500
+	}
 	before := r.URL.Query().Get("before")
 
 	msgs, hasMore, err := s.agents.MessagesPaginated(id, limit, before)
@@ -610,9 +1321,302 @@ func (s *Server) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, map[string]any{"messages": msgs, "hasMore": hasMore})
 }
 
+// proxyPeerGetMessages forwards a GET /messages request to the
+// holder peer via peer-auth signed HTTP. Returns true if the proxy
+// succeeded and the response was written; false if the caller should
+// fall back to the local store (peer unreachable, signing not
+// configured, etc.). Errors are logged but not surfaced to the
+// client — the fallback path serves stale-but-available data.
+func (s *Server) proxyPeerGetMessages(w http.ResponseWriter, r *http.Request, agentID, holderDeviceID string) bool {
+	if s.peerID == nil || s.agents.Store() == nil {
+		return false
+	}
+	st := s.agents.Store()
+	peerRec, err := st.GetPeer(r.Context(), holderDeviceID)
+	if err != nil || peerRec == nil || peerRec.Status != store.PeerStatusOnline {
+		return false
+	}
+	addr, err := peer.NormalizeAddress(peerRec.URL)
+	if err != nil {
+		return false
+	}
+
+	// Rebuild the query string for the upstream request.
+	targetURL := addr + "/api/v1/agents/" + agentID + "/messages"
+	if qs := r.URL.RawQuery; qs != "" {
+		targetURL += "?" + qs
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return false
+	}
+
+	// Forward the agent's own token so the holder's auth middleware
+	// can resolve the original principal. Peer identity itself is
+	// carried in the WireGuard tunnel and resolved server-side via
+	// tsnet WhoIs (docs/peer-tsnet-identity.md).
+	if tok := r.Header.Get("X-Kojo-Token"); tok != "" {
+		req.Header.Set("X-Kojo-Token", tok)
+	}
+
+	client := peer.NoKeepAliveHTTPClient(10 * time.Second)
+	resp, err := client.Do(req)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Debug("proxyPeerGetMessages: request failed", "agent", agentID, "peer", holderDeviceID, "err", err)
+		}
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		if s.logger != nil {
+			s.logger.Debug("proxyPeerGetMessages: non-200 from peer", "agent", agentID, "peer", holderDeviceID, "status", resp.StatusCode)
+		}
+		return false
+	}
+
+	// Body をバッファに読み込んで mirror upsert + client への echo を行う。
+	// 直接 io.Copy で stream すると mirror に残せないため、32 MiB 上限で
+	// バッファリング。decode 失敗は client への echo を諦めて fallback。
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Debug("proxyPeerGetMessages: read body failed", "agent", agentID, "peer", holderDeviceID, "err", err)
+		}
+		return false
+	}
+	// holder peer が一時 offline になった瞬間でも、ここで mirror に書いた
+	// スナップショットが Hub UI の Dashboard / Chat の read fallback で
+	// 引かれる。decode 失敗は raw body をそのまま echo して mirror upsert を
+	// 諦める (UI には影響しない)。
+	var parsed struct {
+		Messages []*agent.Message `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &parsed); err == nil && len(parsed.Messages) > 0 {
+		if uerr := s.agents.UpsertMirrorFromMessages(agentID, holderDeviceID, parsed.Messages); uerr != nil && s.logger != nil {
+			s.logger.Debug("proxyPeerGetMessages: mirror upsert failed",
+				"agent", agentID, "peer", holderDeviceID, "err", uerr)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+	return true
+}
+
+// enrichRemoteAgentsLatestActivity refreshes the LastMessage preview and
+// UpdatedAt of every agent in `all` that lives on a remote peer (HolderPeer
+// != ""). Each enrichment is a one-message GET /messages?limit=1 against
+// the holder, parallel-fanned with a hard total deadline so a slow peer
+// can't stall the list endpoint.
+//
+// Mutates `all` in place. Best effort: agents whose holder is unreachable,
+// unsigned-peer, or whose response we can't parse are left with whatever
+// the local store had — the UI surfaces them as "転移中" anyway.
+func (s *Server) enrichRemoteAgentsLatestActivity(ctx context.Context, all []*agent.Agent) {
+	if s.peerID == nil || s.agents.Store() == nil {
+		return
+	}
+	// Collect work items first so we know whether to bother spinning up
+	// the deadline goroutine at all.
+	type work struct {
+		idx   int
+		agent *agent.Agent
+	}
+	var jobs []work
+	for i, a := range all {
+		if a == nil || a.HolderPeer == "" {
+			continue
+		}
+		jobs = append(jobs, work{idx: i, agent: a})
+	}
+	if len(jobs) == 0 {
+		return
+	}
+
+	// Hard deadline: keep ListAgents snappy even when several remote
+	// agents' holders are slow. Picked to be larger than a healthy
+	// LAN round-trip but well under the dashboard's 5s poll cadence.
+	deadline := 1500 * time.Millisecond
+	ctx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(len(jobs))
+	for _, j := range jobs {
+		go func(j work) {
+			defer wg.Done()
+			ts, role, content, ok := s.fetchRemoteLatestMessage(ctx, j.agent.ID, j.agent.HolderPeer)
+			if !ok || ts == "" {
+				// holder offline 等で fetch 失敗 — 直前の成功 proxy
+				// 時に書いた remote_message_mirror から最新行を引いて
+				// 代用する。空ならそのまま fallthrough (local DB の
+				// 転移前 LastMessage を残す)。
+				msgs, _, merr := s.agents.MirrorMessagesPaginated(j.agent.ID, 1, "")
+				if merr != nil || len(msgs) == 0 {
+					return
+				}
+				m := msgs[len(msgs)-1]
+				ts = m.Timestamp
+				role = m.Role
+				content = m.Content
+			}
+			// Update both sort keys. UpdatedAt drives the dashboard's
+			// primary sort; LastMessage.Timestamp is the displayed "ago".
+			if isRFC3339After(ts, j.agent.UpdatedAt) {
+				j.agent.UpdatedAt = ts
+			}
+			if j.agent.LastMessage == nil || isRFC3339After(ts, j.agent.LastMessage.Timestamp) {
+				preview := truncateForPreview(content)
+				j.agent.LastMessage = &agent.MessagePreview{
+					Content:   preview,
+					Role:      role,
+					Timestamp: ts,
+				}
+			}
+		}(j)
+	}
+	wg.Wait()
+}
+
+// fetchRemoteLatestMessage asks the holder peer for one message
+// (?limit=1) and returns (timestamp, role, content, ok). ok=false on
+// any signing / transport / decode failure — caller treats as "no
+// fresh data".
+func (s *Server) fetchRemoteLatestMessage(ctx context.Context, agentID, holderDeviceID string) (string, string, string, bool) {
+	st := s.agents.Store()
+	if st == nil {
+		return "", "", "", false
+	}
+	peerRec, err := st.GetPeer(ctx, holderDeviceID)
+	if err != nil || peerRec == nil || peerRec.Status != store.PeerStatusOnline {
+		return "", "", "", false
+	}
+	addr, err := peer.NormalizeAddress(peerRec.URL)
+	if err != nil {
+		return "", "", "", false
+	}
+	targetURL := addr + "/api/v1/agents/" + agentID + "/messages?limit=1"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return "", "", "", false
+	}
+
+	client := peer.NoKeepAliveHTTPClient(1500 * time.Millisecond)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", "", false
+	}
+	// agent.Message full shape で decode して mirror upsert にも回す。
+	// ?limit=1 だが Dashboard が頻繁に叩くので、増分的に mirror に積もる。
+	var body struct {
+		Messages []*agent.Message `json:"messages"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
+		return "", "", "", false
+	}
+	if len(body.Messages) == 0 {
+		return "", "", "", false
+	}
+	if uerr := s.agents.UpsertMirrorFromMessages(agentID, holderDeviceID, body.Messages); uerr != nil && s.logger != nil {
+		s.logger.Debug("fetchRemoteLatestMessage: mirror upsert failed",
+			"agent", agentID, "peer", holderDeviceID, "err", uerr)
+	}
+	m := body.Messages[len(body.Messages)-1]
+	if m == nil {
+		return "", "", "", false
+	}
+	return m.Timestamp, m.Role, m.Content, true
+}
+
+// timestampAfter は a > b を時刻として判定する。両方 parse 失敗時のみ
+// 文字列比較 fallback。同値判定は呼出側 (sort closure) が tie-break する。
+func timestampAfter(a, b string) bool {
+	at, aerr := time.Parse(time.RFC3339, a)
+	bt, berr := time.Parse(time.RFC3339, b)
+	if aerr == nil && berr == nil {
+		return at.After(bt)
+	}
+	return a > b
+}
+
+// timestampBefore は a < b を時刻として判定する。両方 parse 失敗時のみ
+// 文字列比較 fallback。
+func timestampBefore(a, b string) bool {
+	at, aerr := time.Parse(time.RFC3339, a)
+	bt, berr := time.Parse(time.RFC3339, b)
+	if aerr == nil && berr == nil {
+		return at.Before(bt)
+	}
+	return a < b
+}
+
+// isRFC3339After reports whether a is strictly after b. Empty b is
+// treated as the zero time so any valid a wins; an unparseable a or
+// b leaves the answer false (the caller keeps the existing value).
+func isRFC3339After(a, b string) bool {
+	at, err := time.Parse(time.RFC3339, a)
+	if err != nil {
+		return false
+	}
+	if b == "" {
+		return true
+	}
+	bt, err := time.Parse(time.RFC3339, b)
+	if err != nil {
+		return true
+	}
+	return at.After(bt)
+}
+
+// truncateForPreview clips long bodies to a list-preview-friendly size,
+// matching the budget Manager.refreshLastMessage applies via
+// truncatePreview. Kept here to avoid exporting the runes-aware helper
+// from the agent package just for this proxy path.
+func truncateForPreview(s string) string {
+	const maxLen = 100
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "…"
+}
+
 func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	msgID := r.PathValue("msgId")
+
+	// If-Match is forwarded into the store transaction below — no
+	// handler-level mutex needed (unlike PATCH /api/v1/agents/{id},
+	// which still goes through the file-backed Manager.Update).
+	// `*` is rejected: PATCH /messages/{msgId} is per-row and a
+	// wildcard precondition makes no sense (`*` means "the resource
+	// exists with any current etag", which here adds nothing over
+	// the existing row-load and would invite sloppy clients to skip
+	// real concurrency control entirely).
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
+	if ifMatchPresent && ifMatch == "*" {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"If-Match: * is not supported on PATCH /messages/{msgId}; send a specific etag")
+		return
+	}
 
 	var body struct {
 		Content string `json:"content"`
@@ -622,10 +1626,22 @@ func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msg, err := s.agents.UpdateMessageContent(id, msgID, body.Content)
+	msg, newETag, err := s.agents.UpdateMessageContent(id, msgID, body.Content, ifMatch)
 	if err != nil {
+		if errors.Is(err, agent.ErrMessageETagMismatch) {
+			writeError(w, http.StatusPreconditionFailed, "precondition_failed",
+				"If-Match: etag mismatch")
+			return
+		}
 		writeTranscriptEditError(w, err, msgID)
 		return
+	}
+	// Echo the etag returned by the same store transaction that did
+	// the UPDATE, NOT a fresh GetMessage — between Manager.Update's
+	// editing-flag release and a follow-up read another PATCH could
+	// land and surface its etag here, which would lie to the client.
+	if newETag != "" {
+		w.Header().Set("ETag", quoteETag(newETag))
 	}
 	writeJSONResponse(w, http.StatusOK, msg)
 }
@@ -634,7 +1650,39 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	msgID := r.PathValue("msgId")
 
-	if err := s.agents.DeleteMessage(id, msgID); err != nil {
+	// If-Match here mirrors PATCH /messages/{msgId}: the store enforces
+	// the precondition atomically inside SoftDeleteMessage, so the
+	// handler just parses and forwards. `*` is rejected for the same
+	// reason as PATCH — a per-row wildcard adds nothing over the
+	// existing row-load and would invite clients to bypass CAS.
+	//
+	// Empty If-Match disables the precondition (legacy unconditional
+	// delete), but the agent.deleteMessage layer still runs a
+	// GetMessage up front (cross-agent guard), so a bare DELETE on a
+	// missing or already-tombstoned row surfaces as 404, NOT 200 —
+	// callers that want strict idempotence should not rely on the
+	// historical store-level "missing row → ok" path through this
+	// handler.
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
+	if ifMatchPresent && ifMatch == "*" {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"If-Match: * is not supported on DELETE /messages/{msgId}; send a specific etag or omit the header")
+		return
+	}
+
+	if err := s.agents.DeleteMessage(id, msgID, ifMatch); err != nil {
+		if errors.Is(err, agent.ErrMessageETagMismatch) {
+			writeError(w, http.StatusPreconditionFailed, "precondition_failed",
+				"If-Match: etag mismatch")
+			return
+		}
 		writeTranscriptEditError(w, err, msgID)
 		return
 	}
@@ -644,7 +1692,34 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRegenerateMessage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	msgID := r.PathValue("msgId")
-	if err := s.agents.Regenerate(id, msgID); err != nil {
+
+	// Optional If-Match preconditions on the *clicked* message's etag —
+	// catches the case where another device edited the message between
+	// the user clicking Regenerate and the request landing, which would
+	// otherwise truncate the transcript against a stale view. `*` is
+	// rejected for the same reason as PATCH/DELETE: regenerate is per-
+	// row and a wildcard precondition adds nothing over the existing
+	// row-load. Empty If-Match disables the check (legacy behaviour).
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
+	if ifMatchPresent && ifMatch == "*" {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"If-Match: * is not supported on POST /messages/{msgId}/regenerate; send a specific etag or omit the header")
+		return
+	}
+
+	if err := s.agents.Regenerate(r.Context(), id, msgID, ifMatch); err != nil {
+		if errors.Is(err, agent.ErrMessageETagMismatch) {
+			writeError(w, http.StatusPreconditionFailed, "precondition_failed",
+				"If-Match: etag mismatch")
+			return
+		}
 		writeTranscriptEditError(w, err, msgID)
 		return
 	}
@@ -827,6 +1902,20 @@ func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// AcquireMutation BEFORE Get. ReleaseAgentLocally on the
+	// source-release path deletes from m.agents BEFORE clearing
+	// the switching flag, so once AcquireMutation succeeds the
+	// agent is guaranteed to still be in the map (or already
+	// gone and we 404). The previous order (Get → Acquire) had
+	// a window where Get hit, release evicted, Acquire then
+	// succeeded post-switch and wrote credentials for a
+	// released agent.
+	releaseMut, err := s.agents.AcquireMutation(id)
+	if err != nil {
+		writeError(w, http.StatusConflict, "agent_busy", err.Error())
+		return
+	}
+	defer releaseMut()
 	if _, ok := s.agents.Get(id); !ok {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
 		return
@@ -880,6 +1969,14 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUpdateCredential(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	credID := r.PathValue("credId")
+	// AcquireMutation before Get — see handleAddCredential
+	// comment for the source-release race rationale.
+	releaseMut, err := s.agents.AcquireMutation(id)
+	if err != nil {
+		writeError(w, http.StatusConflict, "agent_busy", err.Error())
+		return
+	}
+	defer releaseMut()
 	if _, ok := s.agents.Get(id); !ok {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
 		return
@@ -939,6 +2036,14 @@ func (s *Server) handleUpdateCredential(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	credID := r.PathValue("credId")
+	// AcquireMutation before Get — see handleAddCredential
+	// comment for the source-release race rationale.
+	releaseMut, err := s.agents.AcquireMutation(id)
+	if err != nil {
+		writeError(w, http.StatusConflict, "agent_busy", err.Error())
+		return
+	}
+	defer releaseMut()
 	if _, ok := s.agents.Get(id); !ok {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
 		return
@@ -1010,11 +2115,20 @@ func (s *Server) handleParseQR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10MB max
+	// QR images are tiny; the inner DecodeQRImage hard-caps the
+	// reader at 10 MiB, so accepting more than that just wastes
+	// bandwidth before failing inside the decoder. Keep the
+	// outer cap aligned with the decoder's budget.
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10 MiB max
 	if err := r.ParseMultipartForm(10 << 20); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid multipart form")
 		return
 	}
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
 
 	file, _, err := r.FormFile("qr")
 	if err != nil {
@@ -1065,6 +2179,12 @@ func (s *Server) handleUploadGeneratedAvatar(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
 		return
 	}
+	releaseMut, err := s.agents.AcquireMutation(id)
+	if err != nil {
+		writeError(w, http.StatusConflict, "agent_busy", err.Error())
+		return
+	}
+	defer releaseMut()
 
 	var req struct {
 		AvatarPath string `json:"avatarPath"`
@@ -1099,7 +2219,19 @@ func (s *Server) handleUploadGeneratedAvatar(w http.ResponseWriter, r *http.Requ
 	}
 	defer src.Close()
 
-	if err := agent.SaveAvatar(id, src, ext); err != nil {
+	// Serialize against Manager.Delete — see handleUploadAvatar for
+	// the orphan-blob race rationale. The duplicated lock-and-recheck
+	// is intentional: factoring it into a helper would obscure the
+	// contract that callers MUST hold LockPatch across the live-check
+	// → SaveAvatar window.
+	release := s.agents.LockPatch(id)
+	defer release()
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+
+	if err := agent.SaveAvatar(s.blob, id, src, ext); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
@@ -1111,16 +2243,21 @@ func (s *Server) handleUploadGeneratedAvatar(w http.ResponseWriter, r *http.Requ
 }
 
 // --- Task Handlers ---
+//
+// Tasks live in the agent_tasks DB table post-cutover. The HTTP surface
+// keeps the v0 vocabulary ("open" / "done") for status; translation
+// to/from the v1 store vocabulary ('pending' / 'done') happens inside
+// internal/agent/task.go.
+//
+// PATCH and DELETE accept a strong If-Match header for optimistic
+// concurrency. The store's etag-in-WHERE clause is the canonical guard;
+// the handler simply forwards the parsed value.
 
 func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, ok := s.agents.Get(id); !ok {
-		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
-		return
-	}
-	tasks, err := agent.ListTasks(id)
+	tasks, err := s.agents.ListTasks(r.Context(), id)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		mapTaskErr(w, err)
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]any{"tasks": tasks})
@@ -1128,19 +2265,18 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, ok := s.agents.Get(id); !ok {
-		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
-		return
-	}
 	var params agent.TaskCreateParams
 	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
-	task, err := agent.CreateTask(id, params)
+	task, err := s.agents.CreateTask(r.Context(), id, params)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		mapTaskErr(w, err)
 		return
+	}
+	if task.ETag != "" {
+		w.Header().Set("ETag", quoteETag(task.ETag))
 	}
 	writeJSONResponse(w, http.StatusOK, task)
 }
@@ -1148,23 +2284,36 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	taskID := r.PathValue("taskId")
-	if _, ok := s.agents.Get(id); !ok {
-		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
 		return
 	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
+	// `*` is rejected on PATCH because the row must already exist —
+	// "any current version" carries no meaning when the only valid
+	// shape of "current" is "live row with some etag".
+	if ifMatchPresent && ifMatch == "*" {
+		writeError(w, http.StatusPreconditionFailed, "precondition_failed",
+			"If-Match: * is not supported on PATCH /tasks/{taskId}; send a specific etag or omit the header")
+		return
+	}
+
 	var params agent.TaskUpdateParams
 	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
-	task, err := agent.UpdateTask(id, taskID, params)
+	task, err := s.agents.UpdateTask(r.Context(), id, taskID, ifMatch, params)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			writeError(w, http.StatusNotFound, "not_found", err.Error())
-		} else {
-			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		}
+		mapTaskErr(w, err)
 		return
+	}
+	if task.ETag != "" {
+		w.Header().Set("ETag", quoteETag(task.ETag))
 	}
 	writeJSONResponse(w, http.StatusOK, task)
 }
@@ -1172,80 +2321,60 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	taskID := r.PathValue("taskId")
-	if _, ok := s.agents.Get(id); !ok {
-		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
 		return
 	}
-	if err := agent.DeleteTask(id, taskID); err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			writeError(w, http.StatusNotFound, "not_found", err.Error())
-		} else {
-			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
-		}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
+	if ifMatchPresent && ifMatch == "*" {
+		writeError(w, http.StatusPreconditionFailed, "precondition_failed",
+			"If-Match: * is not supported on DELETE /tasks/{taskId}")
+		return
+	}
+
+	if err := s.agents.DeleteTask(r.Context(), id, taskID, ifMatch); err != nil {
+		mapTaskErr(w, err)
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// --- User Context Handlers ---
-
-func (s *Server) handleGetUserContext(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if _, ok := s.agents.Get(id); !ok {
-		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
-		return
+// mapTaskErr translates the typed errors raised by Manager task helpers
+// into the right HTTP status. Keeps the handlers free of repeated
+// errors.Is ladders.
+//
+// The default branch returns 500 — anything that isn't a known input
+// validation error (typed sentinel + the few "title is required" /
+// "title cannot be empty" cases) is treated as an internal failure so
+// a SQL error or transport hiccup doesn't get masquerade as a 4xx
+// "your request is bad". Callers who want to distinguish should add
+// a typed sentinel rather than relying on string-matching here.
+func mapTaskErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, agent.ErrAgentNotFound):
+		writeError(w, http.StatusNotFound, "not_found", err.Error())
+	case errors.Is(err, agent.ErrTaskNotFound):
+		writeError(w, http.StatusNotFound, "not_found", err.Error())
+	case errors.Is(err, agent.ErrTaskETagMismatch):
+		writeError(w, http.StatusPreconditionFailed, "precondition_failed",
+			"If-Match: etag mismatch")
+	case errors.Is(err, agent.ErrAgentBusy):
+		writeError(w, http.StatusConflict, "agent_busy", err.Error())
+	case errors.Is(err, agent.ErrInvalidTaskStatus),
+		errors.Is(err, agent.ErrTaskTitleRequired),
+		errors.Is(err, agent.ErrTaskTitleEmpty):
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+	default:
+		// Unknown error — almost certainly a store / SQL / transport
+		// failure. The Manager has already logged details; surface as
+		// 500 so a buggy / failing backend isn't silently miscoded as
+		// "client sent a bad request".
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 	}
-	p := auth.FromContext(r.Context())
-	if !p.CanReadFull(id) {
-		writeError(w, http.StatusForbidden, "forbidden", "not allowed to read this agent's user context")
-		return
-	}
-	content, isDefault, err := agent.ReadUserFileOrDefault(id)
-	if err != nil {
-		s.logger.Warn("failed to read user.md", "agent", id, "err", err)
-		writeError(w, http.StatusInternalServerError, "internal_error", "failed to read user.md")
-		return
-	}
-	writeJSONResponse(w, http.StatusOK, map[string]any{
-		"content":   content,
-		"isDefault": isDefault,
-	})
-}
-
-func (s *Server) handleSetUserContext(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if _, ok := s.agents.Get(id); !ok {
-		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
-		return
-	}
-	p := auth.FromContext(r.Context())
-	if !p.CanMutateSelf(id) {
-		writeError(w, http.StatusForbidden, "forbidden", "agents may only PUT their own user context")
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	var body struct {
-		Content string `json:"content"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
-		return
-	}
-	if err := agent.WriteUserFile(id, body.Content); err != nil {
-		// Don't surface the raw filesystem error to the client — it can leak
-		// internal paths / OS details. Log server-side and return a stable
-		// message (matches the checkin-file handler pattern).
-		s.logger.Warn("failed to write user.md", "agent", id, "err", err)
-		writeError(w, http.StatusInternalServerError, "internal_error", "failed to write user.md")
-		return
-	}
-	// After a PUT user.md exists on disk, so the UI is no longer viewing the
-	// in-memory default template. Echo isDefault=false so the form can clear
-	// the dirty/default guards and skip future no-op PUTs on this session.
-	writeJSONResponse(w, http.StatusOK, map[string]any{
-		"content":   body.Content,
-		"isDefault": false,
-	})
 }
 
 // --- Pre-Compact Handler ---
@@ -1268,6 +2397,24 @@ type preCompactHookPayload struct {
 
 func (s *Server) handlePreCompact(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §3.7 device switch gate: PreCompact writes memory diary /
+	// recent / marker. A switch mid-write would strand those
+	// entries on source.
+	//
+	// AcquireMutation BEFORE Get so a release between the
+	// initial Get and the mutation hold can't slip past — see
+	// handleAddCredential for the source-release-race
+	// rationale. We re-Get the agent under the mutation hold
+	// to read fresh Tool / Archived flags; a stale snapshot
+	// from before AcquireMutation could carry a Tool value
+	// that's since been switched (target may have changed it
+	// during sync).
+	releaseMut, mutErr := s.agents.AcquireMutation(id)
+	if mutErr != nil {
+		writeError(w, http.StatusConflict, "agent_busy", mutErr.Error())
+		return
+	}
+	defer releaseMut()
 	a, ok := s.agents.Get(id)
 	if !ok {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
@@ -1309,6 +2456,24 @@ func (s *Server) handlePrivilegeAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden", "privilege is owner-only")
 		return
 	}
+
+	// privilege flips are admin-class mutations of the agent record;
+	// same If-Match contract as PATCH applies. `*` rejected — the row
+	// must already exist (we 404 below if it doesn't).
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return
+	}
+	if ifMatchPresent && ifMatch == "*" {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"If-Match: * is not supported on POST /agents/{id}/privilege; send a specific etag or omit the header")
+		return
+	}
+
 	var body struct {
 		Privileged bool `json:"privileged"`
 	}
@@ -1316,13 +2481,27 @@ func (s *Server) handlePrivilegeAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
-	if err := s.agents.SetPrivileged(id, body.Privileged); err != nil {
-		if errors.Is(err, agent.ErrAgentNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", err.Error())
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+
+	release := s.agents.LockPatch(id)
+	defer release()
+
+	if !s.agentIfMatchPrecheck(w, r, id, ifMatch, ifMatchPresent) {
 		return
+	}
+
+	if err := s.agents.SetPrivileged(id, body.Privileged); err != nil {
+		switch {
+		case errors.Is(err, agent.ErrAgentNotFound):
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		case errors.Is(err, agent.ErrAgentBusy):
+			writeError(w, http.StatusConflict, "agent_busy", err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	if newETag := s.readAgentETag(r, id); newETag != "" {
+		w.Header().Set("ETag", quoteETag(newETag))
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]any{"id": id, "privileged": body.Privileged})
 }
@@ -1345,4 +2524,3 @@ func (s *Server) handleResetSession(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
-

@@ -6,9 +6,9 @@ import { useTTSCapability } from "../../hooks/useTTS";
 import { ttsApi, pickBestFormat } from "../../lib/ttsApi";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
-import { NotifySourcesEditor } from "./NotifySourcesEditor";
 import { SlackBotSettings } from "./SlackBotSettings";
 import { defaultModelForTool, modelsForTool, effortLevelsForModel, defaultEffortForModel, supportsEffort, type EffortLevel } from "../../lib/toolModels";
+import { buildAgentSavePayload } from "./agentSettingsPayload";
 
 export function AgentSettings() {
   const { id } = useParams<{ id: string }>();
@@ -25,12 +25,42 @@ export function AgentSettings() {
   const [customModels, setCustomModels] = useState<string[]>([]);
   const [thinkingMode, setThinkingMode] = useState("");
   const [workDir, setWorkDir] = useState("");
-  const [intervalMinutes, setIntervalMinutes] = useState(30);
+  const [cronExpr, setCronExpr] = useState("");
   const [timeoutMinutes, setTimeoutMinutes] = useState(10);
   const [resumeIdleMinutes, setResumeIdleMinutes] = useState(0);
   const [silentStart, setSilentStart] = useState("");
   const [silentEnd, setSilentEnd] = useState("");
   const [notifyDuringSilent, setNotifyDuringSilent] = useState(false);
+  const [cronMessage, setCronMessage] = useState("");
+  // checkinIsDefault tracks whether the value currently shown in the
+  // cronMessage textarea is the in-memory DefaultCheckinContent template
+  // (no checkin.md on disk yet) versus an actual saved file. Save
+  // suppresses no-op PUTs when the user hasn't dirtied the default.
+  const [checkinIsDefault, setCheckinIsDefault] = useState(false);
+  // loadedCheckin pins the exact textarea content the form was
+  // hydrated with — works for both the saved-from-disk path AND the
+  // default-template path. Dirty detection compares the current
+  // textarea against this snapshot directly: if they match, no PUT
+  // (covers the "open settings → click Save without editing"
+  // no-op case for default templates, which would otherwise persist
+  // the unedited template to disk).
+  const [loadedCheckin, setLoadedCheckin] = useState("");
+  // checkinEtag pins the etag returned by the most recent GET / PUT so
+  // the next PUT sends a matching If-Match. Strict-mode servers
+  // (KOJO_REQUIRE_IF_MATCH=1) reject PUTs without it; a concurrent
+  // edit from another tab surfaces as 412 via PreconditionFailedError.
+  // Empty string means "no live row yet" (default-template path) —
+  // putWithIfMatch omits the header in that case which is fine: the
+  // server's not-yet-existent row has no etag to assert against.
+  const [checkinEtag, setCheckinEtag] = useState("");
+  // user.md workspace file — separate textarea below the persona / cron
+  // sections. Same default-vs-saved tracking as cronMessage so an unedited
+  // template doesn't get persisted on Save.
+  const [userContext, setUserContext] = useState("");
+  const [userContextIsDefault, setUserContextIsDefault] = useState(false);
+  const [loadedUser, setLoadedUser] = useState("");
+  // Same etag-threading as checkinEtag above, for the user.md workspace file.
+  const [userContextEtag, setUserContextEtag] = useState("");
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [archiving, setArchiving] = useState(false);
@@ -48,6 +78,10 @@ export function AgentSettings() {
     messagesRemoved: number;
     claudeSessionEntriesRemoved: number;
     claudeSessionFilesRemoved: number;
+    // Optional so older servers (pre-grok-truncate rollout) that omit the
+    // fields render as "0" via `?? 0` below instead of "undefined".
+    grokSessionsRemoved?: number;
+    grokSessionFilesRemoved?: number;
     diaryFilesRemoved: number;
     diaryEntriesRemoved: number;
   } | null>(null);
@@ -134,100 +168,23 @@ export function AgentSettings() {
   const [forkIncludeTranscript, setForkIncludeTranscript] = useState(false);
   const [forking, setForking] = useState(false);
   const [forkError, setForkError] = useState("");
-  const [userContext, setUserContext] = useState("");
-  // userContext mirrors cronMessage's three-state model: the textarea content,
-  // the last value the server confirmed it has, and whether what's currently
-  // shown is the in-memory default template (no user.md on disk).
-  //
-  // Without these guards an unconditional PUT on every Save would write
-  // DefaultUserContent back as a real user.md the first time the user edits
-  // any *other* field, flipping isDefault to false and pinning the agent to
-  // a frozen copy of whatever default existed at that save time. Future
-  // template updates would then never reach that agent.
-  const [savedUserContext, setSavedUserContext] = useState("");
-  const [userContextIsDefault, setUserContextIsDefault] = useState(false);
-  const [cronMessage, setCronMessage] = useState("");
-  // Track whether cronMessage diverges from what's persisted in checkin.md.
-  // Manual check-in runs against the persisted file, so editing the textarea
-  // without saving would silently fire with stale instructions. We block the
-  // button when this is true (see handleCheckin).
-  const [savedCronMessage, setSavedCronMessage] = useState("");
-  // cronIsDefault is true when the textarea is currently showing the server-
-  // supplied DefaultCheckinContent template (no checkin.md exists yet). In
-  // that state a Save click must NOT write the template back as a real
-  // checkin.md — that would erase the "uses default" distinction and pin
-  // whatever the default happens to be at this moment, freezing the agent on
-  // an old template if we update the default later. We only PUT when the
-  // textarea is dirty (user actually edited something). When the user has a
-  // real checkin.md already, isDefault is false and every save persists.
-  const [cronIsDefault, setCronIsDefault] = useState(false);
-  // Compare trimmed values so pure-whitespace edits (e.g. accidentally
-  // hitting Enter at the end while reading the default template) don't
-  // count as a real change. The server-side WriteCheckinFile trims before
-  // persisting, so an untrimmed-equal comparison would flag the textarea
-  // as dirty, then a Save would PUT, the server would trim, and the
-  // resulting checkin.md would be byte-identical to the previous default —
-  // except isDefault would now be false, silently pinning the agent to a
-  // frozen copy of whatever default existed at that save time.
-  const cronMessageDirty = cronMessage.trim() !== savedCronMessage.trim();
-  // Same trim-compare reasoning as cronMessageDirty: keep pure-whitespace
-  // edits from triggering a no-op PUT that would pin the default template.
-  const userContextDirty = userContext.trim() !== savedUserContext.trim();
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!id) return;
-    // Cancellation guard for the in-flight Promise.allSettled. When the user
-    // navigates between /agents/{a}/settings → /agents/{b}/settings before
-    // the previous fetch resolves, the older promise must NOT win the race
-    // and stomp on b's form state — that would silently mix a's fields into
-    // a save that targets b.
-    let cancelled = false;
-    // Reset all per-agent state up front so a partial-failure load can't
-    // leave the textareas showing the previous agent's content. If
-    // /user-context fetches for the new agent reject (transient 500, broken
-    // symlink, etc.) and we kept the previous values, the user could edit
-    // and Save that stale content as the new agent's user.md.
-    setAgent(null);
-    setError("");
-    setUserContext("");
-    setSavedUserContext("");
-    setUserContextIsDefault(false);
-    setCronMessage("");
-    setSavedCronMessage("");
-    setCronIsDefault(false);
-    // Promise.allSettled so a 500 from /user-context or /checkin-file (e.g.
-    // unreadable / broken symlink on disk) doesn't blank out the entire
-    // settings screen — the user still needs to see the agent fields, the
-    // Save / Reset / Archive buttons, and a concrete error so they can fix
-    // the bad file or pick another action. The previous Promise.all + catch
-    // redirected to "/" on any failure, which hid the underlying cause and
-    // left the broken file un-fixable from this UI.
+    // Run agent + workspace-file fetches in parallel via allSettled so a
+    // 404 on one endpoint (e.g. /user-context against a server that
+    // hasn't been rebuilt) doesn't blank out the rest of the form. The
+    // agent record is the gate that determines whether the agent exists
+    // at all; any error on its fetch redirects home, but workspace-file
+    // failures fall back to the in-memory defaults.
     Promise.allSettled([
       agentApi.get(id),
-      agentApi.userContext.get(id),
       agentApi.getCheckinFile(id),
-    ]).then(([agentRes, ucRes, checkinRes]) => {
-      if (cancelled) return;
-      // Agent itself missing or unfetchable. Only treat 404 (caller deleted
-      // it from another tab, or wrong ID) as "go home"; surface every other
-      // failure inline so the user can read the actual server response.
-      //
-      // httpClient throws `${res.status}: ${body}` for any non-2xx (see
-      // lib/httpClient.ts request()), so a real 404 always shows up as a
-      // string starting with "404:". Matching the substring "not found"
-      // instead would also fire on 500 bodies that happen to mention the
-      // phrase (e.g. "configuration file not found in cache") and silently
-      // bounce the user home on transient backend failures.
-      if (agentRes.status === "rejected") {
-        const msg = agentRes.reason instanceof Error
-          ? agentRes.reason.message
-          : String(agentRes.reason);
-        if (msg.startsWith("404:")) {
-          navigate("/");
-        } else {
-          setError(msg);
-        }
+      agentApi.getUserContext(id),
+    ]).then(([agentRes, checkinRes, userCtxRes]) => {
+      if (agentRes.status !== "fulfilled") {
+        navigate("/");
         return;
       }
       const a = agentRes.value;
@@ -242,7 +199,7 @@ export function AgentSettings() {
       setCustomBaseURL(a.customBaseURL ?? "http://localhost:8080");
       setThinkingMode(a.thinkingMode ?? "");
       setWorkDir(a.workDir ?? "");
-      setIntervalMinutes(a.intervalMinutes);
+      setCronExpr(a.cronExpr ?? "");
       setTimeoutMinutes(a.timeoutMinutes || 10);
       setResumeIdleMinutes(a.resumeIdleMinutes ?? 0);
       setSilentStart(a.silentStart ?? "");
@@ -255,36 +212,122 @@ export function AgentSettings() {
       setTTSModel(a.tts?.model ?? "");
       setTTSVoice(a.tts?.voice ?? "");
       setTTSStylePrompt(a.tts?.stylePrompt ?? "");
-
-      const loadErrors: string[] = [];
-      if (ucRes.status === "fulfilled") {
-        setUserContext(ucRes.value.content);
-        setSavedUserContext(ucRes.value.content);
-        setUserContextIsDefault(ucRes.value.isDefault);
-      } else {
-        const msg = ucRes.reason instanceof Error ? ucRes.reason.message : String(ucRes.reason);
-        loadErrors.push(`User Context: ${msg}`);
-      }
+      // checkin.md: prefer the workspace file. The legacy inline
+      // agent.cronMessage is migrated into checkin.md on agent load
+      // (see Manager init), so on a current server the endpoint
+      // always wins. The fallback only matters during the brief
+      // upgrade window when an old server is still in the deployment.
+      //
+      // getCheckinFile / getUserContext now return EtaggedResponse so
+      // we capture the etag alongside the body — the next PUT threads
+      // it via If-Match. Default-template responses come back with
+      // etag="" (no row yet); we pass that through to the etag state
+      // and putWithIfMatch will omit the header in that case.
       if (checkinRes.status === "fulfilled") {
-        setCronMessage(checkinRes.value.content);
-        // When the server reports isDefault=true the textarea is showing the
-        // template, not the persisted file. Mark savedCronMessage with the
-        // same value so cronMessageDirty stays false until the user actually
-        // types — and remember isDefault so handleSave can skip the no-op PUT.
-        setSavedCronMessage(checkinRes.value.content);
-        setCronIsDefault(checkinRes.value.isDefault);
+        const v = checkinRes.value.value;
+        setCronMessage(v.content);
+        setCheckinIsDefault(v.isDefault);
+        setLoadedCheckin(v.content);
+        setCheckinEtag(checkinRes.value.etag ?? v.etag ?? "");
       } else {
-        const msg = checkinRes.reason instanceof Error ? checkinRes.reason.message : String(checkinRes.reason);
-        loadErrors.push(`Check-in Message: ${msg}`);
+        const fallback = a.cronMessage ?? "";
+        setCronMessage(fallback);
+        setCheckinIsDefault(!fallback.trim());
+        setLoadedCheckin(fallback);
+        setCheckinEtag("");
       }
-      if (loadErrors.length > 0) {
-        setError(loadErrors.join("\n"));
+      if (userCtxRes.status === "fulfilled") {
+        const v = userCtxRes.value.value;
+        setUserContext(v.content);
+        setUserContextIsDefault(v.isDefault);
+        setLoadedUser(v.content);
+        setUserContextEtag(userCtxRes.value.etag ?? v.etag ?? "");
+      } else {
+        setUserContext("");
+        setUserContextIsDefault(true);
+        setLoadedUser("");
+        setUserContextEtag("");
       }
     });
+  }, [id, navigate]);
+
+  // Keep nextCronAt fresh. The initial GET captures a snapshot; without
+  // this the displayed time drifts into the past (e.g. user leaves the
+  // tab open across a check-in) and the "(X ago)" relative label becomes
+  // a stale read of a value the server has long since recomputed.
+  //
+  // Strategy: schedule a single-shot refetch for ~5s after the displayed
+  // nextCronAt elapses (small grace so we land *after* the server-side
+  // tick fires and updates its own state), and refetch whenever the tab
+  // regains visibility (covers laptop-sleep + phone background cases
+  // where the timer doesn't fire on time).
+  //
+  // Merges ONLY the server-derived display fields (nextCronAt,
+  // cronPausedGlobal) into local agent state. Crucially does NOT
+  // overwrite `etag` — the form's snapshot etag must keep pointing at
+  // the version the user last loaded so a subsequent save still gets
+  // the 412 (precondition failed) on concurrent edits. Form fields
+  // aren't touched either, so unsaved edits survive.
+  useEffect(() => {
+    if (!id) return;
+    const next = agent?.nextCronAt;
+    if (!next) return;
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    // Cap at 1 day so browsers don't silently round huge int32 ms
+    // delays (~24.8d) to instant-fire — a monthly cron that schedules
+    // further out keeps re-arming each day until the real tick arrives.
+    const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+    const arm = (dueAt: number) => {
+      if (Number.isNaN(dueAt)) return;
+      // Clear any prior pending tick — a visibility-triggered refetch
+      // that lands while a timer is still armed must not leak the
+      // stale handle (the cleanup `clearTimeout(timer)` only sees the
+      // most recent assignment).
+      if (timer !== null) clearTimeout(timer);
+      // 5s grace lets the server's own scheduler advance its entry.Next
+      // past the firing tick before we ask. Negative delays (already
+      // overdue from a stale fetch) collapse to a near-immediate refetch.
+      const raw = dueAt + 5_000 - Date.now();
+      const delay = Math.max(0, Math.min(raw, ONE_DAY_MS));
+      timer = setTimeout(refetch, delay);
+    };
+
+    const refetch = () => {
+      if (cancelled) return;
+      agentApi.get(id).then((fresh) => {
+        // A late-arriving response from a refetch issued before the
+        // user navigated / edited could clobber newer state. Drop it.
+        if (cancelled) return;
+        setAgent((prev) => prev ? {
+          ...prev,
+          nextCronAt: fresh.nextCronAt,
+          cronPausedGlobal: fresh.cronPausedGlobal,
+        } : fresh);
+        // If the value is unchanged the outer effect won't re-run
+        // (deps still equal) — re-arm explicitly so a 1-day-capped
+        // timer for a far-future cron keeps making progress.
+        if (!cancelled && fresh.nextCronAt && fresh.nextCronAt === next) {
+          arm(new Date(fresh.nextCronAt).getTime());
+        }
+      }).catch(() => { /* keep prior */ });
+    };
+
+    const visibilityHandler = () => {
+      if (document.visibilityState === "visible") refetch();
+    };
+    document.addEventListener("visibilitychange", visibilityHandler);
+
+    arm(new Date(next).getTime());
+
     return () => {
       cancelled = true;
+      if (timer !== null) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", visibilityHandler);
     };
-  }, [id, navigate]);
+  }, [id, agent?.nextCronAt]);
 
   const needsCustomURL = tool === "custom" || tool === "llama.cpp";
 
@@ -308,78 +351,124 @@ export function AgentSettings() {
     setError("");
     setSuccess(false);
     try {
-      // Save sequentially rather than via Promise.all so a failure in any
-      // earlier write surfaces before later writes fire. Promise.all races
-      // them in parallel, which would leave partially-applied state on the
-      // server when one write fails and the others succeed (e.g. user
-      // context lands but agent.update rejects), and the user has to figure
-      // out from the error message alone what actually persisted.
-      const updated = await agentApi.update(id!, {
-        name: name.trim(),
-        persona: persona.trim(),
-        ...(publicProfileOverride ? { publicProfile: publicProfile.trim() } : {}),
-        publicProfileOverride,
-        model: model.trim(),
-        effort: supportsEffort(tool) ? effort : undefined,
-        tool: tool.trim(),
-        customBaseURL: needsCustomURL ? customBaseURL.trim() : undefined,
-        thinkingMode: tool === "llama.cpp" ? thinkingMode : undefined,
-        workDir: workDir.trim(),
-        intervalMinutes,
-        timeoutMinutes,
-        resumeIdleMinutes,
-        silentStart,
-        silentEnd,
-        notifyDuringSilent,
-        allowedTools: (tool === "custom") ? allowedTools : undefined,
-        allowProtectedPaths: (tool === "claude" || tool === "custom") ? allowProtectedPaths : undefined,
-        tts: {
-          enabled: ttsEnabled,
-          model: ttsModel || undefined,
-          voice: ttsVoice || undefined,
-          stylePrompt: ttsStylePrompt.trim() || undefined,
-        },
-      });
-      // Only PUT when the textarea actually changed. The previous condition
-      // (`userContextDirty || !userContextIsDefault`) re-wrote user.md on
-      // every save once the agent had a persisted file, which means a
-      // transient /user-context failure (network blip, EISDIR, etc.) would
-      // re-introduce the partial-update bug: agentApi.update has already
-      // succeeded, but the unrelated user-context write rejects and the
-      // whole save() throws — leaving name/persona persisted while the
-      // user thinks the save failed entirely.
-      //
-      // The isDefault skip-guard the earlier condition tried to address
-      // (don't pin the in-memory default by PUTting it back) is still
-      // covered: if the user didn't edit the textarea, dirty is false and
-      // we skip; if they did edit (whether starting from the default or
-      // from a custom file), dirty is true and we PUT, which is correct.
-      if (userContextDirty) {
-        const savedUC = await agentApi.userContext.set(id!, userContext);
-        setUserContext(savedUC.content);
-        setSavedUserContext(savedUC.content);
-        setUserContextIsDefault(savedUC.isDefault);
+      // cronMessage and userContext live in separate workspace files
+      // (checkin.md, user.md) — they're persisted via dedicated
+      // endpoints, NOT the agents PATCH. Dirty detection compares the
+      // current textarea against the loaded snapshot directly. This
+      // covers all four interesting cases without special-casing the
+      // default-template path:
+      //   - default + textarea untouched (still equals
+      //     DefaultCheckinContent): no PUT.
+      //   - default + textarea edited: PUT creates the file on disk.
+      //   - saved + textarea cleared: PUT with empty body, server
+      //     removes the file via trim+remove.
+      //   - saved + body changed: PUT writes the new body.
+      const checkinDirty = cronMessage !== loadedCheckin;
+      const userDirty = userContext !== loadedUser;
+
+      const updated = await agentApi.update(
+        id!,
+        buildAgentSavePayload({
+          name,
+          persona,
+          publicProfile,
+          publicProfileOverride,
+          model,
+          effort,
+          tool,
+          customBaseURL,
+          thinkingMode,
+          workDir,
+          cronExpr,
+          timeoutMinutes,
+          resumeIdleMinutes,
+          silentStart,
+          silentEnd,
+          notifyDuringSilent,
+          // cronMessage is intentionally left blank in the PATCH payload —
+          // the agents row no longer drives cron/checkin behaviour. Save
+          // continues below via PUT /checkin-file.
+          cronMessage: "",
+          allowedTools,
+          allowProtectedPaths,
+          tts: {
+            enabled: ttsEnabled,
+            model: ttsModel,
+            voice: ttsVoice,
+            stylePrompt: ttsStylePrompt,
+          },
+        }),
+        // The form's snapshot etag — captured at GET time, NOT a global
+        // cache lookup. Without this If-Match the server happily accepts
+        // a stale form's overwrite even when another tab has saved newer
+        // values; with it, the second writer gets 412 and we surface a
+        // "someone else changed this" message below.
+        agent?.etag,
+      );
+
+      if (checkinDirty) {
+        // Thread the etag captured at load time as If-Match. Empty
+        // (default-template path) is fine — putWithIfMatch omits the
+        // header. After the write the response carries the freshly
+        // computed etag, which we re-pin for the next save.
+        const wrapped = await agentApi.putCheckinFile(
+          id!,
+          cronMessage,
+          checkinEtag || undefined,
+        );
+        const res = wrapped.value;
+        setCheckinIsDefault(res.isDefault);
+        setCronMessage(res.content);
+        // Re-pin the loaded snapshot so subsequent edits compare
+        // against the value now on disk (or the default template if
+        // the body was cleared), not the value the form was first
+        // hydrated with.
+        setLoadedCheckin(res.content);
+        setCheckinEtag(wrapped.etag ?? res.etag ?? "");
       }
-      // Same logic as above for checkin.md — only PUT when the textarea
-      // changed. Previously a !cronIsDefault clause forced a PUT on every
-      // save once an agent had a persisted checkin.md; a transient
-      // /checkin-file failure would then block saving unrelated fields
-      // even though agentApi.update had already applied them.
-      if (cronMessageDirty) {
-        const savedCheckin = await agentApi.putCheckinFile(id!, cronMessage);
-        // Sync the textarea to the server-normalized value (WriteCheckinFile
-        // trims whitespace) so the UI matches what was actually persisted,
-        // and reset the dirty flag so manual check-in unblocks.
-        setCronMessage(savedCheckin.content);
-        setSavedCronMessage(savedCheckin.content);
-        setCronIsDefault(savedCheckin.isDefault);
+      if (userDirty) {
+        const wrapped = await agentApi.setUserContext(
+          id!,
+          userContext,
+          userContextEtag || undefined,
+        );
+        const res = wrapped.value;
+        setUserContextIsDefault(res.isDefault);
+        setUserContext(res.content);
+        setLoadedUser(res.content);
+        setUserContextEtag(wrapped.etag ?? res.etag ?? "");
       }
+
       setAgent(updated);
       setPublicProfile(updated.publicProfile ?? "");
       setPublicProfileOverride(updated.publicProfileOverride ?? false);
+      // Re-sync cronExpr to whatever the server actually persisted. Without
+      // this, picking a Preset chip ("@preset:30") leaves the local state at
+      // the sentinel even though the saved row is the expanded form
+      // ("7,37 * * * *"); the dirty diff stays true forever.
+      setCronExpr(updated.cronExpr ?? "");
       setSuccess(true);
       setTimeout(() => setSuccess(false), 2000);
     } catch (err) {
+      // PreconditionFailedError is the etag-mismatch 412. Re-fetch the
+      // agent so the form rebases onto the server's current row before
+      // the user re-applies their edit (otherwise the next Save would
+      // 412 again with the same stale etag they started with).
+      if (err instanceof Error && err.name === "PreconditionFailedError") {
+        setError("Someone else updated this agent. Reloading…");
+        try {
+          const fresh = await agentApi.get(id!);
+          setAgent(fresh);
+          // Don't blow away the user's in-progress edits — only refresh
+          // the etag-bearing record. Form fields stay as-is so the user
+          // can decide what to do; clicking Save again will use the new
+          // etag and either succeed or 412 again if a third write
+          // landed in between.
+        } catch {
+          /* swallow — primary error is already shown */
+        }
+        return;
+      }
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSaving(false);
@@ -387,22 +476,27 @@ export function AgentSettings() {
   };
 
   const handleCheckin = async () => {
-    // The server runs the check-in against the persisted agent record and
-    // the persisted checkin.md, not the in-flight edits in this form. Bail
-    // with a notice if either Timeout or Check-in Message has unsaved
-    // changes — fixing this with an auto-save would mean committing other
-    // unrelated dirty fields too.
+    // The server runs the check-in against the persisted agent record, not
+    // the in-flight edits in this form. Bail with a notice instead of
+    // silently using stale cronMessage/timeoutMinutes — fixing this with
+    // an auto-save would mean committing other unrelated dirty fields too.
+    // Match the same normalisations the load path applies so an agent that
+    // hasn't been touched doesn't read as dirty:
+    //   - timeoutMinutes: 0 (server default) is shown as 10 in the UI, so
+    //     compare against the same "|| 10" coercion done at load.
+    //   - cronMessage: the server trims on save, so a saved value of "x"
+    //     stays equal to "x" no matter how many spaces the textarea adds.
+    // Dirty detection compares the current textarea against the
+    // loaded snapshot — same source of truth Save uses. Hitting the
+    // network here would race against an in-flight PUT and surface a
+    // false positive whenever the form just saved.
     const savedTimeout = agent ? (agent.timeoutMinutes || 10) : timeoutMinutes;
-    if (agent && savedTimeout !== timeoutMinutes) {
+    if (
+      agent &&
+      (cronMessage !== loadedCheckin || savedTimeout !== timeoutMinutes)
+    ) {
       setCheckinNotice(
-        "Save your changes first — manual check-in uses the saved Timeout.",
-      );
-      setTimeout(() => setCheckinNotice(""), 5000);
-      return;
-    }
-    if (cronMessageDirty) {
-      setCheckinNotice(
-        "Save your changes first — manual check-in uses the saved Check-in Message.",
+        "Save your changes first — manual check-in uses the saved Check-in Message and Timeout.",
       );
       setTimeout(() => setCheckinNotice(""), 5000);
       return;
@@ -501,7 +595,7 @@ export function AgentSettings() {
     }
     if (
       !confirm(
-        `Delete every memory recorded at or after ${iso}? This drops kojo transcript records, Claude --resume session entries (with trailing-turn cleanup), and matching daily diary bullets. Persona, MEMORY.md, project / people / topic notes, and credentials are kept.`,
+        `Delete every memory recorded at or after ${iso}? This drops kojo transcript records, Claude --resume session entries (with trailing-turn cleanup), the entire grok --resume session (events.jsonl has no per-record timestamp so partial cuts are not safe — the next turn opens a fresh session), and matching daily diary bullets. Persona, MEMORY.md, project / people / topic notes, and credentials are kept.`,
       )
     ) {
       return;
@@ -634,24 +728,7 @@ export function AgentSettings() {
     }
   };
 
-  // Initial fetch failed before agentApi.get resolved. Show the error so
-  // the user can see what went wrong (and a Back link so they can leave)
-  // instead of a blank page.
-  if (!agent) {
-    return error ? (
-      <div className="min-h-full bg-neutral-950 text-neutral-200 p-4 max-w-md mx-auto">
-        <button
-          onClick={() => navigate("/")}
-          className="text-neutral-400 hover:text-neutral-200 text-sm mb-3"
-        >
-          ← Back
-        </button>
-        <div className="p-3 bg-red-950 border border-red-800 rounded-lg text-sm text-red-300 whitespace-pre-wrap">
-          {error}
-        </div>
-      </div>
-    ) : null;
-  }
+  if (!agent) return null;
 
   return (
     <div className="min-h-full bg-neutral-950 text-neutral-200">
@@ -751,26 +828,25 @@ export function AgentSettings() {
           </div>
         </div>
 
-        {/* User Context */}
+        {/* User Context (user.md) */}
         <div>
           <label className="block text-sm text-neutral-400 mb-2">
             User Context
           </label>
           <textarea
             value={userContext}
-            onChange={(e) => setUserContext(e.target.value)}
+            onChange={(e) => {
+              setUserContext(e.target.value);
+              // First keystroke off the default template — clear the
+              // default flag so Save persists the edit instead of
+              // treating it as a no-op against the in-memory template.
+              if (userContextIsDefault) setUserContextIsDefault(false);
+            }}
             rows={6}
-            // Backend caps the PUT body at 1 MiB (http.MaxBytesReader in
-            // handleSetUserContext). Match it client-side using the most
-            // pessimistic UTF-8 footprint (4 bytes/char) so confusingly
-            // large pastes get blocked at the input instead of failing on
-            // save.
-            maxLength={Math.floor((1 << 20) / 4)}
-            placeholder="Record information about users and collaborators (agents also update this through conversation)"
-            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm resize-none focus:outline-none focus:border-neutral-500"
+            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm font-mono resize-y focus:outline-none focus:border-neutral-500"
           />
           <p className="mt-1 text-xs text-neutral-600">
-            Injected into system prompt. Agents can also update this via their tools.
+            Notes about the people this agent works with — name, timezone, communication preferences, etc. Injected into the system prompt as data (head/tail truncated above 1500 chars). {userContextIsDefault && "Template — not yet saved."}
           </p>
         </div>
 
@@ -870,7 +946,7 @@ export function AgentSettings() {
         <div>
           <label className="block text-sm text-neutral-400 mb-2">Tool</label>
           <div className="flex flex-wrap gap-2">
-            {["claude", "codex", "gemini", "custom", "llama.cpp"].map((t) => (
+            {["claude", "codex", "grok", "custom", "llama.cpp"].map((t) => (
               <button
                 key={t}
                 onClick={() => {
@@ -1011,8 +1087,8 @@ export function AgentSettings() {
 
         {/* Schedule */}
         <ScheduleEditor
-          intervalMinutes={intervalMinutes}
-          onIntervalChange={setIntervalMinutes}
+          cronExpr={cronExpr}
+          onCronExprChange={setCronExpr}
           timeoutMinutes={timeoutMinutes}
           onTimeoutChange={setTimeoutMinutes}
           resumeIdleMinutes={resumeIdleMinutes}
@@ -1022,12 +1098,22 @@ export function AgentSettings() {
           silentEnd={silentEnd}
           onSilentStartChange={setSilentStart}
           onSilentEndChange={setSilentEnd}
+          cronMessage={cronMessage}
+          onCronMessageChange={(v) => {
+            setCronMessage(v);
+            // First keystroke against the default template — flip the
+            // flag so Save persists the edit. checkinIsDefault stays
+            // true through the no-op case where the user just opened
+            // the form and didn't touch the textarea.
+            if (checkinIsDefault) setCheckinIsDefault(false);
+          }}
           nextCronAt={agent.nextCronAt}
+          cronPausedGlobal={agent.cronPausedGlobal}
           scheduleDirty={
             // Schedule-affecting fields differ from the persisted agent —
             // nextCronAt is computed against the saved schedule so showing
             // it during edits would mislead.
-            agent.intervalMinutes !== intervalMinutes ||
+            (agent.cronExpr ?? "") !== cronExpr ||
             (agent.silentStart ?? "") !== silentStart ||
             (agent.silentEnd ?? "") !== silentEnd
           }
@@ -1036,8 +1122,6 @@ export function AgentSettings() {
           // user doesn't fire repeated 409s in quick succession before the
           // server-side run actually gets going.
           checkingIn={checkingIn || checkinNotice !== ""}
-          cronMessage={cronMessage}
-          onCronMessageChange={setCronMessage}
         />
 
         {/* Notify During Silent Hours */}
@@ -1283,11 +1367,6 @@ export function AgentSettings() {
           </button>
         </section>
 
-        {/* ── Notifications ── */}
-        <section className="rounded-xl border border-neutral-800 p-5">
-          <NotifySourcesEditor agentId={id!} />
-        </section>
-
         {/* ── Slack Bot ── */}
         <section className="rounded-xl border border-neutral-800 p-5">
           <SlackBotSettings agentId={id!} />
@@ -1349,7 +1428,7 @@ export function AgentSettings() {
               {truncating ? "Truncating..." : "Truncate Memory From This Time"}
             </button>
             <p className="text-xs text-neutral-600 mt-1">
-              Drop transcript records, Claude --resume session entries, and daily diary bullets recorded at or after this instant. Persona, MEMORY.md, project / people / topic notes, archive, and credentials are kept.
+              Drop transcript records, Claude --resume session entries, the grok --resume session (dropped wholesale — see below), and daily diary bullets recorded at or after this instant. Persona, MEMORY.md, project / people / topic notes, archive, and credentials are kept.
             </p>
             {truncateResult && (
               <div className="mt-2 text-xs text-neutral-400 bg-neutral-900/60 border border-neutral-800 rounded-lg p-2 space-y-0.5">
@@ -1357,6 +1436,7 @@ export function AgentSettings() {
                 <div>
                   Transcript: {truncateResult.messagesRemoved} ·
                   {" "}Claude session: {truncateResult.claudeSessionEntriesRemoved} entries / {truncateResult.claudeSessionFilesRemoved} files ·
+                  {" "}Grok session: {truncateResult.grokSessionsRemoved ?? 0} sessions / {truncateResult.grokSessionFilesRemoved ?? 0} files ·
                   {" "}Diary: {truncateResult.diaryEntriesRemoved} entries / {truncateResult.diaryFilesRemoved} files
                 </div>
               </div>

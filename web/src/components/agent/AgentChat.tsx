@@ -1,13 +1,20 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { useParams, useNavigate } from "react-router";
 import { agentApi, type AgentInfo, type AgentMessage, type AgentMessageAttachment, type ChatEvent } from "../../lib/agentApi";
-import { api } from "../../lib/api";
+import { api, isThumbSupported } from "../../lib/api";
 import { localRFC3339 } from "../../lib/utils";
 import { useEnterSends } from "../../lib/preferences";
 import { useAgentWebSocket } from "../../hooks/useAgentWebSocket";
 import { useTTSAutoToggle, useTTSPlayer } from "../../hooks/useTTS";
 import { ChatMessage, StreamingMessage } from "./ChatMessage";
 import { AgentAvatar } from "./AgentAvatar";
+import {
+  appendSystemErrorIfNew,
+  appendUniqueMessage,
+  applyDoneMessage,
+  applyToolResult,
+  newToolFromEvent,
+} from "./chatEventReducer";
 
 const PAGE_SIZE = 30;
 
@@ -96,6 +103,129 @@ export function AgentChat() {
     }).catch(console.error);
   }, [id, navigate]);
 
+  // §3.7 device-switch: when the agent's runtime lives on a remote
+  // peer that is currently offline, the WS proxy + GET /messages
+  // proxy both 502, the transcript shown is whatever stale snapshot
+  // Hub has locally, and Send would just queue into the void. We
+  // poll the agent record every 5 s to refresh holderPeerStatus
+  // without tearing the chat down — when the holder flips back to
+  // online we refetch /messages so the most-recent transcript from
+  // the holder lands. Stops when the agent has no holder (local)
+  // or the page unmounts.
+  const holderOffline = !!agent?.holderPeer && agent.holderPeerStatus !== "online";
+  // Key the seen status by holderPeer so a holder rotation (peerA →
+  // peerB) doesn't silently reuse peerA's last-seen status as the
+  // "prev" for peerB. Holder change with both endpoints already
+  // "online" also triggers a refetch — the new holder may have
+  // accumulated messages while peerA owned the lock.
+  const lastHolderRef = useRef<{ peer: string; status?: string } | null>(null);
+  // Monotonic refetch generation: every refetch increments the seq
+  // and only the latest one's response is allowed to commit. Guards
+  // against a slow response from holderA arriving after holderB has
+  // already supplied a fresh transcript — without this the stale
+  // response would re-order or replace the newer view.
+  const refetchSeqRef = useRef(0);
+  useEffect(() => {
+    if (!id) {
+      // Agent route gone — invalidate any in-flight refetch so a
+      // late response can't commit to whatever loads next.
+      refetchSeqRef.current++;
+      return;
+    }
+    if (!agent?.holderPeer) {
+      // Agent went back to local. Drop the seen state so a future
+      // re-transition to a remote holder starts fresh, and bump
+      // the seq so an in-flight refetch from the previous remote
+      // holder can't land on the now-local transcript.
+      refetchSeqRef.current++;
+      lastHolderRef.current = null;
+      return;
+    }
+    const prev = lastHolderRef.current;
+    const currStatus = agent.holderPeerStatus;
+    const currPeer = agent.holderPeer;
+    lastHolderRef.current = { peer: currPeer, status: currStatus };
+
+    // Refetch trigger:
+    //   (a) holder rotation — peer changed, regardless of status,
+    //   (b) status flip away-from-online → online on the SAME holder.
+    // Case (a) catches new-holder-with-already-online-status; case
+    // (b) catches recovery from a transient offline window.
+    const holderChanged = !!prev && prev.peer !== currPeer;
+    const cameOnline = !!prev && prev.peer === currPeer && prev.status !== "online" && currStatus === "online";
+    if (!holderChanged && !cameOnline) return;
+
+    // Preserve scroll position over the refetch — the user may be
+    // mid-read on older content and a jump-to-bottom would be
+    // disruptive. Mirrors loadOlderMessages's restore protocol.
+    const container = scrollContainerRef.current;
+    suppressAutoScrollRef.current = true;
+    scrollRestoreRef.current = {
+      prevScrollHeight: container?.scrollHeight ?? 0,
+      prevScrollTop: container?.scrollTop ?? 0,
+    };
+    const seq = ++refetchSeqRef.current;
+    agentApi.messages(id, PAGE_SIZE).then((r) => {
+      // Generation guard: if a newer refetch has fired (e.g. holder
+      // rotated again, or another flip-online landed) we drop this
+      // response — applying it would either reorder the transcript
+      // (older response containing only top-N rows) or overwrite a
+      // fresher view with a stale snapshot.
+      if (seq !== refetchSeqRef.current) return;
+      setMessages((existing) => {
+        // Merge: prefer the server's view for the most recent
+        // PAGE_SIZE rows, but keep
+        //   1. older rows the user already paged in (any non-
+        //      synthetic id absent from the fresh page), and
+        //   2. local-only synthetic rows (pending_/error_/aborted_)
+        //      so an in-flight optimistic message survives.
+        // Mirrors the merge in the background-done branch.
+        const newIds = new Set(r.messages.map((m) => m.id));
+        const olderKept = existing.filter((m) => !newIds.has(m.id) && !/^(pending|error|aborted)_/.test(m.id));
+        const localSynthetic = existing.filter((m) => !newIds.has(m.id) && /^(pending|error|aborted)_/.test(m.id));
+        return [...olderKept, ...r.messages, ...localSynthetic];
+      });
+      // Don't shrink hasMore — older pages may already be loaded.
+      // Only widen it if the server now reports more.
+      if (r.hasMore) setHasMore(true);
+    }).catch(() => {
+      // Refetch failed — release the scroll-restore tokens so a
+      // subsequent normal update isn't suppressed forever. Skip
+      // when a newer refetch has superseded this one (it owns the
+      // restore tokens now).
+      if (seq !== refetchSeqRef.current) return;
+      suppressAutoScrollRef.current = false;
+      scrollRestoreRef.current = null;
+    });
+    // Cleanup: when the effect re-runs (holder/status/id changed)
+    // or the component unmounts, bump the seq so this iteration's
+    // pending response can't commit out of order, and release the
+    // scroll-restore tokens — the stale response will early-return
+    // before clearing them itself, and leaving them set would let an
+    // unrelated next message update consume an out-of-date scroll
+    // anchor.
+    return () => {
+      refetchSeqRef.current++;
+      suppressAutoScrollRef.current = false;
+      scrollRestoreRef.current = null;
+    };
+  }, [id, agent?.holderPeer, agent?.holderPeerStatus]);
+
+  // Polling refresh for the agent record so holderPeerStatus tracks
+  // peer_registry without a page reload. Cheap (one row read) so 5 s
+  // matches the dashboard's cadence.
+  useEffect(() => {
+    if (!id || !agent?.holderPeer) return;
+    const t = setInterval(() => {
+      agentApi.get(id).then(setAgent).catch(() => {
+        // Transient — leave the previous record in place. We don't
+        // want a flaky poll to clear holderPeerStatus and flip the
+        // UI back to "online" when nothing changed.
+      });
+    }, 5000);
+    return () => clearInterval(t);
+  }, [id, agent?.holderPeer]);
+
   const scrollToBottom = useCallback(() => {
     if (suppressAutoScrollRef.current) return;
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -173,43 +303,22 @@ export function AgentChat() {
           liveStreamThinkingRef.current += event.delta ?? "";
           setStreamThinking((prev) => prev + (event.delta ?? ""));
           break;
-        case "tool_use":
-          if (event.toolName) {
-            const tool = { id: event.toolUseId ?? "", name: event.toolName!, input: event.toolInput ?? "", output: null };
+        case "tool_use": {
+          const tool = newToolFromEvent(event);
+          if (tool) {
             liveStreamToolsRef.current = [...liveStreamToolsRef.current, tool];
             setStreamTools((prev) => [...prev, tool]);
           }
           break;
+        }
         case "tool_result": {
-          const matchById = (t: { id: string; name: string; output: string | null }) =>
-            event.toolUseId ? t.id === event.toolUseId : t.name === event.toolName && t.output === null;
-          const liveTools = [...liveStreamToolsRef.current];
-          for (let i = liveTools.length - 1; i >= 0; i--) {
-            if (matchById(liveTools[i])) {
-              liveTools[i] = { ...liveTools[i], output: event.toolOutput ?? "" };
-              break;
-            }
-          }
-          liveStreamToolsRef.current = liveTools;
-          setStreamTools((prev) => {
-            const copy = [...prev];
-            for (let i = copy.length - 1; i >= 0; i--) {
-              if (matchById(copy[i])) {
-                copy[i] = { ...copy[i], output: event.toolOutput ?? "" };
-                break;
-              }
-            }
-            return copy;
-          });
+          liveStreamToolsRef.current = applyToolResult(liveStreamToolsRef.current, event);
+          setStreamTools((prev) => applyToolResult(prev, event));
           break;
         }
         case "message": {
           if (event.message) {
-            setMessages((prev) =>
-              prev.some((m) => m.id === event.message!.id)
-                ? prev
-                : [...prev, event.message!],
-            );
+            setMessages((prev) => appendUniqueMessage(prev, event.message!));
           }
           break;
         }
@@ -219,24 +328,15 @@ export function AgentChat() {
 
           if (abortedId) {
             // Abort message was already committed by handleAbort.
-            // If the server delivered a more complete version, upgrade it.
+            // applyDoneMessage handles the upgrade-or-drop branch
+            // for the synthetic marker; when event.message is absent
+            // it falls through to a copy (the marker stays).
             if (event.message) {
-              setMessages((prev) => {
-                // If server's message already exists (e.g. stale synthesized
-                // terminal from a prior turn), just remove the synthetic abort.
-                if (prev.some((m) => m.id === event.message!.id && m.id !== abortedId)) {
-                  return prev.filter((m) => m.id !== abortedId);
-                }
-                return prev.map((m) => m.id === abortedId ? event.message! : m);
-              });
+              setMessages((prev) => applyDoneMessage(prev, event, abortedId));
             }
           } else if (event.message) {
-            // Normal completion — deduplicate by message ID
-            setMessages((prev) =>
-              prev.some((m) => m.id === event.message!.id)
-                ? prev
-                : [...prev, event.message!],
-            );
+            // Normal completion — appendUniqueMessage dedupes by id.
+            setMessages((prev) => applyDoneMessage(prev, event, null));
             // Auto-play if both agent has TTS enabled AND the user has
             // the header toggle on. abortedId == null already guarantees
             // this is a real completion, not a synthesized abort marker.
@@ -266,21 +366,9 @@ export function AgentChat() {
           // Show process error as system message (e.g. auth failures, stderr).
           if (event.errorMessage) {
             const errorContent = `⚠️ Error: ${event.errorMessage}`;
-            setMessages((prev) => {
-              const last = prev[prev.length - 1];
-              if (last?.role === "system" && last.content === errorContent) {
-                return prev;
-              }
-              return [
-                ...prev,
-                {
-                  id: "error_" + Date.now(),
-                  role: "system",
-                  content: errorContent,
-                  timestamp: localRFC3339(),
-                },
-              ];
-            });
+            setMessages((prev) =>
+              appendSystemErrorIfNew(prev, errorContent, Date.now, localRFC3339),
+            );
           }
           resetStream();
           break;
@@ -288,22 +376,9 @@ export function AgentChat() {
         case "error": {
           abortedIdRef.current = null; // Clear on every terminal path
           const errorContent = `⚠️ Error: ${event.errorMessage || "An error occurred"}`;
-          setMessages((prev) => {
-            // Skip if already shown (e.g. loaded from transcript on reconnect)
-            const last = prev[prev.length - 1];
-            if (last?.role === "system" && last.content === errorContent) {
-              return prev;
-            }
-            return [
-              ...prev,
-              {
-                id: "error_" + Date.now(),
-                role: "system",
-                content: errorContent,
-                timestamp: localRFC3339(),
-              },
-            ];
-          });
+          setMessages((prev) =>
+            appendSystemErrorIfNew(prev, errorContent, Date.now, localRFC3339),
+          );
           resetStream();
           break;
         }
@@ -389,6 +464,10 @@ export function AgentChat() {
   const handleSend = () => {
     const text = input.trim();
     if ((!text && pendingFiles.length === 0) || streaming || !connected) return;
+    // Holder peer offline → the WS frame would dead-end at the Hub
+    // proxy and the user's message would be lost. Refuse rather than
+    // silently swallow.
+    if (holderOffline) return;
     abortedIdRef.current = null; // Finalize any pending abort — synthetic message stays as-is
 
     // Add user message immediately
@@ -453,7 +532,13 @@ export function AgentChat() {
         <div className="flex-1 min-w-0">
           <div className="font-medium text-sm truncate">{agent.name}</div>
           <div className="text-xs text-neutral-500">
-            {connected ? (streaming ? "typing..." : "online") : "connecting..."}
+            {holderOffline
+              ? `host offline @ ${agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)}`
+              : connected
+                ? streaming
+                  ? "typing..."
+                  : "online"
+                : "connecting..."}
           </div>
         </div>
         {ttsAgentEnabled && (
@@ -488,9 +573,32 @@ export function AgentChat() {
               const idx = modes.indexOf((agent.thinkingMode ?? "") as typeof modes[number]);
               const next = modes[(idx + 1) % modes.length];
               try {
-                const updated = await agentApi.update(agent.id, { thinkingMode: next });
+                // Pass agent.etag as the optimistic-concurrency token.
+                // Without this the toggle would be an unconditional
+                // PATCH and could overwrite a settings-page edit that
+                // landed since this AgentChat fetched the agent.
+                const updated = await agentApi.update(
+                  agent.id,
+                  { thinkingMode: next },
+                  agent.etag,
+                );
                 setAgent(updated);
-              } catch {}
+              } catch (err) {
+                // 412 → refetch and retry once. Any other failure is
+                // swallowed (existing behavior); the button visibly
+                // doesn't change so the user sees nothing happened.
+                if (err instanceof Error && err.name === "PreconditionFailedError") {
+                  try {
+                    const fresh = await agentApi.get(agent.id);
+                    const updated = await agentApi.update(
+                      agent.id,
+                      { thinkingMode: next },
+                      fresh.etag,
+                    );
+                    setAgent(updated);
+                  } catch { /* give up — user can retry */ }
+                }
+              }
             }}
             className={`px-2 py-1 rounded text-xs font-mono ${
               agent.thinkingMode === "on"
@@ -557,6 +665,7 @@ export function AgentChat() {
           const editable =
             agent.tool === "llama.cpp" &&
             !streaming &&
+            !holderOffline &&
             !msg.id.startsWith("pending_") &&
             !msg.id.startsWith("error_") &&
             !msg.id.startsWith("aborted_");
@@ -571,20 +680,71 @@ export function AgentChat() {
               avatarHash={agent.avatarHash}
               ttsEnabled={ttsAgentEnabled}
               ttsPlayState={tts.state[msg.id]}
-              onTTSPlay={ttsAgentEnabled ? tts.play : undefined}
+              // TTS synthesize is an agent sub-route that the remote-
+              // agent proxy forwards to the holder peer. Disable
+              // play while the holder is offline — otherwise the
+              // request just 502s through the proxy.
+              onTTSPlay={ttsAgentEnabled && !holderOffline ? tts.play : undefined}
               onEdit={
                 editable
                   ? async (msgId, content) => {
-                      const updated = await agentApi.updateMessage(agent.id, msgId, content);
-                      setMessages((prev) => prev.map((m) => (m.id === msgId ? { ...m, ...updated } : m)));
+                      // Pass the message's current etag so the server can
+                      // reject the edit with 412 if someone else changed
+                      // the row in the meantime. The msg here came from
+                      // the most recent setMessages() so it carries the
+                      // freshest etag we have.
+                      try {
+                        const updated = await agentApi.updateMessage(
+                          agent.id,
+                          msgId,
+                          content,
+                          msg.etag,
+                        );
+                        setMessages((prev) => prev.map((m) => (m.id === msgId ? { ...m, ...updated } : m)));
+                      } catch (err) {
+                        // 412 means our cached etag is stale — refetch the
+                        // transcript so subsequent edits start from the
+                        // current row. We rethrow so the ChatMessage's
+                        // edit UI can show the error (the form stays open
+                        // with the user's draft intact).
+                        if (err instanceof Error && err.name === "PreconditionFailedError") {
+                          const fresh = await agentApi.messages(agent.id, 30);
+                          setMessages(fresh.messages);
+                        }
+                        throw err;
+                      }
                     }
                   : undefined
               }
               onDelete={
                 editable
                   ? async (msgId) => {
-                      await agentApi.deleteMessage(agent.id, msgId);
-                      setMessages((prev) => prev.filter((m) => m.id !== msgId));
+                      try {
+                        await agentApi.deleteMessage(agent.id, msgId, msg.etag);
+                        setMessages((prev) => prev.filter((m) => m.id !== msgId));
+                      } catch (err) {
+                        // Two stale-state shapes both want a refetch:
+                        //   - 412: row was edited under us (etag advanced)
+                        //   - 404 with conditional delete: row already
+                        //     vanished. The store distinguishes this from
+                        //     "row never existed" — the conditional
+                        //     SoftDelete returns ErrNotFound only for
+                        //     tombstoned/missing rows, and the deleteMessage
+                        //     pre-read maps unrelated 404s the same way.
+                        //     Either way the local view is stale; refetch
+                        //     is the safe move. We do NOT auto-retry —
+                        //     delete is destructive and the user should
+                        //     re-confirm against fresh content.
+                        const isStale =
+                          err instanceof Error &&
+                          (err.name === "PreconditionFailedError" ||
+                            (msg.etag && /^404:/.test(err.message)));
+                        if (isStale) {
+                          const fresh = await agentApi.messages(agent.id, 30);
+                          setMessages(fresh.messages);
+                        }
+                        throw err;
+                      }
                     }
                   : undefined
               }
@@ -607,23 +767,52 @@ export function AgentChat() {
                       setStreamStatus("thinking");
                       setStreamStartTime(Date.now());
                       try {
-                        await agentApi.regenerateMessage(agent.id, msgId);
+                        // Pass msg.etag to catch the case where another
+                        // device edited this row between the user clicking
+                        // regenerate and the request landing — without the
+                        // precondition the server would happily truncate
+                        // against a stale view of the conversation.
+                        await agentApi.regenerateMessage(agent.id, msgId, msg.etag);
                       } catch (e) {
-                        // Server rejected before regen started (400/404/409/5xx).
-                        // Roll back optimistic state and show the error inline
-                        // — the backend never streamed, so no WS error will
-                        // arrive.
-                        const errorContent = `⚠️ Error: ${e instanceof Error ? e.message : String(e)}`;
-                        setMessages([
-                          ...snapshot,
-                          {
-                            id: "error_" + Date.now(),
-                            role: "system",
-                            content: errorContent,
-                            timestamp: localRFC3339(),
-                          },
-                        ]);
-                        resetStream();
+                        // Server rejected before regen started (400/404/409/412/5xx).
+                        // The backend never streamed, so no WS error will
+                        // arrive — we own the rollback. On 412 we refetch so
+                        // the user sees the fresh transcript before deciding
+                        // whether to re-confirm regenerate (no auto-retry:
+                        // regen is destructive and may now target a different
+                        // row). For everything else, restore the snapshot
+                        // and surface an inline error.
+                        //
+                        // The try/finally ensures resetStream() runs even
+                        // if the 412-refetch itself fails — without it we'd
+                        // leave the chat stuck in optimistic-truncated +
+                        // streaming-spinner state forever.
+                        try {
+                          if (e instanceof Error && e.name === "PreconditionFailedError") {
+                            try {
+                              const fresh = await agentApi.messages(agent.id, 30);
+                              setMessages(fresh.messages);
+                            } catch {
+                              // Refetch failed too — fall back to the
+                              // snapshot so the user at least sees the
+                              // transcript they had before clicking.
+                              setMessages(snapshot);
+                            }
+                            return;
+                          }
+                          const errorContent = `⚠️ Error: ${e instanceof Error ? e.message : String(e)}`;
+                          setMessages([
+                            ...snapshot,
+                            {
+                              id: "error_" + Date.now(),
+                              role: "system",
+                              content: errorContent,
+                              timestamp: localRFC3339(),
+                            },
+                          ]);
+                        } finally {
+                          resetStream();
+                        }
                       }
                     }
                   : undefined
@@ -650,6 +839,21 @@ export function AgentChat() {
 
       {/* Input */}
       <div className="border-t border-neutral-800 px-4 py-3 shrink-0">
+        {/* Holder offline banner — replaces the live indicator while the
+            §3.7 device-switch target is unreachable. The transcript shown
+            above this banner is whatever Hub has locally; latest messages
+            from the holder will land once it reconnects (see status-flip
+            refetch in the holderPeerStatus effect). */}
+        {holderOffline && (
+          <div className="flex items-center gap-2 mb-2 px-3 py-1.5 bg-amber-950/60 border border-amber-900/60 rounded-lg text-xs text-amber-200">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-3.5 h-3.5 shrink-0">
+              <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 5a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 5zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
+            </svg>
+            <span className="flex-1">
+              ホスト端末 <span className="font-mono">{agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)}</span> がオフライン。復帰まで送信不可。
+            </span>
+          </div>
+        )}
         {/* Upload error */}
         {uploadError && (
           <div className="flex items-center gap-2 mb-2 px-3 py-1.5 bg-red-950/50 border border-red-900/50 rounded-lg text-xs text-red-300">
@@ -671,9 +875,15 @@ export function AgentChat() {
               >
                 {file.mime.startsWith("image/") ? (
                   <img
-                    src={api.files.rawUrl(file.path)}
+                    src={
+                      isThumbSupported(file.path)
+                        ? api.files.thumbUrl(file.path, 64)
+                        : api.files.rawUrl(file.path)
+                    }
                     alt={file.name}
                     className="w-6 h-6 rounded object-cover"
+                    loading="lazy"
+                    decoding="async"
                   />
                 ) : (
                   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-neutral-500">
@@ -703,9 +913,9 @@ export function AgentChat() {
           />
           <button
             onClick={() => fileInputRef.current?.click()}
-            disabled={uploading || streaming}
+            disabled={uploading || streaming || holderOffline}
             className="p-2 text-neutral-500 hover:text-neutral-300 disabled:opacity-40 shrink-0"
-            title="Attach files"
+            title={holderOffline ? "Holder peer offline" : "Attach files"}
           >
             {uploading ? (
               <svg className="w-5 h-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -741,8 +951,9 @@ export function AgentChat() {
           ) : (
             <button
               onClick={handleSend}
-              disabled={(!input.trim() && pendingFiles.length === 0) || !connected}
+              disabled={(!input.trim() && pendingFiles.length === 0) || !connected || holderOffline}
               className="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-xl text-sm font-medium disabled:opacity-40 shrink-0"
+              title={holderOffline ? `Holder peer is offline — send disabled until @ ${agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)} reconnects` : undefined}
             >
               Send
             </button>

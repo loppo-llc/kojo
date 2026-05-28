@@ -160,6 +160,20 @@ func TestLoadHistoryMissingFile(t *testing.T) {
 	}
 }
 
+func TestAppendCreatesDirectories(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a", "b", "c", "test.jsonl")
+
+	msgs := []HistoryMessage{{Platform: "test", MessageID: "1"}}
+	if err := AppendMessages(path, msgs); err != nil {
+		t.Fatalf("AppendMessages: %v", err)
+	}
+
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("file not created: %v", err)
+	}
+}
+
 // TestScanJSONLLines_BasicAndEOF guards the contract LoadHistory /
 // LastMessage / LastPlatformTS rely on: every newline-terminated line is
 // passed to onLine, the final line is delivered even without a trailing
@@ -180,8 +194,7 @@ func TestScanJSONLLines_BasicAndEOF(t *testing.T) {
 
 // TestScanJSONLLines_LongLineCrossingBufioBuffer ensures that lines longer
 // than bufio's default buffer (4 KiB) are correctly reassembled across
-// ReadSlice/ErrBufferFull boundaries — this is the regression boundary the
-// switch from ReadBytes to a bounded scanner introduced.
+// ReadSlice/ErrBufferFull boundaries.
 func TestScanJSONLLines_LongLineCrossingBufioBuffer(t *testing.T) {
 	long := strings.Repeat("a", 100_000) // > default bufio buffer
 	input := "first\n" + long + "\nlast\n"
@@ -203,15 +216,11 @@ func TestScanJSONLLines_LongLineCrossingBufioBuffer(t *testing.T) {
 	}
 }
 
-// TestScanJSONLLines_OversizeLineReturnsErr is the actual security-relevant
+// TestScanJSONLLines_OversizeLineReturnsErr is the security-relevant
 // behavior of this helper: a single line that exceeds MaxJSONLLineBytes
 // must abort with ErrLineTooLarge instead of growing the buffer
-// unboundedly. We use a bytes.Reader so the test is deterministic even on
-// systems where allocations would otherwise be slow.
+// unboundedly.
 func TestScanJSONLLines_OversizeLineReturnsErr(t *testing.T) {
-	// One line larger than the cap. Use a reader that doesn't actually
-	// allocate the full payload upfront (compose-on-demand) so the test
-	// itself stays cheap.
 	huge := bytes.Repeat([]byte("x"), MaxJSONLLineBytes+1)
 	var got int
 	err := ScanJSONLLines(bytes.NewReader(huge), func(line []byte) {
@@ -226,8 +235,7 @@ func TestScanJSONLLines_OversizeLineReturnsErr(t *testing.T) {
 }
 
 // TestScanJSONLLines_EmptyLinesIgnored ensures the helper treats lone
-// "\n\n" runs without crashing and passes through empty lines that the
-// caller can choose to skip (JSON unmarshal of "" is a no-op already).
+// "\n\n" runs without crashing and passes through empty lines.
 func TestScanJSONLLines_EmptyLinesIgnored(t *testing.T) {
 	input := "a\n\nb\n"
 	var got []string
@@ -243,16 +251,10 @@ func TestScanJSONLLines_EmptyLinesIgnored(t *testing.T) {
 }
 
 // TestLoadHistory_OversizeLinePropagates ensures that a corrupted history
-// file with an oversize line surfaces as an error to LoadHistory's caller
-// (instead of silently truncating the result or OOMing). LastMessage /
-// LastPlatformTS deliberately swallow this error — see their docstrings —
-// so they're not covered here.
+// file with an oversize line surfaces as an error to LoadHistory's caller.
 func TestLoadHistory_OversizeLinePropagates(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "huge.jsonl")
-	// One valid record followed by a line > MaxJSONLLineBytes so we can
-	// confirm the error fires on the second line and the first is reachable
-	// via partial-state tools if we ever change the contract.
 	first := `{"platform":"slack","messageId":"1.0","userName":"alice","text":"hi"}` + "\n"
 	huge := strings.Repeat("x", MaxJSONLLineBytes+1) + "\n"
 	if err := os.WriteFile(path, []byte(first+huge), 0o644); err != nil {
@@ -264,19 +266,5 @@ func TestLoadHistory_OversizeLinePropagates(t *testing.T) {
 	}
 	if !errors.Is(err, ErrLineTooLarge) {
 		t.Errorf("expected ErrLineTooLarge, got %v", err)
-	}
-}
-
-func TestAppendCreatesDirectories(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "a", "b", "c", "test.jsonl")
-
-	msgs := []HistoryMessage{{Platform: "test", MessageID: "1"}}
-	if err := AppendMessages(path, msgs); err != nil {
-		t.Fatalf("AppendMessages: %v", err)
-	}
-
-	if _, err := os.Stat(path); err != nil {
-		t.Errorf("file not created: %v", err)
 	}
 }

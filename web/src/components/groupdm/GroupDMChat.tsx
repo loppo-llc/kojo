@@ -9,9 +9,11 @@ import {
   DEFAULT_GROUPDM_VENUE,
   type GroupMessage,
 } from "../../lib/groupdmApi";
+import { api } from "../../lib/api";
+import type { AgentMessageAttachment } from "../../lib/agentApi";
 import { useEnterSends } from "../../lib/preferences";
 import { AgentAvatar } from "../agent/AgentAvatar";
-import { MessageContent } from "../agent/ChatMessage";
+import { AttachmentList, MessageContent } from "../agent/ChatMessage";
 
 const PAGE_SIZE = 50;
 
@@ -46,6 +48,13 @@ export function GroupDMChat() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [enterSends] = useEnterSends();
 
+  // File attachments — uploaded to /api/v1/blobs but not yet attached to a
+  // posted message. Cleared on successful send.
+  const [pendingFiles, setPendingFiles] = useState<AgentMessageAttachment[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   // Restore draft / reset textarea height when id changes
   useEffect(() => {
     if (!id) {
@@ -78,6 +87,8 @@ export function GroupDMChat() {
     setShowDeleteDialog(false);
     setDeleteNotify(false);
     setDeleteError("");
+    setPendingFiles([]);
+    setUploadError(null);
   }, [id]);
 
   // Load group info
@@ -153,29 +164,56 @@ export function GroupDMChat() {
     }
   }, [id, hasMore, messages]);
 
-  if (notFound) {
-    return (
-      <div className="min-h-full bg-neutral-950 text-neutral-200 flex flex-col items-center justify-center gap-3">
-        <p className="text-neutral-500">Group not found</p>
-        <button
-          onClick={() => navigate("/")}
-          className="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 rounded text-sm"
-        >
-          Back
-        </button>
-      </div>
-    );
-  }
+  const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    setUploading(true);
+    setUploadError(null);
+    try {
+      const results = await Promise.allSettled(
+        Array.from(files).map((file) => api.upload(file)),
+      );
+      const uploaded: AgentMessageAttachment[] = [];
+      const failed: string[] = [];
+      for (let i = 0; i < results.length; i++) {
+        const r = results[i];
+        if (r.status === "fulfilled") {
+          uploaded.push({ path: r.value.path, name: r.value.name, size: r.value.size, mime: r.value.mime });
+        } else {
+          failed.push(Array.from(files)[i].name);
+        }
+      }
+      if (uploaded.length > 0) {
+        setPendingFiles((prev) => [...prev, ...uploaded]);
+      }
+      if (failed.length > 0) {
+        setUploadError(`Upload failed: ${failed.join(", ")}`);
+      }
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }, []);
+
+  const removePendingFile = useCallback((index: number) => {
+    setPendingFiles((prev) => prev.filter((_, i) => i !== index));
+  }, []);
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
-    if (!text || sending || !id) return;
+    if ((!text && pendingFiles.length === 0) || sending || !id) return;
     setSending(true);
     setSendError(null);
     try {
-      const sent = await groupdmApi.postUserMessage(id, text);
+      const sent = await groupdmApi.postUserMessage(
+        id,
+        text,
+        pendingFiles.length > 0 ? pendingFiles : undefined,
+      );
       // Clear input + draft on success
       setInput("");
+      setPendingFiles([]);
+      setUploadError(null);
       sessionStorage.removeItem(`groupdm-draft:${id}`);
       if (textareaRef.current) {
         textareaRef.current.style.height = "auto";
@@ -190,7 +228,7 @@ export function GroupDMChat() {
     } finally {
       setSending(false);
     }
-  }, [id, input, sending]);
+  }, [id, input, pendingFiles, sending]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -211,6 +249,23 @@ export function GroupDMChat() {
         Math.min(textareaRef.current.scrollHeight, 150) + "px";
     }
   }, []);
+
+  // Conditional renders MUST live below every hook above. Moving them up
+  // would change the hook count between renders (notFound flips after the
+  // initial groupdmApi.get failure) and React would throw.
+  if (notFound) {
+    return (
+      <div className="min-h-full bg-neutral-950 text-neutral-200 flex flex-col items-center justify-center gap-3">
+        <p className="text-neutral-500">Group not found</p>
+        <button
+          onClick={() => navigate("/")}
+          className="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 rounded text-sm"
+        >
+          Back
+        </button>
+      </div>
+    );
+  }
 
   if (!group) return null;
 
@@ -444,6 +499,9 @@ export function GroupDMChat() {
                     {msg.agentName}
                   </div>
                 )}
+                {msg.attachments && msg.attachments.length > 0 && (
+                  <AttachmentList attachments={msg.attachments} isUser={isUser} />
+                )}
                 <MessageContent
                   messageId={msg.id}
                   content={msg.content}
@@ -472,7 +530,72 @@ export function GroupDMChat() {
             </button>
           </div>
         )}
+        {uploadError && (
+          <div className="flex items-center gap-2 mb-2 px-3 py-1.5 bg-red-950/50 border border-red-900/50 rounded-lg text-xs text-red-300">
+            <span className="flex-1">{uploadError}</span>
+            <button onClick={() => setUploadError(null)} className="text-red-400 hover:text-red-200">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3">
+                <path d="M5.28 4.22a.75.75 0 00-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 101.06 1.06L8 9.06l2.72 2.72a.75.75 0 101.06-1.06L9.06 8l2.72-2.72a.75.75 0 00-1.06-1.06L8 6.94 5.28 4.22z" />
+              </svg>
+            </button>
+          </div>
+        )}
+        {pendingFiles.length > 0 && (
+          <div className="flex flex-wrap gap-2 mb-2">
+            {pendingFiles.map((file, i) => (
+              <div
+                key={file.path}
+                className="flex items-center gap-1.5 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded-lg text-xs text-neutral-300"
+              >
+                {file.mime.startsWith("image/") ? (
+                  <img
+                    src={api.files.rawUrl(file.path)}
+                    alt={file.name}
+                    className="w-6 h-6 rounded object-cover"
+                  />
+                ) : (
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-neutral-500">
+                    <path d="M3 3.5A1.5 1.5 0 014.5 2h6.879a1.5 1.5 0 011.06.44l4.122 4.12A1.5 1.5 0 0117 7.622V16.5a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 013 16.5v-13z" />
+                  </svg>
+                )}
+                <span className="max-w-[120px] truncate">{file.name}</span>
+                <button
+                  onClick={() => removePendingFile(i)}
+                  className="text-neutral-500 hover:text-neutral-300 ml-0.5"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3">
+                    <path d="M5.28 4.22a.75.75 0 00-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 101.06 1.06L8 9.06l2.72 2.72a.75.75 0 101.06-1.06L9.06 8l2.72-2.72a.75.75 0 00-1.06-1.06L8 6.94 5.28 4.22z" />
+                  </svg>
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
         <div className="flex items-end gap-2">
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            onChange={handleFileSelect}
+            className="hidden"
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploading || sending}
+            className="p-2 text-neutral-500 hover:text-neutral-300 disabled:opacity-40 shrink-0"
+            title="Attach files"
+          >
+            {uploading ? (
+              <svg className="w-5 h-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
+            ) : (
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
+                <path fillRule="evenodd" d="M15.621 4.379a3 3 0 00-4.242 0l-7 7a3 3 0 004.241 4.243h.001l.497-.5a.75.75 0 011.064 1.057l-.498.501-.002.002a4.5 4.5 0 01-6.364-6.364l7-7a4.5 4.5 0 016.368 6.36l-3.455 3.553A2.625 2.625 0 119.52 9.52l3.45-3.451a.75.75 0 111.061 1.06l-3.45 3.451a1.125 1.125 0 001.587 1.595l3.454-3.553a3 3 0 000-4.242z" clipRule="evenodd" />
+              </svg>
+            )}
+          </button>
           <textarea
             ref={textareaRef}
             value={input}
@@ -488,7 +611,7 @@ export function GroupDMChat() {
           />
           <button
             onClick={() => void handleSend()}
-            disabled={!input.trim() || sending}
+            disabled={(!input.trim() && pendingFiles.length === 0) || sending}
             className="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-xl text-sm font-medium disabled:opacity-40 shrink-0"
           >
             {sending ? "Sending…" : "Send"}

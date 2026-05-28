@@ -36,11 +36,11 @@ func TestFormatUntil(t *testing.T) {
 	}
 }
 
-func TestIntervalToCron(t *testing.T) {
+func TestIntervalToCronExpr(t *testing.T) {
 	tests := []struct {
-		name     string
-		interval int
-		agentID  string
+		name      string
+		interval  int
+		agentID   string
 		wantEmpty bool
 	}{
 		{"zero returns empty", 0, "ag_test", true},
@@ -50,11 +50,19 @@ func TestIntervalToCron(t *testing.T) {
 		{"30 min produces sub-hourly", 30, "ag_test", false},
 		{"60 min produces hourly", 60, "ag_test", false},
 		{"180 min produces 3-hourly", 180, "ag_test", false},
+		{"360 min produces 6-hourly", 360, "ag_test", false},
+		{"720 min produces 12-hourly", 720, "ag_test", false},
 		{"1440 min produces daily", 1440, "ag_test", false},
+		// Values outside the legacy whitelist must be rejected — bypassing
+		// the whitelist would let a hand-edited "intervalMinutes": 1 land
+		// every-minute cron during migration.
+		{"1 min rejected (not in whitelist)", 1, "ag_test", true},
+		{"90 min rejected (not in whitelist)", 90, "ag_test", true},
+		{"240 min rejected (not in whitelist)", 240, "ag_test", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := intervalToCron(tt.interval, tt.agentID)
+			got := intervalToCronExpr(tt.interval, tt.agentID)
 			if tt.wantEmpty && got != "" {
 				t.Errorf("expected empty, got %q", got)
 			}
@@ -65,14 +73,14 @@ func TestIntervalToCron(t *testing.T) {
 	}
 
 	// Deterministic: same ID always produces same result
-	a := intervalToCron(10, "ag_fixed")
-	b := intervalToCron(10, "ag_fixed")
+	a := intervalToCronExpr(10, "ag_fixed")
+	b := intervalToCronExpr(10, "ag_fixed")
 	if a != b {
 		t.Errorf("expected deterministic output, got %q and %q", a, b)
 	}
 
 	// Different IDs may produce different offsets
-	c := intervalToCron(10, "ag_other")
+	c := intervalToCronExpr(10, "ag_other")
 	// Not guaranteed different, but the function should at least return valid cron
 	if c == "" {
 		t.Error("expected non-empty for different ID")
@@ -126,21 +134,6 @@ func TestValidSilentHours(t *testing.T) {
 				t.Errorf("ValidSilentHours(%q, %q) error = %v, wantErr %v", tt.start, tt.end, err, tt.wantErr)
 			}
 		})
-	}
-}
-
-func TestValidInterval(t *testing.T) {
-	valid := []int{0, 5, 10, 30, 60, 180, 360, 720, 1440}
-	for _, v := range valid {
-		if !ValidInterval(v) {
-			t.Errorf("expected %d to be valid", v)
-		}
-	}
-	invalid := []int{-1, 1, 15, 20, 45, 90, 120, 240}
-	for _, v := range invalid {
-		if ValidInterval(v) {
-			t.Errorf("expected %d to be invalid", v)
-		}
 	}
 }
 

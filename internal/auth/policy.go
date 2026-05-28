@@ -5,6 +5,56 @@ import (
 	"strings"
 )
 
+// allowPeerSessionPath returns true when (method, path) names a
+// known RolePeer-callable session route. Explicit list — additions
+// require a deliberate edit here. Covers every endpoint registered
+// by registerRoutes under /api/v1/sessions; /api/v1/ws is handled
+// by the caller because its query semantics differ.
+//
+// Routes:
+//
+//	GET    /api/v1/sessions                           list
+//	POST   /api/v1/sessions                           create
+//	GET    /api/v1/sessions/{id}                      info
+//	DELETE /api/v1/sessions/{id}                      stop
+//	PATCH  /api/v1/sessions/{id}                      yolo toggle / patch
+//	POST   /api/v1/sessions/{id}/restart
+//	POST   /api/v1/sessions/{id}/tmux
+//	GET    /api/v1/sessions/{id}/terminal
+//	GET    /api/v1/sessions/{id}/attachments
+//	DELETE /api/v1/sessions/{id}/attachments          ?path=
+func allowPeerSessionPath(method, path string) bool {
+	if path == "/api/v1/sessions" {
+		return method == http.MethodGet || method == http.MethodPost
+	}
+	const prefix = "/api/v1/sessions/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	rest := path[len(prefix):]
+	// Strip the {id} segment.
+	slash := strings.IndexByte(rest, '/')
+	var sub string
+	if slash >= 0 {
+		sub = rest[slash:] // e.g. "/restart", "/attachments"
+	}
+	switch sub {
+	case "":
+		// /api/v1/sessions/{id}
+		switch method {
+		case http.MethodGet, http.MethodPatch, http.MethodDelete:
+			return true
+		}
+	case "/restart", "/tmux":
+		return method == http.MethodPost
+	case "/terminal":
+		return method == http.MethodGet
+	case "/attachments":
+		return method == http.MethodGet || method == http.MethodDelete
+	}
+	return false
+}
+
 // EnforceMiddleware gates /api/v1/* requests by Principal/method/path
 // using AllowNonOwner. It runs after AuthMiddleware (which set the
 // Principal in ctx). Static files and non-API paths pass through.
@@ -25,9 +75,17 @@ func EnforceMiddleware(next http.Handler) http.Handler {
 // API routes. Unrecognised paths are denied with 403, and recognised
 // paths may further be denied based on Principal/method/target.
 //
-// This wrapper applies on the *agent-facing* (auth-required) listener
-// only. The public listener uses OwnerOnlyMiddleware and never enters
-// this gate.
+// Wired via EnforceMiddleware on BOTH listeners:
+//
+//   - public (tsnet) listener — TailnetIdentityMiddleware stamps
+//     RoleOwner for every tailnet caller (Hub mode), including
+//     callers whose WhoIs is transiently unresolved, or RolePeer /
+//     Guest (peer mode). Owner short-circuits at the top, so this
+//     gate effectively runs only for the §3.7 RolePeer inter-peer
+//     surface and Guest fallthroughs.
+//   - agent-facing (auth-required) loopback listener — AuthMiddleware
+//     resolves Bearer/X-Kojo-Token to Owner/Agent/PrivAgent/WebDAV,
+//     and this gate enforces per-route policy for non-Owner roles.
 //
 // The intent is "default deny". Routes are grouped into three buckets:
 //
@@ -40,7 +98,7 @@ func EnforceMiddleware(next http.Handler) http.Handler {
 //      reset-session. Permitted for self by Agent, or for any target by
 //      PrivAgent.
 //
-// Owner-only routes (sessions, git, files browser, oauth, embedding,
+// Owner-only routes (sessions, git, files browser, embedding,
 // push, custom-models, group DM mutate-as-owner, fork, /privilege,
 // generate-*) fall through and 403. Note: POST /api/v1/groupdms
 // (group creation) is exposed to Agent / PrivAgent below — the handler
@@ -50,8 +108,154 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		return true
 	}
 
+	// WebDAV mount surface: the handler-side `webdavGate` is the
+	// canonical authorization point here because the credential a
+	// WebDAV client presents is HTTP Basic — AuthMiddleware can't
+	// resolve it to a Principal (only Bearer / X-Kojo-Token go
+	// through there), so we'd 403 a perfectly valid Basic-auth
+	// mount request before it ever reached the gate.
+	//
+	// Letting any principal through to the mux means the gate has
+	// to enforce both "no creds → 401 with Basic challenge" and
+	// "bad creds → 401" itself, which it does. The blast radius is
+	// bounded: only /api/v1/webdav/* opts out of policy-layer
+	// enforcement.
+	if strings.HasPrefix(path, "/api/v1/webdav/") || path == "/api/v1/webdav" {
+		return true
+	}
+
+	// RoleWebDAV is otherwise a dead-end — the token's only valid
+	// destination is the webdav mount above. Any other API path
+	// falls through to default-deny.
+	if p.IsWebDAV() {
+		return false
+	}
+
+	// RolePeer is scoped to the inter-peer surface (status push
+	// feed for §3.10, blob handoff for §3.7, device-switch
+	// orchestration). The principal is stamped by
+	// TailnetIdentityMiddleware when the request arrives over the
+	// peer's tsnet listener and WhoIs resolves to a peer_registry
+	// row — Tailnet identity IS the trust signal. The legacy
+	// Ed25519-signed Bearer envelope path has been retired; no
+	// other RolePeer stamping route exists. Every API path
+	// outside this block falls through to default-deny, so an
+	// unpaired tailnet caller (Guest after WhoIs) can't reach
+	// /api/v1/agents or any other route. Method gating is
+	// explicit so a future mutation handler under the same
+	// prefix doesn't inherit the read allowlist.
+	if p.IsPeer() {
+		if method == http.MethodGet {
+			if path == "/api/v1/peers/events" {
+				return true
+			}
+			if strings.HasPrefix(path, "/api/v1/peers/blobs/") {
+				return true
+			}
+		}
+		if method == http.MethodHead &&
+			strings.HasPrefix(path, "/api/v1/peers/blobs/") {
+			// HEAD is the metadata-only twin of the GET above —
+			// hub's kojo-attach live-read fallback uses it to
+			// probe size / ETag before deciding whether to relay
+			// the body. Admit alongside GET so HEAD doesn't 403
+			// while GET succeeds.
+			return true
+		}
+		if method == http.MethodPost && path == "/api/v1/peers/pull" {
+			// Device-switch orchestration (§3.7 step 4): the
+			// Hub signs the pull dispatch as its own peer
+			// identity; the target's policy admits it as
+			// RolePeer. No other peer-auth POST surface is
+			// allowed — keep the method/path check tight so a
+			// future handler under /api/v1/peers/* doesn't
+			// inherit POST access by accident.
+			return true
+		}
+		if method == http.MethodPost && path == "/api/v1/peers/agent-sync" {
+			// Device-switch agent metadata push (§3.7 step
+			// 4-bis): source peer signs the payload, target
+			// applies via store.SyncAgentFromPeer. Same trust
+			// model as /peers/pull.
+			return true
+		}
+		if method == http.MethodPost &&
+			(path == "/api/v1/peers/agent-sync/finalize" ||
+				path == "/api/v1/peers/agent-sync/drop") {
+			// Two-phase agent-sync companions. finalize
+			// activates target runtime state after a
+			// successful complete; drop rolls back on abort.
+			return true
+		}
+		if method == http.MethodPost && path == "/api/v1/peers/agent-sync/state" {
+			// Incremental device-switch preflight (§3.7): source
+			// peer asks target for its high-water marks so the
+			// agent-sync payload ships only the delta. Read-only
+			// at the row level (no mutations on target);
+			// signer-equals-source and agent_lock holder check
+			// run inside the handler.
+			return true
+		}
+		// kojo-attach hub-ingest path.
+		if method == http.MethodPut && strings.HasPrefix(path, "/api/v1/peers/blobs-ingest/") {
+			return true
+		}
+		// Every paired peer (= has a peer_registry row matched by
+		// WhoIs over tsnet) is admitted on the privileged surface.
+		// The earlier "trusted" bit that gated this is gone —
+		// Tailnet identity (registry membership) IS the operator's
+		// trust signal. --unsafe collapses the WhoIs check and
+		// unconditionally stamps RolePeer on every caller (LAN /
+		// docker / CI escape hatch).
+		if strings.HasPrefix(path, "/api/v1/agents/") {
+			return true
+		}
+		if allowPeerSessionPath(method, path) {
+			return true
+		}
+		if method == http.MethodGet && path == "/api/v1/ws" {
+			return true
+		}
+		if method == http.MethodGet && path == "/api/v1/info" {
+			return true
+		}
+		if method == http.MethodGet && path == "/api/v1/dirs" {
+			return true
+		}
+		// File browser + raw fetch + upload. Mirrors the routes the
+		// Hub UI hits when it has selected a remote peer in the
+		// session screen's File/Attachments tabs.
+		if method == http.MethodGet && (path == "/api/v1/files" ||
+			path == "/api/v1/files/view" || path == "/api/v1/files/raw") {
+			return true
+		}
+		if method == http.MethodPost && path == "/api/v1/upload" {
+			return true
+		}
+		// Git surface used by the Git tab. Read-only routes admit
+		// GET; the exec endpoint runs whitelisted operations
+		// inside handler-side guards.
+		if method == http.MethodGet && (path == "/api/v1/git/status" ||
+			path == "/api/v1/git/log" || path == "/api/v1/git/diff") {
+			return true
+		}
+		if method == http.MethodPost && path == "/api/v1/git/exec" {
+			return true
+		}
+		return false
+	}
+
 	// Bare /api/v1/info — reduced view (version only) returned by the handler.
 	if method == http.MethodGet && path == "/api/v1/info" {
+		return true
+	}
+	// Peer list: agents need this to discover handoff targets
+	// by Tailscale machine name. The wire shape carries no
+	// identity-sensitive fields, so Owner and Agent see the same
+	// response. Mutating /api/v1/peers/* routes (POST, PATCH,
+	// DELETE) and /self stay owner-only via the handler-level
+	// gate.
+	if method == http.MethodGet && path == "/api/v1/peers" && p.IsAgent() {
 		return true
 	}
 	// Public agent reads.
@@ -66,7 +270,7 @@ func AllowNonOwner(p Principal, method, path string) bool {
 	}
 
 	// Per-agent {id} routes.
-	if id, sub, ok := splitAgentIDPath(path); ok {
+	if id, sub, ok := SplitAgentIDPath(path); ok {
 		// Avatar and agent-active status are public-readable.
 		if method == http.MethodGet && (sub == "/avatar" || sub == "/active") {
 			return true
@@ -91,6 +295,14 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			case "/fork", "/privilege":
 				// Owner-only — already filtered out above.
 				return false
+			case "/handoff/switch":
+				// Agent-self orchestrated device switch
+				// (§3.7). Only the agent itself may move
+				// itself between peers — Owner is handled by
+				// the IsOwner short-circuit at the top of
+				// AllowNonOwner. Other agents must NOT be
+				// able to migrate someone else's data.
+				return p.IsAgent() && p.AgentID == id
 			}
 		}
 		// Everything else is self-scoped read/write. The handler still
@@ -158,15 +370,13 @@ func isSelfScopedRoute(method, sub string) bool {
 		return method == http.MethodPost
 	case "/avatar/generated":
 		return method == http.MethodPost
-	case "/files", "/files/view", "/files/raw":
+	case "/files", "/files/view", "/files/raw", "/files/thumb":
 		return method == http.MethodGet
 	case "/messages":
 		return method == http.MethodGet
 	case "/tasks":
 		return method == http.MethodGet || method == http.MethodPost
 	case "/credentials":
-		return method == http.MethodGet || method == http.MethodPost
-	case "/notify-sources":
 		return method == http.MethodGet || method == http.MethodPost
 	case "/slackbot":
 		return method == http.MethodGet || method == http.MethodPut || method == http.MethodDelete
@@ -179,21 +389,20 @@ func isSelfScopedRoute(method, sub string) bool {
 		// PreCompact hook fired by claude-code on the agent's own session.
 		return method == http.MethodPost
 	case "/user-context":
-		// Agent reads/edits its own user.md (people-it-works-with notes).
-		// GET returns the in-memory default template when the file is absent
-		// without requiring filesystem access via /files, so this gate covers
-		// both reads and writes.
+		// Agent reads/writes its own user.md workspace file. GET surfaces
+		// the in-memory DefaultUserContent template for new agents (no
+		// disk persistence until the first PUT). PUT lands at the
+		// per-agent path under agentDir(id).
 		return method == http.MethodGet || method == http.MethodPut
 	case "/checkin-file":
-		// Agent reads/edits its own checkin.md (recurring check-in instructions).
-		// GET returns DefaultCheckinContent when the file is absent so the
-		// settings screen renders the template even before first save; this
-		// gate covers both reads and writes.
+		// Agent reads/writes its own checkin.md workspace file. GET
+		// surfaces DefaultCheckinContent when checkin.md is absent so
+		// the settings UI shows the same body the cron path would run.
 		return method == http.MethodGet || method == http.MethodPut
 	}
 
 	// Sub-resources with their own {id} segments (messages, tasks,
-	// credentials, notify-sources). Match conservatively.
+	// credentials). Match conservatively.
 	switch {
 	case strings.HasPrefix(sub, "/messages/"):
 		return method == http.MethodPatch || method == http.MethodDelete || method == http.MethodPost
@@ -201,16 +410,14 @@ func isSelfScopedRoute(method, sub string) bool {
 		return method == http.MethodPatch || method == http.MethodDelete
 	case strings.HasPrefix(sub, "/credentials/"):
 		return method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete || method == http.MethodPost
-	case strings.HasPrefix(sub, "/notify-sources/"):
-		return method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete
 	}
 	return false
 }
 
-// splitAgentIDPath parses /api/v1/agents/{id}{sub} into (id, sub, true)
+// SplitAgentIDPath parses /api/v1/agents/{id}{sub} into (id, sub, true)
 // where sub starts with "/" or is empty. Returns ok=false if the path
 // does not match.
-func splitAgentIDPath(path string) (id, sub string, ok bool) {
+func SplitAgentIDPath(path string) (id, sub string, ok bool) {
 	const prefix = "/api/v1/agents/"
 	if !strings.HasPrefix(path, prefix) {
 		return "", "", false
@@ -230,7 +437,7 @@ func splitAgentIDPath(path string) (id, sub string, ok bool) {
 // expected suffix ("" for the bare GET /agents/{id}). Used in the
 // allowlist for read-only endpoints exposed to Agent principals.
 func matchAgentSubpath(path, expectedSub string) bool {
-	_, sub, ok := splitAgentIDPath(path)
+	_, sub, ok := SplitAgentIDPath(path)
 	if !ok {
 		return false
 	}

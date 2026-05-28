@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useParams, useNavigate, useLocation } from "react-router";
+import { useParams, useNavigate, useLocation, useSearchParams } from "react-router";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { useTerminal } from "../hooks/useTerminal";
 import { api, type SessionInfo, type Attachment } from "../lib/api";
@@ -26,6 +26,12 @@ export function SessionPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const location = useLocation();
+  const [searchParams] = useSearchParams();
+  // peerId, when present, tells the Hub's WS proxy which peer
+  // hosts this session. NewSession stamps it into the URL after a
+  // peer-targeted create; refreshes preserve it via the query
+  // param so the browser bookmark survives a tab restore.
+  const peerId = searchParams.get("peer") ?? undefined;
   const termContainerRef = useRef<HTMLDivElement>(null);
   const [session, setSession] = useState<SessionInfo>();
   const [input, setInput] = useState("");
@@ -48,7 +54,12 @@ export function SessionPage() {
     setActiveTab(tab);
     const base = `/session/${id}`;
     const path = tab === "cli" ? base : `${base}/${tab}`;
-    navigate(path, { replace: true });
+    // Preserve `?peer=<id>` across tab switches so the WS + REST
+    // routing stays pointed at the peer that owns this session.
+    // Without this the user would silently lose the peer route on
+    // the first tab change and the next refresh.
+    const target = peerId ? `${path}?peer=${encodeURIComponent(peerId)}` : path;
+    navigate(target, { replace: true });
   };
 
   const gotScrollbackRef = useRef(false);
@@ -60,10 +71,30 @@ export function SessionPage() {
   const sendResizeRef = useRef<(cols: number, rows: number) => void>(() => {});
   const wrapInputRef = useRef<(data: string) => string>((d) => d);
 
+  // Non-claude CLIs (grok build, codex, ...) get a fixed-height terminal with no
+  // scrollback — they don't rely on internal scrollback navigation and the
+  // visible scrollbar is just noise. Claude keeps the default 1000-line buffer.
+  // The scrollback value is applied at runtime in useTerminal (no recreate),
+  // so output that arrives before session metadata loads isn't dropped.
+  // Gate on `session.id === id`: after navigating between sessions the React
+  // state still holds the previous session for a tick, and we must not apply
+  // its scrollback to the new terminal — otherwise switching grok → claude
+  // could pin scrollback at 0 and drop history before the new metadata loads.
+  const sessionMatches = session?.id === id;
+  const isClaude = sessionMatches && session?.tool === "claude";
+  const isGrok = sessionMatches && session?.tool === "grok";
+  // grok-builder binds its own scroll shortcuts (Ctrl+K up, Ctrl+J down) and
+  // ignores xterm's internal scrollback. Forward wheel/swipe to those keys so
+  // the user can drive the TUI's scroll without a keyboard.
+  const scrollAsKeys = isGrok
+    ? { up: "\x0b", down: "\x0a", send: (key: string) => sendInputRef.current(key) }
+    : undefined;
   const { termRef: xtermRef, autoScrollRef, safeFit, immediateFit } = useTerminal({
     containerRef: termContainerRef,
     onInput: useCallback((data: string) => sendInputRef.current(wrapInputRef.current(data)), []),
     onResize: useCallback((cols: number, rows: number) => sendResizeRef.current(cols, rows), []),
+    scrollback: sessionMatches ? (isClaude ? 1000 : 0) : undefined,
+    scrollAsKeys,
     deps: [id],
   });
 
@@ -114,6 +145,7 @@ export function SessionPage() {
 
   const { connected, sendInput, sendResize, reconnect } = useWebSocket({
     sessionId: id!,
+    peerId,
     onOutput,
     onScrollback,
     onExit,
@@ -124,7 +156,7 @@ export function SessionPage() {
   sendInputRef.current = sendInput;
   sendResizeRef.current = sendResize;
 
-  const { ctrlMode, shiftMode, handleKeyPress, wrapInput } = useSpecialKeys(sendInput, autoScrollRef);
+  const { ctrlMode, shiftMode, altMode, handleKeyPress, wrapInput } = useSpecialKeys(sendInput, autoScrollRef);
   wrapInputRef.current = wrapInput;
 
   // Clean up yolo timer on unmount and session switch
@@ -140,12 +172,12 @@ export function SessionPage() {
     setExited(false);
     setAttachments([]);
     gotScrollbackRef.current = false;
-    api.sessions.get(id!).then((s) => {
+    api.sessions.get(id!, peerId).then((s) => {
       setSession(s);
       if (s.status === "exited") setExited(true);
     }).catch(() => navigate("/"));
-    api.sessions.attachments(id!).then(mergeAttachments).catch(() => {});
-  }, [id, navigate]);
+    api.sessions.attachments(id!, peerId).then(mergeAttachments).catch(() => {});
+  }, [id, navigate, peerId]);
 
   // Show persisted lastOutput for exited sessions when no live scrollback arrived
   useEffect(() => {
@@ -203,7 +235,7 @@ export function SessionPage() {
   const handleResume = async () => {
     if (!id) return;
     try {
-      const updated = await api.sessions.restart(id);
+      const updated = await api.sessions.restart(id, peerId);
       setSession(updated);
       setExited(false);
       reconnect();
@@ -215,7 +247,7 @@ export function SessionPage() {
   const handleStop = async () => {
     if (!id) return;
     try {
-      await api.sessions.delete(id);
+      await api.sessions.delete(id, peerId);
       setExited(true);
     } catch (err) {
       console.error("failed to stop session", err);
@@ -225,7 +257,7 @@ export function SessionPage() {
   const handleYoloToggle = async () => {
     if (!id || !session) return;
     try {
-      const updated = await api.sessions.patch(id, { yoloMode: !session.yoloMode });
+      const updated = await api.sessions.patch(id, { yoloMode: !session.yoloMode }, peerId);
       setSession(updated);
     } catch (err) {
       console.error("failed to toggle yolo mode", err);
@@ -239,7 +271,7 @@ export function SessionPage() {
     fileInput.onchange = async () => {
       const file = fileInput.files?.[0];
       if (!file) return;
-      const result = await api.upload(file);
+      const result = await api.upload(file, peerId);
       setInput((prev) => (prev ? prev + "\n" : "") + result.path);
     };
     fileInput.click();
@@ -260,17 +292,19 @@ export function SessionPage() {
           )
         ) : (
           <>
-            <button
-              onClick={handleYoloToggle}
-              className={`px-2.5 py-1.5 text-xs rounded min-h-[44px] min-w-[44px] flex items-center justify-center ${
-                session?.yoloMode
-                  ? "bg-yellow-900 text-yellow-300"
-                  : "bg-neutral-800 text-neutral-500"
-              }`}
-              title="Yolo Mode"
-            >
-              &#x26A1;
-            </button>
+            {isClaude && (
+              <button
+                onClick={handleYoloToggle}
+                className={`px-2.5 py-1.5 text-xs rounded min-h-[44px] min-w-[44px] flex items-center justify-center ${
+                  session?.yoloMode
+                    ? "bg-yellow-900 text-yellow-300"
+                    : "bg-neutral-800 text-neutral-500"
+                }`}
+                title="Yolo Mode"
+              >
+                &#x26A1;
+              </button>
+            )}
             <button
               onClick={handleStop}
               className="px-2.5 py-1.5 text-xs bg-neutral-800 hover:bg-red-900 text-neutral-400 hover:text-red-300 rounded min-h-[44px] min-w-[44px] flex items-center justify-center"
@@ -319,7 +353,7 @@ export function SessionPage() {
         >
           <div className="relative flex-1 min-h-0">
             <div ref={termContainerRef} className="absolute inset-0" style={{ touchAction: "none" }} />
-            {!exited && (
+            {!exited && isClaude && (
               <button
                 ref={yoloOverlayRef}
                 style={{ display: "none" }}
@@ -340,7 +374,7 @@ export function SessionPage() {
           {/* Controls — only when running */}
           {!exited && (
             <>
-              <SpecialKeysBar ctrlMode={ctrlMode} shiftMode={shiftMode} onKeyPress={handleKeyPress} />
+              <SpecialKeysBar ctrlMode={ctrlMode} shiftMode={shiftMode} altMode={altMode} onKeyPress={handleKeyPress} />
               <div className="flex items-end gap-2 px-2 py-2 border-t border-neutral-800 shrink-0">
                 <button
                   onClick={handleFileAttach}
@@ -388,6 +422,7 @@ export function SessionPage() {
                 parentSessionId={id!}
                 workDir={session?.workDir ?? ""}
                 visible={activeTab === "terminal"}
+                peerId={peerId}
               />
             </div>
             <div
@@ -397,7 +432,7 @@ export function SessionPage() {
                 visibility: activeTab === "files" ? "visible" : "hidden",
               }}
             >
-              <FileBrowser embedded initialPath={session?.workDir} />
+              <FileBrowser embedded initialPath={session?.workDir} peerId={peerId} />
             </div>
             <div
               className="absolute inset-0"
@@ -406,7 +441,7 @@ export function SessionPage() {
                 visibility: activeTab === "git" ? "visible" : "hidden",
               }}
             >
-              <GitPanel embedded workDir={session?.workDir} />
+              <GitPanel embedded workDir={session?.workDir} peerId={peerId} />
             </div>
             <div
               className="absolute inset-0"
@@ -418,6 +453,7 @@ export function SessionPage() {
               <AttachmentsTab
                 sessionId={id!}
                 attachments={attachments}
+                peerId={peerId}
                 onDelete={(path) => setAttachments((prev) => prev.filter((a) => a.path !== path))}
               />
             </div>
@@ -437,8 +473,9 @@ export function SessionPage() {
           <button
             onClick={async () => {
               if (!session) return;
-              const s = await api.sessions.create({ tool: session.tool, workDir: session.workDir, args: session.args });
-              navigate(`/session/${s.id}`, { replace: true });
+              const s = await api.sessions.create({ tool: session.tool, workDir: session.workDir, args: session.args, peerId });
+              const target = peerId ? `/session/${s.id}?peer=${encodeURIComponent(peerId)}` : `/session/${s.id}`;
+              navigate(target, { replace: true });
             }}
             className="w-full py-3.5 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-base font-medium"
           >

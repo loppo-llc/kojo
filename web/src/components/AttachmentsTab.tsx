@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, type Attachment } from "../lib/api";
+import { api, isThumbSupported, type Attachment } from "../lib/api";
 import { authHeaders } from "../lib/auth";
 import { formatSize } from "../lib/utils";
 
@@ -16,10 +16,13 @@ const SORT_OPTIONS: { key: SortField; label: string }[] = [
 interface Props {
   sessionId: string;
   attachments: Attachment[];
+  // peerId, when set, forwards deleteAttachment to the peer that
+  // owns the session.
+  peerId?: string;
   onDelete: (path: string) => void;
 }
 
-export function AttachmentsTab({ sessionId, attachments, onDelete }: Props) {
+export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Props) {
   const [sortField, setSortField] = useState<SortField>("modTime");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [previewPath, setPreviewPath] = useState<string | null>(null);
@@ -70,7 +73,7 @@ export function AttachmentsTab({ sessionId, attachments, onDelete }: Props) {
     try {
       // Header-based auth keeps the Owner token out of the request
       // URL / access logs for fetch-driven calls.
-      const res = await fetch(api.files.rawPath(att.path), {
+      const res = await fetch(api.files.rawPath(att.path, peerId), {
         headers: authHeaders(),
       });
       if (!res.ok) {
@@ -124,7 +127,7 @@ export function AttachmentsTab({ sessionId, attachments, onDelete }: Props) {
       return;
     }
     try {
-      await api.sessions.deleteAttachment(sessionId, path);
+      await api.sessions.deleteAttachment(sessionId, path, peerId);
       onDelete(path);
     } catch {
       // silently ignore — file may already be gone
@@ -219,10 +222,15 @@ export function AttachmentsTab({ sessionId, attachments, onDelete }: Props) {
                   className="w-full aspect-square bg-neutral-900 relative block"
                 >
                   <img
-                    src={api.files.rawUrl(att.path)}
+                    src={
+                      isThumbSupported(att.path)
+                        ? api.files.thumbUrl(att.path, 384, att.modTime, peerId)
+                        : api.files.rawUrl(att.path, false, peerId)
+                    }
                     alt={att.name}
                     className="w-full h-full object-cover"
                     loading="lazy"
+                    decoding="async"
                   />
                   {feedback?.path === att.path && (
                     <div className="absolute inset-0 bg-black/60 flex items-center justify-center text-xs text-green-400 pointer-events-none">
@@ -332,14 +340,14 @@ export function AttachmentsTab({ sessionId, attachments, onDelete }: Props) {
           <div className="max-w-full max-h-full p-4" onClick={(e) => e.stopPropagation()}>
             {isImage(previewAttachment.mime) && (
               <img
-                src={api.files.rawUrl(previewPath)}
+                src={api.files.rawUrl(previewPath, false, peerId)}
                 alt={previewAttachment.name}
                 className="max-w-full max-h-[85vh] object-contain"
               />
             )}
             {isVideo(previewAttachment.mime) && (
               <video
-                src={api.files.rawUrl(previewPath)}
+                src={api.files.rawUrl(previewPath, false, peerId)}
                 controls
                 className="max-w-full max-h-[85vh]"
               />

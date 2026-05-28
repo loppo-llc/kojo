@@ -11,7 +11,7 @@ import (
 // listener — every /api/v1/* request needs the per-agent token.
 type mcpServerEntry struct {
 	URL     string            `json:"url,omitempty"`
-	Type    string            `json:"type,omitempty"` // "http" for Gemini/Codex
+	Type    string            `json:"type,omitempty"` // "http" for Codex
 	Headers map[string]string `json:"headers,omitempty"`
 }
 

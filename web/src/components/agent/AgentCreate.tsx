@@ -19,11 +19,18 @@ export function AgentCreate() {
   const [customModels, setCustomModels] = useState<string[]>([]);
   const [thinkingMode, setThinkingMode] = useState("");
   const [workDir, setWorkDir] = useState("");
-  const [intervalMinutes, setIntervalMinutes] = useState(30);
+  // cronExpr starts as the default "*/30 * * * *" only for ScheduleEditor's
+  // initial visual state. Until the user actually touches the editor we send
+  // `cronExpr: undefined` on POST so the server picks the per-agent offset
+  // default — without this every newly-created agent would land on :00/:30
+  // and bunch up at the same minute.
+  const [cronExpr, setCronExpr] = useState("*/30 * * * *");
+  const [cronExprDirty, setCronExprDirty] = useState(false);
   const [timeoutMinutes, setTimeoutMinutes] = useState(10);
   const [resumeIdleMinutes, setResumeIdleMinutes] = useState(0);
   const [silentStart, setSilentStart] = useState("");
   const [silentEnd, setSilentEnd] = useState("");
+  const [cronMessage, setCronMessage] = useState("");
   const [genPrompt, setGenPrompt] = useState("");
   const [personaPrompt, setPersonaPrompt] = useState("");
   const [loading, setLoading] = useState(false);
@@ -237,11 +244,12 @@ export function AgentCreate() {
         customBaseURL: needsCustomURL ? customBaseURL : undefined,
         thinkingMode: tool === "llama.cpp" && thinkingMode ? thinkingMode : undefined,
         workDir: workDir.trim() || undefined,
-        intervalMinutes,
+        cronExpr: cronExprDirty ? cronExpr : undefined,
         timeoutMinutes,
         resumeIdleMinutes: resumeIdleMinutes || undefined,
         silentStart: silentStart || undefined,
         silentEnd: silentEnd || undefined,
+        cronMessage: cronMessage.trim() || undefined,
       });
 
       // Upload avatar (best-effort — agent is already created)
@@ -452,7 +460,7 @@ export function AgentCreate() {
         <div>
           <label className="block text-sm text-neutral-400 mb-2">Tool</label>
           <div className="flex flex-wrap gap-2">
-            {["claude", "codex", "gemini", "custom", "llama.cpp"].map((t) => (
+            {["claude", "codex", "grok", "custom", "llama.cpp"].map((t) => (
               <button
                 key={t}
                 onClick={() => {
@@ -584,8 +592,11 @@ export function AgentCreate() {
 
         {/* Schedule */}
         <ScheduleEditor
-          intervalMinutes={intervalMinutes}
-          onIntervalChange={setIntervalMinutes}
+          cronExpr={cronExpr}
+          onCronExprChange={(v) => {
+            setCronExpr(v);
+            setCronExprDirty(true);
+          }}
           timeoutMinutes={timeoutMinutes}
           onTimeoutChange={setTimeoutMinutes}
           resumeIdleMinutes={resumeIdleMinutes}
@@ -595,10 +606,8 @@ export function AgentCreate() {
           silentEnd={silentEnd}
           onSilentStartChange={setSilentStart}
           onSilentEndChange={setSilentEnd}
-          // Hide the Check-in Message field on create — checkin.md doesn't
-          // exist until the agent is created, and there's no API surface to
-          // PUT it before creation. Users can edit it from AgentSettings
-          // immediately after creating.
+          cronMessage={cronMessage}
+          onCronMessageChange={setCronMessage}
         />
 
         {error && (

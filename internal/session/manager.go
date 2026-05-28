@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/loppo-llc/kojo/internal/store"
 )
 
 const (
@@ -56,7 +57,7 @@ const (
 var userTools = map[string]bool{
 	"claude": true,
 	"codex":  true,
-	"gemini": true,
+	"grok":   true,
 	"custom": true,
 }
 
@@ -106,8 +107,27 @@ func (m *Manager) GetCustomBaseURL() string {
 	return m.customBaseURL
 }
 
-func NewManager(logger *slog.Logger) *Manager {
-	st := newStore(logger)
+// ManagerOptions tunes Manager construction. Zero-value is the
+// minimal-effects posture: no v0 → v1 session fallback. Callers that
+// know migration is complete (the startup gate confirmed v1Complete)
+// supply a non-empty V0LegacyDir so the v0 dir's sessions.json can
+// be picked up on first Load.
+type ManagerOptions struct {
+	// V0LegacyDir is the v0 config directory (configdir.V0Path()).
+	// Empty means: do not consult the v0 dir at all — the runtime
+	// opted out (e.g. --fresh) or there is no v0 install to fall
+	// back to. Non-empty enables the v0-side fallback inside
+	// internal/session.Store.Load(): kv miss → v1 dir → v0 dir.
+	V0LegacyDir string
+}
+
+// NewManager constructs a session.Manager. db is the kv-backed
+// persistence layer (Phase 2c-2 slice 28); pass nil to disable
+// persistence (test scaffolding that exercises Manager methods
+// without a configured store). The runtime path always passes a
+// real *store.Store via server.Config.
+func NewManager(logger *slog.Logger, db *store.Store, opts ManagerOptions) *Manager {
+	st := newStore(logger, db, opts.V0LegacyDir)
 	m := &Manager{
 		sessions: make(map[string]*Session),
 		logger:   logger,
@@ -695,21 +715,62 @@ func buildRestartArgs(tool string, origArgs []string, toolSessionID string) []st
 		}
 		return []string{"resume", "--last"}
 
-	case "gemini":
+	case "grok":
+		// Strip any prior --continue/-c and --resume/-r (including
+		// "--resume=<id>" / "-r=<id>") from origArgs so we can re-
+		// apply a deterministic restart flag. Grok's -r/--resume
+		// takes an OPTIONAL argument: the next positional is its
+		// value only when it doesn't look like another flag.
+		//
+		// preservedResumeID captures an explicit resume target the
+		// user originally passed to `grok`. kojo's PTY layer does
+		// not capture grok session IDs from interactive output, so
+		// toolSessionID is virtually always "" — without preserving
+		// the user's original ID the restart would silently degrade
+		// to --continue and pick whichever session grok last
+		// touched in this cwd, defeating the explicit resume.
 		args := make([]string, 0, len(origArgs)+2)
 		skipNext := false
-		for _, a := range origArgs {
+		var preservedResumeID string
+		for i, a := range origArgs {
 			if skipNext {
 				skipNext = false
 				continue
 			}
+			if a == "--continue" || a == "-c" {
+				continue
+			}
 			if a == "--resume" || a == "-r" {
-				skipNext = true
+				if i+1 < len(origArgs) && !strings.HasPrefix(origArgs[i+1], "-") {
+					preservedResumeID = origArgs[i+1]
+					skipNext = true
+				}
+				continue
+			}
+			if v, ok := strings.CutPrefix(a, "--resume="); ok {
+				preservedResumeID = v
+				continue
+			}
+			if v, ok := strings.CutPrefix(a, "-r="); ok {
+				preservedResumeID = v
 				continue
 			}
 			args = append(args, a)
 		}
-		return append(args, "--resume", "latest")
+		// Re-apply the resume target as --resume=<id> (joined form)
+		// rather than --resume <id> (split form). Reason: grok's
+		// --resume takes an OPTIONAL argument, so a split-form value
+		// that happens to start with "-" (e.g. a malformed/stored
+		// "-r=foo") would be parsed as the NEXT flag rather than the
+		// resume target. The joined form is unambiguous.
+		switch {
+		case toolSessionID != "":
+			return append(args, "--resume="+toolSessionID)
+		case preservedResumeID != "":
+			return append(args, "--resume="+preservedResumeID)
+		default:
+			return append(args, "--continue")
+		}
 
 	default:
 		// Internal tools (tmux/shell) use platform-specific restart args

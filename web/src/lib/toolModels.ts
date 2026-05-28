@@ -20,15 +20,9 @@ export const toolModels: Record<string, ToolModelConfig> = {
       "gpt-5.2",
     ],
   },
-  gemini: {
-    default: "gemini-3-pro-preview",
-    models: [
-      "gemini-3-pro-preview",
-      "gemini-3-flash-preview",
-      "gemini-2.5-pro",
-      "gemini-2.5-flash",
-      "gemini-2.5-flash-lite",
-    ],
+  grok: {
+    default: "grok-build",
+    models: ["grok-build"],
   },
   custom: {
     default: "",
@@ -55,10 +49,10 @@ export const effortLevels = ["low", "medium", "high", "xhigh", "max"] as const;
 export type EffortLevel = (typeof effortLevels)[number];
 
 /** Models that support the xhigh effort level. */
-const xhighModels = new Set(["opus", "claude-opus-4-7"]);
+const xhighModels = new Set(["opus", "claude-opus-4-7", "grok-build"]);
 
 export function supportsEffort(tool: string): boolean {
-  return tool === "claude";
+  return tool === "claude" || tool === "grok";
 }
 
 /** Return available effort levels for a given model. */

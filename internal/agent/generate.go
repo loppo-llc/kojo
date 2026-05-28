@@ -2,9 +2,7 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -12,9 +10,6 @@ import (
 	"strings"
 	"time"
 )
-
-const geminiModel = "gemini-2.5-flash"
-const geminiAPI = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s"
 
 // runCLIGenerate executes a CLI tool with a prompt on stdin and returns the
 // stripped output. The tool is run with a 120-second timeout. workDir defaults
@@ -74,13 +69,6 @@ func runCodex(prompt string) (string, error) {
 	return stripCodeFence(string(data)), nil
 }
 
-// runGemini executes a prompt via gemini CLI (stdin to -p) and returns the output.
-func runGemini(prompt string) (string, error) {
-	return runCLIGenerate("gemini", []string{
-		"-p", "Follow the instructions from stdin.",
-	}, os.TempDir(), prompt)
-}
-
 // stripCodeFence removes a single outer markdown code fence that LLMs sometimes
 // wrap around output. Only strips when the entire content is enclosed in one
 // matching fence pair (``` ... ```). Returns original text otherwise.
@@ -116,10 +104,9 @@ type cliBackend struct {
 var defaultBackends = []cliBackend{
 	{"claude", runClaude},
 	{"codex", runCodex},
-	{"gemini", runGemini},
 }
 
-// generate runs prompt through available backends in default priority order: claude → codex → gemini.
+// generate runs prompt through available backends in default priority order: claude → codex.
 func generate(prompt string) (string, error) {
 	return tryBackends(defaultBackends, prompt)
 }
@@ -163,7 +150,7 @@ func tryBackends(backends []cliBackend, prompt string) (string, error) {
 	}
 
 	if len(errs) == 0 {
-		return "", fmt.Errorf("no supported CLI backend found (need claude, codex, or gemini in PATH)")
+		return "", fmt.Errorf("no supported CLI backend found (need claude or codex in PATH)")
 	}
 	return "", fmt.Errorf("all backends failed: %s", strings.Join(errs, "; "))
 }
@@ -269,6 +256,7 @@ func GeneratePublicProfile(persona string) (string, error) {
 func LoadGeminiAPIKey(creds *CredentialStore) (string, error) {
 	return loadGeminiAPIKey(creds)
 }
+
 // loadGeminiAPIKey loads the Gemini API key.
 // Priority: 1) encrypted credential store, 2) nanobanana credentials file (fallback).
 func loadGeminiAPIKey(creds *CredentialStore) (string, error) {
@@ -309,56 +297,7 @@ func loadEmbeddingModel(creds *CredentialStore) string {
 	return defaultEmbeddingModel
 }
 
-// geminiHTTPClient is used for all Gemini API calls with a 60s timeout.
+// geminiHTTPClient is the shared HTTP client for Gemini API calls
+// (embedding generation in embedding.go). 60s timeout covers the
+// largest batch embedding request.
 var geminiHTTPClient = &http.Client{Timeout: 60 * time.Second}
-
-// callGemini makes a simple text generation request to the Gemini API.
-func callGemini(apiKey string, prompt string) (string, error) {
-	url := fmt.Sprintf(geminiAPI, geminiModel, apiKey)
-
-	body := map[string]any{
-		"contents": []map[string]any{
-			{
-				"parts": []map[string]string{
-					{"text": prompt},
-				},
-			},
-		},
-	}
-
-	bodyJSON, err := json.Marshal(body)
-	if err != nil {
-		return "", err
-	}
-
-	resp, err := geminiHTTPClient.Post(url, "application/json", strings.NewReader(string(bodyJSON)))
-	if err != nil {
-		return "", fmt.Errorf("gemini API request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("gemini API error %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var result struct {
-		Candidates []struct {
-			Content struct {
-				Parts []struct {
-					Text string `json:"text"`
-				} `json:"parts"`
-			} `json:"content"`
-		} `json:"candidates"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("gemini API decode error: %w", err)
-	}
-
-	if len(result.Candidates) == 0 || len(result.Candidates[0].Content.Parts) == 0 {
-		return "", fmt.Errorf("gemini API returned no content")
-	}
-
-	return result.Candidates[0].Content.Parts[0].Text, nil
-}

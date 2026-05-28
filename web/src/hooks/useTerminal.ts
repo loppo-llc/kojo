@@ -20,6 +20,19 @@ interface UseTerminalOptions {
    *   sent via onInput so tmux can handle per-pane scrolling (for Terminal tab)
    */
   touchMode?: "scroll" | "mouse";
+  /**
+   * xterm.js scrollback line count. Set to 0 to disable scrollback entirely
+   * (fixed-height terminal, no internal scrollbar). Defaults to xterm's 1000.
+   */
+  scrollback?: number;
+  /**
+   * When set, mouse-wheel and single-finger touch scrolls are converted to
+   * the given key sequences and pushed via `send` instead of moving xterm's
+   * scrollback viewport. Used for TUI apps (e.g. grok) that bind their own
+   * scroll shortcuts and ignore xterm's internal scrollback. `send` bypasses
+   * the modifier-wrapping path used for typed input.
+   */
+  scrollAsKeys?: { up: string; down: string; send: (key: string) => void };
   /** Dependency array for recreating the terminal (e.g. [sessionId]) */
   deps?: React.DependencyList;
 }
@@ -39,8 +52,14 @@ export function useTerminal({
   onInput,
   onResize,
   touchMode = "scroll",
+  scrollback,
+  scrollAsKeys,
   deps = [],
 }: UseTerminalOptions): UseTerminalReturn {
+  // Live ref so wheel/touch handlers (bound once on mount) pick up the
+  // latest value without recreating the terminal.
+  const scrollAsKeysRef = useRef(scrollAsKeys);
+  scrollAsKeysRef.current = scrollAsKeys;
   const termRef = useRef<Terminal>(null);
   const fitRef = useRef<FitAddon>(null);
   const autoScrollRef = useRef(true);
@@ -111,6 +130,7 @@ export function useTerminal({
       cursorBlink: true,
       fontSize: 14,
       fontFamily: "Menlo, Monaco, 'Courier New', monospace",
+      ...(scrollback !== undefined ? { scrollback } : {}),
       theme: {
         background: "#0a0a0a",
         foreground: "#e5e5e5",
@@ -175,6 +195,16 @@ export function useTerminal({
     const el = containerRef.current;
 
     const onWheel = (e: WheelEvent) => {
+      const sk = scrollAsKeysRef.current;
+      if (sk) {
+        // Suppress xterm's own wheel handling — the TUI manages its own
+        // scroll via the forwarded keys, not via xterm scrollback.
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.deltaY < 0) sk.send(sk.up);
+        else if (e.deltaY > 0) sk.send(sk.down);
+        return;
+      }
       if (e.deltaY < 0) {
         autoScrollRef.current = false;
         savedDeltaRef.current = -1; // pending until xterm processes wheel
@@ -195,7 +225,10 @@ export function useTerminal({
         });
       }
     };
-    el.addEventListener("wheel", onWheel, { capture: true, passive: true });
+    // passive: false so the scrollAsKeys path can preventDefault and keep the
+    // wheel event from reaching xterm's own handler. The default (non-grok)
+    // path doesn't preventDefault, so behaviour is unchanged there.
+    el.addEventListener("wheel", onWheel, { capture: true, passive: false });
 
     let touchStartY = 0;
     let accumDelta = 0;
@@ -229,7 +262,17 @@ export function useTerminal({
       const lineHeight = getLineHeight();
       const lines = Math.trunc(accumDelta / lineHeight);
       if (lines !== 0) {
-        if (touchMode === "mouse") {
+        const sk = scrollAsKeysRef.current;
+        if (sk) {
+          // `lines > 0` = finger moved down (matches the dy sign comment
+          // above, even though the non-grok branch below uses the opposite
+          // convention by handing `lines` straight to xterm.scrollLines).
+          // A downward swipe is the user's "show older content" gesture, so
+          // it maps to `up` — for grok-builder this fires Ctrl+K.
+          const key = lines > 0 ? sk.up : sk.down;
+          const count = Math.abs(lines);
+          for (let i = 0; i < count; i++) sk.send(key);
+        } else if (touchMode === "mouse") {
           // Convert touch scroll to SGR mouse-wheel escape sequences.
           // tmux intercepts these and scrolls the pane under the cursor.
           const rect = el.getBoundingClientRect();
@@ -288,6 +331,16 @@ export function useTerminal({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [containerRef, onInput, safeFit, touchMode, ...deps]);
+
+  // Apply scrollback changes at runtime so we don't have to recreate the
+  // terminal (which would drop already-written output) when the value is
+  // determined after session metadata loads. xterm.js accepts runtime mutation
+  // of `options.scrollback`.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term || scrollback === undefined) return;
+    term.options.scrollback = scrollback;
+  }, [scrollback]);
 
   return { termRef, fitRef, autoScrollRef, safeFit, immediateFit };
 }

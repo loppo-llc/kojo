@@ -1,4 +1,5 @@
 import { get, post, del, patch } from "./httpClient";
+import type { AgentMessageAttachment } from "./agentApi";
 
 export type GroupDMStyle = "efficient" | "expressive";
 
@@ -39,6 +40,7 @@ export interface GroupMessage {
   agentId: string;
   agentName: string;
   content: string;
+  attachments?: AgentMessageAttachment[];
   timestamp: string;
 }
 
@@ -87,8 +89,15 @@ export const groupdmApi = {
   postMessage: (groupId: string, agentId: string, content: string) =>
     post<GroupMessage>(`/api/v1/groupdms/${groupId}/messages`, { agentId, content }),
 
-  postUserMessage: (groupId: string, content: string) =>
-    post<GroupMessage>(`/api/v1/groupdms/${groupId}/user-messages`, { content }),
+  postUserMessage: (
+    groupId: string,
+    content: string,
+    attachments?: AgentMessageAttachment[],
+  ) =>
+    post<GroupMessage>(`/api/v1/groupdms/${groupId}/user-messages`, {
+      content,
+      ...(attachments && attachments.length > 0 ? { attachments } : {}),
+    }),
 
   forAgent: (agentId: string) =>
     get<{ groups: GroupDMInfo[] }>(`/api/v1/agents/${agentId}/groups`).then(

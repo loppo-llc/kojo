@@ -51,6 +51,10 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
 
+	// SystemPromptExtra is appended by the manager before reaching us — see
+	// Manager.ChatOneShot. The backend treats systemPrompt as the final
+	// system prompt to pass to --system-prompt, with the cacheable prefix
+	// already placed at offset 0.
 	args := b.buildClaudeArgs(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers, opts.AutomatedTrigger, opts.SessionKey)
 
 	// Expected session ID for THIS branch, used as the recovery fallback if
@@ -159,12 +163,12 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		// produced no usable text. Only used as fallback, never overrides
 		// text that was successfully captured from the stream.
 		//
-		// Prefer streamSessionID (authoritative — Claude told us which file it
-		// wrote to). When unavailable (e.g. process died before the result
-		// event), fall back to the deterministic UUID we computed for this
-		// branch. Never fall through to "" because findSessionFile then picks
-		// the most-recently-modified JSONL, which under concurrent threads can
-		// be a sibling thread's file.
+		// Prefer streamSessionID (authoritative — Claude told us which
+		// file it wrote to). When unavailable (process died before the
+		// result event), fall back to the deterministic UUID computed
+		// for this branch. Never fall through to "" because findSessionFile
+		// then picks the most-recently-modified JSONL, which under
+		// concurrent Slack threads can be a sibling thread's file.
 		recoverSessionID := result.streamSessionID
 		if recoverSessionID == "" {
 			recoverSessionID = expectedSessionID
@@ -211,6 +215,10 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 }
 
 // buildClaudeArgs constructs the CLI arguments for a Claude chat invocation.
+//
+// sessionKey, when non-empty, overrides the default agent-ID-based session
+// identifier. The key hashes to a deterministic UUID so successive calls in
+// the same logical conversation (e.g. a Slack thread) land on the same JSONL.
 func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir string, oneShot bool, mcpServers map[string]mcpServerEntry, automatedTrigger bool, sessionKey string) []string {
 	args := []string{
 		"-p",
@@ -268,8 +276,10 @@ func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir s
 	// sessions — then the next --continue picks whichever branch was most
 	// recent, losing the other's context.
 	//
-	// OneShot mode (e.g. Slack conversations) skips session resumption entirely,
-	// running a fresh ephemeral session each time.
+	// OneShot mode (no SessionKey, e.g. ephemeral Discord chats) skips
+	// session resumption entirely. When SessionKey is set the call still
+	// resumes — but against the key-derived UUID, isolating that branch
+	// (Slack thread, etc.) from the agent's main session.
 	if sessionID := expectedClaudeSessionID(agent.ID, sessionKey, oneShot); sessionID != "" {
 		if sessionFileUsable(dir, sessionID, automatedTrigger, agent.ID, agent.ResumeIdleDuration(), b.logger) {
 			args = append(args, "--resume", sessionID)
@@ -578,11 +588,20 @@ func (lw *limitedWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// claudeEncodePath encodes a directory path using Claude's project path scheme:
-// "/" (or separator), ".", "_" are all replaced with "-".
+// claudeEncodePath encodes a directory path using Claude's project
+// path scheme. Replaces "/", "\", ":", ".", "_" with "-" so the
+// result is portable across macOS / Linux (POSIX) and Windows
+// (`C:\Users\alice\foo` → `-C--Users-alice-foo`). Using a fixed
+// replacer (not filepath.Separator alone) is essential: a
+// Windows path that survived an across-OS round-trip with only
+// one separator translated would land at a different project
+// dir on the new host and claude --continue would lose the
+// transcript.
 func claudeEncodePath(dir string) string {
 	return strings.NewReplacer(
-		string(filepath.Separator), "-",
+		"/", "-",
+		"\\", "-",
+		":", "-",
 		".", "-",
 		"_", "-",
 	).Replace(dir)
@@ -659,22 +678,16 @@ const sessionResetThresholdTokens = 150_000
 const sessionTailReadBytes = 1 * 1024 * 1024
 
 // preResetSummarize is the summarization hook invoked by sessionFileUsable
-// right before it deletes a session file. Defaults to runAutoSummary in
-// strict mode, which writes a diary entry from the named session JSONL.
-// Exposed as a package variable so tests can substitute a deterministic
-// fake instead of spawning a real claude CLI process.
-//
-// sessionPath is the absolute path of the JSONL we're about to delete.
-// Forwarding it eliminates a cross-session contamination risk: when a Slack
-// agent has multiple thread-keyed sessions, mtime-based discovery would
-// otherwise pick the most recently modified JSONL — which may be a different
-// thread's session that is NOT being reset — and summarise THAT into today's
-// diary. Strict mode pins the summary to the session about to be wiped: if
-// the path fails validation or yields no messages, the summary returns an
-// error, which sessionFileUsable treats as "abort the reset" so we don't
-// lose context to a misleading delete.
-var preResetSummarize = func(agentID, tool, sessionPath string, logger *slog.Logger) error {
-	return runAutoSummary(agentID, tool, sessionPath, true, logger)
+// right before it deletes a session file. Defaults to PreCompactSummarize,
+// which writes a diary entry from the live session JSONL. Exposed as a
+// package variable so tests can substitute a deterministic fake instead of
+// spawning a real claude CLI process.
+var preResetSummarize = func(agentID, tool string, logger *slog.Logger) error {
+	// Reset path doesn't have the PreCompact-hook stdin payload (claude
+	// isn't telling us about a compaction here — kojo is initiating a
+	// session wipe), so transcriptPath is left empty and the function
+	// falls back to discovery.
+	return PreCompactSummarize(agentID, tool, "", logger)
 }
 
 // sessionResetMinIdleDuration is the package-default idle window used when
@@ -708,7 +721,7 @@ const sessionResetMinIdleDuration = defaultResumeIdleDuration
 //
 // automatedTrigger disables the interactive-chat idle guard. Pass true when
 // the caller is a non-interactive trigger (cron fire, groupdm notification,
-// notify poller) — there is no human conversation to protect and the guard
+// Slack one-shot) — there is no human conversation to protect and the guard
 // would otherwise prevent resets on agents whose interval is shorter than
 // the idle window.
 //
@@ -770,7 +783,7 @@ func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool,
 	// abort the reset — losing context silently would be worse than
 	// carrying a slightly-over-threshold session for one more turn.
 	if agentID != "" {
-		if err := preResetSummarize(agentID, "claude", path, logger); err != nil {
+		if err := preResetSummarize(agentID, "claude", logger); err != nil {
 			slog.Warn("pre-reset summary failed, keeping session to avoid context loss",
 				"path", path, "agent", agentID, "err", err)
 			return true
@@ -886,6 +899,13 @@ func agentIDToUUID(agentID string) string {
 // expectedClaudeSessionID returns the deterministic Claude session UUID that
 // this invocation would resume/create, or "" when the caller has opted out of
 // session persistence (oneShot mode).
+//
+// oneShot takes precedence: a true oneShot call ALWAYS returns "" so the
+// backend skips --resume / --session-id entirely. The manager is responsible
+// for setting OneShot=false whenever a non-empty SessionKey should actually
+// resume — this preserves the canonical "OneShot means ephemeral" invariant
+// and avoids a backend-level override that would surprise callers passing
+// SessionKey for purposes other than resumption.
 //
 // When sessionKey is non-empty (e.g. per-Slack-thread isolation), the UUID is
 // derived from that key so each thread maps to its own JSONL. Otherwise the

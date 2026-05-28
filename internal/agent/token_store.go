@@ -5,8 +5,10 @@ import (
 	"time"
 )
 
-// createTokenTable creates the notify_tokens table for storing OAuth2 and
-// other encrypted tokens used by notification sources.
+// createTokenTable creates the notify_tokens table for storing encrypted
+// per-(provider, agent, source) tokens. The Gmail notify-source feature
+// was removed; the table now backs the Slack bot's app/bot token storage.
+// The name is kept for migration compatibility with v1 databases.
 func createTokenTable(s *CredentialStore) error {
 	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS notify_tokens (
 		provider   TEXT NOT NULL,
@@ -22,7 +24,8 @@ func createTokenTable(s *CredentialStore) error {
 }
 
 // SetToken stores an encrypted token value.
-// Use empty agent_id/source_id for global tokens (e.g., OAuth2 client secrets).
+// Use empty agent_id/source_id for global tokens (currently only the Slack
+// bot's per-agent app/bot tokens use this, with sourceID="").
 func (s *CredentialStore) SetToken(provider, agentID, sourceID, key, value string, expiresAt time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -63,31 +66,6 @@ func (s *CredentialStore) GetToken(provider, agentID, sourceID, key string) (str
 	return s.decrypt(enc)
 }
 
-// GetTokenExpiry retrieves a token's value and expiration time.
-func (s *CredentialStore) GetTokenExpiry(provider, agentID, sourceID, key string) (string, time.Time, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	var enc string
-	var expUnix int64
-	err := s.db.QueryRow(
-		`SELECT value_enc, expires_at FROM notify_tokens WHERE provider=? AND agent_id=? AND source_id=? AND key=?`,
-		provider, agentID, sourceID, key,
-	).Scan(&enc, &expUnix)
-	if err != nil {
-		return "", time.Time{}, err
-	}
-	val, err := s.decrypt(enc)
-	if err != nil {
-		return "", time.Time{}, err
-	}
-	var exp time.Time
-	if expUnix > 0 {
-		exp = time.Unix(expUnix, 0)
-	}
-	return val, exp, nil
-}
-
 // DeleteToken removes a single token.
 func (s *CredentialStore) DeleteToken(provider, agentID, sourceID, key string) error {
 	s.mu.Lock()
@@ -119,29 +97,4 @@ func (s *CredentialStore) DeleteTokensByAgent(agentID string) error {
 
 	_, err := s.db.Exec(`DELETE FROM notify_tokens WHERE agent_id=?`, agentID)
 	return err
-}
-
-// ListTokenKeys returns all keys stored for a given provider/agent/source.
-func (s *CredentialStore) ListTokenKeys(provider, agentID, sourceID string) ([]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	rows, err := s.db.Query(
-		`SELECT key FROM notify_tokens WHERE provider=? AND agent_id=? AND source_id=?`,
-		provider, agentID, sourceID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var keys []string
-	for rows.Next() {
-		var k string
-		if err := rows.Scan(&k); err != nil {
-			return nil, err
-		}
-		keys = append(keys, k)
-	}
-	return keys, rows.Err()
 }

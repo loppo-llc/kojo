@@ -177,7 +177,16 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		// Step 2: Send initialized notification (no params per protocol)
 		sendNotify("initialized")
 
-		// Step 3: Start thread
+		// Step 3: Start thread.
+		//
+		// systemPrompt (already merged with any SystemPromptExtra by the
+		// manager) flows into Codex's baseInstructions — set once at
+		// thread/start — rather than being concatenated onto the user
+		// message. This keeps Codex's prompt cache stable across turns:
+		// the base instructions form a fixed prefix, and only the per-turn
+		// user message changes. Mixing the system prompt into each turn's
+		// input would invalidate the cache and force full re-tokenisation
+		// on every reply.
 		threadParams := map[string]any{
 			"cwd":            dir,
 			"approvalPolicy": "never",
@@ -226,7 +235,9 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			return
 		}
 
-		// Step 4: Start turn with user message
+		// Step 4: Start turn with user message.
+		// System prompt is NOT prepended here — it flows through
+		// baseInstructions above so the prompt cache stays warm across turns.
 		turnStartID = sendRPC("turn/start", map[string]any{
 			"threadId": threadID,
 			"input": []map[string]any{

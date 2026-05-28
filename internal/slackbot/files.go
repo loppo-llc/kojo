@@ -16,8 +16,12 @@ import (
 // uploadDir matches the WebUI upload directory (file_handlers.go).
 var uploadDir = filepath.Join(os.TempDir(), "kojo", "upload")
 
-// maxFileSize is the maximum file size (20 MB) the bot will download.
-const maxFileSize = 20 * 1024 * 1024
+// maxFileSize is the maximum file size the bot will download from
+// Slack. Slack itself caps uploads at 1 GiB on most workspaces, so
+// matching that ceiling here is effectively "no extra limit beyond
+// what Slack already enforces". A var (not const) so tests can lower
+// the cap to exercise the limit path without allocating 1+ GiB.
+var maxFileSize int64 = 1 << 30
 
 // fileDownloadTimeout caps how long a single Slack attachment download may
 // take. Using http.DefaultClient directly would allow a hung upstream to
@@ -32,7 +36,7 @@ var slackFileHTTPClient = &http.Client{Timeout: fileDownloadTimeout}
 // preflightSlackFile validates a Slack file descriptor before we spend any
 // I/O on it. Returns a nil error when the file is eligible for download.
 func preflightSlackFile(f slack.File) error {
-	if f.Size > maxFileSize {
+	if int64(f.Size) > maxFileSize {
 		return fmt.Errorf("file too large (%d bytes, max %d)", f.Size, maxFileSize)
 	}
 	if f.URLPrivateDownload == "" {

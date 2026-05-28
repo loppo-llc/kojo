@@ -46,9 +46,7 @@ func ScanJSONLLines(r io.Reader, onLine func(line []byte)) error {
 			// accumulating in `buf` because earlier ReadSlice calls hit
 			// ErrBufferFull, the final tail chunk could push the total over
 			// the cap — check here too so onLine never receives a
-			// > MaxJSONLLineBytes slice. (The bare-chunk branch can't
-			// exceed the cap since bufio's buffer is 4 KiB by default, but
-			// keep the guard for symmetry/future-proofing.)
+			// > MaxJSONLLineBytes slice.
 			if len(buf) > 0 {
 				if len(buf)+len(chunk) > MaxJSONLLineBytes {
 					return ErrLineTooLarge

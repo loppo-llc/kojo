@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { api, type ServerInfo } from "../lib/api";
+import { peersApi, type PeerInfo } from "../lib/peerApi";
 
 export function NewSession() {
   const navigate = useNavigate();
@@ -18,21 +19,73 @@ export function NewSession() {
   const [showSuggestions, setShowSuggestions] = useState(false);
   const suggestTimer = useRef<ReturnType<typeof setTimeout>>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
+  // Peer selector. Empty selectedPeerId = "this host". The list
+  // includes every registry row (including self) so the operator
+  // can explicitly confirm "this device" — the dropdown shows
+  // human-friendly names, not URLs.
+  const [peers, setPeers] = useState<PeerInfo[]>([]);
+  const [selfPeerId, setSelfPeerId] = useState("");
+  const [selectedPeerId, setSelectedPeerId] = useState("");
 
+  // Peer list is best-effort: a server without peer-identity wiring
+  // returns 404 / 503 and we just hide the selector. Runs once.
   useEffect(() => {
-    api.info().then((info) => {
+    peersApi.list().then((resp) => {
+      setPeers(resp.items ?? []);
+      setSelfPeerId(resp.selfDeviceId ?? "");
+    }).catch(() => { /* peer registry unavailable */ });
+  }, []);
+
+  // Fetch server info from the SELECTED host (Hub default, or the
+  // remote peer when one is chosen) so tool availability / homeDir
+  // reflect what's actually installed on that machine. Re-runs on
+  // peer switch — the Hub proxy forwards the info call when
+  // ?peer=<id> is present and the peer is paired (registered on
+  // both sides via the join-request flow).
+  //
+  // Concurrency: a rapid peer switch can spawn two info() promises;
+  // without a guard the slower (older) reply could overwrite the
+  // newer one and leave the form on the wrong host's tools / homeDir.
+  // The infoSeq counter discards stale replies. On failure we clear
+  // `info` so the Create button (which gates on `tool` + `workDir`)
+  // can't fire against the previous host's settings.
+  const infoSeq = useRef(0);
+  const [infoLoading, setInfoLoading] = useState(false);
+  useEffect(() => {
+    const peerId = selectedPeerId && selectedPeerId !== selfPeerId ? selectedPeerId : undefined;
+    const seq = ++infoSeq.current;
+    setError("");
+    // Clear the form during the switch so a click on Start lands
+    // on whichever host the user picked LAST. Otherwise the
+    // previous host's tool / workDir stays selectable while the
+    // new info() is still in flight.
+    setInfo(undefined);
+    setTool("");
+    setWorkDir("");
+    setInfoLoading(true);
+    api.info(peerId).then((info) => {
+      if (seq !== infoSeq.current) return;
       setInfo(info);
       const paramTool = searchParams.get("tool");
       const paramDir = searchParams.get("workDir");
-      if (paramTool && info.tools[paramTool]?.available) {
+      if (paramTool && info.tools?.[paramTool]?.available) {
         setTool(paramTool);
-      } else {
+      } else if (info.tools) {
         const available = Object.entries(info.tools).find(([, t]) => t.available);
         if (available) setTool(available[0]);
+        else setTool("");
       }
       setWorkDir(paramDir || info.homeDir || "");
-    }).catch(console.error);
-  }, [searchParams]);
+      setInfoLoading(false);
+    }).catch((err) => {
+      if (seq !== infoSeq.current) return;
+      console.error(err);
+      setInfoLoading(false);
+      if (selectedPeerId && selectedPeerId !== selfPeerId) {
+        setError("Peer info unavailable. Is the peer online and paired with this host?");
+      }
+    });
+  }, [searchParams, selectedPeerId, selfPeerId]);
 
   // close suggestions on outside click
   useEffect(() => {
@@ -53,7 +106,8 @@ export function NewSession() {
       return;
     }
     suggestTimer.current = setTimeout(() => {
-      api.dirSuggest(value).then((dirs) => {
+      const peerId = selectedPeerId && selectedPeerId !== selfPeerId ? selectedPeerId : undefined;
+      api.dirSuggest(value, peerId).then((dirs) => {
         setSuggestions(dirs);
         setShowSuggestions(dirs.length > 0);
       }).catch(console.error);
@@ -80,8 +134,19 @@ export function NewSession() {
       if (model && !parsedArgs.includes("--model")) {
         parsedArgs = ["--model", model, ...parsedArgs];
       }
-      const session = await api.sessions.create({ tool, workDir, args: parsedArgs.length > 0 ? parsedArgs : undefined, yoloMode, simpleSystemPrompt });
-      navigate(`/session/${session.id}`, { replace: true });
+      const peerId = selectedPeerId && selectedPeerId !== selfPeerId ? selectedPeerId : undefined;
+      const session = await api.sessions.create({
+        tool,
+        workDir,
+        args: parsedArgs.length > 0 ? parsedArgs : undefined,
+        yoloMode,
+        simpleSystemPrompt,
+        peerId,
+      });
+      const target = peerId
+        ? `/session/${session.id}?peer=${encodeURIComponent(peerId)}`
+        : `/session/${session.id}`;
+      navigate(target, { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setLoading(false);
@@ -100,6 +165,37 @@ export function NewSession() {
       </header>
 
       <main className="p-4 space-y-6 max-w-md mx-auto">
+        {/* Peer selection (only when 2+ peers are registered) */}
+        {peers.length > 1 && (
+          <div>
+            <label className="block text-sm text-neutral-400 mb-2">Host</label>
+            <select
+              value={selectedPeerId || selfPeerId}
+              onChange={(e) => setSelectedPeerId(e.target.value)}
+              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+            >
+              {peers.map((p) => {
+                const isSelf = p.deviceId === selfPeerId;
+                const offline = p.status !== "online";
+                // A non-self peer needs to be paired (registered on
+                // both sides via the join-request flow). The local
+                // UI can only hint at what we know: status + name.
+                // The Hub-side proxy will 403 if the pairing is
+                // missing on the other side — surface it as a
+                // runtime error rather than disabling here.
+                const disabled = !isSelf && offline;
+                return (
+                  <option key={p.deviceId} value={p.deviceId} disabled={disabled}>
+                    {p.name}
+                    {isSelf ? " (this device)" : ""}
+                    {offline && !isSelf ? " — offline" : ""}
+                  </option>
+                );
+              })}
+            </select>
+          </div>
+        )}
+
         {/* Tool selection */}
         <div>
           <label className="block text-sm text-neutral-400 mb-2">Tool</label>
@@ -214,7 +310,7 @@ export function NewSession() {
 
         <button
           onClick={handleCreate}
-          disabled={loading || !tool || !workDir}
+          disabled={loading || infoLoading || !tool || !workDir}
           className="w-full py-3 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm font-medium disabled:opacity-40"
         >
           {loading ? "Starting..." : "Start Session"}
