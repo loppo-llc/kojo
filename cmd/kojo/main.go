@@ -38,7 +38,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-var version = "0.19.0"
+var version = "0.101.0"
 
 func main() {
 	port := flag.Int("port", 8080, "port number (auto-increments if busy)")
@@ -49,13 +49,14 @@ func main() {
 	showVersion := flag.Bool("version", false, "show version")
 	noAuth := flag.Bool("no-auth", false, "disable agent-facing auth listener (--local/--dev only)")
 
-	// v1 migration flags (docs/multi-device-storage.md §5).
-	doMigrate := flag.Bool("migrate", false, "import v0 data into v1 dir, then exit")
-	migrateRestart := flag.Bool("migrate-restart", false, "discard a partially-imported v1 dir and re-import from v0 (mutually exclusive with --migrate)")
-	freshInstall := flag.Bool("fresh", false, "skip v0 import and start v1 from scratch (refuses if v1 dir already populated)")
+	// Upgrade-migration flags: import the legacy kojo/ config dir
+	// into the new kojo-v1 config dir.
+	doMigrate := flag.Bool("migrate", false, "import the legacy kojo/ config dir into the kojo-v1 config dir, then exit")
+	migrateRestart := flag.Bool("migrate-restart", false, "discard a partially-imported kojo-v1 config dir and re-import from the legacy kojo/ config dir (mutually exclusive with --migrate)")
+	freshInstall := flag.Bool("fresh", false, "skip the legacy kojo/ config dir and start the kojo-v1 config dir from scratch (refuses if kojo-v1 is already populated)")
 	migrateExternalCLI := flag.Bool("migrate-external-cli", true, "with --migrate: link external CLI transcripts (claude symlinks) so prior context is reachable")
-	migrateForceRecentMtime := flag.Bool("migrate-force-recent-mtime", false, "with --migrate: bypass the v0 mtime safety window (5min). Use when v0 is confirmed dead but a recent `ls`/backup-extract bumped a file's timestamp; mid-import data races silently corrupt if v0 is actually live")
-	rollbackExternal := flag.Bool("rollback-external-cli", false, "revert --migrate-external-cli changes; required before booting a v0 binary again")
+	migrateForceRecentMtime := flag.Bool("migrate-force-recent-mtime", false, "with --migrate: bypass the legacy kojo/ dir mtime safety window (5min). Use when the legacy install is confirmed dead but a recent `ls`/backup-extract bumped a file's timestamp; mid-import data races silently corrupt if the legacy install is actually live")
+	rollbackExternal := flag.Bool("rollback-external-cli", false, "revert --migrate-external-cli changes; required before booting a pre-0.101 binary again")
 
 	peerMode := flag.Bool("peer", false, "run as a daemon peer: bind a Tailscale-interface listener (the OS tailscaled is consulted via LocalAPI WhoIs for identity) on :<port> plus a 127.0.0.1 agent-auth listener on <port>+1. Registers the full peer API (sessions, agents, files, git, /api/v1/peers/*) so a device-switch can land an agent CLI here. Skipped on a peer: peer-registry mutation (POST/DELETE/rotate-key on /api/v1/peers), the Web UI / dev proxy. Owner Bearer is unavailable; inter-peer access is gated by Tailnet identity (peer_registry NodeKey match → RolePeer; --unsafe collapses the check and stamps Owner). Mutually exclusive with --dev / --local / --no-auth.")
 	peerList := flag.Bool("peer-list", false, "list peer_registry rows and exit (read-only; coexists with running kojo)")

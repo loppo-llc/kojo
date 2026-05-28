@@ -87,7 +87,8 @@ Use `--local` or `--dev` to bind to localhost only.
 
 ### Multi-device cluster (peer mode)
 
-A second machine joins the Hub as a peer with a single command:
+A second machine joins the Hub as a peer with a single command. Any
+combination of macOS, Linux, and Windows machines is supported.
 
 ```bash
 # On the peer host
@@ -95,12 +96,11 @@ kojo --peer
 ```
 
 The peer auto-discovers the Hub via Tailscale MagicDNS
-(`https://kojo.<tailnet>.ts.net:8080`), writes the Hub into its local peer
-registry, and POSTs a join request. The Hub parks the request in
-`peer_pending` and surfaces it in Settings → Peers → "Pending join
-requests". Click **Approve** to grant the peer the privileged surface
-(sessions, files, git). Reject drops the request; the peer is free to
-retry.
+(`https://kojo.<tailnet>.ts.net:8080`), writes the Hub into its local
+peer registry, and POSTs a join request. The Hub holds the request and
+surfaces it in Settings → Peers → "Pending join requests". Click
+**Approve** to grant the peer the privileged surface (sessions, files,
+git). Reject drops the request; the peer is free to retry.
 
 Override the discovery target when needed:
 
@@ -118,6 +118,18 @@ kojo --peer --tailnet-only
 
 The legacy manual pairing path (`--peer-add` / `--peer-trust` /
 `--peer-remove`) still works as an escape hatch.
+
+See [docs/multi-device.md](docs/multi-device.md) for the full
+multi-device setup, agent device-switch, and Hub failover procedure.
+
+### Upgrading from an earlier release
+
+The on-disk config layout changed in v0.101.0. If you ran an earlier
+kojo release (v0.x using `~/.config/kojo/` on macOS / Linux or
+`%APPDATA%\kojo\` on Windows), see [docs/migration.md](docs/migration.md)
+for the `--migrate` flow, rollback path, and the list of features that
+did not carry over (Gemini CLI backend and Gmail notifications were
+removed).
 
 ## Tailscale HTTPS Setup
 
@@ -141,7 +153,7 @@ When you run `kojo` (without `--local`):
 ```bash
 $ kojo
 
-  kojo v0.19.0 running at:
+  kojo v0.101.0 running at:
 
     https://kojo.tail1234.ts.net
     https://100.x.y.z:8080
