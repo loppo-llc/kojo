@@ -38,7 +38,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-var version = "0.101.3"
+var version = "0.101.4"
 
 func main() {
 	port := flag.Int("port", 8080, "port number (auto-increments if busy)")
