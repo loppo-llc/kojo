@@ -67,6 +67,26 @@ func (m *Manager) ResetData(id string) error {
 	// failure) so the lock spans the full critical region.
 	releaseSync := lockMemorySync(id)
 
+	// Tombstone all memory_entries DB rows BEFORE wiping disk.
+	// Without this, the post-reset syncMemoryEntriesToDB sees an
+	// empty memory/ directory, enters hydrate mode (len(disk)==0),
+	// and writes pre-reset DB rows back to disk — effectively
+	// undoing the reset. Tombstoning first makes the rows invisible
+	// to ListMemoryEntries (WHERE deleted_at IS NULL), so the hydrate
+	// phase finds nothing to restore.
+	if st := getGlobalStore(); st != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		n, err := st.SoftDeleteAllMemoryEntries(ctx, id)
+		cancel()
+		if err != nil {
+			releaseSync()
+			return fmt.Errorf("reset: tombstone memory entries: %w", err)
+		}
+		if n > 0 {
+			m.logger.Info("reset: tombstoned memory entries", "agent", id, "count", n)
+		}
+	}
+
 	// Remove memory files. The entire memory/ subtree is wiped —
 	// daily diaries (memory/YYYY-MM-DD.md), recent.md, project /
 	// topic / people / archive notes — along with MEMORY.md

@@ -572,6 +572,32 @@ UPDATE memory_entries
 	return tx.Commit()
 }
 
+// SoftDeleteAllMemoryEntries tombstones every live memory_entries row for
+// agentID in a single UPDATE statement. Used by ResetData to wipe memory
+// entries from the DB before the post-reset syncMemoryEntriesToDB runs —
+// without this, the sync sees an empty memory/ directory, enters hydrate
+// mode, and writes the pre-reset DB rows back to disk, effectively
+// undoing the reset.
+//
+// Idempotent: calling on an agent with no live entries is a no-op (0 rows
+// affected). Does NOT recompute per-row etags — the rows are dead and the
+// next sync (if any) will either ignore them or insert fresh rows.
+func (s *Store) SoftDeleteAllMemoryEntries(ctx context.Context, agentID string) (int64, error) {
+	if agentID == "" {
+		return 0, errors.New("store.SoftDeleteAllMemoryEntries: agent_id required")
+	}
+	now := NowMillis()
+	const q = `
+UPDATE memory_entries
+   SET deleted_at = ?, updated_at = ?
+ WHERE agent_id = ? AND deleted_at IS NULL`
+	res, err := s.db.ExecContext(ctx, q, now, now, agentID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func scanMemoryEntryRow(r rowScanner) (*MemoryEntryRecord, error) {
 	var (
 		rec       MemoryEntryRecord
