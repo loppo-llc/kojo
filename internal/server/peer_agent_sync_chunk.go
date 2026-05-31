@@ -145,6 +145,7 @@ type peerAgentSyncChunkedChunkRequest struct {
 	WorkspaceFiles []*store.AgentWorkspaceFileRecord `json:"workspace_files,omitempty"`
 	Tasks          []*store.AgentTaskRecord          `json:"tasks,omitempty"`
 	ClaudeSessions []claudeSessionWire               `json:"claude_sessions,omitempty"`
+	CodexThreads   []codexThreadWire                 `json:"codex_threads,omitempty"`
 }
 
 // peerAgentSyncChunkedResponse is returned by begin / chunk / commit.
@@ -435,6 +436,12 @@ func (s *Server) handlePeerAgentSyncChunkedChunk(w http.ResponseWriter, r *http.
 	entry.req.WorkspaceFiles = append(entry.req.WorkspaceFiles, cReq.WorkspaceFiles...)
 	entry.req.Tasks = append(entry.req.Tasks, cReq.Tasks...)
 	entry.req.ClaudeSessions = append(entry.req.ClaudeSessions, cReq.ClaudeSessions...)
+	if len(cReq.CodexThreads) > 0 {
+		if entry.req.CodexSession == nil {
+			entry.req.CodexSession = &codexSessionWire{}
+		}
+		entry.req.CodexSession.Threads = append(entry.req.CodexSession.Threads, cReq.CodexThreads...)
+	}
 	entry.accumulatedBytes = newTotal
 	entry.nextChunkSeq++
 	entry.lastTouched = time.Now()
@@ -520,6 +527,12 @@ func (s *Server) handlePeerAgentSyncChunkedCommit(w http.ResponseWriter, r *http
 		"workspace_files", len(entry.req.WorkspaceFiles),
 		"tasks", len(entry.req.Tasks),
 		"claude_sessions", len(entry.req.ClaudeSessions),
+		"codex_threads", func() int {
+			if entry.req.CodexSession == nil {
+				return 0
+			}
+			return len(entry.req.CodexSession.Threads)
+		}(),
 		"accumulated_bytes", entry.accumulatedBytes)
 
 	// applyPeerAgentSync re-runs the request through the same

@@ -46,9 +46,9 @@ func (m *Manager) ResetData(id string) error {
 	}
 
 	// Clear the global CLI session stores BEFORE acquiring
-	// memorySyncMu. clearGrokSession now takes lockGrokSessionTransfer
-	// internally, and the peer-agent-sync handler holds
-	// lockGrokSessionTransfer THEN takes memorySyncMu (via
+	// memorySyncMu. clearGrokSession / clearCodexSession take their
+	// transfer locks internally, and the peer-agent-sync handler holds
+	// the transfer lock THEN takes memorySyncMu (via
 	// agent.LockAgentMemorySync at peer_agent_sync_handler.go:519).
 	// Acquiring memorySyncMu first here would invert that order and
 	// deadlock against a concurrent device-switch arrival. Neither
@@ -57,6 +57,7 @@ func (m *Manager) ResetData(id string) error {
 	// invariant the lock protects.
 	clearClaudeSession(id)
 	clearGrokSession(id)
+	clearCodexSession(id)
 
 	// Hold the per-agent memory-sync lock around the entire on-
 	// disk wipe + recreate + post-reset sync so concurrent CRUD /
@@ -591,8 +592,8 @@ func (m *Manager) ActivateAgentRuntime(agentID string) {
 	// the kojo-switch-device skill. SyncDeviceSwitchSkillForTool
 	// dispatches based on Tool: claude/custom install the
 	// Claude-Code-flavored body, grok installs its own body
-	// (no `!`exec`` substitution, `grok --resume` wording),
-	// codex/llama.cpp are no-op.
+	// (no `!`exec`` substitution, `grok --resume` wording), codex
+	// installs a .codex/skills body, and llama.cpp is no-op.
 	SyncDeviceSwitchSkillForTool(agentID, a.Tool, a.IsDeviceSwitchEnabled(), m.logger)
 }
 
@@ -2069,8 +2070,18 @@ func (m *Manager) ResetSession(agentID string) error {
 				"agent", agentID,
 				"filesRemoved", files, "sessionsRemoved", sessions)
 		}
+	case "codex":
+		files, threads, cerr := clearCodexSessionCounted(agentID)
+		if cerr != nil {
+			m.logger.Warn("CLI session reset: codex clear partial failure",
+				"agent", agentID, "err", cerr,
+				"filesRemoved", files, "threadsRemoved", threads)
+		} else {
+			m.logger.Debug("CLI session reset: codex cleared",
+				"agent", agentID,
+				"filesRemoved", files, "threadsRemoved", threads)
+		}
 	}
-	// Codex uses ephemeral sessions — no persistent state to clear
 
 	m.logger.Info("CLI session reset", "agent", agentID, "tool", tool)
 	return nil

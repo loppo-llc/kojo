@@ -36,7 +36,7 @@ import (
 //
 // Lifecycle (mirrors device_switch_skill.go):
 //
-//   - Manager.prepareChat calls SyncAttachSkill right after
+//   - Manager.prepareChat calls SyncAttachSkillForTool right after
 //     PrepareClaudeSettings / SyncDeviceSwitchSkill.
 //   - The skill is installed only when the blob store is wired and
 //     the operator has not opted out via PATCH /api/v1/agents/{id}
@@ -147,13 +147,33 @@ func lockAttachSkill(agentID string) func() {
 // walks up from its cwd looking for skills/, and we set cmd.Dir to
 // agentDir when spawning, so the skill is in scope.
 func SyncAttachSkill(agentID string, enabled bool, logger *slog.Logger) {
+	syncAttachSkillAt(agentID, ".claude", enabled, logger)
+}
+
+// SyncCodexAttachSkill installs the same kojo-attach instructions in
+// Codex's project skill tree. Codex app-server loads `.codex/skills`
+// from cwd, while Claude/Grok use `.claude/skills`.
+func SyncCodexAttachSkill(agentID string, enabled bool, logger *slog.Logger) {
+	syncAttachSkillAt(agentID, ".codex", enabled, logger)
+}
+
+func SyncAttachSkillForTool(agentID, tool string, enabled bool, logger *slog.Logger) {
+	switch tool {
+	case "claude", "custom", "grok":
+		SyncAttachSkill(agentID, enabled, logger)
+	case "codex":
+		SyncCodexAttachSkill(agentID, enabled, logger)
+	}
+}
+
+func syncAttachSkillAt(agentID, root string, enabled bool, logger *slog.Logger) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	unlock := lockAttachSkill(agentID)
 	defer unlock()
 	dir := agentDir(agentID)
-	skillDir := filepath.Join(dir, ".claude", "skills", attachSkillDirName)
+	skillDir := filepath.Join(dir, root, "skills", attachSkillDirName)
 	skillPath := filepath.Join(skillDir, "SKILL.md")
 
 	if !enabled {

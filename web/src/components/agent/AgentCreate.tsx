@@ -542,7 +542,7 @@ export function AgentCreate() {
           })()}
         </div>
 
-        {/* Effort (claude only) */}
+        {/* Effort */}
         {supportsEffort(tool) && (
           <div>
             <label className="block text-sm text-neutral-400 mb-2">Effort</label>

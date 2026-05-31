@@ -34,4 +34,10 @@ describe("toolModels — Opus 4.8 / effort defaults", () => {
     expect(effortLevelsForModel("sonnet")).not.toContain("xhigh");
     expect(defaultEffortForModel("sonnet")).toBe("high");
   });
+
+  it("codex models support xhigh, default to medium, and omit max", () => {
+    expect(effortLevelsForModel("gpt-5.5")).toContain("xhigh");
+    expect(effortLevelsForModel("gpt-5.5")).not.toContain("max");
+    expect(defaultEffortForModel("gpt-5.5")).toBe("medium");
+  });
 });

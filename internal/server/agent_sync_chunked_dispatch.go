@@ -356,6 +356,22 @@ func splitAgentSyncIntoChunks(payload *peerAgentSyncRequest, budgetBytes int) (b
 		current.ClaudeSessions = append(current.ClaudeSessions, cs)
 		currentSize += len(raw)
 	}
+	if payload.CodexSession != nil {
+		for _, ct := range payload.CodexSession.Threads {
+			raw, merr := json.Marshal(ct)
+			if merr != nil {
+				return nil, nil, fmt.Errorf("marshal codex_thread: %w", merr)
+			}
+			if cerr := checkRow(len(raw), "codex_thread"); cerr != nil {
+				return nil, nil, cerr
+			}
+			if currentSize > 0 && currentSize+len(raw) > budgetBytes {
+				seal()
+			}
+			current.CodexThreads = append(current.CodexThreads, ct)
+			currentSize += len(raw)
+		}
+	}
 	seal()
 
 	// Post-seal verification: re-marshal each chunk and assert
@@ -518,6 +534,21 @@ func estimateAgentSyncRawSize(payload *peerAgentSyncRequest) (int64, error) {
 		return n, nil
 	}); err != nil {
 		return 0, err
+	}
+	if payload.CodexSession != nil {
+		if err := addArray("codex_threads", func() (int64, error) {
+			var n int64
+			for _, ct := range payload.CodexSession.Threads {
+				b, merr := json.Marshal(ct)
+				if merr != nil {
+					return 0, merr
+				}
+				n += int64(len(b)) + 1
+			}
+			return n, nil
+		}); err != nil {
+			return 0, err
+		}
 	}
 	return total, nil
 }

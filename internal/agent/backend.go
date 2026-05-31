@@ -64,7 +64,7 @@ type ChatOptions struct {
 
 // backendSupportsSessionKey reports whether the backend honors
 // ChatOptions.SessionKey when building its CLI invocation. Backends that
-// ignore SessionKey (codex, grok, llama.cpp, custom) cannot isolate a
+// ignore SessionKey (grok, llama.cpp) cannot isolate a
 // per-thread session from the agent's main session, so the manager drops
 // SessionKey for them and degrades to OneShot=true — keeping the chat
 // ephemeral rather than silently mixing thread contexts.
@@ -76,8 +76,9 @@ func backendSupportsSessionKey(b ChatBackend) bool {
 		return false
 	}
 	switch b.Name() {
-	case "claude", "custom":
-		// custom delegates to ClaudeBackend.Chat, which honors SessionKey.
+	case "claude", "custom", "codex":
+		// custom delegates to ClaudeBackend.Chat, and codex stores a
+		// deterministic per-key thread ref under agentDir/.codex/threads.
 		return true
 	default:
 		return false
@@ -91,12 +92,10 @@ func backendSupportsSessionKey(b ChatBackend) bool {
 // compatibility source (verified empirically via `grok inspect` from
 // an agentDir that has the kojo-* skills installed — they list as
 // `project` scope alongside the user-scoped `~/.grok/skills/` ones).
-// codex / llama.cpp do not have a skill loader, so any `.claude/`
-// tree in their agentDir is inert. We intentionally do NOT clean it
-// up on those tools (see SyncDeviceSwitchSkillForTool's no-op
-// branch): preserving a pre-existing install lets a Tool=claude
-// flip-back restore the original behaviour without re-running
-// install logic.
+// codex has its own `.codex/skills/<name>/SKILL.md` loader, so it
+// intentionally remains false here even though Kojo can install
+// codex-native skills via Sync*SkillForTool dispatchers. llama.cpp
+// has no skill loader.
 //
 // Used to gate SyncAttachSkill installation: writing the SKILL.md
 // into an agentDir whose backend never reads it just leaves dead
@@ -131,8 +130,12 @@ func backendLoadsClaudeSkills(tool string) bool {
 //     the resume pointer at the next chat and issues
 //     `grok --resume <uuid>`.
 //
-// codex / llama.cpp have no session transfer wired up; they stay
-// off.
+//   - codex: switch_device_handler.go transfers the per-agent
+//     `.codex/threads/*.json` refs, rollout JSONLs, and Codex state
+//     sqlite rows via CodexSession; backend_codex.go resumes with
+//     app-server `thread/resume`.
+//
+// llama.cpp has no session transfer wired up; it stays off.
 //
 // Gating the SKILL.md install (instead of, say, a runtime 4xx) keeps
 // the failure mode obvious for unsupported tools: the skill simply
@@ -140,7 +143,7 @@ func backendLoadsClaudeSkills(tool string) bool {
 // offers a switch it cannot fulfil.
 func backendSupportsDeviceSwitch(tool string) bool {
 	switch tool {
-	case "claude", "custom", "grok":
+	case "claude", "custom", "grok", "codex":
 		return true
 	default:
 		return false

@@ -23,6 +23,10 @@ func skillPath(agentID string) string {
 	return filepath.Join(agentDir(agentID), ".claude", "skills", deviceSwitchSkillDirName, "SKILL.md")
 }
 
+func codexSkillPath(agentID string) string {
+	return filepath.Join(agentDir(agentID), ".codex", "skills", deviceSwitchSkillDirName, "SKILL.md")
+}
+
 // TestSyncDeviceSwitchSkill_InstallsWhenEnabledWithPeers verifies the
 // install path: enabled=true + peer count > 0 → SKILL.md written
 // under the per-agent .claude/skills/ tree.
@@ -308,7 +312,7 @@ func (e errShortRead) Error() string {
 // custom) installs the Claude-Code-flavored SKILL.md, then the
 // operator PATCHes Tool to grok. grok reads .claude/skills/, so
 // the dispatcher MUST overwrite the on-disk body with the grok
-// flavor (no `!`exec`` substitution, `grok --resume` wording) on
+// flavor (no `!`exec“ substitution, `grok --resume` wording) on
 // the next sync — otherwise grok would execute Claude-Code-only
 // constructs literally and the switch would derail.
 func TestSyncDeviceSwitchSkillForTool_GrokOverwritesClaudeBody(t *testing.T) {
@@ -408,14 +412,10 @@ func TestSyncDeviceSwitchSkillForTool_ClaudeInstalls(t *testing.T) {
 	}
 }
 
-// TestSyncDeviceSwitchSkillForTool_CodexIsNoop confirms codex (no
-// skill loader) does NOT receive any cleanup attempt — calling
-// RemoveAll on a `.claude/` tree that should not exist for codex
-// would be a code smell, and importantly we want to preserve any
-// pre-existing claude-installed file on disk so that a future
-// Tool=claude flip restores it intact (the operator may flip back
-// without realising they lost the install).
-func TestSyncDeviceSwitchSkillForTool_CodexIsNoop(t *testing.T) {
+// TestSyncDeviceSwitchSkillForTool_CodexInstallsCodexSkill confirms
+// codex gets a native .codex/skills install and leaves any stale
+// .claude/skills body alone.
+func TestSyncDeviceSwitchSkillForTool_CodexInstallsCodexSkill(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
@@ -436,11 +436,17 @@ func TestSyncDeviceSwitchSkillForTool_CodexIsNoop(t *testing.T) {
 		t.Fatalf("pre-condition: claude-style install failed: %v", err)
 	}
 
-	// codex sync must leave the file alone (no-op branch).
 	SyncDeviceSwitchSkillForTool(agentID, "codex", true, logger)
 
 	if _, err := os.Stat(skillPath(agentID)); err != nil {
-		t.Fatalf("codex sync unexpectedly removed pre-existing SKILL.md: %v", err)
+		t.Fatalf("codex sync unexpectedly removed pre-existing .claude SKILL.md: %v", err)
+	}
+	body, err := os.ReadFile(codexSkillPath(agentID))
+	if err != nil {
+		t.Fatalf("codex SKILL.md not written: %v", err)
+	}
+	if !strings.Contains(string(body), "Codex") || strings.Contains(string(body), "grok --resume") {
+		t.Fatalf("codex body did not get codex wording; got:\n%s", body)
 	}
 }
 

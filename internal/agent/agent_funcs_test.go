@@ -138,7 +138,7 @@ func TestValidSilentHours(t *testing.T) {
 }
 
 func TestValidEffort(t *testing.T) {
-	valid := []string{"", "low", "medium", "high", "xhigh", "max"}
+	valid := []string{"", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
 	for _, v := range valid {
 		if !ValidEffort(v) {
 			t.Errorf("expected %q to be valid", v)
@@ -156,11 +156,25 @@ func TestValidModelEffort(t *testing.T) {
 			t.Errorf("expected xhigh to be valid for %q", m)
 		}
 	}
-	// xhigh is invalid for non-opus models
+	// xhigh is invalid for non-opus/non-codex models
 	for _, m := range []string{"sonnet", "claude-opus-4-6", "haiku", ""} {
 		if ValidModelEffort(m, "xhigh") {
 			t.Errorf("expected xhigh to be invalid for %q", m)
 		}
+	}
+	for _, m := range []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2"} {
+		if !ValidModelEffort(m, "xhigh") {
+			t.Errorf("expected xhigh to be valid for codex model %q", m)
+		}
+		if ValidModelEffort(m, "max") {
+			t.Errorf("expected max to be invalid for codex model %q", m)
+		}
+		if !ValidModelEffort(m, "minimal") {
+			t.Errorf("expected minimal to be valid for codex model %q", m)
+		}
+	}
+	if ValidModelEffort("sonnet", "minimal") {
+		t.Errorf("expected minimal to be invalid for non-codex model")
 	}
 	// other effort levels are valid for any model
 	for _, e := range []string{"", "low", "medium", "high", "max"} {

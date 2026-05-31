@@ -1549,6 +1549,33 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 		}
 	}
 
+	if agentRecordTool(rec) == "codex" {
+		codexTransfer, codexSkipped, cerr := agent.ReadCodexSessionFiles(agentID)
+		if cerr != nil {
+			return nil, fmt.Errorf("read codex session: %w", cerr)
+		}
+		if len(codexSkipped) > 0 {
+			s.logger.Warn("agent-sync: skipped codex session files",
+				"agent", agentID, "files", codexSkipped)
+		}
+		if codexTransfer != nil && len(codexTransfer.Threads) > 0 {
+			cw := &codexSessionWire{
+				Threads: make([]codexThreadWire, 0, len(codexTransfer.Threads)),
+			}
+			for _, th := range codexTransfer.Threads {
+				cw.Threads = append(cw.Threads, codexThreadWire{
+					RefName:           th.RefName,
+					ThreadID:          th.ThreadID,
+					RolloutRelPath:    th.RolloutRelPath,
+					RolloutContentB64: base64.StdEncoding.EncodeToString(th.RolloutContent),
+					ThreadRow:         th.ThreadRow,
+					DynamicToolRows:   th.DynamicToolRows,
+				})
+			}
+			req.CodexSession = cw
+		}
+	}
+
 	// Raw agent token (best-effort — post-restart peers only
 	// have the kv hash, so the callback may return false; that's
 	// acceptable in v1, the target will require a re-issue

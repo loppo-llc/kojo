@@ -44,12 +44,13 @@ export function modelsForTool(tool: string): string[] {
   return toolModels[tool]?.models ?? [];
 }
 
-/** Effort levels (claude only). */
+/** Effort levels shared by Claude/Grok. Codex omits "max". */
 export const effortLevels = ["low", "medium", "high", "xhigh", "max"] as const;
 export type EffortLevel = (typeof effortLevels)[number];
 
 /** Models that support the xhigh effort level. */
 const xhighModels = new Set(["opus", "claude-opus-4-8", "claude-opus-4-7", "grok-build"]);
+const codexEffortModels = new Set(toolModels.codex.models);
 
 /**
  * Models whose default effort is xhigh (rather than high).
@@ -60,16 +61,18 @@ const xhighModels = new Set(["opus", "claude-opus-4-8", "claude-opus-4-7", "grok
 const defaultXhighModels = new Set(["claude-opus-4-7", "grok-build"]);
 
 export function supportsEffort(tool: string): boolean {
-  return tool === "claude" || tool === "grok";
+  return tool === "claude" || tool === "grok" || tool === "codex";
 }
 
 /** Return available effort levels for a given model. */
 export function effortLevelsForModel(model: string): readonly EffortLevel[] {
+  if (codexEffortModels.has(model)) return ["low", "medium", "high", "xhigh"] as const;
   if (xhighModels.has(model)) return effortLevels;
   return effortLevels.filter((e) => e !== "xhigh");
 }
 
 /** Return the default effort level label for a given model. */
 export function defaultEffortForModel(model: string): string {
+  if (codexEffortModels.has(model)) return "medium";
   return defaultXhighModels.has(model) ? "xhigh" : "high";
 }

@@ -99,3 +99,23 @@ func TestSyncAttachSkill_Idempotent(t *testing.T) {
 		t.Errorf("SKILL.md body changed across idempotent sync")
 	}
 }
+
+func TestSyncAttachSkillForTool_CodexInstallsCodexSkill(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("APPDATA", "")
+
+	agentID := "ag_skill_codex"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	SyncAttachSkillForTool(agentID, "codex", true, logger)
+
+	skillPath := filepath.Join(agentDir(agentID), ".codex", "skills",
+		attachSkillDirName, "SKILL.md")
+	body, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatalf("codex SKILL.md not written: %v", err)
+	}
+	if !strings.Contains(string(body), "name: kojo-attach") {
+		t.Errorf("codex SKILL.md missing frontmatter name")
+	}
+}

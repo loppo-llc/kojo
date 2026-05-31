@@ -117,9 +117,9 @@ func IsInSilentHours(start, end string) bool {
 	return nowMinutes >= startMin || nowMinutes < endMin
 }
 
-// allowedEfforts defines valid effort levels (claude only). Empty string is allowed (= default).
+// allowedEfforts defines valid effort levels. Empty string is allowed (= default).
 var allowedEfforts = map[string]bool{
-	"": true, "low": true, "medium": true, "high": true, "xhigh": true, "max": true,
+	"": true, "none": true, "minimal": true, "low": true, "medium": true, "high": true, "xhigh": true, "max": true,
 }
 
 // ValidEffort returns true if the given effort level is valid.
@@ -151,12 +151,25 @@ var xhighModels = map[string]bool{
 	// every model it ships (only grok-build today). Keep this in
 	// sync with web/src/lib/toolModels.ts xhighModels.
 	"grok-build": true,
+	"gpt-5.5":    true, "gpt-5.4": true, "gpt-5.4-mini": true,
+	"gpt-5.3-codex": true, "gpt-5.2": true,
+}
+
+var codexEffortModels = map[string]bool{
+	"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true,
+	"gpt-5.3-codex": true, "gpt-5.2": true,
 }
 
 // ValidModelEffort returns true if the model+effort combination is valid.
 // xhigh is only allowed for specific models.
 func ValidModelEffort(model, effort string) bool {
 	if !ValidEffort(effort) {
+		return false
+	}
+	if (effort == "none" || effort == "minimal") && !codexEffortModels[model] {
+		return false
+	}
+	if effort == "max" && codexEffortModels[model] {
 		return false
 	}
 	if effort == "xhigh" && !xhighModels[model] {
@@ -221,7 +234,7 @@ type Agent struct {
 	Name    string `json:"name"`
 	Persona string `json:"persona"`           // persona description (markdown)
 	Model   string `json:"model"`             // e.g. "sonnet", "opus"
-	Effort  string `json:"effort,omitempty"`  // claude/grok only: "low", "medium", "high", "xhigh", "max"
+	Effort  string `json:"effort,omitempty"`  // claude/grok/codex effort level
 	Tool    string `json:"tool"`              // CLI tool: "claude", "codex", "grok"
 	WorkDir string `json:"workDir,omitempty"` // file storage directory (empty = agentDir)
 	// CronExpr is a 5-field standard cron expression (M H DOM Mon DOW).

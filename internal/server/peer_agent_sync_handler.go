@@ -140,6 +140,13 @@ type peerAgentSyncRequest struct {
 	// session starts on target).
 	GrokSession *grokSessionWire `json:"grok_session,omitempty"`
 
+	// CodexSession carries Codex app-server thread refs plus their
+	// rollout JSONLs and sqlite metadata so `thread/resume` on target
+	// can continue the same conversation. Empty / absent for non-codex
+	// agents and for codex agents that have not yet materialized a
+	// persistent thread.
+	CodexSession *codexSessionWire `json:"codex_session,omitempty"`
+
 	// SinceMessageSeq, when > 0, signals INCREMENTAL message
 	// sync: the orchestrator consulted target's /agent-sync/state
 	// endpoint, learned target already has messages up to this
@@ -249,6 +256,19 @@ type grokSessionWire struct {
 type grokSessionFileWire struct {
 	RelPath    string `json:"rel_path"`
 	ContentB64 string `json:"content_b64"`
+}
+
+type codexSessionWire struct {
+	Threads []codexThreadWire `json:"threads,omitempty"`
+}
+
+type codexThreadWire struct {
+	RefName           string                 `json:"ref_name"`
+	ThreadID          string                 `json:"thread_id"`
+	RolloutRelPath    string                 `json:"rollout_rel_path"`
+	RolloutContentB64 string                 `json:"rollout_content_b64"`
+	ThreadRow         *agent.CodexSQLiteRow  `json:"thread_row,omitempty"`
+	DynamicToolRows   []agent.CodexSQLiteRow `json:"dynamic_tool_rows,omitempty"`
 }
 
 type peerAgentSyncResponse struct {
@@ -509,6 +529,31 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		}
 	}
 
+	// codex session: optional. Decode rollout JSONLs before any DB /
+	// disk state is touched so malformed base64 fails atomically.
+	var decodedCodex *agent.CodexSessionTransfer
+	if req.CodexSession != nil && len(req.CodexSession.Threads) > 0 {
+		decodedCodex = &agent.CodexSessionTransfer{
+			Threads: make([]agent.CodexThreadTransfer, 0, len(req.CodexSession.Threads)),
+		}
+		for i, ct := range req.CodexSession.Threads {
+			body, derr := base64.StdEncoding.DecodeString(ct.RolloutContentB64)
+			if derr != nil {
+				writeError(w, http.StatusBadRequest, "bad_request",
+					"codex_session.threads["+itoa(i)+"]: invalid base64: "+derr.Error())
+				return
+			}
+			decodedCodex.Threads = append(decodedCodex.Threads, agent.CodexThreadTransfer{
+				RefName:         ct.RefName,
+				ThreadID:        ct.ThreadID,
+				RolloutRelPath:  ct.RolloutRelPath,
+				RolloutContent:  body,
+				ThreadRow:       ct.ThreadRow,
+				DynamicToolRows: ct.DynamicToolRows,
+			})
+		}
+	}
+
 	// Materialise the portable default workDir on disk so a
 	// subsequent Settings save (validateUpdateConfigPure absolute
 	// path check + the post-existence stat in Update) doesn't 400
@@ -578,6 +623,31 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 
+	// codex session: same two-phase staging as claude/grok. A codex
+	// agent with no CodexSession block means source has no resumable
+	// thread; purge target's stale per-agent codex refs so the next
+	// chat starts fresh instead of resuming an old local thread.
+	var codexCommit, codexRollback func()
+	var cserr error
+	if req.Agent != nil && agentRecordTool(req.Agent) == "codex" && decodedCodex == nil {
+		codexCommit, codexRollback, cserr = agent.StageCodexSessionCleanup(req.Agent.ID)
+	} else {
+		codexCommit, codexRollback, cserr = agent.StageCodexSession(req.Agent.ID, decodedCodex)
+	}
+	if cserr != nil {
+		if sessionRollback != nil {
+			sessionRollback()
+		}
+		if grokRollback != nil {
+			grokRollback()
+		}
+		s.logger.Error("peer agent-sync: codex session stage failed",
+			"agent", req.Agent.ID, "err", cserr)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"codex session stage: "+cserr.Error())
+		return
+	}
+
 	// Incremental message sync: SinceMessageSeq > 0 means source
 	// has consulted /agent-sync/state, confirmed source's
 	// transcript is append-only (no tombstones, no edits), and
@@ -601,6 +671,9 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		}
 		if grokRollback != nil {
 			grokRollback()
+		}
+		if codexRollback != nil {
+			codexRollback()
 		}
 		writeError(w, http.StatusBadRequest, "unsupported",
 			"since_memory_entry_seq is not a valid delta cursor; use since_memory_entry_updated_at")
@@ -639,6 +712,9 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		if grokRollback != nil {
 			grokRollback()
 		}
+		if codexRollback != nil {
+			codexRollback()
+		}
 		s.logger.Error("peer agent-sync: store apply failed; rolled back session files",
 			"agent", req.Agent.ID, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal",
@@ -650,6 +726,9 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	}
 	if grokCommit != nil {
 		grokCommit()
+	}
+	if codexCommit != nil {
+		codexCommit()
 	}
 
 	// Credentials sync: re-encrypt and replace target's credentials

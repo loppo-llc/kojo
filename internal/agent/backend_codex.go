@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -50,6 +51,10 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	cmd := exec.CommandContext(ctx, codexPath, args...)
 	cmd.Dir = dir
 	cmd.Env = filterEnv([]string{"AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
+	cmd.WaitDelay = 10 * time.Second
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -177,12 +182,12 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		// Step 2: Send initialized notification (no params per protocol)
 		sendNotify("initialized")
 
-		// Step 3: Start thread.
+		// Step 3: Start or resume thread.
 		//
 		// systemPrompt (already merged with any SystemPromptExtra by the
 		// manager) flows into Codex's baseInstructions — set once at
-		// thread/start — rather than being concatenated onto the user
-		// message. This keeps Codex's prompt cache stable across turns:
+		// thread/start / thread/resume — rather than being concatenated
+		// onto the user message. This keeps Codex's prompt cache stable across turns:
 		// the base instructions form a fixed prefix, and only the per-turn
 		// user message changes. Mixing the system prompt into each turn's
 		// input would invalidate the cache and force full re-tokenisation
@@ -192,41 +197,61 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			"approvalPolicy": "never",
 			"sandbox":        "danger-full-access",
 		}
+		if opts.OneShot {
+			threadParams["ephemeral"] = true
+		}
 		if agent.Model != "" {
 			threadParams["model"] = agent.Model
 		}
 		if systemPrompt != "" {
 			threadParams["baseInstructions"] = systemPrompt
 		}
-		threadStartID = sendRPC("thread/start", threadParams)
 
-		// Wait for thread/start response to get thread ID
-		for scanner.Scan() {
-			line := scanner.Text()
-			if line == "" {
-				continue
-			}
-			var msg rpcMessage
-			if err := json.Unmarshal([]byte(line), &msg); err != nil {
-				continue
-			}
-			if msg.ID != nil && *msg.ID == threadStartID {
-				if msg.Error != nil {
-					send(ChatEvent{Type: "error", ErrorMessage: "codex thread/start failed: " + msg.Error.Message})
+		var rolloutPath string
+		var existingRef *codexThreadRef
+		if !opts.OneShot {
+			if ref, rerr := readCodexThreadRef(agent.ID, opts.SessionKey); rerr == nil && ref != nil && ref.ThreadID != "" {
+				existingRef = ref
+				resumeParams := cloneStringAnyMap(threadParams)
+				resumeParams["threadId"] = ref.ThreadID
+				threadStartID = sendRPC("thread/resume", resumeParams)
+				msg, ok := waitCodexRPCResponse(scanner, threadStartID)
+				if !ok {
+					send(ChatEvent{Type: "error", ErrorMessage: "codex thread/resume failed: no response"})
 					shutdown()
 					return
 				}
-				if msg.Result != nil {
-					var result struct {
-						Thread struct {
-							ID string `json:"id"`
-						} `json:"thread"`
+				if msg.Error != nil {
+					b.logger.Warn("codex thread/resume failed; starting a fresh thread",
+						"agent", agent.ID, "sessionKey", opts.SessionKey,
+						"thread_id", ref.ThreadID, "err", msg.Error.Message)
+					deleteCodexThreadRef(agent.ID, opts.SessionKey, b.logger)
+				} else {
+					threadID, rolloutPath = decodeCodexThreadResult(msg.Result)
+					if rolloutPath == "" {
+						rolloutPath = ref.RolloutPath
 					}
-					json.Unmarshal(*msg.Result, &result)
-					threadID = result.Thread.ID
 				}
-				break
+			} else if rerr != nil {
+				b.logger.Warn("codex thread ref read failed; starting a fresh thread",
+					"agent", agent.ID, "sessionKey", opts.SessionKey, "err", rerr)
 			}
+		}
+
+		if threadID == "" {
+			threadStartID = sendRPC("thread/start", threadParams)
+			msg, ok := waitCodexRPCResponse(scanner, threadStartID)
+			if !ok {
+				send(ChatEvent{Type: "error", ErrorMessage: "codex thread/start failed: no response"})
+				shutdown()
+				return
+			}
+			if msg.Error != nil {
+				send(ChatEvent{Type: "error", ErrorMessage: "codex thread/start failed: " + msg.Error.Message})
+				shutdown()
+				return
+			}
+			threadID, rolloutPath = decodeCodexThreadResult(msg.Result)
 		}
 
 		if threadID == "" {
@@ -234,16 +259,32 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			shutdown()
 			return
 		}
+		if !opts.OneShot {
+			if rolloutPath == "" && existingRef != nil {
+				rolloutPath = existingRef.RolloutPath
+			}
+			writeCodexThreadRef(agent.ID, opts.SessionKey, codexThreadRef{
+				ThreadID:    threadID,
+				RolloutPath: rolloutPath,
+			}, b.logger)
+		}
 
 		// Step 4: Start turn with user message.
 		// System prompt is NOT prepended here — it flows through
 		// baseInstructions above so the prompt cache stays warm across turns.
-		turnStartID = sendRPC("turn/start", map[string]any{
+		turnParams := map[string]any{
 			"threadId": threadID,
 			"input": []map[string]any{
 				{"type": "text", "text": userMessage},
 			},
-		})
+		}
+		if effort := codexEffortForProtocol(agent.Effort); effort != "" {
+			turnParams["effort"] = effort
+		} else if agent.Effort != "" {
+			b.logger.Warn("codex: unsupported effort value; using CLI default",
+				"agent", agent.ID, "effort", agent.Effort)
+		}
+		turnStartID = sendRPC("turn/start", turnParams)
 
 		if !send(ChatEvent{Type: "status", Status: "thinking"}) {
 			shutdown()
@@ -254,6 +295,9 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		result := parseCodexStream(scanner, turnStartID, b.logger, send)
 		if result.cancelled {
 			shutdown()
+			if ctx.Err() != nil {
+				emitCancelDone(ctx, ch, result.fullText.String(), result.thinking.String(), result.toolUses, result.usage)
+			}
 			return
 		}
 		if result.turnCompleted {
@@ -598,4 +642,3 @@ type rpcError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 }
-

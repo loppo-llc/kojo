@@ -56,6 +56,16 @@ type TruncateMemoryResult struct {
 	// summary.json, system_prompt.txt, terminal/*.log, …).
 	GrokSessionFilesRemoved int `json:"grokSessionFilesRemoved"`
 
+	// CodexThreadsRemoved counts Codex app-server threads whose Kojo
+	// per-agent refs were dropped. Codex rollouts do not carry a
+	// kojo-compatible per-record timestamp, so truncation drops the
+	// whole referenced thread and lets the next turn start fresh.
+	CodexThreadsRemoved int `json:"codexThreadsRemoved"`
+
+	// CodexSessionFilesRemoved counts rollout JSONL files removed while
+	// dropping the referenced Codex threads.
+	CodexSessionFilesRemoved int `json:"codexSessionFilesRemoved"`
+
 	// DiaryFilesRemoved counts memory/YYYY-MM-DD.md files we deleted
 	// outright because their date is strictly after the threshold's date
 	// (in JST — diary timestamps are JST-local). Also counts memory_entries
@@ -244,6 +254,13 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 	res.GrokSessionFilesRemoved = grokFilesRm
 	res.GrokSessionsRemoved = grokSessRm
 
+	codexFilesRm, codexThreadsRm, cerr := clearCodexSessionCounted(agentID)
+	if cerr != nil {
+		m.logger.Warn("truncate: codex session partial failure", "agent", agentID, "err", cerr)
+	}
+	res.CodexSessionFilesRemoved = codexFilesRm
+	res.CodexThreadsRemoved = codexThreadsRm
+
 	// 3. Daily diary (per-day .md files plus their pre-compaction summary
 	//    sections AND the corresponding memory_entries rows). Held under
 	//    memorySyncMu so a concurrent syncMemoryEntriesToDB can't race
@@ -361,6 +378,8 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 		"claudeFiles", res.ClaudeSessionFilesRemoved,
 		"grokSessions", res.GrokSessionsRemoved,
 		"grokFiles", res.GrokSessionFilesRemoved,
+		"codexThreads", res.CodexThreadsRemoved,
+		"codexFiles", res.CodexSessionFilesRemoved,
 		"diaryEntries", res.DiaryEntriesRemoved,
 		"diaryFiles", res.DiaryFilesRemoved,
 	)

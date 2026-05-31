@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/loppo-llc/kojo/internal/atomicfile"
@@ -35,8 +36,9 @@ import (
 //     grok writes the grok-flavored body
 //     (deviceSwitchSkillBodyGrokPOSIX / deviceSwitchSkillBodyGrokWindows
 //     — no Claude-Code-only `!`exec`` substitution, mentions
-//     `grok --resume` instead of `claude --continue`), and
-//     codex/llama.cpp are no-op. The Update path additionally
+//     `grok --resume` instead of `claude --continue`), codex writes
+//     a `.codex/skills` body that mentions Codex thread resume, and
+//     llama.cpp is no-op. The Update path additionally
 //     re-fires the dispatcher whenever Tool changes so a tool
 //     switch overwrites the on-disk body with the variant the
 //     new backend can actually execute.
@@ -73,7 +75,7 @@ const deviceSwitchSkillDirName = "kojo-switch-device"
 //   - argument-hint: shows up in the /-menu; "<peer-name>" is the
 //     human-readable label expected from the operator.
 //
-// The body uses `!``…``` to inline shell output. claude executes the
+// The body uses `!“…``` to inline shell output. claude executes the
 // command and substitutes the result; the LLM only sees the
 // rendered text.
 const deviceSwitchSkillBody = `---
@@ -271,7 +273,7 @@ Outcome catalog:
 // body (POSIX shells: bash / zsh / fish on macOS / Linux).
 // Differences from deviceSwitchSkillBody:
 //
-//   - No Claude-Code-only `!`curl …`` inline shell substitution.
+//   - No Claude-Code-only `!`curl …“ inline shell substitution.
 //     grok renders inline-backticked text literally (binary
 //     strings: "Inside fenced code blocks and inline backticked
 //     text, content is shown literally") so an `!`-style command
@@ -523,7 +525,7 @@ func SyncDeviceSwitchSkill(agentID string, enabled bool, logger *slog.Logger) {
 // SyncGrokDeviceSwitchSkill is the grok-flavored counterpart to
 // SyncDeviceSwitchSkill. Uses the same lock + atomic-write
 // machinery but writes the deviceSwitchSkillBodyGrok* variant so
-// the body no longer relies on Claude-Code-only `!`...`` inline
+// the body no longer relies on Claude-Code-only `!`...“ inline
 // shell substitution and mentions `grok --resume` instead of
 // `claude --continue`. Same enable + peer-count gate.
 func SyncGrokDeviceSwitchSkill(agentID string, enabled bool, logger *slog.Logger) {
@@ -532,6 +534,32 @@ func SyncGrokDeviceSwitchSkill(agentID string, enabled bool, logger *slog.Logger
 		body = deviceSwitchSkillBodyGrokWindows
 	}
 	syncDeviceSwitchSkillBody(agentID, body, enabled, logger)
+}
+
+// SyncCodexDeviceSwitchSkill installs Codex's project-scoped skill
+// under `.codex/skills`. The body follows the grok-compatible
+// no-inline-exec shape because Codex skills do not support Claude
+// Code's `!`...“ substitution syntax.
+func SyncCodexDeviceSwitchSkill(agentID string, enabled bool, logger *slog.Logger) {
+	body := codexDeviceSwitchSkillBody(deviceSwitchSkillBodyGrokPOSIX)
+	if runtime.GOOS == "windows" {
+		body = codexDeviceSwitchSkillBody(deviceSwitchSkillBodyGrokWindows)
+	}
+	syncDeviceSwitchSkillBodyAt(agentID, ".codex", body, enabled, logger)
+}
+
+func codexDeviceSwitchSkillBody(body string) string {
+	repl := strings.NewReplacer(
+		"grok --resume", "Codex app-server thread/resume",
+		"grok session state", "Codex thread state",
+		"grok agent", "Codex agent",
+		"grok process", "codex process",
+		"grok session", "Codex thread",
+		"grok state", "Codex state",
+		"Grok", "Codex",
+		"grok", "codex",
+	)
+	return repl.Replace(body)
 }
 
 // syncDeviceSwitchSkillBody is the shared writer for both the
@@ -545,13 +573,17 @@ func SyncGrokDeviceSwitchSkill(agentID string, enabled bool, logger *slog.Logger
 // half-overwritten body, regardless of which flavor wins the
 // rename.
 func syncDeviceSwitchSkillBody(agentID, body string, enabled bool, logger *slog.Logger) {
+	syncDeviceSwitchSkillBodyAt(agentID, ".claude", body, enabled, logger)
+}
+
+func syncDeviceSwitchSkillBodyAt(agentID, root, body string, enabled bool, logger *slog.Logger) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	unlock := lockDeviceSwitchSkill(agentID)
 	defer unlock()
 	dir := agentDir(agentID)
-	skillDir := filepath.Join(dir, ".claude", "skills", deviceSwitchSkillDirName)
+	skillDir := filepath.Join(dir, root, "skills", deviceSwitchSkillDirName)
 	skillPath := filepath.Join(skillDir, "SKILL.md")
 
 	shouldInstall := enabled && LookupPeerCount() > 0
@@ -590,24 +622,23 @@ func syncDeviceSwitchSkillBody(agentID, body string, enabled bool, logger *slog.
 //
 //   - "grok": install the grok-flavored body when enabled, remove
 //     otherwise (SyncGrokDeviceSwitchSkill). The grok body avoids
-//     Claude-Code-only `!`exec`` substitution and mentions
+//     Claude-Code-only `!`exec“ substitution and mentions
 //     `grok --resume` instead of `claude --continue`. Writing
 //     OVER any pre-existing claude-body SKILL.md is intentional:
 //     a tool change must yield a body the new backend can
 //     execute.
 //
-//   - any other tool (codex / llama.cpp): no-op. Those backends
-//     do not read `.claude/skills/`, so a stray SKILL.md left
-//     over from a previous claude/custom/grok tool is inert.
-//     Skipping the RemoveAll avoids creating a per-call lock /
-//     stat for the common case and preserves a leftover install
-//     so a future Tool=claude flip restores the original
-//     behaviour without re-running install logic.
+//   - "codex": install the codex-flavored body under `.codex/skills`
+//     when enabled, remove otherwise (SyncCodexDeviceSwitchSkill).
+//
+//   - any other tool (llama.cpp): no-op.
 func SyncDeviceSwitchSkillForTool(agentID, tool string, enabled bool, logger *slog.Logger) {
 	switch tool {
 	case "claude", "custom":
 		SyncDeviceSwitchSkill(agentID, enabled, logger)
 	case "grok":
 		SyncGrokDeviceSwitchSkill(agentID, enabled, logger)
+	case "codex":
+		SyncCodexDeviceSwitchSkill(agentID, enabled, logger)
 	}
 }

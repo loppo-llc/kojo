@@ -1692,9 +1692,9 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 	}
 	// §3.7 device-switch skill. SyncDeviceSwitchSkillForTool
 	// dispatches based on Tool. Every supported tool (claude,
-	// custom, grok) goes through normal install/remove driven by
-	// the toggle, with the right body for that backend; codex and
-	// llama.cpp are no-op (no skill loader). Toggle defaults to
+	// custom, grok, codex) goes through normal install/remove driven by
+	// the toggle, with the right body/path for that backend; llama.cpp is
+	// no-op (no skill loader). Toggle defaults to
 	// true via IsDeviceSwitchEnabled; the underlying writer
 	// internally gates installation on LookupPeerCount() > 0 so a
 	// single-node install never sees the skill regardless of the
@@ -1703,16 +1703,14 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 	SyncDeviceSwitchSkillForTool(agentID, agentCopy.Tool, agentCopy.IsDeviceSwitchEnabled(), m.logger)
 	// kojo-attach skill: agent writes files into
 	// <agentDir>/.kojo/attach/ during the turn and kojo surfaces
-	// them as MessageAttachment chips on the assistant reply. Gated
-	// on backendLoadsClaudeSkills (claude/custom/grok) because the
-	// SKILL.md only reaches an LLM whose backend reads
-	// `.claude/skills/`; and on blob store presence because without
-	// a blob.Store there is no canonical place to store the bytes
-	// and the user UI cannot fetch them. No operator toggle yet —
-	// the feature is always-on when both gates pass.
-	if backendLoadsClaudeSkills(agentCopy.Tool) {
-		SyncAttachSkill(agentID, m.blobStore != nil, m.logger)
-	}
+	// them as MessageAttachment chips on the assistant reply. The
+	// dispatcher writes to the backend's project skill tree
+	// (.claude/skills for Claude/Grok, .codex/skills for Codex).
+	// Gated on blob store presence because without a blob.Store
+	// there is no canonical place to store the bytes and the user UI
+	// cannot fetch them. No operator toggle yet — the feature is
+	// always-on when both gates pass.
+	SyncAttachSkillForTool(agentID, agentCopy.Tool, m.blobStore != nil, m.logger)
 
 	// Build MCP server list (backend-agnostic, URL-based).
 	hasSlackBot := m.loadSlackBotToken(agentID, &agentCopy) != ""
@@ -1899,7 +1897,7 @@ type OneShotOpts struct {
 	// session and from other Slack threads. Empty string preserves the
 	// pre-PR-#12 "fresh ephemeral session per call" behaviour.
 	//
-	// Honored only by backends in backendSupportsSessionKey (claude). For
+	// Honored only by backends in backendSupportsSessionKey (claude/codex). For
 	// other backends the manager drops the key and falls back to OneShot,
 	// rather than risk silently mixing thread contexts on a backend that
 	// would interpret !OneShot as "resume the agent's latest session".
@@ -1983,7 +1981,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	oneShotMode := true
 	if sessionKey != "" && backendSupportsSessionKey(prep.backend) {
 		// Resume the key-derived session: stop forcing OneShot so the
-		// claude backend issues --resume <derivedUUID>. AutomatedTrigger
+		// backend resumes the key-derived session/thread. AutomatedTrigger
 		// stays false — every SessionKey caller today (Slack) is a human
 		// reply in a thread, and the idle-window guard in sessionFileUsable
 		// must protect those just like it protects WebUI chats.
@@ -2322,9 +2320,9 @@ func (m *Manager) resolveBackend(agentID string, agentCopy *Agent) (ChatBackend,
 // Used by the Slack bot (Phase B Part 2) to gate one-time "inject Slack
 // thread history into the user message" behaviour: on the first message
 // in a thread we replay history, on subsequent messages we skip the
-// replay because Claude already has the prior turns in its session.
+// replay because the backend already has the prior turns in its session.
 //
-// Caveat: this does NOT check sessionResetThresholdTokens. If a
+// Claude caveat: this does NOT check sessionResetThresholdTokens. If a
 // long-running thread's JSONL eventually exceeds the reset threshold,
 // sessionFileUsable will summarise + delete it on the next chat and
 // Claude starts a new session with --session-id. The Slack bot would
@@ -2356,7 +2354,11 @@ func (m *Manager) CanResumeSession(agentID, sessionKey string) bool {
 		return false
 	}
 
-	// Probe the deterministic session file. expectedClaudeSessionID is
+	if backend.Name() == "codex" {
+		return codexCanResumeSession(agentID, sessionKey)
+	}
+
+	// Probe the deterministic Claude session file. expectedClaudeSessionID is
 	// called with oneShot=false because CanResumeSession asks whether a
 	// resumable session EXISTS; the ChatOneShot call site decides the
 	// actual oneShot/sessionKey combination.

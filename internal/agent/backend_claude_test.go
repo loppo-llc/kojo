@@ -167,10 +167,10 @@ func TestBackendSupportsSessionKey(t *testing.T) {
 			t.Errorf("custom should support session key")
 		}
 	})
-	t.Run("codex does not", func(t *testing.T) {
+	t.Run("codex supports", func(t *testing.T) {
 		b := &CodexBackend{}
-		if backendSupportsSessionKey(b) {
-			t.Errorf("codex should not support session key")
+		if !backendSupportsSessionKey(b) {
+			t.Errorf("codex should support session key")
 		}
 	})
 	t.Run("llama does not", func(t *testing.T) {

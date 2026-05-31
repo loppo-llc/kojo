@@ -68,15 +68,14 @@ describe("buildAgentSavePayload", () => {
   });
 
   it("omits effort for tools that don't support an effort selector", () => {
-    // codex doesn't surface effort in toolModels
-    const out = buildAgentSavePayload(baseState({ tool: "codex" }));
+    const out = buildAgentSavePayload(baseState({ tool: "llama.cpp" }));
     expect(out.effort).toBeUndefined();
   });
 
   it("forwards effort for tools that do support it", () => {
-    // Only "claude" passes supportsEffort today.
     const out = buildAgentSavePayload(baseState({ tool: "claude", effort: "high" }));
     expect(out.effort).toBe("high");
+    expect(buildAgentSavePayload(baseState({ tool: "codex", effort: "medium" })).effort).toBe("medium");
   });
 
   it("emits customBaseURL only for custom / llama.cpp", () => {
