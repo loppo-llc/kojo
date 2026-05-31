@@ -13,8 +13,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/loppo-llc/kojo/internal/blob"
 )
 
@@ -504,6 +506,254 @@ func guessMime(name string, body []byte) string {
 		return httpDetectContentType(body)
 	}
 	return "application/octet-stream"
+}
+
+// attachDebounce is the delay after the last fs event for a file
+// before the watcher ingests it. Covers non-atomic writes (cp) that
+// emit CREATE then a burst of WRITEs; 150 ms is long enough for a
+// small-to-medium file cp to finish, short enough to feel instant.
+const attachDebounce = 150 * time.Millisecond
+
+// watchAndStreamAttachments uses fsnotify to watch the
+// <agentDir>/.kojo/attach/ directory for new files. When a file
+// is created (or renamed into place), the watcher debounces
+// briefly to let non-atomic writes settle, then ingests the file
+// into the blob store and emits a MessageAttachment on the channel.
+//
+// Lifecycle is driven by a single context: Stop() cancels it,
+// which exits the goroutine, cancels in-flight ingest/forward,
+// and unblocks debounce callbacks. StopAndDrain() is the only
+// correct way to obtain the definitive attachment list — the
+// channel is for real-time UI notification only.
+func (m *Manager) watchAndStreamAttachments(ctx context.Context, agentID string, messageID string) *attachWatcher {
+	wCtx, wCancel := context.WithCancel(ctx)
+
+	w := &attachWatcher{
+		out:     make(chan MessageAttachment, 16),
+		cancel:  wCancel,
+		quit:    wCtx.Done(),
+		used:    map[string]struct{}{},
+		exited:  make(chan struct{}),
+		timers:  map[string]*time.Timer{},
+		retries: map[string]int{},
+	}
+
+	go w.run(m, wCtx, agentID, messageID)
+	return w
+}
+
+// attachWatcher is the handle returned by watchAndStreamAttachments.
+type attachWatcher struct {
+	out    chan MessageAttachment
+	cancel context.CancelFunc
+	quit   <-chan struct{} // closed when the watcher should exit
+	used   map[string]struct{}
+	exited chan struct{} // closed when the goroutine exits
+
+	timerMu sync.Mutex
+	timers  map[string]*time.Timer
+
+	retryMu sync.Mutex
+	retries map[string]int // mtime re-debounce count per filename
+
+	mu      sync.Mutex
+	pending []MessageAttachment
+}
+
+// C returns the channel on which streamed attachments arrive.
+func (w *attachWatcher) C() <-chan MessageAttachment { return w.out }
+
+// Stop signals the watcher to exit. Idempotent (context cancel).
+func (w *attachWatcher) Stop() { w.cancel() }
+
+// StopAndDrain stops the watcher, waits for exit, and returns
+// the definitive list of all successfully ingested attachments.
+func (w *attachWatcher) StopAndDrain() []MessageAttachment {
+	w.cancel()
+	<-w.exited
+	for range w.out {
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]MessageAttachment(nil), w.pending...)
+}
+
+func (w *attachWatcher) run(m *Manager, ctx context.Context, agentID, messageID string) {
+	defer close(w.out)
+	defer close(w.exited)
+	defer w.stopTimers()
+
+	if m.blobStore == nil {
+		return
+	}
+	logger := m.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	// Try safeStageDir first — if the directory already exists
+	// and passes symlink / containment checks, use it directly.
+	// When absent, validate the parent (.kojo) is not a symlink
+	// before MkdirAll so we never create attach/ inside a
+	// symlink target.
+	stageDir, ok := safeStageDir(agentID, logger)
+	if !ok {
+		kojoDir := filepath.Join(agentDir(agentID), ".kojo")
+		if st, err := os.Lstat(kojoDir); err == nil && st.Mode()&os.ModeSymlink != 0 {
+			logger.Warn("attach stream: .kojo is a symlink, refusing", "agent", agentID)
+			return
+		}
+		raw := filepath.Join(kojoDir, "attach")
+		if err := os.MkdirAll(raw, 0o755); err != nil {
+			logger.Warn("attach stream: mkdir stage dir", "err", err)
+			return
+		}
+		stageDir, ok = safeStageDir(agentID, logger)
+		if !ok {
+			return
+		}
+	}
+
+	fsw, err := fsnotify.NewWatcher()
+	if err != nil {
+		logger.Warn("attach stream: create watcher", "err", err)
+		return
+	}
+	defer fsw.Close()
+
+	if err := fsw.Add(stageDir); err != nil {
+		logger.Warn("attach stream: watch dir", "err", err)
+		return
+	}
+
+	forwarder := m.attachmentForwarder()
+
+	// ingestCh receives filenames whose debounce timer fired.
+	ingestCh := make(chan string, 16)
+
+	// Initial scan: files may already be present before
+	// fsw.Add. Run them through debounce so partially-
+	// written files get the same stability check as
+	// fsnotify-triggered ones.
+	if entries, err := os.ReadDir(stageDir); err == nil {
+		for _, e := range entries {
+			if _, done := w.used[e.Name()]; !done {
+				w.debounce(e.Name(), ingestCh)
+			}
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-fsw.Events:
+			if !ok {
+				return
+			}
+			if ev.Op&(fsnotify.Create|fsnotify.Write) == 0 {
+				continue
+			}
+			name := filepath.Base(ev.Name)
+			if _, done := w.used[name]; done {
+				continue
+			}
+			w.debounce(name, ingestCh)
+		case name := <-ingestCh:
+			w.ingestOne(m, ctx, logger, agentID, messageID, stageDir, name, ingestCh, forwarder)
+		case err, ok := <-fsw.Errors:
+			if !ok {
+				return
+			}
+			logger.Debug("attach stream: watcher error", "err", err)
+		}
+	}
+}
+
+// debounce (re)arms a per-file timer. When the timer fires, the
+// filename is sent to ingestCh.
+func (w *attachWatcher) debounce(name string, ingestCh chan<- string) {
+	w.timerMu.Lock()
+	defer w.timerMu.Unlock()
+	if t, ok := w.timers[name]; ok {
+		t.Reset(attachDebounce)
+		return
+	}
+	w.timers[name] = time.AfterFunc(attachDebounce, func() {
+		w.timerMu.Lock()
+		delete(w.timers, name)
+		w.timerMu.Unlock()
+		select {
+		case ingestCh <- name:
+		case <-w.quit:
+		}
+	})
+}
+
+func (w *attachWatcher) stopTimers() {
+	w.timerMu.Lock()
+	defer w.timerMu.Unlock()
+	for name, t := range w.timers {
+		t.Stop()
+		delete(w.timers, name)
+	}
+}
+
+// attachMaxDebounceRetries caps re-debounce cycles so a file
+// whose mtime keeps advancing (external touch loop, clock skew)
+// doesn't spin forever. After this many retries the file is
+// ingested as-is — ingestOneAttachment's grow-detection rejects
+// it if the body is still changing.
+const attachMaxDebounceRetries = 10
+
+// ingestOne processes a single file: check mtime stability →
+// ingest → record → remove → notify. If the file's mtime is
+// within the debounce window it is re-armed instead of ingested,
+// preventing partial reads of non-atomic writes.
+func (w *attachWatcher) ingestOne(
+	m *Manager, ctx context.Context, logger *slog.Logger,
+	agentID, messageID, stageDir, name string,
+	ingestCh chan<- string,
+	forwarder AttachmentForwarder,
+) {
+	if _, done := w.used[name]; done {
+		return
+	}
+	full := filepath.Join(stageDir, name)
+
+	// Mtime stability: if the file was modified within the
+	// debounce window it may still be open for writing.
+	// Re-debounce so we check again after the next quiet period.
+	// Cap retries so a continuously-touched file doesn't spin.
+	if info, err := os.Stat(full); err == nil {
+		if time.Since(info.ModTime()) < attachDebounce {
+			w.retryMu.Lock()
+			n := w.retries[name] + 1
+			w.retries[name] = n
+			w.retryMu.Unlock()
+			if n < attachMaxDebounceRetries {
+				w.debounce(name, ingestCh)
+				return
+			}
+			logger.Debug("attach stream: max debounce retries, ingesting anyway", "name", name)
+		}
+	}
+
+	att, ok := m.ingestOneAttachment(ctx, logger, agentID, messageID, full, name, w.used, forwarder)
+	if !ok {
+		return
+	}
+	w.mu.Lock()
+	w.pending = append(w.pending, att)
+	w.mu.Unlock()
+
+	if err := os.Remove(full); err != nil {
+		logger.Warn("attach stream: remove after ingest", "path", full, "err", err)
+	}
+	select {
+	case w.out <- att:
+	case <-w.quit:
+	}
 }
 
 // strSliceSortInPlace is a tiny insertion-sort used in place of

@@ -722,6 +722,94 @@ func (s *Store) Delete(scope Scope, p string, opts DeleteOptions) error {
 	return nil
 }
 
+// Move renames a blob from src to dst within the same scope. The
+// on-disk file is os.Renamed (atomic on the same filesystem — always
+// true here since both paths resolve under the same blob root). The
+// blob_refs row is copied to the new URI and the old one deleted.
+//
+// Fails if dst already exists. On ref-update failure the rename is
+// rolled back so the blob stays at its original path.
+func (s *Store) Move(scope Scope, src, dst string) error {
+	srcFull, srcCleaned, err := s.fsPath(scope, src)
+	if err != nil {
+		return fmt.Errorf("blob: move src: %w", err)
+	}
+	dstFull, dstCleaned, err := s.fsPath(scope, dst)
+	if err != nil {
+		return fmt.Errorf("blob: move dst: %w", err)
+	}
+
+	// Lock both paths in deterministic order to avoid deadlock
+	// with concurrent Put/Delete/Move on the same paths.
+	first, second := srcCleaned, dstCleaned
+	if first > second {
+		first, second = second, first
+	}
+	mu1 := s.pathLock(scope, first)
+	mu1.Lock()
+	defer mu1.Unlock()
+	if first != second {
+		mu2 := s.pathLock(scope, second)
+		mu2.Lock()
+		defer mu2.Unlock()
+	}
+
+	// Refuse to overwrite an existing dst.
+	if _, err := os.Lstat(dstFull); err == nil {
+		return fmt.Errorf("blob: move dst exists: %s", dst)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dstFull), 0o755); err != nil {
+		return fmt.Errorf("blob: move mkdir: %w", err)
+	}
+	if err := os.Rename(srcFull, dstFull); err != nil {
+		return fmt.Errorf("blob: move rename: %w", err)
+	}
+
+	// Update refs: copy the old row to the new URI, delete the old.
+	// On failure, roll back the rename so body and ref stay consistent.
+	srcURI := BuildURI(scope, srcCleaned)
+	dstURI := BuildURI(scope, dstCleaned)
+	ref, gerr := s.refs.Get(context.Background(), srcURI)
+	switch {
+	case gerr == nil && ref != nil:
+		// Normal path: clone the existing ref to the new URI.
+		ref.URI = dstURI
+	case errors.Is(gerr, ErrRefNotFound):
+		// Row missing (noopRefs, or real DB with a gap). Verify
+		// the on-disk body to seed a full ref (including SHA256)
+		// so the new URI is visible to handoff/hydrate/scrub.
+		obj, verr := s.Verify(scope, dst)
+		if verr != nil {
+			_ = os.Rename(dstFull, srcFull)
+			return fmt.Errorf("blob: move verify dst: %w", verr)
+		}
+		ref = &Ref{
+			URI:    dstURI,
+			Scope:  string(scope),
+			Size:   obj.Size,
+			SHA256: obj.SHA256,
+		}
+	default:
+		// DB error — rollback rename, don't leave body orphaned.
+		_ = os.Rename(dstFull, srcFull)
+		return fmt.Errorf("blob: move ref get: %w", gerr)
+	}
+	if _, perr := s.refs.Put(context.Background(), ref); perr != nil {
+		_ = os.Rename(dstFull, srcFull)
+		return fmt.Errorf("blob: move ref put: %w", perr)
+	}
+	// Delete old ref. Retry once on transient failure. If both
+	// attempts fail, body + new ref are valid — treat as success
+	// so the caller adopts the new URI. The stale src ref is
+	// harmless (points at a removed file) and will be cleaned
+	// up by the scrub job.
+	if derr := s.refs.Delete(context.Background(), srcURI); derr != nil {
+		_ = s.refs.Delete(context.Background(), srcURI) // retry once
+	}
+	return nil
+}
+
 // List walks the scope's subtree and returns every regular file whose
 // logical path begins with `prefix`. Reserved names / prefixes /
 // suffixes are skipped — they cannot legally exist via Put, but a

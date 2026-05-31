@@ -86,11 +86,12 @@ description: Send a file (image, audio, video, PDF, archive, anything) to the us
    mv ./out/report.pdf .kojo/attach/report.pdf
    ` + "```" + `
 
-3. Finish your reply normally. As soon as your turn ends kojo
-   moves every file out of ` + "`.kojo/attach/`" + `, stores it in the
-   user-facing blob store, attaches it to the message you just
-   sent, and (when you are running on a non-hub peer) forwards a
-   copy to the hub so the UI can download it.
+3. The file appears in the user's chat UI immediately — kojo
+   watches the directory for changes while your turn is in
+   progress and streams each file as soon as it lands. When your
+   turn ends, any remaining files are swept up and attached to
+   the final message. On non-hub peers a copy is also forwarded
+   to hub so the UI can download it.
 
 ## Rules
 

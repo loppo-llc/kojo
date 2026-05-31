@@ -22,6 +22,10 @@ func eventSize(ev ChatEvent) int {
 	n := len(ev.Type) + len(ev.Status) + len(ev.Delta) +
 		len(ev.ToolUseID) + len(ev.ToolName) + len(ev.ToolInput) +
 		len(ev.ToolOutput) + len(ev.ErrorMessage)
+	for i := range ev.Attachments {
+		a := &ev.Attachments[i]
+		n += len(a.Path) + len(a.Name) + len(a.Mime)
+	}
 	if ev.Message != nil {
 		m := ev.Message
 		n += len(m.ID) + len(m.Role) + len(m.Content) + len(m.Thinking) + len(m.Timestamp)

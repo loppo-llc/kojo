@@ -234,7 +234,7 @@ export interface OTPEntry {
 }
 
 export interface ChatEvent {
-  type: "status" | "text" | "thinking" | "tool_use" | "tool_result" | "done" | "error" | "message";
+  type: "status" | "text" | "thinking" | "tool_use" | "tool_result" | "done" | "error" | "message" | "attachment";
   status?: string;
   delta?: string;
   toolUseId?: string;
@@ -242,6 +242,7 @@ export interface ChatEvent {
   toolInput?: string;
   toolOutput?: string;
   message?: AgentMessage;
+  attachments?: AgentMessageAttachment[]; // streamed kojo-attach files
   usage?: { inputTokens: number; outputTokens: number };
   errorMessage?: string;
   startedAt?: string; // RFC3339 timestamp of when processing started

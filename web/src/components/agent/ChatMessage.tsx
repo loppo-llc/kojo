@@ -1177,6 +1177,7 @@ interface StreamingMessageProps {
   text: string;
   thinking: string;
   toolUses: Array<{ id?: string; name: string; input: string; output: string | null }>;
+  attachments?: AgentMessageAttachment[];
   agentName: string;
   agentId: string;
   status: string;
@@ -1190,6 +1191,7 @@ export function StreamingMessage({
   text,
   thinking,
   toolUses,
+  attachments,
   agentName,
   agentId,
   status,
@@ -1238,6 +1240,10 @@ export function StreamingMessage({
           </div>
         )}
         {thinking && <ThinkingBlock text={thinking} streaming={!text} />}
+        {/* Streaming attachments — rendered as they arrive from kojo-attach */}
+        {attachments && attachments.length > 0 && (
+          <AttachmentList attachments={attachments} isUser={false} />
+        )}
         {text && (
           <div className="relative">
             {viewMode === "markdown" ? (

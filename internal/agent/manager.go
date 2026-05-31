@@ -2061,6 +2061,17 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 	var accToolUses []ToolUse
 	receivedDone := false
 
+	// Streaming kojo-attach: poll the staging directory during the
+	// turn so files appear in the UI as they are written, not only
+	// when the turn completes. A provisional messageID is used for
+	// blob paths — it's unique per-turn, so no collision risk.
+	// The watcher's pending list (returned by StopAndDrain) is the
+	// definitive source of streamed attachments — the channel is
+	// used only for real-time UI notification.
+	provisionalMsgID := generateMessageID()
+	watcher := m.watchAndStreamAttachments(ctx, agentID, provisionalMsgID)
+	attachCh := watcher.C()
+
 	// Shared accumulator on the busy entry: SnapshotAccumulatedMessageRecord
 	// reads from this struct (NOT the broadcaster's log) so the §3.7
 	// self-call snapshot reflects every event the chat goroutine saw,
@@ -2086,6 +2097,7 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 		_, stillHere := m.agents[agentID]
 		m.mu.Unlock()
 		if !stillHere {
+			watcher.Stop()
 			return
 		}
 		if receivedDone {
@@ -2097,11 +2109,20 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			}
 			return
 		}
-		if accText.Len() > 0 || accThinking.Len() > 0 || len(accToolUses) > 0 {
+		// Abort path: stop the watcher and drain before the
+		// final scan so we don't race. StopAndDrain returns
+		// the definitive list of all streamed attachments.
+		streamedAtts := watcher.StopAndDrain()
+
+		if accText.Len() > 0 || accThinking.Len() > 0 || len(accToolUses) > 0 || len(streamedAtts) > 0 {
 			msg := newAssistantMessage()
 			msg.Content = accText.String()
 			msg.Thinking = accThinking.String()
 			msg.ToolUses = accToolUses
+			// Include attachments already streamed during the turn.
+			if len(streamedAtts) > 0 {
+				msg.Attachments = append(msg.Attachments, streamedAtts...)
+			}
 			// kojo-attach abort path: any files the agent had
 			// already written into .kojo/attach/ before the
 			// abort still belong to this partial reply. Use a
@@ -2111,7 +2132,7 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			// cancelled.
 			scanCtx, scanCancel := context.WithTimeout(context.Background(), attachScanCeiling)
 			if atts := m.scanAndIngestAttachments(scanCtx, agentID, msg.ID); len(atts) > 0 {
-				msg.Attachments = atts
+				msg.Attachments = append(msg.Attachments, atts...)
 			}
 			scanCancel()
 			m.persistDoneEvent(agentID, msg)
@@ -2156,13 +2177,9 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			// release guard. The switch device handler's deferred
 			// finalize goroutine sits on accumulator.WaitDone to
 			// pick up the post-tool-result text generated AFTER
-			// the lock has moved to target (the source-release
-			// path that would otherwise skip every persist). Once
-			// captured here, the goroutine ships the message to
-			// target as the tail payload of /handoff/finalize so
-			// target's arrival prompt sees the full conversation
-			// including the agent's "I'll do X on arrival"
-			// commitment. Idempotent under sync.Once.
+			// the lock has moved to target. If we skip MarkDone
+			// when evicted, WaitDone blocks forever and the
+			// finalize goroutine leaks. Idempotent under sync.Once.
 			sharedAcc.MarkDone(event.Message)
 
 			// §3.7 release guard: if a source-release evicted
@@ -2176,8 +2193,45 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			_, stillHere := m.agents[agentID]
 			m.mu.Unlock()
 			if !stillHere {
+				watcher.Stop()
 				return
 			}
+
+			// Stop the streaming watcher before the final scan
+			// so we don't race on file removal. StopAndDrain
+			// returns the definitive list of all streamed
+			// attachments.
+			streamedAtts := watcher.StopAndDrain()
+
+			// Move streamed blobs from the provisional messageID
+			// to the real one so blob GC keyed by messageID works
+			// correctly when the message is eventually deleted.
+			//
+			// Skip in peer mode: the watcher already forwarded
+			// each blob to hub under the provisional URI. Moving
+			// the local copy would make att.Path point to a real
+			// URI that hub doesn't have → 404 in the UI. The
+			// provisional path still resolves on both peers.
+			realMsgID := event.Message.ID
+			if m.blobStore != nil && realMsgID != "" && m.attachmentForwarder() == nil {
+				for i := range streamedAtts {
+					att := &streamedAtts[i]
+					oldPath := buildAttachBlobPath(agentID, provisionalMsgID, att.Name)
+					newPath := buildAttachBlobPath(agentID, realMsgID, att.Name)
+					if err := m.blobStore.Move(blob.ScopeGlobal, oldPath, newPath); err != nil {
+						m.logger.Warn("attach stream: move blob to real msgID",
+							"old", oldPath, "new", newPath, "err", err)
+						continue // keep the old URI — it still resolves
+					}
+					att.Path = blob.BuildURI(blob.ScopeGlobal, newPath)
+				}
+			}
+
+			// Prepend already-streamed attachments to the message.
+			if len(streamedAtts) > 0 {
+				event.Message.Attachments = append(streamedAtts, event.Message.Attachments...)
+			}
+
 			// kojo-attach: drain <agentDir>/.kojo/attach/ before
 			// persisting so the assistant Message that lands in
 			// the transcript already carries its attachments.
@@ -2192,13 +2246,10 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			// leak the goroutine across shutdown.
 			scanCtx, scanCancel := context.WithTimeout(context.Background(), attachScanCeiling)
 			if atts := m.scanAndIngestAttachments(scanCtx, agentID, event.Message.ID); len(atts) > 0 {
-				if len(event.Message.Attachments) == 0 {
-					event.Message.Attachments = atts
-				} else {
-					event.Message.Attachments = append(event.Message.Attachments, atts...)
-				}
+				event.Message.Attachments = append(event.Message.Attachments, atts...)
 			}
 			scanCancel()
+
 			m.persistDoneEvent(agentID, event.Message)
 
 			if m.OnChatDone != nil && event.ErrorMessage == "" {
@@ -2262,6 +2313,25 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 				case outCh <- event:
 				default:
 				}
+			}
+		case att, ok := <-attachCh:
+			if !ok {
+				// Watcher stopped (ctx cancelled or stop called).
+				// Nil out the channel so we don't spin on a
+				// closed channel.
+				attachCh = nil
+				continue
+			}
+			// Emit an "attachment" event so the UI renders
+			// the file immediately. The definitive list is
+			// tracked in the watcher's pending slice — the
+			// channel is for UI notification only.
+			select {
+			case outCh <- ChatEvent{
+				Type:        "attachment",
+				Attachments: []MessageAttachment{att},
+			}:
+			default:
 			}
 		case <-ctx.Done():
 			// Abort: drain remaining events from backendCh to capture

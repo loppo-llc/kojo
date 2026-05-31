@@ -31,6 +31,7 @@ export function AgentChat() {
   const [streamStatus, setStreamStatus] = useState("");
   const [streamStartTime, setStreamStartTime] = useState<number>(Date.now());
   const [streamViewMode, setStreamViewMode] = useState<"markdown" | "plain">("markdown");
+  const [streamAttachments, setStreamAttachments] = useState<AgentMessageAttachment[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<AgentMessageAttachment[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -51,6 +52,7 @@ export function AgentChat() {
   const liveStreamTextRef = useRef("");
   const liveStreamThinkingRef = useRef("");
   const liveStreamToolsRef = useRef<Array<{ id: string; name: string; input: string; output: string | null }>>([]);
+  const liveStreamAttachmentsRef = useRef<AgentMessageAttachment[]>([]);
 
   // TTS — auto-play toggle (per agent, persisted in localStorage) and
   // shared player. The player is only "enabled" when both the agent has
@@ -276,11 +278,13 @@ export function AgentChat() {
     setStreamText("");
     setStreamThinking("");
     setStreamTools([]);
+    setStreamAttachments([]);
     setStreamStatus("");
     setStreamStartTime(Date.now());
     liveStreamTextRef.current = "";
     liveStreamThinkingRef.current = "";
     liveStreamToolsRef.current = [];
+    liveStreamAttachmentsRef.current = [];
   }, []);
 
   const onEvent = useCallback(
@@ -314,6 +318,13 @@ export function AgentChat() {
         case "tool_result": {
           liveStreamToolsRef.current = applyToolResult(liveStreamToolsRef.current, event);
           setStreamTools((prev) => applyToolResult(prev, event));
+          break;
+        }
+        case "attachment": {
+          if (event.attachments) {
+            liveStreamAttachmentsRef.current = [...liveStreamAttachmentsRef.current, ...event.attachments];
+            setStreamAttachments((prev) => [...prev, ...event.attachments!]);
+          }
           break;
         }
         case "message": {
@@ -404,7 +415,8 @@ export function AgentChat() {
     const text = liveStreamTextRef.current;
     const thinking = liveStreamThinkingRef.current;
     const tools = liveStreamToolsRef.current;
-    const hasContent = text || thinking || tools.length > 0;
+    const atts = liveStreamAttachmentsRef.current;
+    const hasContent = text || thinking || tools.length > 0 || atts.length > 0;
 
     if (hasContent) {
       const syntheticId = "aborted_" + Date.now();
@@ -417,6 +429,7 @@ export function AgentChat() {
         toolUses: tools.length > 0
           ? tools.map((t) => ({ id: t.id || undefined, name: t.name, input: t.input, output: t.output ?? "" }))
           : undefined,
+        attachments: atts.length > 0 ? atts : undefined,
         timestamp: localRFC3339(),
       }]);
     }
@@ -825,6 +838,7 @@ export function AgentChat() {
             text={streamText}
             thinking={streamThinking}
             toolUses={streamTools}
+            attachments={streamAttachments}
             agentName={agent.name}
             agentId={agent.id}
             status={streamStatus}
