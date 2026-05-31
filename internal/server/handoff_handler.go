@@ -284,12 +284,9 @@ func (s *Server) runHandoffOp(ctx context.Context, agentID, op, targetPeerID str
 		return resp, nil
 	}
 
-	// begin / abort: per-row updates remain non-atomic across
-	// the loop because partial failure here is meaningful (the
-	// orchestrator's per-URI report lets the operator see WHICH
-	// rows failed). A future slice can fold these into a single
-	// UPDATE … RETURNING when the partial-error surface is no
-	// longer needed.
+	// begin / abort: per-row updates remain non-atomic across the loop
+	// because partial failure here is meaningful; the orchestrator's
+	// per-URI report tells the operator exactly which rows failed.
 	for _, ref := range refs {
 		res := handoffBlobResult{URI: ref.URI, Status: "ok"}
 		switch op {

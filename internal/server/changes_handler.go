@@ -20,16 +20,9 @@ import (
 //	    ...
 //	  ],
 //	  "next_since": <seq to pass on the next poll>,
-//	  "watermark":  <smallest seq currently retained — informational>,
-//	  "truncated":  <currently always false; reserved for when a
-//	                retention worker prunes events the caller never saw>
+//	  "watermark":  <smallest seq currently retained>,
+//	  "truncated":  <true when retention pruned rows below the caller cursor>
 //	}
-//
-// Note: `truncated` is reserved for a future retention slice. Today
-// the events table grows without bound, so the cursor cannot lose
-// events out from under a peer. When retention lands it will set a
-// persisted "pruned-through" floor in kv; the handler will then flip
-// `truncated` true when `since < floor`.
 //
 // `since` defaults to 0; `limit` clamps to [1, 5000] (default 500);
 // `table` is optional and narrows to one domain.
@@ -83,15 +76,7 @@ func (s *Server) handleChanges(w http.ResponseWriter, r *http.Request) {
 		Events:    make([]wireEvent, 0, len(res.Events)),
 		NextSince: res.NextSince,
 		Watermark: res.Watermark,
-		// Truncation reporting requires a persisted "pruned-through"
-		// floor — the simple `since < MIN(seq)` check trips for every
-		// fresh peer because seq is epoch-ms-based and even an empty-
-		// retention DB has MIN(seq) ~= now. Until a background
-		// retention worker (and matching kv row) lands, we cannot
-		// distinguish "you missed events" from "you have never polled
-		// before", so we leave Truncated=false. Watermark is still
-		// reported so a peer can see the oldest seq the Hub still has.
-		Truncated: false,
+		Truncated: res.PrunedThrough > 0 && since < res.PrunedThrough,
 	}
 	for _, e := range res.Events {
 		out.Events = append(out.Events, wireEvent{

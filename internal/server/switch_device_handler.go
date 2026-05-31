@@ -1520,11 +1520,9 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 	// message itself is captured separately via
 	// SnapshotAccumulatedMessageRecord (the same path claude
 	// uses), so target's UI transcript stays complete even when
-	// the file-level session lags a turn. A post-arrival re-sync
-	// to replace the lagged session with the final source-side
-	// version is NOT implemented in v1; if the resumed
-	// conversation drifts the operator can ResetSession on target
-	// and start fresh.
+	// the file-level session lags a turn. The transcript is the
+	// authoritative carried-over state; ResetSession remains available
+	// for operators who want to discard a stale backend-local session.
 	if agentRecordTool(rec) == "grok" {
 		grokTransfer, grokSkipped, gerr := agent.ReadGrokSessionFiles(agentID)
 		if gerr != nil {

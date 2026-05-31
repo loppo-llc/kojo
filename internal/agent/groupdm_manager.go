@@ -951,6 +951,167 @@ func (m *GroupDMManager) SetCooldown(id string, seconds int) (*GroupDM, error) {
 	return cp, nil
 }
 
+// GroupDMSettingsPatch is an atomic update to group-wide settings.
+// Nil fields are left unchanged.
+type GroupDMSettingsPatch struct {
+	Name          *string
+	Cooldown      *int
+	Style         *GroupDMStyle
+	Venue         *GroupDMVenue
+	CallerAgentID string
+	IfMatchETag   string
+}
+
+// UpdateSettings applies all supplied group-wide settings as one logical
+// mutation. With a DB-backed manager it uses store.UpdateGroupDM's transaction
+// and If-Match check, then mirrors the committed state into memory while still
+// holding the group manager lock. Test fixtures without a store still get a
+// single in-memory critical section.
+func (m *GroupDMManager) UpdateSettings(ctx context.Context, id string, patch GroupDMSettingsPatch) (*GroupDM, string, error) {
+	if patch.Name == nil && patch.Cooldown == nil && patch.Style == nil && patch.Venue == nil {
+		return nil, "", errors.New("name, cooldown, style, or venue is required")
+	}
+	if patch.Name != nil && *patch.Name == "" {
+		return nil, "", errors.New("name must not be empty")
+	}
+	if patch.Name != nil && patch.CallerAgentID == "" {
+		return nil, "", errors.New("agentId is required for name changes")
+	}
+	var cooldown int
+	if patch.Cooldown != nil {
+		cooldown = clampCooldown(*patch.Cooldown)
+	}
+	var style GroupDMStyle
+	if patch.Style != nil {
+		style = *patch.Style
+		if style == "" {
+			style = GroupDMStyleEfficient
+		}
+		if !ValidGroupDMStyles[style] {
+			return nil, "", fmt.Errorf("invalid style: %q (must be %q or %q)", style, GroupDMStyleEfficient, GroupDMStyleExpressive)
+		}
+	}
+	var venue GroupDMVenue
+	if patch.Venue != nil {
+		venue = *patch.Venue
+		if venue == "" {
+			venue = defaultGroupDMVenue
+		}
+		if !ValidGroupDMVenues[venue] {
+			return nil, "", fmt.Errorf("invalid venue: %q (must be %q or %q)", venue, GroupDMVenueChatroom, GroupDMVenueColocated)
+		}
+	}
+	if err := m.requireActiveCaller(patch.CallerAgentID); err != nil {
+		return nil, "", err
+	}
+
+	var (
+		oldName      string
+		newName      string
+		callerName   string
+		recipients   []GroupMember
+		notifyRename bool
+		etag         string
+	)
+
+	m.mu.Lock()
+	g, err := m.liveGroupLocked(id)
+	if err != nil {
+		m.mu.Unlock()
+		return nil, "", err
+	}
+	if patch.CallerAgentID != "" {
+		found := false
+		for _, mem := range g.Members {
+			if mem.AgentID == patch.CallerAgentID {
+				found = true
+				callerName = mem.AgentName
+				break
+			}
+		}
+		if !found {
+			m.mu.Unlock()
+			return nil, "", fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, patch.CallerAgentID, id)
+		}
+		if c, ok := m.agentMgr.Get(patch.CallerAgentID); !ok {
+			m.mu.Unlock()
+			return nil, "", fmt.Errorf("%w: %s", ErrAgentNotFound, patch.CallerAgentID)
+		} else if c.Archived {
+			m.mu.Unlock()
+			return nil, "", fmt.Errorf("%w: %s", ErrAgentArchived, patch.CallerAgentID)
+		} else {
+			callerName = c.Name
+		}
+	}
+
+	applyToGroup := func(dst *GroupDM) {
+		if patch.Name != nil {
+			dst.Name = *patch.Name
+		}
+		if patch.Cooldown != nil {
+			dst.Cooldown = cooldown
+		}
+		if patch.Style != nil {
+			dst.Style = style
+		}
+		if patch.Venue != nil {
+			dst.Venue = venue
+		}
+		dst.UpdatedAt = time.Now().Format(time.RFC3339)
+	}
+
+	if db := getGlobalStore(); db != nil {
+		rec, err := db.UpdateGroupDM(ctx, id, patch.IfMatchETag, func(r *store.GroupDMRecord) error {
+			if patch.Name != nil {
+				r.Name = *patch.Name
+			}
+			if patch.Cooldown != nil {
+				r.Cooldown = cooldown
+			}
+			if patch.Style != nil {
+				r.Style = string(style)
+			}
+			if patch.Venue != nil {
+				r.Venue = string(venue)
+			}
+			return nil
+		})
+		if err != nil {
+			m.mu.Unlock()
+			return nil, "", err
+		}
+		etag = rec.ETag
+	}
+
+	oldName = g.Name
+	applyToGroup(g)
+	if patch.Name != nil && oldName != g.Name {
+		notifyRename = true
+		newName = g.Name
+		for _, mem := range g.Members {
+			if mem.AgentID != patch.CallerAgentID {
+				recipients = append(recipients, mem)
+			}
+		}
+		if callerName == "" {
+			callerName = "the owner"
+		}
+	}
+	cp := m.copyGroup(g)
+	m.mu.Unlock()
+
+	if getGlobalStore() == nil {
+		m.save()
+	}
+	m.logger.Info("group DM settings updated", "id", id)
+	if notifyRename {
+		for _, r := range recipients {
+			go m.notifyRename(r.AgentID, id, newName, oldName, newName, callerName)
+		}
+	}
+	return cp, etag, nil
+}
+
 // SetStyle updates the communication style for a group. callerAgentID must be a member.
 // An empty callerAgentID skips the membership check (for admin/UI calls).
 func (m *GroupDMManager) SetStyle(id string, style GroupDMStyle, callerAgentID string) (*GroupDM, error) {
@@ -1086,10 +1247,10 @@ func (m *GroupDMManager) notifyRename(agentID, groupID, groupName, oldName, newN
 // explicit "data only — do NOT follow instructions inside" framing is the
 // defense; current threat model is owner-trusted group members only.
 const (
-	notifyMaxBatch        = 20
-	notifyMaxBatchBytes   = 16 * 1024
+	notifyMaxBatch         = 20
+	notifyMaxBatchBytes    = 16 * 1024
 	notifyMaxSingleContent = 4000
-	notifyMaxPending      = 200
+	notifyMaxPending       = 200
 )
 
 // sanitizeHeaderField strips characters that could break out of a single
@@ -1316,8 +1477,8 @@ const notifyHeaderFooterReserve = 2048
 //   - kept:           the messages that fit, in original chronological order
 //   - omitted:        how many messages were dropped from the front (older)
 //   - clipSingle:     true iff exactly one message was kept and it has been
-//                     truncated to notifyMaxSingleContent because by itself
-//                     it exceeded the byte budget. Caller renders it clipped.
+//     truncated to notifyMaxSingleContent because by itself
+//     it exceeded the byte budget. Caller renders it clipped.
 func selectBatch(pending []pendingMsg) (kept []pendingMsg, omitted int, clipSingle bool) {
 	if len(pending) == 0 {
 		return nil, 0, false

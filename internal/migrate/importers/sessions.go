@@ -48,9 +48,8 @@ func (sessionsImporter) Domain() string { return "sessions" }
 //     Settings on the agent row, not on the session itself.
 //
 // AgentID is not a v0 field — sessions in v0 are not associated with
-// agents on the SessionInfo struct itself. v1 agent_id is left NULL;
-// a future enrichment pass could backfill from agent transcripts if
-// needed (out of scope here per design doc §5.5).
+// agents on the SessionInfo struct itself. v1 agent_id is left NULL and
+// transcript ownership remains in agent_messages rather than sessions.
 type v0SessionInfo struct {
 	ID        string   `json:"id"`
 	Tool      string   `json:"tool"`

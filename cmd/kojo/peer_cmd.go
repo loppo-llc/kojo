@@ -161,10 +161,9 @@ func relativeTime(deltaMillis int64) string {
 // All three components are required. `name` is the human-friendly
 // device label; `url` is the dial address other peers reach it on
 // (`host:port` for tsnet/HTTPS or `http://host:port` for peer-mode).
-// The Ed25519 public_key field that used to live in the fourth slot
-// was retired in docs/peer-simplify-plan.md step 9 — Bearer tokens
-// delivered through the auto-pairing approve flow now carry the
-// identity material.
+// The Ed25519 public_key field that used to live in the fourth slot was
+// retired in docs/peer-simplify-plan.md step 9. Inter-peer identity is now
+// bound by Tailscale NodeKey, captured by the auto-pairing approve flow.
 //
 // Status defaults to "offline" — the operator only asserted the
 // peer's identity, not its current reachability. The Hub flips it
@@ -211,10 +210,10 @@ func runPeerAddCommand(logger *slog.Logger, configDir, spec string) int {
 	fmt.Printf("peer added: %s (%s, %s)\n", deviceID, name, peerURL)
 	fmt.Fprintln(os.Stderr,
 		"\n  WARNING: --peer-add writes peer_registry metadata only.\n"+
-			"  Bearer tokens are minted only by the auto-pairing Approve\n"+
+			"  NodeKey binding is captured only by the auto-pairing Approve\n"+
 			"  flow (peer side runs `kojo --peer --hub <hub>`, operator\n"+
-			"  clicks Approve in Settings). Until that's done, inter-peer\n"+
-			"  auth against this row will return 401.")
+			"  clicks Approve in Settings). Until the NodeKey lands,\n"+
+			"  inter-peer auth against this row will be refused.")
 	return 0
 }
 
@@ -261,13 +260,13 @@ func runPeerRemoveCommand(logger *slog.Logger, configDir, deviceID string) int {
 // With Ed25519 signing retired (docs/peer-simplify-plan.md) the
 // authoritative pairing channel is the auto-pairing flow: peer hosts
 // run `kojo --peer` against this Hub's URL and the Owner approves
-// the pending join request in Settings. That flow mints + delivers
-// the Bearer pair end-to-end with no manual paste.
+// the pending join request in Settings. That flow captures the peer's
+// Tailscale NodeKey end-to-end with no manual paste.
 //
 // `--peer-add` survives only as a metadata-only escape hatch (writes
-// peer_registry without Bearer tokens). Until a follow-up adds
-// matching `--peer-mint-bearer` / `--peer-import-bearer` commands,
-// rows added that way cannot authenticate inter-peer requests.
+// peer_registry without a NodeKey binding). Rows added that way cannot
+// authenticate inter-peer requests until the auto-pairing flow backfills
+// the NodeKey.
 //
 // role is "hub" or "peer" — wording in the banner shifts so the
 // operator knows which side they are sitting on.
@@ -288,7 +287,7 @@ func printPairingSpec(id *peer.Identity, peerURL, role string) {
 			"  This host's identity (for diagnostics / manual offline rows):\n"+
 			"        %s\n\n"+
 			"  Manual `--peer-add '<spec>'` writes the registry row only;\n"+
-			"  it does NOT mint Bearer tokens, so the resulting peer cannot\n"+
-			"  authenticate until a future --peer-mint-bearer command lands.\n\n",
+			"  it does NOT bind a Tailscale NodeKey, so the resulting peer\n"+
+			"  cannot authenticate until auto-pairing backfills that binding.\n\n",
 		hubURL, spec)
 }

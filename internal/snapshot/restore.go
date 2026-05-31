@@ -51,9 +51,8 @@ type ApplyOptions struct {
 //     a stale snapshot would break envelope decryption if the KEK
 //     has been rotated). The operator must supply a matching KEK to
 //     the target before kojo can boot.
-//   - <target>/auth/agent_tokens/*: per-peer machine credentials are
-//     out of scope (peer-replicated kv rows in kojo.db carry the
-//     hashes already).
+//   - <target>/auth/agent_tokens/*: per-peer machine credentials stay on
+//     each peer; peer-replicated kv rows in kojo.db carry the hashes.
 //   - Per-peer scoped blobs / credentials.db: these stay on their
 //     respective peers. The new Hub serves them through the same
 //     peer-fan-out path the original Hub did.

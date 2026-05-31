@@ -333,8 +333,7 @@ export const agentApi = {
   // prefer the body (it's threaded through React state alongside
   // every other field, so a stale form snapshot keeps its original
   // etag rather than picking up a newer one from a shared cache).
-  // Fall back to the header for endpoints that have not yet been
-  // taught to embed `etag` in the body.
+  // Fall back to the header for responses that omit `etag` from the body.
   get: async (id: string): Promise<AgentInfo> => {
     const { value, etag } = await getWithEtag<AgentInfo>(`/api/v1/agents/${id}`);
     if (!value.etag && etag) value.etag = etag;

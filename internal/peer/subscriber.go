@@ -30,12 +30,10 @@ import (
 // cluster the operator's peer_registry rows drive the target list;
 // the Subscriber polls peer_registry periodically and reconciles.
 //
-// Conflict with OfflineSweeper: the Subscriber's LiveStatus
-// reports what the WS feed last said. OfflineSweeper writes
-// peer_registry.status based on Hub-side last_seen. The two are
-// independent views — a future slice may have the Hub consult
-// LiveStatus as a "we just observed this peer over WS within the
-// last N seconds, don't flip it offline yet" hint.
+// Conflict with OfflineSweeper: the Subscriber's LiveStatus reports what
+// the WS feed last said. OfflineSweeper writes peer_registry.status based
+// on Hub-side last_seen. The two are independent views; registry status is
+// the durable source, and LiveStatus is process-local telemetry.
 
 // SubscriberTarget identifies one peer the Subscriber should
 // connect to. Address is the base URL (e.g.
@@ -413,10 +411,8 @@ func (s *Subscriber) handleFrame(target string, data []byte) {
 // the same event again, ad infinitum. The status_event payload
 // has no origin / event_id / hop field to break the loop.
 //
-// In-process consumers can query Subscriber.LiveStatus instead;
-// the bus is retained on the struct (and the function kept as
-// a deliberate no-op) for a future slice that adds origin
-// tagging.
+// In-process consumers query Subscriber.LiveStatus instead; republish is a
+// deliberate no-op to avoid reflection loops.
 func (s *Subscriber) republish(evt StatusEvent) {
 	_ = evt
 }

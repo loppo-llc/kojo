@@ -5,8 +5,8 @@
 // on a domain table) so subscribed peers can drop the matching cache
 // row and re-fetch. Events are best-effort: a slow subscriber whose
 // buffer overflows is dropped, and the peer is expected to reconcile
-// via the resync cursor (`GET /api/v1/changes?since=<seq>`, future
-// slice). This is the design call-out in §3.5: "再同期用 cursor:
+// via the resync cursor (`GET /api/v1/changes?since=<seq>`). This is
+// the design call-out in §3.5: "再同期用 cursor:
 // invalidation broadcast の event drop に備え".
 //
 // The bus is process-local. Cross-peer fan-out is the WebSocket layer's

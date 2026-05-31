@@ -21,9 +21,8 @@
 -- transaction as the dispatch write so a crash between commit and
 -- ledger insert is impossible.
 --
--- Retention: rows accumulate forever in v1. A future slice can
--- prune entries older than the longest peer's expected reconnect
--- window (mirroring the events-table retention TODO).
+-- Retention: `kojo --clean events` prunes entries older than the
+-- operator-selected reconnect window together with the events table.
 
 CREATE TABLE oplog_applied (
   op_id        TEXT    PRIMARY KEY,

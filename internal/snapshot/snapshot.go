@@ -15,11 +15,9 @@
 // Hub's own responsibility.
 //
 // This package owns the on-disk layout and the atomic creation
-// guarantees; cron / rsync / failover scripting is out of scope (a
-// future slice or operator runbook). All exposed functions are safe
-// to call concurrently with running writers — VACUUM INTO takes a
-// SQLite read lock that snapshots a consistent view, and the blob
-// tree copy walks the filesystem.
+// guarantees. All exposed functions are safe to call concurrently with
+// running writers: VACUUM INTO takes a SQLite read lock that snapshots
+// a consistent view, and the blob tree copy walks the filesystem.
 package snapshot
 
 import (

@@ -470,10 +470,10 @@ func nullableText(s string) any {
 
 // -- agent_persona ------------------------------------------------------
 
-// UpsertAgentPersona writes (or replaces) the persona row for agentID. The
-// persona body lives both here (canonical) and on the filesystem under
-// `<v1>/global/agents/<id>/persona.md` (handled by the blob layer in Phase 3).
-// This helper only touches the DB row; the blob mirror is wired up later.
+// UpsertAgentPersona writes (or replaces) the canonical persona row for
+// agentID. The CLI-facing persona.md file is a hydrated per-agent mirror
+// maintained by the agent manager sync paths; this store helper only touches
+// the DB row.
 //
 // ifMatchETag enforces optimistic locking against the prior row's etag —
 // pass "" to skip (used by the v0→v1 importer and by daemon-internal callers

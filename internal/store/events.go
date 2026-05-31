@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 )
 
 // EventOp is the verb persisted in events.op. Restricted to the three
@@ -15,6 +16,9 @@ const (
 	EventOpInsert EventOp = "insert"
 	EventOpUpdate EventOp = "update"
 	EventOpDelete EventOp = "delete"
+
+	ChangesKVNamespace     = "changes"
+	ChangesKVPrunedThrough = "events_pruned_through"
 )
 
 // EventRecord is one durable row from the events table. It mirrors the
@@ -94,12 +98,12 @@ type ListEventsResult struct {
 	// rewinds).
 	NextSince int64
 	// Watermark is the smallest seq currently present in the events
-	// table — informational only in v1, since no retention worker
-	// runs yet and the events table grows without bound. Reserved for
-	// a future retention slice that will persist a pruned-through
-	// floor in kv; the handler will then promote a sub-watermark
-	// `since` to a `truncated` response.
+	// table.
 	Watermark int64
+	// PrunedThrough is the largest seq that retention has deleted from
+	// events. A caller whose since cursor is below this floor missed rows
+	// and must full-resync.
+	PrunedThrough int64
 }
 
 // ListEventsSince returns rows with seq > since, ordered by seq. The
@@ -121,6 +125,13 @@ func (s *Store) ListEventsSince(ctx context.Context, since int64, opts ListEvent
 	}
 	if watermark.Valid {
 		out.Watermark = watermark.Int64
+	}
+	if rec, err := s.GetKV(ctx, ChangesKVNamespace, ChangesKVPrunedThrough); err == nil {
+		if n, parseErr := strconv.ParseInt(rec.Value, 10, 64); parseErr == nil && n > 0 {
+			out.PrunedThrough = n
+		}
+	} else if !errors.Is(err, ErrNotFound) {
+		return nil, fmt.Errorf("ListEventsSince: pruned-through: %w", err)
 	}
 
 	var rows *sql.Rows

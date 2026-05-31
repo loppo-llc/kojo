@@ -169,13 +169,13 @@ func TestImportersRoundTrip(t *testing.T) {
 		got[e.Kind+"|"+e.Name] = e.Body
 	}
 	want := map[string]string{
-		"daily|2026-04-01":      "daily 1\n",
-		"daily|2026-04-02":      "daily 2\n",
-		"project|kojo":          "project kojo\n",
-		"people|akari":          "people akari\n",
-		"topic|release":         "topic release\n",
-		"archive|2026-03":       "archived march\n",
-		"topic|loose":           "loose topic file\n", // top-level non-date
+		"daily|2026-04-01": "daily 1\n",
+		"daily|2026-04-02": "daily 2\n",
+		"project|kojo":     "project kojo\n",
+		"people|akari":     "people akari\n",
+		"topic|release":    "topic release\n",
+		"archive|2026-03":  "archived march\n",
+		"topic|loose":      "loose topic file\n", // top-level non-date
 	}
 	for k, v := range want {
 		if got[k] != v {
@@ -735,9 +735,7 @@ func TestImportAgentMessagesCrossAgentCollision(t *testing.T) {
 // The fatal point is the vapid importer (which runs before
 // push_subscriptions in importerOrder); push_subscriptions's own
 // fatal-on-missing-vapid logic remains as a defense-in-depth fallback,
-// covered by TestImportPushSubscriptionsEdgeCases_NoVapidImporter
-// (intentionally not implemented — the chain enforces the contract,
-// covering it twice would just couple two tests to one bug).
+// while this test covers the production importer chain once.
 //
 // The "good" case exercises the happy path: a well-formed vapid.json
 // matched by well-formed subscriptions; both importers succeed.
@@ -901,10 +899,10 @@ func TestImportPushSubscriptionsEdgeCases(t *testing.T) {
 // to leave the rows absent and let the runtime regenerate.
 func TestImportVAPIDEdgeCases(t *testing.T) {
 	type vapidCase struct {
-		name      string
-		vapid     string // empty ⇒ <MISSING> sentinel handled below
-		wantPub   bool   // expect notify/vapid_public row to exist
-		wantPriv  bool   // expect notify/vapid_private row to exist
+		name     string
+		vapid    string // empty ⇒ <MISSING> sentinel handled below
+		wantPub  bool   // expect notify/vapid_public row to exist
+		wantPriv bool   // expect notify/vapid_private row to exist
 	}
 	cases := []vapidCase{
 		{"good", `{"privateKey":"priv","publicKey":"pub"}`, true, true},
@@ -1675,11 +1673,11 @@ func writeV0Fixtures(t *testing.T, v0 string) {
 	mustMkdir(gdir)
 	groupsJSON, err := json.Marshal([]map[string]any{
 		{
-			"id":      "gd_1",
-			"name":    "alice×bob",
-			"members": []map[string]any{{"agentId": "ag_1", "agentName": "Alice"}, {"agentId": "ag_2", "agentName": "Bob"}},
-			"style":   "efficient",
-			"venue":   "chatroom",
+			"id":        "gd_1",
+			"name":      "alice×bob",
+			"members":   []map[string]any{{"agentId": "ag_1", "agentName": "Alice"}, {"agentId": "ag_2", "agentName": "Bob"}},
+			"style":     "efficient",
+			"venue":     "chatroom",
 			"createdAt": "2026-04-01T10:00:00+09:00",
 			"updatedAt": "2026-04-01T10:00:00+09:00",
 		},

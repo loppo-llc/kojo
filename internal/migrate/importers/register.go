@@ -41,11 +41,9 @@ func importerOrder() []migrate.Importer {
 		// the private key is envelope-sealed with the host-bound KEK
 		// at <v1>/auth/kek.bin (see design doc §3.4)
 		// (scope=machine, secret=true). Order: must run before
-		// pushSubscriptionsImporter — push_subscriptions still reads
-		// vapid.json directly today (its vapid_public_key column is
-		// stamped from the file, not the kv row), but the dependency
-		// will flip in a future slice that has push_subscriptions
-		// resolve vapid_public from kv.
+		// pushSubscriptionsImporter — push_subscriptions reads
+		// vapid.json to stamp vapid_public_key, while this importer
+		// writes the canonical kv rows used at runtime.
 		vapidImporter{},
 		// pushSubscriptionsImporter copies <v0>/push_subscriptions.json
 		// into push_subscriptions, filling vapid_public_key from

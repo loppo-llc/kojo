@@ -84,10 +84,8 @@ type ExternalChatCursorInsertOptions struct {
 }
 
 // BulkInsertExternalChatCursors inserts many external_chat_cursor rows in
-// a single transaction. Used by the v0→v1 importer; live cutover (the
-// polling plugin writing each cursor as it advances) goes through a single-
-// row Upsert API which is intentionally not yet exposed — the runtime still
-// reads the JSONL file directly as of slice 11.
+// a single transaction. It is used by the v0→v1 importer; runtime cursor
+// writers still own their source-specific storage rather than this table.
 //
 // Idempotency contract: rows whose id already exists are skipped via
 // ON CONFLICT DO NOTHING + a preload-set so a re-run leaves the existing

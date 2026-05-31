@@ -303,9 +303,7 @@ func (m *Manager) acquireMemoryEdit(agentID string) (func(), error) {
 
 // writeFileAtomic writes data to path via a temp file in the same dir
 // + rename so a crash mid-write doesn't leave a half-written file the
-// CLI would then read on next session. The full §2.5 intent-file
-// protocol is a future hardening; this gives us crash safety today
-// without the cross-device coordination surface.
+// CLI would then read on next session.
 //
 // The temp file uses a `.tmp-*` prefix without a `.md` suffix so the
 // memory/ scan (scanMemorySubdir) skips it on a crash — otherwise a

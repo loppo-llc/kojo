@@ -52,9 +52,9 @@ func buildVAPIDStore(agentMgr *agent.Manager, configDir string, logger *slog.Log
 //     KEK; AAD = "notify/vapid_private" so a copy/paste of one row's
 //     ciphertext into another row's slot fails authentication.
 //
-// The KEK is loaded once at construction; rotating it is out of scope
-// for v1 (operators must rewrap every secret row before swapping
-// kek.bin, and we have no migration tooling for that yet).
+// The KEK is loaded once at construction. Operators who rotate kek.bin must
+// rewrap secret kv rows before the swap so existing ciphertext remains
+// decryptable.
 type vapidKVStore struct {
 	st  *store.Store
 	kek []byte

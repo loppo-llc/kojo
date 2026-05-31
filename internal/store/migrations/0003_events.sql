@@ -19,12 +19,11 @@
 --   * `ts` is unix millis at the time of the write (server clock —
 --     used for staleness reporting only, not for ordering).
 --
--- Retention: rows accumulate forever in v1. A future slice can add a
--- background trimmer that drops rows older than the longest peer's
--- expected reconnect window (default: 7 days). The cursor read path
--- already tolerates trims by returning the SMALLEST seq still present
--- as the "watermark" so peers can detect "your cursor predates my
--- retention; please full-resync".
+-- Retention: `kojo --clean events` prunes rows older than the
+-- operator-selected window and records the largest deleted seq in kv.
+-- The cursor read path returns both the smallest retained seq
+-- ("watermark") and a `truncated` flag when a caller's cursor predates
+-- the pruned-through floor.
 
 CREATE TABLE events (
   seq        INTEGER PRIMARY KEY,

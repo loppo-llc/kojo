@@ -60,7 +60,7 @@ func main() {
 
 	peerMode := flag.Bool("peer", false, "run as a daemon peer: bind a Tailscale-interface listener (the OS tailscaled is consulted via LocalAPI WhoIs for identity) on :<port> plus a 127.0.0.1 agent-auth listener on <port>+1. Registers the full peer API (sessions, agents, files, git, /api/v1/peers/*) so a device-switch can land an agent CLI here. Skipped on a peer: peer-registry mutation (POST/DELETE/rotate-key on /api/v1/peers), the Web UI / dev proxy. Owner Bearer is unavailable; inter-peer access is gated by Tailnet identity (peer_registry NodeKey match → RolePeer; --unsafe collapses the check and stamps Owner). Mutually exclusive with --dev / --local / --no-auth.")
 	peerList := flag.Bool("peer-list", false, "list peer_registry rows and exit (read-only; coexists with running kojo)")
-	peerAdd := flag.String("peer-add", "", "register a remote peer in peer_registry; spec = <device_id>|<name>|<url>. Metadata-only; Bearer tokens are minted by the auto-pairing /join-request Approve flow.")
+	peerAdd := flag.String("peer-add", "", "register a remote peer in peer_registry; spec = <device_id>|<name>|<url>. Metadata-only; NodeKey binding is captured by the auto-pairing /join-request Approve flow.")
 	peerRemove := flag.String("peer-remove", "", "delete a peer_registry row by device_id; refuses to remove self")
 	// Auto-onboarding flags (docs/peer-onboarding-plan.md).
 	hubURL := flag.String("hub", "", "with --peer: override Hub auto-discovery. Accepts host:port or scheme://host:port. Falls back to $KOJO_HUB_URL then MagicDNS default `https://kojo.<tailnet>.ts.net:<KOJO_HUB_PORT or 8080>`.")
@@ -69,9 +69,9 @@ func main() {
 	doSnapshot := flag.Bool("snapshot", false, "take a point-in-time snapshot of kojo.db + blobs/global into <configdir>/snapshots/<ts>/ and exit")
 	doRestore := flag.String("restore", "", "restore a snapshot (verified sha256) into <configdir>. The configdir must not be in use by a running kojo. KEK and per-peer credentials are NOT restored — supply them out-of-band before booting.")
 	restoreForce := flag.Bool("restore-force", false, "with --restore: overwrite an existing kojo.db in the target. Required when the target is a previously-used Hub being re-seeded.")
-	doClean := flag.String("clean", "", "housekeeping: 'snapshots' | 'legacy' | 'v0' (soft-delete v0 dir post-migration; not included in 'all') | 'v0-trash' (purge kojo.deleted-<ts>/ dirs; not included in 'all') | 'all' (v2 adds 'blobs', 'agents'). dry-run by default")
+	doClean := flag.String("clean", "", "housekeeping: 'snapshots' | 'legacy' | 'blobs' | 'agents' | 'events' | 'v0' (soft-delete v0 dir post-migration; explicit only) | 'v0-trash' (purge kojo.deleted-<ts>/ dirs; explicit only) | 'all' (snapshots+legacy). dry-run by default")
 	cleanApply := flag.Bool("clean-apply", false, "with --clean: actually delete the listed entries (default is dry-run)")
-	cleanMaxAgeDays := flag.Int("clean-max-age-days", 7, "with --clean snapshots: anything older than N days (and not in --clean-keep-latest) is dropped")
+	cleanMaxAgeDays := flag.Int("clean-max-age-days", 7, "with --clean snapshots/blobs/agents/events: anything older than N days is eligible (snapshots still honor --clean-keep-latest)")
 	cleanKeepLatest := flag.Int("clean-keep-latest", 3, "with --clean snapshots: always keep at least N most-recent successful snapshots regardless of age")
 	cleanForce := flag.Bool("clean-force", false, "with --clean v0: skip the v0-manifest divergence guard (operator has confirmed v0 was edited post-migration)")
 	cleanMinAgeDays := flag.Int("clean-min-age-days", 7, "with --clean v0-trash: only purge trash dirs whose timestamp is older than N days (default 7; pass 0 to purge every age, which defeats the soft-delete recovery window)")
@@ -939,10 +939,10 @@ func main() {
 		// If-Match header with 428 Precondition Required. Off by
 		// default — operators flip it once their UI / agent CLI have
 		// caught up and stopped sending bare PUT/PATCH/DELETEs.
-		RequireIfMatch:   os.Getenv("KOJO_REQUIRE_IF_MATCH") == "1",
-		V0LegacyDir:      sessionV0LegacyDir,
-		PeerOnly:         *peerMode,
-		PendingSyncKEK:   pendingSyncKEK,
+		RequireIfMatch: os.Getenv("KOJO_REQUIRE_IF_MATCH") == "1",
+		V0LegacyDir:    sessionV0LegacyDir,
+		PeerOnly:       *peerMode,
+		PendingSyncKEK: pendingSyncKEK,
 		// --no-auth is loopback-only and contractually Owner-trusted
 		// ("--no-auth (--local/--dev only): the loopback listener is
 		// Owner-trusted"). Collapse it onto the same Unsafe path

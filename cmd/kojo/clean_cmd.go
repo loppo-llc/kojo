@@ -19,7 +19,7 @@ import (
 
 // cleanFlags carries the parsed `--clean*` flag values from main.go.
 type cleanFlags struct {
-	target        string // "snapshots" | "legacy" | "v0" | "v0-trash" | "all"
+	target        string // "snapshots" | "legacy" | "blobs" | "agents" | "events" | "v0" | "v0-trash" | "all"
 	apply         bool
 	maxAgeDays    int
 	keepLatest    int
@@ -71,12 +71,20 @@ type cleanFlags struct {
 //     an apply-time future guard. Also NOT folded into "all"
 //     because the trash dirs ARE the soft-delete recovery window.
 //
-//   - "all": runs "snapshots" + "legacy". Intentionally excludes
-//     "v0" and "v0-trash" (see above).
+//   - "blobs": removes unreferenced blob files, blob_refs rows marked
+//     for GC past --clean-max-age-days, and empty directories under
+//     the blob scope trees.
 //
-// Future slices add "blobs" (orphan blob files, GC-marked refs) and
-// "agents" (hard-delete soft-deleted agents past grace), each isolated
-// behind its own target so an operator can opt in piecewise.
+//   - "agents": hard-deletes soft-deleted agents past
+//     --clean-max-age-days from the sqlite store.
+//
+//   - "events": prunes events/oplog_applied rows older than
+//     --clean-max-age-days and records the deleted event floor so
+//     /changes can report truncated cursors.
+//
+//   - "all": runs "snapshots" + "legacy". Intentionally excludes
+//     "v0", "v0-trash", "blobs", "agents", and "events"; the latter
+//     targets are explicit because they delete runtime data.
 //
 // Exit codes:
 //
@@ -98,10 +106,10 @@ func runCleanCommand(f cleanFlags) int {
 	}
 
 	switch f.target {
-	case "", "all", "snapshots", "legacy", "v0", "v0-trash":
+	case "", "all", "snapshots", "legacy", "blobs", "agents", "events", "v0", "v0-trash":
 		// fall through
 	default:
-		fmt.Fprintf(os.Stderr, "kojo: --clean target %q not recognized (try 'snapshots', 'legacy', 'v0', 'v0-trash', or 'all')\n", f.target)
+		fmt.Fprintf(os.Stderr, "kojo: --clean target %q not recognized (try 'snapshots', 'legacy', 'blobs', 'agents', 'events', 'v0', 'v0-trash', or 'all')\n", f.target)
 		return 2
 	}
 
@@ -120,6 +128,9 @@ func runCleanCommand(f cleanFlags) int {
 	// §5.8 design specified; operators who want to purge every
 	// age must pass `--clean-min-age-days=0` explicitly.
 	runV0Trash := f.target == "v0-trash"
+	runBlobs := f.target == "blobs"
+	runAgents := f.target == "agents"
+	runEvents := f.target == "events"
 
 	var snapshotPlan *cleanPlan
 	if runSnapshots {
@@ -194,6 +205,51 @@ func runCleanCommand(f cleanFlags) int {
 		printV0CleanPlan(v0Plan, f.apply)
 	}
 
+	var (
+		blobPlan  *blobCleanPlan
+		agentPlan *agentCleanPlan
+		eventPlan *eventCleanPlan
+		storePlan *store.Store
+	)
+	if runBlobs || runAgents || runEvents {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		st, err := store.Open(ctx, store.Options{ConfigDir: f.configDirPath, ReadOnly: true})
+		if err != nil {
+			f.logger.Error("clean: open store (read-only) failed", "err", err)
+			return 1
+		}
+		defer st.Close()
+		storePlan = st
+	}
+	if runBlobs {
+		p, err := planBlobCleanup(context.Background(), storePlan, f.configDirPath, f.maxAgeDays)
+		if err != nil {
+			f.logger.Error("clean: blob scan failed", "err", err)
+			return 1
+		}
+		blobPlan = p
+		printBlobCleanPlan(blobPlan, f.apply)
+	}
+	if runAgents {
+		p, err := planAgentCleanup(context.Background(), storePlan, f.maxAgeDays)
+		if err != nil {
+			f.logger.Error("clean: agent scan failed", "err", err)
+			return 1
+		}
+		agentPlan = p
+		printAgentCleanPlan(agentPlan, f.apply)
+	}
+	if runEvents {
+		p, err := planEventCleanup(context.Background(), storePlan, f.maxAgeDays)
+		if err != nil {
+			f.logger.Error("clean: event scan failed", "err", err)
+			return 1
+		}
+		eventPlan = p
+		printEventCleanPlan(eventPlan, f.apply)
+	}
+
 	if !f.apply {
 		fmt.Fprintln(os.Stderr, "kojo: dry-run; pass --clean-apply to delete the listed entries")
 		return 0
@@ -228,6 +284,36 @@ func runCleanCommand(f cleanFlags) int {
 				f.logger.Error("clean: remove v0 trash dir failed", "err", e)
 			}
 			rc = 1
+		}
+	}
+	if blobPlan != nil || agentPlan != nil || eventPlan != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		st, err := store.Open(ctx, store.Options{ConfigDir: f.configDirPath})
+		if err != nil {
+			f.logger.Error("clean: open store (read-write) failed", "err", err)
+			return 1
+		}
+		defer st.Close()
+		if blobPlan != nil {
+			if errs := applyBlobCleanPlan(ctx, blobPlan, st); len(errs) > 0 {
+				for _, e := range errs {
+					f.logger.Error("clean: remove blob entry failed", "err", e)
+				}
+				rc = 1
+			}
+		}
+		if agentPlan != nil {
+			if err := applyAgentCleanPlan(ctx, agentPlan, st); err != nil {
+				f.logger.Error("clean: hard-delete agents failed", "err", err)
+				rc = 1
+			}
+		}
+		if eventPlan != nil {
+			if err := applyEventCleanPlan(ctx, eventPlan, st); err != nil {
+				f.logger.Error("clean: prune event rows failed", "err", err)
+				rc = 1
+			}
 		}
 	}
 	return rc

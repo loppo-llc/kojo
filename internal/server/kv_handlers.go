@@ -170,10 +170,9 @@ func (s *Server) handleGetKV(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, toKVResponse(rec))
 }
 
-// handlePutKV writes a non-secret kv row. Secret rows are refused
-// (daemon-internal only — no plaintext-secret wire surface in this
-// slice; future work can add a dedicated /api/v1/secrets/... API
-// that envelope-encrypts on the daemon side).
+// handlePutKV writes a non-secret kv row. Secret rows are refused because
+// credentials and VAPID keys have dedicated daemon-side encrypted paths; the
+// generic kv API deliberately has no plaintext-secret wire surface.
 //
 // Precondition handling:
 //   - If-Match: <etag>  → conditional update against that etag (412 on miss)

@@ -17,8 +17,7 @@ import (
 // as advisory: drop the matching cache row and re-fetch on next read.
 // Event delivery is best-effort — a stalled client whose buffer
 // overflows is dropped with close code 1008 (PolicyViolation) and the
-// peer must then resync via `GET /api/v1/changes?since=<seq>` (future
-// slice).
+// peer must then resync via `GET /api/v1/changes?since=<seq>`.
 //
 // Lifecycle ordering is deliberate:
 //

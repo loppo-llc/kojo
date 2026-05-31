@@ -717,9 +717,8 @@ func (s *Store) Delete(scope Scope, p string, opts DeleteOptions) error {
 	// Best-effort: don't fsync the parent on Delete. The semantics
 	// expected by callers ("eventually gone") are weaker than Put's
 	// ("durably published"), and Delete is also a no-op if the
-	// parent dir is empty afterwards (we leave the dir for now; the
-	// eventual `--clean blobs` target (planned Phase 6 #18; not yet
-	// implemented) prunes empty trees).
+	// parent dir is empty afterwards. `kojo --clean blobs` prunes empty
+	// trees during operator-requested housekeeping.
 	return nil
 }
 

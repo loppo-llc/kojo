@@ -16,7 +16,7 @@ import (
 
 // ForkOptions controls what state is copied into the forked agent.
 type ForkOptions struct {
-	Name             string
+	Name              string
 	IncludeTranscript bool
 }
 
@@ -34,11 +34,6 @@ type ForkOptions struct {
 // CLI local state (.claude/) is also skipped so the fork starts a
 // fresh session. WorkDir is cleared so the fork does not share external output
 // storage with the source.
-//
-// Known limitations: Manager.Update and the task API can write to persona.md
-// or agent_tasks without honoring the resetting flag, so the snapshot is not
-// fully atomic against concurrent PATCH /agents/{id} or task mutations. The
-// same looseness applies to Reset today.
 func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 	if strings.TrimSpace(opts.Name) == "" {
 		return nil, fmt.Errorf("name is required")
@@ -453,10 +448,10 @@ func copyTranscript(srcID, dstID string) error {
 		dst := *src
 		dst.ID = generateMessageID()
 		dst.AgentID = dstID
-		dst.Seq = 0       // reallocate
-		dst.Version = 0   // reset
-		dst.ETag = ""     // recompute
-		dst.PeerID = ""   // local fork
+		dst.Seq = 0     // reallocate
+		dst.Version = 0 // reset
+		dst.ETag = ""   // recompute
+		dst.PeerID = "" // local fork
 		dst.DeletedAt = nil
 		if _, err := db.AppendMessage(ctx, &dst, store.MessageInsertOptions{
 			CreatedAt: src.CreatedAt,

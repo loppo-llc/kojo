@@ -5,29 +5,16 @@ package peer
 // must hold a live lock under this peer's DeviceID for as long as
 // the binary is up.
 //
-// Why this exists right now: the agent_locks table + store API have
-// been in place for several slices, but the runtime never wrote a
-// row — so a multi-peer cluster would happily have two binaries
-// both treating themselves as the holder of agent X. v1 is still
-// single-Hub, but landing the lock writes now closes the gap so a
-// future inter-peer slice can rely on the row being present.
-//
-// Scope: this guard takes / refreshes / releases the LOCK rows; it
-// does NOT yet thread the fencing token through individual
-// agent-runtime writes (transcript append, MEMORY.md update, tool
-// side-effects). That requires plumbing the per-agent token into
-// every write call site and is the explicit next slice. Until then
-// the runtime continues to write without a fencing check; the lock
-// row exists so the next slice's CheckFencingTx-gated writes have
-// something to validate against.
+// This guard owns taking, refreshing, and releasing LOCK rows. HTTP
+// mutation routes and store/op-log write paths enforce the holder/fencing
+// checks at their mutation boundaries; the guard keeps the local holder row
+// fresh so those checks have a live token to validate.
 //
 // Lock-loss policy: if a refresh fails (lease was stolen — another
 // peer steals after this binary's lease expired), the guard logs a
-// loud Error. Tearing down the running agent CLI on lock loss is a
-// separate concern handled when fencing-check write paths land.
-// Until then a stolen lock is observable via the registry but does
-// not stop ongoing writes — which is consistent with v1's "best-
-// effort" mode noted in the design.
+// loud Error. New fenced writes are refused by the API/store boundaries
+// after lock loss, while already-running local process cleanup remains the
+// manager's responsibility.
 
 import (
 	"context"
@@ -47,11 +34,10 @@ import (
 // worst-case (binary crashes silently without Stop), another peer
 // has to wait up to the full lease (5min) before it can steal,
 // which is longer than the OfflineSweeper's 150 s
-// (5×HeartbeatInterval) "mark offline" threshold but is intentional
-// — the offline mark only updates registry liveness; lock ownership
-// has stronger correctness needs and warrants a longer holdoff so a
-// flaky network doesn't churn locks across peers. A future slice
-// can fold the failover speed into a tunable.
+// (5×HeartbeatInterval) "mark offline" threshold but is intentional:
+// the offline mark only updates registry liveness; lock ownership has
+// stronger correctness needs and warrants a longer holdoff so a flaky
+// network doesn't churn locks across peers.
 const AgentLockLeaseDuration = 5 * time.Minute
 
 // AgentLockRefreshInterval is how often the guard's refresh loop

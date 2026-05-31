@@ -1708,8 +1708,7 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 	// (.claude/skills for Claude/Grok, .codex/skills for Codex).
 	// Gated on blob store presence because without a blob.Store
 	// there is no canonical place to store the bytes and the user UI
-	// cannot fetch them. No operator toggle yet — the feature is
-	// always-on when both gates pass.
+	// cannot fetch them. The feature is always-on when both gates pass.
 	SyncAttachSkillForTool(agentID, agentCopy.Tool, m.blobStore != nil, m.logger)
 
 	// Build MCP server list (backend-agnostic, URL-based).

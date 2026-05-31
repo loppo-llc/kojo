@@ -48,8 +48,8 @@ export function GroupDMChat() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [enterSends] = useEnterSends();
 
-  // File attachments — uploaded to /api/v1/blobs but not yet attached to a
-  // posted message. Cleared on successful send.
+  // File attachments — uploaded to /api/v1/blobs, attached to the user
+  // message on send, then cleared on success.
   const [pendingFiles, setPendingFiles] = useState<AgentMessageAttachment[]>([]);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);

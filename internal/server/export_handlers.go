@@ -78,12 +78,8 @@ func (s *Server) handleExportAgent(w http.ResponseWriter, r *http.Request) {
 	// Pin a single export timestamp for the manifest, the
 	// Content-Disposition filename, AND every zip header's Modified
 	// field. The within-call consistency guarantees the manifest's
-	// exportedAt matches the zip's modtimes, but two distinct
-	// exports of unchanged data still produce different archives
-	// because exportTime advances each call. True content-addressed
-	// determinism (e.g. modtime derived from the latest source
-	// row's UpdatedAt) is a future hardening the caller can layer
-	// on if reproducible-build semantics matter.
+	// exportedAt matches the zip's modtimes, while distinct exports keep
+	// the time they were actually generated.
 	exportTime := time.Now().UTC()
 
 	dbCtx, cancel := context.WithTimeout(r.Context(), 60*time.Second)

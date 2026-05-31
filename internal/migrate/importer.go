@@ -21,9 +21,9 @@ import (
 //   - Track work via store DB transactions; partial inserts must be
 //     visible only after the importer's own commit.
 //
-// Phase 1 of the v1 implementation ships an empty importer list; later
-// phases register concrete importers in init(). The orchestrator in
-// migrate.go iterates this list in order.
+// Concrete importers are registered from internal/migrate/importers in a
+// single documented order. The orchestrator in migrate.go iterates this
+// list in registration order.
 type Importer interface {
 	Domain() string
 	Run(ctx context.Context, st *store.Store, opts Options) error
@@ -33,8 +33,7 @@ var registered []Importer
 
 // Register adds an Importer to the run list. Importers are run in
 // registration order, so packages with dependencies (e.g. agent_messages
-// must run after agents) should register accordingly. Phase 1: the list
-// is empty.
+// must run after agents) should register accordingly.
 func Register(imp Importer) {
 	registered = append(registered, imp)
 }

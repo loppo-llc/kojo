@@ -157,14 +157,14 @@ func (s *Scrubber) loop(ctx context.Context) {
 	}
 }
 
-// ScrubOnce is exposed for tests + a future manual trigger (CLI
-// flag / API endpoint). Returns the per-outcome counts.
+// ScrubOnce is exposed for tests and admin callers. Returns the per-outcome
+// counts.
 type ScrubResult struct {
-	Total     int
-	OK        int
-	Missing   int
-	Mismatch  int
-	Errors    int
+	Total    int
+	OK       int
+	Missing  int
+	Mismatch int
+	Errors   int
 }
 
 func (s *Scrubber) ScrubOnce(ctx context.Context) ScrubResult {

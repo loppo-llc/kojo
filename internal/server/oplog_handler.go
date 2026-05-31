@@ -525,12 +525,11 @@ func (s *Server) oplogDispatchMessageInsert(ctx context.Context, peerID string, 
 // agent_memory etag is content-derived and the UI keys on etag,
 // not on UpdatedAt, for invalidation.
 //
-// Replay-idempotency for UPDATE ops is otherwise a peer-side
-// responsibility per docs §3.13.1 step 5: the peer removes
-// successful entries from the op-log AFTER the dispatch ack lands,
-// so a crash mid-ack at worst re-applies a no-op. The Hub does NOT
-// maintain an applied-op ledger keyed on op_id in v1; a future
-// slice may add one if a measurable problem emerges.
+// Replay-idempotency for UPDATE ops is enforced by the store-layer
+// oplog_applied ledger when the helper receives an IdempotencyTag. The
+// peer still removes successful entries from the op-log only AFTER the
+// dispatch ack lands, so a crash mid-ack retries against the saved ledger
+// result instead of re-running the mutation.
 func (s *Server) oplogDispatchMemoryUpdate(ctx context.Context, peerID string, ent *oplog.Entry, tag *store.IdempotencyTag) (string, error) {
 	var body struct {
 		Body       string  `json:"body"`
