@@ -76,6 +76,23 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 			case <-ticker.C:
 				pingCtx, pingCancel := context.WithTimeout(ctx, 10*time.Second)
 				if err := conn.Ping(pingCtx); err != nil {
+					// Symmetric to the read goroutine's classification:
+					// suppress the log when we initiated the close
+					// (ctx cancelled) and when the peer closed
+					// cleanly. The interesting case for diagnosing
+					// reconnect storms is everything else (ping
+					// timeout, peer-side reset). Info there;
+					// browser-reload churn at Debug.
+					if ctx.Err() == nil {
+						switch websocket.CloseStatus(err) {
+						case websocket.StatusNormalClosure, websocket.StatusGoingAway:
+							s.logger.Debug("agent websocket ping closed by client",
+								"agent", agentID, "err", err)
+						default:
+							s.logger.Info("agent websocket ping failed, closing",
+								"agent", agentID, "err", err)
+						}
+					}
 					pingCancel()
 					cancel()
 					return
@@ -91,6 +108,29 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 		for {
 			_, data, err := conn.Read(ctx)
 			if err != nil {
+				// Classify the close reason so reconnect storms
+				// (the case this log is here to diagnose) stand
+				// out against normal browser-reload churn. ctx.Err()
+				// non-nil means we initiated the close ourselves
+				// (e.g. ping goroutine cancelled) — skip the log
+				// in that case to avoid duplicating the ping-fail
+				// entry. websocket.StatusNormalClosure /
+				// StatusGoingAway are the clean closes browsers
+				// emit on tab navigation / shutdown — log them at
+				// Debug so noisy environments stay readable.
+				// Everything else (read timeouts, frame errors,
+				// peer-side resets) is Info so the abnormal
+				// disconnects show up in production logs.
+				if ctx.Err() == nil {
+					switch websocket.CloseStatus(err) {
+					case websocket.StatusNormalClosure, websocket.StatusGoingAway:
+						s.logger.Debug("agent websocket closed by client",
+							"agent", agentID, "err", err)
+					default:
+						s.logger.Info("agent websocket read ended",
+							"agent", agentID, "err", err)
+					}
+				}
 				return
 			}
 

@@ -78,6 +78,14 @@ type Bot struct {
 	// sleeps and run the retry loop without real wall-clock delays. nil
 	// in production.
 	rateLimitSleep func(time.Duration) <-chan time.Time
+
+	// runAsync, when non-nil, replaces the bare `go fn()` used by
+	// sendToAgent for fire-and-forget background work (currently:
+	// dead-stream cleanup after the thread mutex is released). Tests
+	// use this to run the work synchronously so they can observe the
+	// resulting Slack API calls. nil in production, where the default
+	// `go fn()` semantics are used.
+	runAsync func(func())
 }
 
 const (
@@ -120,6 +128,25 @@ const (
 	// mislead users who hit a non-length failure. Centralized so the
 	// stream-finalize and batch-fallback paths cannot drift apart.
 	deliveryFailureNotice = "_⚠️ The full response could not be delivered to Slack. Check kojo logs for details._"
+
+	// slackErrNotStreaming is the Slack chat.appendStream / chat.stopStream
+	// error code returned when the target message is no longer in
+	// streaming state. Once a stream is finalized — by an explicit
+	// chat.stopStream, by the Slack-side inactivity TTL, or by any other
+	// path that closes it — every subsequent chat.appendStream on the
+	// same ts fails with this error. The bot uses this signal to abandon
+	// the dead streamTS and start a fresh stream so the user keeps
+	// seeing live progress instead of a silently truncated reply.
+	slackErrNotStreaming = "message_not_in_streaming_state"
+
+	// maxStreamRestarts caps how many times sendToAgent will open a new
+	// streaming message in a single turn after the previous one died.
+	// Each restart leaves an orphaned partial-content message in the
+	// thread, so we don't want an unbounded chain of them if Slack is
+	// closing streams faster than we can append. Past this cap the bot
+	// stops trying to stream and relies on the finalize-time chat.update
+	// / postMessage fallback to deliver the full reply.
+	maxStreamRestarts = 5
 )
 
 // NewBot creates a new Bot instance. Call Run() to start it.
@@ -557,18 +584,51 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 
 	var response strings.Builder     // full response text
 	var pendingDelta strings.Builder // text not yet flushed via AppendStream
-	var streamTS string              // ts of the streaming message (empty = not started or fallback)
+	var streamTS string              // ts of the streaming message (empty = not started, dead, or fallback)
+	var deadStreams []string         // streamTS values that died mid-response (TTL/external stop); finalized best-effort at end
 	var lastAppend time.Time
 	hasError := false
-	streamFailed := false // true if StartStream failed, use fallback
+	streamFailed := false // true if StartStream failed permanently, use batch-post fallback
+
+	// dropStream parks the current streamTS in deadStreams and clears
+	// streamTS so the next startStream() opens a fresh streaming
+	// message. Called when appendStream signals the stream is no longer
+	// in streaming state (Slack-side TTL expiry, external stopStream,
+	// etc.). The orphaned dead stream keeps the partial text it
+	// already received — finalize stops it best-effort so Slack stops
+	// rendering the streaming indicator.
+	dropStream := func() {
+		if streamTS == "" {
+			return
+		}
+		deadStreams = append(deadStreams, streamTS)
+		streamTS = ""
+	}
 
 	// startStream initializes the Slack stream lazily on the first text
-	// or tool_use event. Returns true if the stream is active.
+	// or tool_use event, AND re-initializes it after a previous stream
+	// died (deadStreams non-empty, streamTS == ""). Returns true if the
+	// stream is active. After maxStreamRestarts orphaned streams the
+	// turn gives up on streaming entirely and falls back to the
+	// chat.update / batch-post finalize paths.
 	startStream := func() bool {
 		if streamTS != "" {
 			return true
 		}
 		if streamFailed {
+			return false
+		}
+		// deadStreams holds every streamTS that died this turn — its
+		// length equals the number of completed restart attempts so far
+		// (the initial open is not counted as a restart). Allow up to
+		// maxStreamRestarts further restart attempts: opening when
+		// len(deadStreams) == maxStreamRestarts is the maxStreamRestarts-th
+		// restart and is permitted; the next attempt (len == maxStreamRestarts+1)
+		// trips the cap and falls back to batch post.
+		if len(deadStreams) > maxStreamRestarts {
+			b.logger.Warn("slack stream restart limit reached, falling back to batch post for remainder",
+				"channel", channel, "deadStreams", len(deadStreams))
+			streamFailed = true
 			return false
 		}
 		opts := []slack.MsgOption{}
@@ -601,9 +661,18 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			// Throttle AppendStream so a fast text-delta loop doesn't
 			// burn chat:write quota.
 			if pendingDelta.Len() > 0 && time.Since(lastAppend) >= streamAppendInterval {
-				b.appendStream(ctx, channel, streamTS, pendingDelta.String())
+				delta := pendingDelta.String()
 				pendingDelta.Reset()
 				lastAppend = time.Now()
+				if !b.appendStream(ctx, channel, streamTS, delta) {
+					// Stream died mid-response. Park it and carry the
+					// unflushed delta into pendingDelta so the NEXT
+					// text event opens a fresh stream and flushes the
+					// combined buffer. response.Builder already holds
+					// the full text for finalize chat.update.
+					pendingDelta.WriteString(delta)
+					dropStream()
+				}
 			}
 
 		case "tool_use":
@@ -624,17 +693,41 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			// most once per tool invocation (not in a tight loop like
 			// text deltas), and a user staring at a long-running tool has
 			// no other signal that the agent is still working.
-			if startStream() {
-				// Flush any pending text delta first so the indicator
-				// appears after whatever text the agent has produced so
-				// far.
-				if pendingDelta.Len() > 0 {
-					b.appendStream(ctx, channel, streamTS, pendingDelta.String())
-					pendingDelta.Reset()
-				}
-				b.appendStream(ctx, channel, streamTS, "\n\n_⏳ "+status+"_")
-				lastAppend = time.Now()
+			if !startStream() {
+				continue
 			}
+			// Flush any pending text delta first so the indicator
+			// appears after whatever text the agent has produced so
+			// far. On dead-stream signal, park the streamTS and carry
+			// the delta to the next event — same pattern as the text
+			// case above.
+			if pendingDelta.Len() > 0 {
+				delta := pendingDelta.String()
+				pendingDelta.Reset()
+				if !b.appendStream(ctx, channel, streamTS, delta) {
+					pendingDelta.WriteString(delta)
+					dropStream()
+					continue
+				}
+			}
+			if !b.appendStream(ctx, channel, streamTS, "\n\n_⏳ "+status+"_") {
+				// Indicator append died. The indicator itself is
+				// ephemeral (finalize chat.update overwrites it),
+				// so no need to carry it forward. We deliberately
+				// do NOT reopen a fresh stream right here to
+				// re-emit the indicator: tool_use fires once per
+				// invocation, and during a long-running tool no
+				// further events arrive that would refresh the
+				// status anyway. The next text/tool_use event will
+				// startStream() and the user will see live
+				// progress resume. The status text already lives
+				// in SetAssistantThreadsStatusContext above, so
+				// the user still sees "running command…" in the
+				// assistant typing indicator while the gap lasts.
+				dropStream()
+				continue
+			}
+			lastAppend = time.Now()
 
 		case "tool_result":
 			// Revert the assistant status to "Thinking…" while the agent
@@ -660,11 +753,31 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	finCtx, finCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
 	defer finCancel()
 
-	// Flush any remaining text delta before finalizing.
+	// Flush any remaining text delta before finalizing. If the final
+	// flush also hits a dead stream, park it so the code below falls
+	// through to the batch-post path — response.Builder still holds the
+	// full text so the user gets the complete reply, just without the
+	// chat.update streaming-replacement effect.
 	if streamTS != "" && pendingDelta.Len() > 0 {
-		b.appendStream(finCtx, channel, streamTS, pendingDelta.String())
+		if !b.appendStream(finCtx, channel, streamTS, pendingDelta.String()) {
+			dropStream()
+		}
 		pendingDelta.Reset()
 	}
+
+	// Best-effort cleanup of orphaned streams is deferred to AFTER the
+	// final response delivery AND released asynchronously so the dead-
+	// stream loop never blocks the thread mutex. Each dead message keeps
+	// whatever partial text it received as a historical artifact; we
+	// deliberately do NOT delete or chat.update them — the final
+	// streamTS / batch post below carries the FULL reply, and rewriting
+	// partials would duplicate content. Trade-off: the channel can
+	// render up to maxStreamRestarts+1 partial messages (initial open +
+	// every restart that died) plus the one full reply; switching to
+	// chat.delete for cleaner UI is a follow-up. Stop indicator hygiene
+	// is also strictly optional — Slack auto-finalizes orphaned streams
+	// via TTL within minutes — so a missed cleanup costs nothing more
+	// than a few minutes of stale indicator.
 
 	if streamTS != "" {
 		// Stop stream (no text — just finalize the typing indicator).
@@ -801,6 +914,35 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	clearCtx, clearCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
 	b.clearAssistantStatus(clearCtx, channel, threadTS)
 	clearCancel()
+
+	// Cleanup orphaned streams from earlier restarts — async because
+	// sendToAgent still holds the per-thread mutex at this point, and
+	// up to maxStreamRestarts StopStream calls (each with its own 5s
+	// timeout) would otherwise stall the next message in the same
+	// thread for tens of seconds for purely cosmetic indicator cleanup.
+	// Slack auto-finalizes orphaned streams via TTL within minutes if
+	// this goroutine never lands its calls, so the worst-case cost of
+	// dropping the cleanup entirely is a few minutes of stale indicator.
+	// The goroutine uses context.Background() so it survives sendToAgent
+	// returning; per-call timeouts cap the total wall time.
+	if len(deadStreams) > 0 {
+		streams := deadStreams // capture so the closure can be run sync (tests) or async (prod)
+		cleanup := func() {
+			for _, ts := range streams {
+				stopCtx, stopCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+				if _, _, err := b.api.StopStreamContext(stopCtx, channel, ts); err != nil {
+					b.logger.Debug("failed to stop orphaned slack stream",
+						"channel", channel, "streamTS", ts, "err", err)
+				}
+				stopCancel()
+			}
+		}
+		if b.runAsync != nil {
+			b.runAsync(cleanup)
+		} else {
+			go cleanup()
+		}
+	}
 
 	// Save bot response to thread history so shouldAutoReply can detect
 	// that the last message was from the bot on subsequent thread messages.
@@ -953,12 +1095,21 @@ func toolStatusText(toolName string) string {
 	}
 }
 
-// appendStream appends text to a streaming Slack message with rate limit retry.
-func (b *Bot) appendStream(ctx context.Context, channel, streamTS, text string) {
+// appendStream appends text to a streaming Slack message with rate limit
+// retry. Returns true if streamTS is still usable for further appends
+// (success, transient/unknown error, rate-limit exhaustion, ctx cancelled);
+// false if Slack reported the stream has left streaming state (TTL expiry,
+// external chat.stopStream, etc.) — the caller MUST abandon streamTS and
+// open a new stream for subsequent chunks. Returning bool instead of
+// silently swallowing the error closes the bug where, after a stream-side
+// TTL expiry, every later append in the same turn failed the same way and
+// the user saw no further updates AND no finalize chat.update (because
+// chat.update against a dead TS is best-effort and may also fail).
+func (b *Bot) appendStream(ctx context.Context, channel, streamTS, text string) bool {
 	for attempt := 0; attempt <= maxRateLimitRetry; attempt++ {
 		_, _, err := b.api.AppendStreamContext(ctx, channel, streamTS, slack.MsgOptionMarkdownText(text))
 		if err == nil {
-			return
+			return true
 		}
 		var rlErr *slack.RateLimitedError
 		if errors.As(err, &rlErr) {
@@ -976,7 +1127,11 @@ func (b *Bot) appendStream(ctx context.Context, channel, streamTS, text string) 
 				b.logger.Warn("failed to append slack stream after rate limit retries",
 					"channel", channel, "streamTS", streamTS,
 					"retryAfter", rlErr.RetryAfter, "err", err)
-				return
+				// Rate limiting doesn't kill the stream itself —
+				// it just means Slack is refusing OUR calls right
+				// now. Keep the streamTS so finalize chat.update
+				// still has a chance to land the full reply.
+				return true
 			}
 			delay := rlErr.RetryAfter
 			if delay == 0 {
@@ -990,12 +1145,46 @@ func (b *Bot) appendStream(ctx context.Context, channel, streamTS, text string) 
 			case <-sleep(delay):
 				continue
 			case <-ctx.Done():
-				return
+				return true
 			}
 		}
+		if isStreamClosedErr(err) {
+			// Stream is irrecoverably dead from Slack's side. Log
+			// at Info (not Debug) so the restart event has an
+			// audit trail — diagnosing the silent-truncation bug
+			// required reconstructing this from 30+ identical
+			// Debug lines, which is the kind of toil this log
+			// level avoids.
+			b.logger.Info("slack stream closed mid-response, will restart on next chunk",
+				"channel", channel, "streamTS", streamTS, "err", err)
+			return false
+		}
 		b.logger.Debug("append stream failed", "err", err)
-		return
+		// Unknown non-rate-limit error: don't churn the stream — Slack
+		// has been known to return transient 5xx that don't kill the
+		// streaming state. Caller keeps the same streamTS; if the
+		// error WAS terminal, the next append will return the
+		// stream-closed signal and we'll restart then.
+		return true
 	}
+	return true
+}
+
+// isStreamClosedErr reports whether err is the Slack
+// "message_not_in_streaming_state" response, which signals that the
+// streaming message identified by streamTS has been finalized
+// server-side and cannot be appended to. Detected via the typed
+// SlackErrorResponse rather than string match so a wrapped error from a
+// future slack-go change still trips the same code path.
+func isStreamClosedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var sErr slack.SlackErrorResponse
+	if errors.As(err, &sErr) {
+		return sErr.Err == slackErrNotStreaming
+	}
+	return false
 }
 
 // finalizeUpdateOpts returns the slack.MsgOption slice used by the

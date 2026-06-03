@@ -2,6 +2,7 @@ package slackbot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -418,6 +419,339 @@ func TestPostMessageRateLimitNoExtraSleepOnFinalAttempt(t *testing.T) {
 	}
 	if got := sleeps.Load(); got != int32(maxRateLimitRetry) {
 		t.Errorf("rateLimitSleep invocations = %d, want %d (one per inter-attempt gap; no sleep after final attempt)", got, maxRateLimitRetry)
+	}
+}
+
+// scriptedMgr returns a pre-canned event stream from ChatOneShot so
+// sendToAgent's event loop can be driven deterministically in tests.
+type scriptedMgr struct {
+	events []agent.ChatEvent
+}
+
+func (m *scriptedMgr) Chat(_ context.Context, _, _, _ string, _ []agent.MessageAttachment, _ ...agent.BusySource) (<-chan agent.ChatEvent, error) {
+	ch := make(chan agent.ChatEvent, len(m.events)+1)
+	for _, e := range m.events {
+		ch <- e
+	}
+	close(ch)
+	return ch, nil
+}
+
+func (m *scriptedMgr) ChatOneShot(_ context.Context, _, _ string, _ agent.OneShotOpts) (<-chan agent.ChatEvent, error) {
+	ch := make(chan agent.ChatEvent, len(m.events)+1)
+	for _, e := range m.events {
+		ch <- e
+	}
+	close(ch)
+	return ch, nil
+}
+
+func (m *scriptedMgr) CanResumeSession(_, _ string) bool { return false }
+
+// streamScript drives a mockSlackServer for sendToAgent-level tests of
+// the stream-restart behavior. It hands out fresh stream timestamps from
+// streamTSs in order, fails the appendStream call at the indexes in
+// killAt with message_not_in_streaming_state, and counts every relevant
+// API call so the test can assert on the resulting sequence. Counters
+// and the issued/stopped lists are mutated from the HTTP handler
+// goroutine; the test reads them only after sendToAgent returns.
+type streamScript struct {
+	streamTSs []string // returned by chat.startStream, in order
+	killAt    []int    // 0-based indexes of appendStream calls that should fail with message_not_in_streaming_state
+
+	startCalls    int
+	appendCalls   int
+	stopCalls     int
+	updateCalls   int
+	postCalls     int
+	issuedTS      []string // ts values returned by chat.startStream
+	stoppedTS     []string // ts values seen by chat.stopStream
+	appendOnTS    []string // ts the bot tried to append to (in order)
+	lastUpdateTS  string
+	lastUpdateMD  string
+}
+
+// newStreamServer returns a mock Slack server that delegates streaming
+// calls to script and otherwise mimics mockSlackServer.
+func newStreamServer(t *testing.T, script *streamScript) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = r.ParseForm()
+		switch r.URL.Path {
+		case "/chat.startStream":
+			idx := script.startCalls
+			script.startCalls++
+			if idx >= len(script.streamTSs) {
+				fmt.Fprintf(w, `{"ok":false,"error":"too_many_streams"}`)
+				return
+			}
+			ts := script.streamTSs[idx]
+			script.issuedTS = append(script.issuedTS, ts)
+			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":%q}`, ts)
+		case "/chat.appendStream":
+			idx := script.appendCalls
+			script.appendCalls++
+			script.appendOnTS = append(script.appendOnTS, r.FormValue("ts"))
+			for _, k := range script.killAt {
+				if k == idx {
+					fmt.Fprintf(w, `{"ok":false,"error":"message_not_in_streaming_state"}`)
+					return
+				}
+			}
+			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":%q}`, r.FormValue("ts"))
+		case "/chat.stopStream":
+			script.stopCalls++
+			script.stoppedTS = append(script.stoppedTS, r.FormValue("ts"))
+			fmt.Fprintf(w, `{"ok":true}`)
+		case "/chat.update":
+			script.updateCalls++
+			script.lastUpdateTS = r.FormValue("ts")
+			script.lastUpdateMD = r.FormValue("markdown_text")
+			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":%q}`, r.FormValue("ts"))
+		case "/chat.postMessage":
+			script.postCalls++
+			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":"post.999"}`)
+		case "/conversations.history", "/conversations.replies":
+			fmt.Fprintf(w, `{"ok":true,"messages":[]}`)
+		case "/assistant.threads.setStatus":
+			fmt.Fprintf(w, `{"ok":true}`)
+		case "/auth.test":
+			fmt.Fprintf(w, `{"ok":true,"user_id":"UBOTTEST","user":"testbot","team":"T1","team_id":"T1"}`)
+		default:
+			fmt.Fprintf(w, `{"ok":true}`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func newBotWithStream(t *testing.T, mgr ChatManager, srv *httptest.Server) *Bot {
+	t.Helper()
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	sm := socketmode.New(api)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return &Bot{
+		agentID:      "test-agent",
+		agentDataDir: "", // empty → skip chathistory writes
+		config:       agent.SlackBotConfig{Enabled: true},
+		api:          api,
+		sm:           sm,
+		mgr:          mgr,
+		logger:       testLogger,
+		botUserID:    "UBOTTEST",
+		ctx:          ctx,
+		cancel:       cancel,
+		done:         make(chan struct{}),
+		threadLocks:  make(map[string]*threadLock),
+		userCache:    make(map[string]string),
+		sem:          make(chan struct{}, maxConcurrentChats),
+		// Run the dead-stream cleanup goroutine synchronously so the
+		// test can observe its API calls after sendToAgent returns.
+		runAsync: func(fn func()) { fn() },
+	}
+}
+
+// TestSendToAgentRestartsOnDeadStream drives sendToAgent end-to-end with
+// a tool_use event that triggers stream open + a doomed append, then a
+// text event whose first append hits the stream-closed error. The bot
+// must:
+//   - open ts-1 on the tool_use,
+//   - drop ts-1 after appendStream returns message_not_in_streaming_state,
+//   - open ts-2 on the next tool_use (since text events are throttled
+//     and won't open a new stream until the throttle clears, we use a
+//     second tool_use which bypasses the throttle),
+//   - flush the carried-over delta + new indicator on ts-2,
+//   - StopStream the dead ts-1 during finalize cleanup,
+//   - chat.update ts-2 with the full response text.
+//
+// This is the integration guard for the silent-truncation bug that was
+// the original motivation for these changes.
+func TestSendToAgentRestartsOnDeadStream(t *testing.T) {
+	script := &streamScript{
+		streamTSs: []string{"stream.1", "stream.2"},
+		// Kill the very first appendStream — that's the indicator
+		// append on the first tool_use event. The bot should drop
+		// ts-1, then the next tool_use opens ts-2 and lands the
+		// indicator there.
+		killAt: []int{0},
+	}
+	srv := newStreamServer(t, script)
+
+	mgr := &scriptedMgr{events: []agent.ChatEvent{
+		{Type: "tool_use", ToolName: "Bash"},
+		{Type: "tool_use", ToolName: "Read"},
+		{Type: "text", Delta: "hello world"},
+	}}
+	bot := newBotWithStream(t, mgr, srv)
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	if script.startCalls != 2 {
+		t.Errorf("chat.startStream calls = %d, want 2 (initial + 1 restart)", script.startCalls)
+	}
+	if len(script.issuedTS) >= 2 && script.issuedTS[0] != "stream.1" {
+		t.Errorf("first startStream returned %q, want %q", script.issuedTS[0], "stream.1")
+	}
+	if !containsString(script.stoppedTS, "stream.1") {
+		t.Errorf("StopStream not called on dead stream.1; stoppedTS=%v", script.stoppedTS)
+	}
+	if script.lastUpdateTS != "stream.2" {
+		t.Errorf("final chat.update targeted %q, want %q", script.lastUpdateTS, "stream.2")
+	}
+	if !strings.Contains(script.lastUpdateMD, "hello world") {
+		t.Errorf("final chat.update markdown_text = %q, want it to contain %q", script.lastUpdateMD, "hello world")
+	}
+}
+
+// TestSendToAgentRestartCapFallsBackToBatchPost forces every appendStream
+// to die so the bot exhausts its maxStreamRestarts budget. After the cap
+// trips, the remaining text must reach the user via chat.postMessage
+// (batch fallback) rather than being silently dropped. Also asserts that
+// every dead streamTS gets a StopStream during finalize cleanup so the
+// channel doesn't render N stuck streaming indicators.
+func TestSendToAgentRestartCapFallsBackToBatchPost(t *testing.T) {
+	// Generate maxStreamRestarts+2 stream TSs so the bot has more
+	// inventory than it can possibly use. The cap check must trip
+	// before the inventory runs out.
+	streams := make([]string, maxStreamRestarts+2)
+	for i := range streams {
+		streams[i] = fmt.Sprintf("stream.%d", i+1)
+	}
+	// Kill every appendStream call.
+	killAll := make([]int, 200)
+	for i := range killAll {
+		killAll[i] = i
+	}
+	script := &streamScript{streamTSs: streams, killAt: killAll}
+	srv := newStreamServer(t, script)
+
+	// Use tool_use events (bypass the 1s throttle on text) so each
+	// event reliably triggers a fresh appendStream attempt.
+	events := make([]agent.ChatEvent, maxStreamRestarts+3)
+	for i := range events {
+		events[i] = agent.ChatEvent{Type: "tool_use", ToolName: "Bash"}
+	}
+	// End with a text event so response.Builder is non-empty and the
+	// finalize path actually emits a chunk (no text → "something went
+	// wrong" branch instead).
+	events = append(events, agent.ChatEvent{Type: "text", Delta: "final words"})
+
+	mgr := &scriptedMgr{events: events}
+	bot := newBotWithStream(t, mgr, srv)
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	// startStream must be called exactly maxStreamRestarts+1 times
+	// (initial open + maxStreamRestarts restarts before the cap trips).
+	// Equality matters here: the previous `>=` cap condition allowed
+	// only maxStreamRestarts opens (off-by-one), and a `> +1` assertion
+	// would happily pass that regression. Asserting equality keeps the
+	// cap semantics pinned down.
+	if script.startCalls != maxStreamRestarts+1 {
+		t.Errorf("chat.startStream called %d times, want %d (initial + maxStreamRestarts)",
+			script.startCalls, maxStreamRestarts+1)
+	}
+	// All dead streams should be stopped during finalize.
+	if len(script.stoppedTS) != script.startCalls {
+		t.Errorf("StopStream called on %d streams, want %d (every issued stream)",
+			len(script.stoppedTS), script.startCalls)
+	}
+	// Fallback path: at least one chat.postMessage for the final text.
+	if script.postCalls == 0 {
+		t.Error("expected at least one chat.postMessage as batch-fallback after cap, got 0")
+	}
+}
+
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// TestIsStreamClosedErr verifies the typed-error detection used by
+// appendStream to decide whether to abandon a dead stream. The detection
+// goes through errors.As + slack.SlackErrorResponse so a future slack-go
+// change that wraps the error still trips the same code path.
+func TestIsStreamClosedErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"unrelated error", errors.New("boom"), false},
+		{"wrong slack error code", slack.SlackErrorResponse{Err: "channel_not_found"}, false},
+		{"raw stream-closed", slack.SlackErrorResponse{Err: slackErrNotStreaming}, true},
+		{"wrapped stream-closed", fmt.Errorf("append failed: %w", slack.SlackErrorResponse{Err: slackErrNotStreaming}), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isStreamClosedErr(tc.err); got != tc.want {
+				t.Fatalf("isStreamClosedErr(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAppendStreamReturnsFalseOnStreamClosed verifies the critical bug-fix
+// signal: when Slack rejects chat.appendStream with
+// message_not_in_streaming_state, appendStream returns false so the
+// caller can drop the dead streamTS and restart a fresh stream. Before
+// this fix the error was silently logged at Debug and the caller kept
+// pushing into the dead stream, producing the 30+ identical failures
+// observed in production (2026-06-03 12:34-12:41).
+func TestAppendStreamReturnsFalseOnStreamClosed(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "appendStream") {
+			calls.Add(1)
+			fmt.Fprintf(w, `{"ok":false,"error":"message_not_in_streaming_state"}`)
+			return
+		}
+		fmt.Fprintf(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	bot := &Bot{api: api, logger: testLogger}
+
+	if bot.appendStream(context.Background(), "C1", "stream-ts", "delta") {
+		t.Fatal("appendStream must return false on message_not_in_streaming_state")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("AppendStream call count = %d, want 1 (no retry on stream-closed)", got)
+	}
+}
+
+// TestAppendStreamReturnsTrueOnUnknownError covers the conservative
+// fallback for non-rate-limit, non-stream-closed errors. A transient
+// Slack 5xx must NOT abandon the stream — the next call might succeed
+// and prematurely churning the streamTS leaves an extra orphaned
+// message in the channel. Caller keeps the same streamTS; if the error
+// WAS terminal, the next append will return the typed stream-closed
+// signal and we'll restart then.
+func TestAppendStreamReturnsTrueOnUnknownError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "appendStream") {
+			fmt.Fprintf(w, `{"ok":false,"error":"internal_error"}`)
+			return
+		}
+		fmt.Fprintf(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	bot := &Bot{api: api, logger: testLogger}
+
+	if !bot.appendStream(context.Background(), "C1", "stream-ts", "delta") {
+		t.Fatal("appendStream must return true on unknown errors (don't churn the stream)")
 	}
 }
 
