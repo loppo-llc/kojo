@@ -124,6 +124,44 @@ func writeGrokSessionID(agentDirPath, sessionID string, logger *slog.Logger) {
 	}
 }
 
+func buildGrokArgs(promptPath, dir, resumeID string, agent *Agent, systemPrompt string) []string {
+	args := []string{
+		"--prompt-file", promptPath,
+		"--output-format", "streaming-json",
+		"--cwd", dir,
+		// Headless mode: never block waiting for an approval prompt.
+		"--always-approve",
+		// Kojo owns agent memory via MEMORY.md, memory/*.md, and DB-backed
+		// memory_entries. Grok's separate ~/.grok/memory store would bypass
+		// Kojo truncation/reset and re-inject stale facts on later turns.
+		"--no-memory",
+		// Skip plan mode + subagent spawning to keep behaviour predictable.
+		"--no-plan",
+		"--no-subagents",
+	}
+	if resumeID != "" {
+		args = append(args, "--resume", resumeID)
+	}
+	if agent.Model != "" {
+		args = append(args, "--model", agent.Model)
+	}
+	if agent.Effort != "" {
+		args = append(args, "--effort", agent.Effort)
+	}
+	if systemPrompt != "" {
+		// `--system-prompt-override` replaces the entire built-in
+		// system prompt, matching the Claude backend's
+		// `--system-prompt` semantics.
+		args = append(args, "--system-prompt-override", systemPrompt)
+	}
+	return args
+}
+
+func grokCommandEnv(agentID, dir string) []string {
+	env := filterEnv([]string{"AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR", "GROK_MEMORY="}, agentID, dir)
+	return append(env, "GROK_MEMORY=0")
+}
+
 func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error) {
 	grokPath, err := exec.LookPath("grok")
 	if err != nil {
@@ -163,31 +201,7 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 		resumeID = readGrokSessionID(dir)
 	}
 
-	args := []string{
-		"--prompt-file", promptPath,
-		"--output-format", "streaming-json",
-		"--cwd", dir,
-		// Headless mode: never block waiting for an approval prompt.
-		"--always-approve",
-		// Skip plan mode + subagent spawning to keep behaviour predictable.
-		"--no-plan",
-		"--no-subagents",
-	}
-	if resumeID != "" {
-		args = append(args, "--resume", resumeID)
-	}
-	if agent.Model != "" {
-		args = append(args, "--model", agent.Model)
-	}
-	if agent.Effort != "" {
-		args = append(args, "--effort", agent.Effort)
-	}
-	if systemPrompt != "" {
-		// `--system-prompt-override` replaces the entire built-in
-		// system prompt, matching the Claude backend's
-		// `--system-prompt` semantics.
-		args = append(args, "--system-prompt-override", systemPrompt)
-	}
+	args := buildGrokArgs(promptPath, dir, resumeID, agent, systemPrompt)
 	mcpWarning := ""
 	if len(opts.MCPServers) > 0 {
 		names := make([]string, 0, len(opts.MCPServers))
@@ -200,7 +214,7 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 	}
 
 	cmd := exec.CommandContext(ctx, grokPath, args...)
-	cmd.Env = filterEnv([]string{"AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
+	cmd.Env = grokCommandEnv(agent.ID, dir)
 	cmd.Dir = dir
 	cmd.Cancel = func() error {
 		return cmd.Process.Signal(syscall.SIGTERM)

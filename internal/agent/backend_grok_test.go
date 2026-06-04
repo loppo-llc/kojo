@@ -29,6 +29,15 @@ func collectGrokEvents(t *testing.T, lines ...string) ([]ChatEvent, *grokStreamR
 	return events, res
 }
 
+func stringSliceContains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 func TestParseGrokStream_TextOnly(t *testing.T) {
 	events, res := collectGrokEvents(t,
 		`{"type":"text","data":"Hi"}`,
@@ -400,6 +409,31 @@ func TestReadGrokSessionID_DropsPoisonedFile(t *testing.T) {
 	// triggering the rejection on every turn.
 	if _, err := os.Stat(grokSessionIDFile(tmp)); !os.IsNotExist(err) {
 		t.Errorf("poisoned session_id file not removed (err=%v)", err)
+	}
+}
+
+func TestBuildGrokArgs_DisablesNativeMemory(t *testing.T) {
+	args := buildGrokArgs("/tmp/prompt.txt", "/tmp/agent", "", &Agent{ID: "ag_grok"}, "system")
+	if !stringSliceContains(args, "--no-memory") {
+		t.Fatalf("grok args missing --no-memory: %#v", args)
+	}
+	if stringSliceContains(args, "--experimental-memory") {
+		t.Fatalf("grok args must not enable native memory: %#v", args)
+	}
+}
+
+func TestGrokCommandEnv_ForcesNativeMemoryOff(t *testing.T) {
+	t.Setenv("GROK_MEMORY", "1")
+	env := grokCommandEnv("ag_grok_env", "/tmp/ag_grok_env")
+
+	var values []string
+	for _, e := range env {
+		if strings.HasPrefix(e, "GROK_MEMORY=") {
+			values = append(values, e)
+		}
+	}
+	if len(values) != 1 || values[0] != "GROK_MEMORY=0" {
+		t.Fatalf("GROK_MEMORY env = %#v, want exactly GROK_MEMORY=0", values)
 	}
 }
 
