@@ -1652,10 +1652,11 @@ func markerTimestamp(rec *store.KVRecord) int64 {
 
 // ReleaseAgentLocally tears down every in-memory side channel that
 // could fire local writes for the agent on THIS peer: cron schedule,
-// in-flight one-shots, cached memory index, group-DM membership, and
-// the agents map entry itself. The on-disk DB rows + persona / blob
-// bodies remain so a future agent-sync back to this peer can
-// re-hydrate via ReloadAgentFromStore.
+// in-flight one-shots, cached memory index, group-DM notification
+// timers, and the agents map entry itself. The on-disk DB rows,
+// durable group-DM memberships, persona, and blob bodies remain so a
+// future agent-sync back to this peer can re-hydrate via
+// ReloadAgentFromStore.
 //
 // Called by the §3.7 source-release hook after a successful complete
 // + finalize: target now holds agent_locks, and source must stop
@@ -1667,45 +1668,35 @@ func markerTimestamp(rec *store.KVRecord) int64 {
 // Safe to call multiple times — every step is no-op-on-missing.
 // Threadsafe.
 func (m *Manager) ReleaseAgentLocally(agentID string) {
-	// withDBCleanup=true: group_dm_members rows are deleted from
-	// this peer's kojo.db. Semantically correct for a §3.7
-	// source-release — the agent's runtime is moving to target, so
-	// the source's local memberships belong to the prior incarnation
-	// and have no surviving consumer here.
-	m.releaseAgentLocallyCore(agentID, true /*withDBCleanup*/, true /*markReleased*/)
+	m.releaseAgentLocallyCore(agentID, true /*markReleased*/)
 }
 
 // TeardownAgentRuntime stops every in-memory runtime side channel
 // (cron, slack, in-flight one-shots, agents map entry) WITHOUT
 // writing the §3.7 source-release marker and WITHOUT touching DB
-// rows the orchestrator is about to overwrite (group-DM members).
-// Used by the inter-peer state-probe
-// self-heal path: the orchestrator is retrying a device-switch
-// against this host, so this peer has to stop driving the agent
-// before the new agent-sync lands, but the released marker would
-// flag the row for startup eviction on the next boot and undo
-// the retry.
+// rows. Used by the inter-peer state-probe self-heal path: the
+// orchestrator is retrying a device-switch against this host, so this
+// peer has to stop driving the agent before the new agent-sync lands,
+// but the released marker would flag the row for startup eviction on
+// the next boot and undo the retry.
 //
 // Idempotent. Threadsafe.
 func (m *Manager) TeardownAgentRuntime(agentID string) {
-	m.releaseAgentLocallyCore(agentID, false /*withDBCleanup*/, false /*markReleased*/)
+	m.releaseAgentLocallyCore(agentID, false /*markReleased*/)
 }
 
 // detachAgentInMemory is the no-DB-cleanup variant used by
 // EvictNonLocalAgentsAtStartup. The marker that triggered eviction
-// implies a prior ReleaseAgentLocally already ran (with full
-// cleanup), so we only need to tear down the in-memory side
-// channels that NewManager just rebuilt on this fresh boot. We do
-// NOT re-issue groupdms.RemoveAgent because its DB-row deletes have
-// already happened, and a stale-marker reconciliation case
-// (operator-driven re-handoff) where the guard above lets us through
-// would re-do destructive deletes against rows that may legitimately
-// belong to the (now re-arrived) agent.
+// implies a prior ReleaseAgentLocally already marked this peer as the
+// old source, so we only need to tear down the in-memory side channels
+// that NewManager just rebuilt on this fresh boot. We never call
+// groupdms.RemoveAgent here: group memberships are durable shared
+// state and source-release must not rewrite them.
 func (m *Manager) detachAgentInMemory(agentID string) {
-	m.releaseAgentLocallyCore(agentID, false /*withDBCleanup*/, false /*markReleased*/)
+	m.releaseAgentLocallyCore(agentID, false /*markReleased*/)
 }
 
-func (m *Manager) releaseAgentLocallyCore(agentID string, withDBCleanup, markReleased bool) {
+func (m *Manager) releaseAgentLocallyCore(agentID string, markReleased bool) {
 	if m == nil || agentID == "" {
 		return
 	}
@@ -1770,8 +1761,8 @@ func (m *Manager) releaseAgentLocallyCore(agentID string, withDBCleanup, markRel
 		}
 	}
 	m.closeIndex(agentID)
-	if withDBCleanup && m.groupdms != nil {
-		m.groupdms.RemoveAgent(agentID)
+	if m.groupdms != nil {
+		m.groupdms.detachAgentRuntime(agentID)
 	}
 	// remote_message_mirror を agent_id 単位に掃除。release / teardown /
 	// startup eviction いずれの経路でも、この peer はもう agent の holder
@@ -1800,10 +1791,10 @@ func (m *Manager) releaseAgentLocallyCore(agentID string, withDBCleanup, markRel
 	// comment above the cron.Remove call for the durability
 	// rationale.)
 	if m.logger != nil {
-		if withDBCleanup {
+		if markReleased {
 			m.logger.Info("agent released locally (handoff source-release)", "agent", agentID)
 		} else {
-			m.logger.Info("agent detached in-memory (startup eviction)", "agent", agentID)
+			m.logger.Info("agent runtime detached locally", "agent", agentID)
 		}
 	}
 }
@@ -1824,7 +1815,7 @@ func (m *Manager) releaseAgentLocallyCore(agentID string, withDBCleanup, markRel
 //     hasn't fired yet (keep, AgentLockGuard + fencing middleware
 //     handle the in-flight state). Without a durable signal of (a)
 //     we cannot tell them apart.
-//   - Released marker present: EVICT via ReleaseAgentLocally. We
+//   - Released marker present: EVICT via detachAgentInMemory. We
 //     wrote the marker at source-release time; the agent's runtime
 //     belongs to the new holder.
 //   - kv read error other than ErrNotFound: KEEP + log. A transient
@@ -1910,13 +1901,11 @@ func (m *Manager) EvictNonLocalAgentsAtStartup(ctx context.Context, selfPeerID s
 			m.logger.Info("startup eviction: released marker present; tearing down local runtime",
 				"agent", id, "holder", holderForLog, "self", selfPeerID)
 		}
-		// In-memory only: the durable side of the release
-		// (group_dm_members deletes) already ran
-		// at the original ReleaseAgentLocally call site that wrote
-		// the marker; re-running them on every restart would
-		// either no-op (rows already gone) or clobber rows that
-		// rightfully belong to a re-arrived incarnation if the
-		// marker is stale.
+		// In-memory only: source-release is a runtime move, not
+		// an archive/delete, so it must not rewrite durable group
+		// memberships. Re-running destructive cleanup on every
+		// restart would clobber rows that rightfully belong to a
+		// re-arrived incarnation if the marker is stale.
 		m.detachAgentInMemory(id)
 	}
 }

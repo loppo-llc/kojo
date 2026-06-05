@@ -770,6 +770,14 @@ func (m *GroupDMManager) GroupsForAgent(agentID string) []*GroupDM {
 	return result
 }
 
+// detachAgentRuntime clears local notification timers for an agent whose
+// runtime is leaving this peer. It intentionally preserves group membership:
+// device-switch release is not an archive/delete, and group definitions are
+// shared durable state that must survive a round trip between peers.
+func (m *GroupDMManager) detachAgentRuntime(agentID string) {
+	m.cleanNotifyKeys(agentID)
+}
+
 // maxCooldown is the upper bound for notification cooldown (1 hour).
 const maxCooldown = 3600
 

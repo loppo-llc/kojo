@@ -388,6 +388,55 @@ func TestGroupDMManager_RemoveAgent(t *testing.T) {
 	}
 }
 
+func TestManagerReleaseAgentLocallyPreservesGroupDMMembership(t *testing.T) {
+	gdm, mgr := setupGroupDMTest(t)
+	mgr.SetGroupDMManager(gdm)
+
+	g, err := gdm.Create("Studio handoff", []string{"ag_alice", "ag_bob", "ag_charlie"}, 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mgr.ReleaseAgentLocally("ag_alice")
+
+	if _, ok := mgr.Get("ag_alice"); ok {
+		t.Fatal("released agent should be detached from the local runtime")
+	}
+	got, ok := gdm.Get(g.ID)
+	if !ok {
+		t.Fatal("group should remain after source-release")
+	}
+	if !groupHasMember(got, "ag_alice") {
+		t.Fatal("source-release must not remove the agent from in-memory group membership")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rec, err := mgr.Store().GetGroupDM(ctx, g.ID)
+	if err != nil {
+		t.Fatalf("read persisted group: %v", err)
+	}
+	found := false
+	for _, mem := range rec.Members {
+		if mem.AgentID == "ag_alice" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("source-release must not remove the agent from persisted group membership")
+	}
+}
+
+func groupHasMember(g *GroupDM, agentID string) bool {
+	for _, mem := range g.Members {
+		if mem.AgentID == agentID {
+			return true
+		}
+	}
+	return false
+}
+
 func TestGroupDMManager_CopyIsolation(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
@@ -684,7 +733,7 @@ func TestGroupDMManager_RenderNotificationInlinesContent(t *testing.T) {
 		{sender: "Bob", content: "hi there", timestamp: "2026-04-25T00:00:00Z"},
 		{sender: "User", content: "ping", timestamp: "2026-04-25T00:00:01Z", senderIsUser: true},
 	}
-	out := gdm.renderNotification("ag_alice", g.ID, g.Name, "",pending)
+	out := gdm.renderNotification("ag_alice", g.ID, g.Name, "", pending)
 	if !strings.Contains(out, "2 new message(s) from User (human operator)") {
 		t.Errorf("missing batch count + latest-sender suffix: %s", out)
 	}
@@ -714,7 +763,7 @@ func TestGroupDMManager_RenderNotificationHeaderHasLatestSender(t *testing.T) {
 		{sender: "Old", content: "first", timestamp: "t"},
 		{sender: "Bob", content: "second", timestamp: "t"},
 	}
-	out := gdm.renderNotification("ag_alice", g.ID, g.Name, "",pending)
+	out := gdm.renderNotification("ag_alice", g.ID, g.Name, "", pending)
 	if !strings.Contains(out, "from Bob.") {
 		t.Errorf("expected 'from Bob.' suffix from newest pending entry: %s", out)
 	}
@@ -724,7 +773,7 @@ func TestGroupDMManager_RenderNotificationHeaderHasLatestSender(t *testing.T) {
 
 	// Human-user message gets the explicit operator tag in the header too.
 	pendingUser := []pendingMsg{{sender: "User", content: "ping", timestamp: "t", senderIsUser: true}}
-	out = gdm.renderNotification("ag_alice", g.ID, g.Name, "",pendingUser)
+	out = gdm.renderNotification("ag_alice", g.ID, g.Name, "", pendingUser)
 	if !strings.Contains(out, "from User (human operator).") {
 		t.Errorf("expected '(human operator)' tag in header: %s", out)
 	}
@@ -741,7 +790,7 @@ func TestGroupDMManager_RenderNotificationLargeMessageInlinedFully(t *testing.T)
 	const size = 3000 // > old 500-cap, < notifyMaxSingleContent and < batch budget
 	long := strings.Repeat("x", size)
 	pending := []pendingMsg{{sender: "Bob", content: long, timestamp: "t"}}
-	out := gdm.renderNotification("ag_alice", g.ID, g.Name, "",pending)
+	out := gdm.renderNotification("ag_alice", g.ID, g.Name, "", pending)
 	if !strings.Contains(out, long) {
 		t.Error("expected full content inlined without truncation")
 	}
@@ -773,7 +822,7 @@ func TestGroupDMManager_RenderNotificationDropsOldWhenBatchTooBig(t *testing.T) 
 			timestamp: "t",
 		}
 	}
-	out := gdm.renderNotification("ag_alice", g.ID, g.Name, "",pending)
+	out := gdm.renderNotification("ag_alice", g.ID, g.Name, "", pending)
 
 	// Newest message must be present in full.
 	newestPrefix := fmt.Sprintf("%d-", len(pending)-1)
@@ -802,7 +851,7 @@ func TestGroupDMManager_RenderNotificationSingleHugeMessageClipped(t *testing.T)
 
 	huge := strings.Repeat("z", notifyMaxBatchBytes+5000)
 	pending := []pendingMsg{{sender: "Bob", content: huge, timestamp: "t"}}
-	out := gdm.renderNotification("ag_alice", g.ID, g.Name, "",pending)
+	out := gdm.renderNotification("ag_alice", g.ID, g.Name, "", pending)
 	if !strings.Contains(out, "…[truncated]") {
 		t.Error("expected truncation marker for single huge message")
 	}
@@ -839,7 +888,7 @@ func TestGroupDMManager_RenderedSizeRespectsBudget(t *testing.T) {
 			senderIsUser: i%5 == 0, // sprinkle "(human operator)" labels
 		}
 	}
-	out := gdm.renderNotification("ag_alice", g.ID, g.Name, "",pending)
+	out := gdm.renderNotification("ag_alice", g.ID, g.Name, "", pending)
 	if len(out) > notifyMaxBatchBytes {
 		t.Fatalf("rendered notification = %d bytes, exceeds notifyMaxBatchBytes=%d. "+
 			"Bump notifyHeaderFooterReserve.", len(out), notifyMaxBatchBytes)
@@ -859,7 +908,7 @@ func TestGroupDMManager_RenderNotificationBatchLimit(t *testing.T) {
 	for i := range many {
 		many[i] = pendingMsg{sender: "Bob", content: "x", timestamp: "t"}
 	}
-	out := gdm.renderNotification("ag_alice", g.ID, g.Name, "",many)
+	out := gdm.renderNotification("ag_alice", g.ID, g.Name, "", many)
 	if !strings.Contains(out, "5 earlier message(s) omitted") {
 		t.Errorf("expected omission marker: %s", out)
 	}
