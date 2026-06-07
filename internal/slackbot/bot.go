@@ -396,6 +396,28 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 // streamAppendInterval is the minimum interval between AppendStream calls.
 const streamAppendInterval = 1 * time.Second
 
+// streamHeartbeatInterval is the maximum idle time tolerated on an open
+// Slack stream before a keepalive append is sent. Slack finalizes a
+// streaming message after a short inactivity TTL (observed: a 12s gap
+// survived, a 20.6s gap died), so the keepalive target stays well under
+// that. Only consulted while a stream is open and no real append has
+// happened for this long. Without this, silent stretches — codex
+// reasoning (emitted as thinking, which the bot does not stream), context
+// compaction, or long tool polling — let the stream die mid-turn and the
+// next real append fails with message_not_in_streaming_state.
+const streamHeartbeatInterval = 7 * time.Second
+
+// streamHeartbeatTick is how often the streaming loop wakes to check
+// whether a keepalive is due. The worst-case gap between appends during
+// silence is streamHeartbeatInterval + streamHeartbeatTick (~10s),
+// comfortably under Slack's inactivity TTL.
+const streamHeartbeatTick = 3 * time.Second
+
+// streamHeartbeatPayload is appended to keep an idle stream alive. A
+// zero-width space renders invisibly in Slack and is overwritten by the
+// finalize chat.update, so the user never sees the keepalive.
+const streamHeartbeatPayload = "\u200B"
+
 func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, messageTS, text, displayName, userID string) {
 	// Serialize processing within the same thread to maintain history
 	// consistency. The lock must cover both history fetching and prompt
@@ -648,7 +670,41 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		return true
 	}
 
-	for evt := range events {
+	// The stream is driven by a select rather than a plain `range events`
+	// so a keepalive ticker can fire even while the events channel is
+	// blocked (e.g. during a 50s+ context compaction, when the backend
+	// emits nothing at all). A separate heartbeat goroutine was rejected:
+	// it would race the main loop on streamTS / deadStreams / lastAppend
+	// and could interleave concurrent AppendStream calls on the same
+	// streamTS. Keeping everything in one goroutine avoids that entirely.
+	heartbeat := time.NewTicker(streamHeartbeatTick)
+	defer heartbeat.Stop()
+streamLoop:
+	for {
+		var evt agent.ChatEvent
+		select {
+		case <-heartbeat.C:
+			// Keep an open, genuinely-idle stream in streaming state.
+			// appendStream returns false only on the stream-closed
+			// signal; on that we park the dead stream so the next real
+			// event opens a fresh one (same recovery path as a real
+			// append failing). Rate-limit / transient errors keep the
+			// streamTS, so a 429 storm won't churn the stream here.
+			if streamTS != "" && time.Since(lastAppend) >= streamHeartbeatInterval {
+				if b.appendStream(ctx, channel, streamTS, streamHeartbeatPayload) {
+					lastAppend = time.Now()
+				} else {
+					dropStream()
+				}
+			}
+			continue
+		case e, ok := <-events:
+			if !ok {
+				break streamLoop
+			}
+			evt = e
+		}
+
 		switch evt.Type {
 		case "text":
 			response.WriteString(evt.Delta)
@@ -921,10 +977,14 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		// Batch post carried the full reply (StartStream failed or every
 		// stream died and we fell back). Dead partials are superseded.
 		finalDelivered = deliveredAll
-	} else if hasError || streamFailed {
-		// Either an explicit agent error, or StartStream failed and the
-		// turn produced no text. Surface a generic failure rather than
-		// going silent on the user.
+	} else if hasError || streamFailed || len(deadStreams) > 0 {
+		// Either an explicit agent error, StartStream failed, or a stream
+		// was opened and then died (every streamTS dropped, so streamTS is
+		// now "") before the turn produced any text. Without the
+		// len(deadStreams) check the last case would fall through every
+		// branch and go silent — the keepalive heartbeat makes this more
+		// likely by proactively dropping a TTL-dead stream during a long
+		// silence. Surface a generic failure rather than going silent.
 		b.postMessage(finCtx, channel, threadTS, "Sorry, something went wrong while processing your request.")
 	}
 
