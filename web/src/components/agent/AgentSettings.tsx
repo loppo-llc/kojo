@@ -734,7 +734,7 @@ export function AgentSettings() {
     <div className="min-h-full bg-neutral-950 text-neutral-200">
       <header className="flex items-center gap-2 px-4 py-3 border-b border-neutral-800">
         <button
-          onClick={() => navigate(`/agents/${id}`)}
+          onClick={() => navigate(`/agents/${id}`, { replace: true })}
           className="text-neutral-400 hover:text-neutral-200"
         >
           &larr;
@@ -1370,16 +1370,6 @@ export function AgentSettings() {
         {/* ── Slack Bot ── */}
         <section className="rounded-xl border border-neutral-800 p-5">
           <SlackBotSettings agentId={id!} />
-        </section>
-
-        {/* ── Credentials ── */}
-        <section className="rounded-xl border border-neutral-800 p-5">
-          <button
-            onClick={() => navigate(`/agents/${id}/credentials`)}
-            className="w-full py-3 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm font-medium"
-          >
-            Manage Credentials
-          </button>
         </section>
 
         {/* ── Actions ── */}

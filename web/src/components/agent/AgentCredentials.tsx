@@ -548,7 +548,7 @@ export function AgentCredentials() {
       <header className="flex items-center justify-between px-4 py-3 border-b border-neutral-800">
         <div className="flex items-center gap-2">
           <button
-            onClick={() => navigate(`/agents/${id}/settings`)}
+            onClick={() => navigate(`/agents/${id}`, { replace: true })}
             className="text-neutral-400 hover:text-neutral-200"
           >
             &larr;

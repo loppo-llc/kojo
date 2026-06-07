@@ -54,6 +54,18 @@ export function AgentChat() {
   const liveStreamToolsRef = useRef<Array<{ id: string; name: string; input: string; output: string | null }>>([]);
   const liveStreamAttachmentsRef = useRef<AgentMessageAttachment[]>([]);
 
+  useEffect(() => {
+    if (!id || typeof window === "undefined") return;
+    if (window.location.pathname !== `/agents/${id}`) return;
+    const state = window.history.state as { idx?: number } | null;
+    if (state && state.idx !== 0) return;
+
+    // Direct-opened chat should still back to kojo home before leaving kojo.
+    const current = window.location.pathname + window.location.search + window.location.hash;
+    window.history.replaceState({ ...(state ?? {}), idx: 0 }, "", "/");
+    window.history.pushState({ ...(state ?? {}), idx: 1 }, "", current);
+  }, [id]);
+
   // TTS — auto-play toggle (per agent, persisted in localStorage) and
   // shared player. The player is only "enabled" when both the agent has
   // a TTS config with enabled=true AND the user has the auto toggle on
@@ -536,7 +548,7 @@ export function AgentChat() {
       {/* Header */}
       <header className="flex items-center gap-3 px-4 py-3 border-b border-neutral-800 shrink-0">
         <button
-          onClick={() => navigate("/")}
+          onClick={() => navigate("/", { replace: true })}
           className="text-neutral-400 hover:text-neutral-200"
         >
           &larr;
@@ -626,7 +638,16 @@ export function AgentChat() {
           </button>
         )}
         <button
+          onClick={() => navigate(`/agents/${agent.id}/credentials`, { replace: true })}
+          className="p-2 text-neutral-500 hover:text-neutral-300 rounded"
+          title="Credentials"
+          aria-label="Credentials"
+        >
+          <span className="text-base leading-none">🔐</span>
+        </button>
+        <button
           onClick={() => navigate(`/agents/${agent.id}/data`, {
+            replace: true,
             state: { kojoFileBrowser: "root", kojoFileBrowserDepth: 0 },
           })}
           className="p-2 text-neutral-500 hover:text-neutral-300 rounded"
@@ -637,7 +658,7 @@ export function AgentChat() {
           </svg>
         </button>
         <button
-          onClick={() => navigate(`/agents/${agent.id}/settings`)}
+          onClick={() => navigate(`/agents/${agent.id}/settings`, { replace: true })}
           className="p-2 text-neutral-500 hover:text-neutral-300 rounded"
           title="Settings"
         >
