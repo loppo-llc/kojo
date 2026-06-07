@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -15,6 +16,60 @@ import (
 	"syscall"
 	"time"
 )
+
+// codexLineScanner reads newline-delimited JSON from an io.Reader with no
+// per-line size limit. bufio.Scanner caps each token at MaxScanTokenSize (and
+// the Buffer max we set), failing with "token too long" the moment Codex emits
+// a single oversized line — e.g. an item/completed notification carrying the
+// full aggregatedOutput of a command that printed hundreds of KB. Once that
+// happens the read loop dies and the whole turn wedges. bufio.Reader.ReadBytes
+// instead grows its buffer to whatever the line needs, so large outputs are
+// read intact and the "token too long" failure class is eliminated.
+type codexLineScanner struct {
+	r    *bufio.Reader
+	line []byte
+	err  error
+}
+
+func newCodexLineScanner(r io.Reader) *codexLineScanner {
+	return &codexLineScanner{r: bufio.NewReaderSize(r, 64*1024)}
+}
+
+// Scan advances to the next line, stripping the trailing CR/LF. It returns
+// false at EOF (after yielding any final unterminated line) or on a read error.
+func (s *codexLineScanner) Scan() bool {
+	if s.err != nil {
+		return false
+	}
+	line, err := s.r.ReadBytes('\n')
+	if err != nil {
+		// ReadBytes returns any bytes read before the error. Yield a final
+		// unterminated line once (matching bufio.Scanner, which surfaces the
+		// last token before reporting the error on the next Scan); the stored
+		// err makes the subsequent Scan return false. This holds for both EOF
+		// and other read errors so partial data is never silently dropped.
+		s.err = err
+		line = bytes.TrimRight(line, "\r\n")
+		if len(line) > 0 {
+			s.line = line
+			return true
+		}
+		return false
+	}
+	s.line = bytes.TrimRight(line, "\r\n")
+	return true
+}
+
+func (s *codexLineScanner) Text() string { return string(s.line) }
+
+// Err returns the first non-EOF read error, or nil. EOF is the normal
+// termination and is not reported as an error (matching bufio.Scanner).
+func (s *codexLineScanner) Err() error {
+	if s.err == io.EOF {
+		return nil
+	}
+	return s.err
+}
 
 // CodexBackend implements ChatBackend for the Codex CLI using app-server
 // (JSON-RPC 2.0 over stdio) for real streaming support.
@@ -120,11 +175,12 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			b.logger.Debug("codex rpc notify", "method", method)
 		}
 
-		shutdown := func() {
+		shutdown := func() error {
 			stdin.Close()
+			var waitErr error
 			done := make(chan struct{})
 			go func() {
-				cmd.Wait()
+				waitErr = cmd.Wait()
 				close(done)
 			}()
 			select {
@@ -133,6 +189,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				cmd.Process.Kill()
 				<-done
 			}
+			return waitErr
 		}
 
 		// Step 1: Initialize handshake
@@ -147,8 +204,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			},
 		})
 
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		scanner := newCodexLineScanner(stdout)
 
 		// Wait for initialize response
 		var threadStartID, turnStartID int64
@@ -306,18 +362,26 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			return
 		}
 
-		// Scanner exited without turn/completed — abnormal exit
+		// Stream ended without turn/completed — abnormal exit.
 		if err := scanner.Err(); err != nil {
 			b.logger.Warn("codex app-server scanner error", "err", err)
 		}
 
-		var processError string
-		if err := cmd.Wait(); err != nil {
-			b.logger.Warn("codex app-server exited with error", "err", err, "stderr", stderrBuf.String())
-			processError = strings.TrimSpace(stderrBuf.String())
-			if processError == "" {
-				processError = err.Error()
-			}
+		// Reap the process via shutdown() rather than calling cmd.Wait()
+		// directly. Codex app-server is a persistent JSON-RPC server: it does
+		// not exit just because we stopped reading its stdout, so a bare
+		// cmd.Wait() here would block forever — leaking the process and hanging
+		// the Slack turn with no terminal event. shutdown() closes stdin to
+		// request a clean exit, then force-kills after a grace period, so we
+		// always reach the done/error send below.
+		waitErr := shutdown()
+
+		processError := strings.TrimSpace(stderrBuf.String())
+		if processError == "" && waitErr != nil {
+			processError = waitErr.Error()
+		}
+		if waitErr != nil || processError != "" {
+			b.logger.Warn("codex app-server exited abnormally", "err", waitErr, "stderr", stderrBuf.String())
 		}
 
 		errMsg := processError
@@ -364,7 +428,7 @@ func (r *codexStreamResult) hasOutput() bool {
 // parseCodexStream reads Codex app-server JSON-RPC notifications from a scanner
 // and emits ChatEvents via the send callback. Returns the accumulated result.
 // If send returns false (context cancelled), parsing stops immediately.
-func parseCodexStream(scanner *bufio.Scanner, turnStartID int64, logger *slog.Logger, send func(ChatEvent) bool) *codexStreamResult {
+func parseCodexStream(scanner *codexLineScanner, turnStartID int64, logger *slog.Logger, send func(ChatEvent) bool) *codexStreamResult {
 	res := &codexStreamResult{}
 	itemPhases := make(map[string]string) // itemID -> phase ("commentary" or "final_answer")
 
