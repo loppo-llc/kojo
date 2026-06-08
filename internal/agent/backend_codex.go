@@ -102,6 +102,18 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	args := []string{"app-server"}
 	for name, srv := range opts.MCPServers {
 		args = append(args, "-c", fmt.Sprintf("mcp_servers.%s.url=%q", name, srv.URL))
+		// Codex's streamable HTTP MCP transport doesn't accept arbitrary request
+		// headers (`mcp_servers.<name>.http_headers` is rejected as an invalid
+		// transport); it only supports a bearer token read from an env var via
+		// `bearer_token_env_var`. kojo's auth middleware (extractBearer) accepts
+		// the per-agent token from either `X-Kojo-Token` or `Authorization:
+		// Bearer`, and filterEnv already exports that exact token into the codex
+		// process env as KOJO_AGENT_TOKEN, so point Codex at it. Without this the
+		// /mcp call lands as a Guest principal (403) and Codex silently drops the
+		// server from its tool list.
+		if srv.Headers["X-Kojo-Token"] != "" {
+			args = append(args, "-c", fmt.Sprintf("mcp_servers.%s.bearer_token_env_var=%q", name, "KOJO_AGENT_TOKEN"))
+		}
 	}
 	cmd := exec.CommandContext(ctx, codexPath, args...)
 	cmd.Dir = dir
