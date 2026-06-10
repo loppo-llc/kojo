@@ -10,6 +10,16 @@ describe("toolModels — Opus 4.8 / effort defaults", () => {
     expect(modelsForTool("claude")).toContain("claude-opus-4-8");
   });
 
+  it("lists claude-fable-5 as a claude model", () => {
+    expect(modelsForTool("claude")).toContain("claude-fable-5");
+  });
+
+  it("Fable 5 supports xhigh and max but defaults to high", () => {
+    expect(effortLevelsForModel("claude-fable-5")).toContain("xhigh");
+    expect(effortLevelsForModel("claude-fable-5")).toContain("max");
+    expect(defaultEffortForModel("claude-fable-5")).toBe("high");
+  });
+
   it("Opus 4.8 supports xhigh but defaults to high", () => {
     expect(effortLevelsForModel("claude-opus-4-8")).toContain("xhigh");
     expect(defaultEffortForModel("claude-opus-4-8")).toBe("high");
