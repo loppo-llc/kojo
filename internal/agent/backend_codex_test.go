@@ -1,10 +1,13 @@
 package agent
 
 import (
-	"bufio"
 	"encoding/json"
+	"errors"
+	"io"
 	"strings"
 	"testing"
+
+	"github.com/loppo-llc/kojo/internal/chathistory"
 )
 
 // rpcLine builds a JSON-RPC notification line for testing.
@@ -38,8 +41,7 @@ func rpcResponseLine(id int64, result any, rpcErr *rpcError) string {
 func collectCodexEvents(t *testing.T, turnStartID int64, lines ...string) ([]ChatEvent, *codexStreamResult) {
 	t.Helper()
 	input := strings.Join(lines, "\n") + "\n"
-	scanner := bufio.NewScanner(strings.NewReader(input))
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	scanner := newCodexLineScanner(strings.NewReader(input))
 
 	var events []ChatEvent
 	send := func(e ChatEvent) bool {
@@ -49,6 +51,163 @@ func collectCodexEvents(t *testing.T, turnStartID int64, lines ...string) ([]Cha
 
 	result := parseCodexStream(scanner, turnStartID, testLogger(), send)
 	return events, result
+}
+
+func TestCodexLineScanner(t *testing.T) {
+	collect := func(input string) ([]string, error) {
+		s := newCodexLineScanner(strings.NewReader(input))
+		var lines []string
+		for s.Scan() {
+			lines = append(lines, s.Text())
+		}
+		return lines, s.Err()
+	}
+
+	t.Run("terminated lines", func(t *testing.T) {
+		lines, err := collect("a\nbb\nccc\n")
+		if err != nil {
+			t.Fatalf("Err = %v, want nil", err)
+		}
+		if want := []string{"a", "bb", "ccc"}; !equalStrings(lines, want) {
+			t.Errorf("lines = %v, want %v", lines, want)
+		}
+	})
+
+	t.Run("final line without trailing newline", func(t *testing.T) {
+		lines, err := collect("a\nlast-no-nl")
+		if err != nil {
+			t.Fatalf("Err = %v, want nil (EOF must not surface as error)", err)
+		}
+		if want := []string{"a", "last-no-nl"}; !equalStrings(lines, want) {
+			t.Errorf("lines = %v, want %v", lines, want)
+		}
+	})
+
+	t.Run("blank lines preserved as empty", func(t *testing.T) {
+		lines, _ := collect("a\n\nb\n")
+		if want := []string{"a", "", "b"}; !equalStrings(lines, want) {
+			t.Errorf("lines = %v, want %v", lines, want)
+		}
+	})
+
+	t.Run("CRLF trimmed", func(t *testing.T) {
+		lines, _ := collect("a\r\nb\r\n")
+		if want := []string{"a", "b"}; !equalStrings(lines, want) {
+			t.Errorf("lines = %v, want %v", lines, want)
+		}
+	})
+
+	t.Run("empty input", func(t *testing.T) {
+		lines, err := collect("")
+		if err != nil {
+			t.Fatalf("Err = %v, want nil", err)
+		}
+		if len(lines) != 0 {
+			t.Errorf("lines = %v, want empty", lines)
+		}
+	})
+
+	t.Run("large line under cap", func(t *testing.T) {
+		big := strings.Repeat("z", 5*1024*1024)
+		lines, err := collect(big + "\n")
+		if err != nil {
+			t.Fatalf("Err = %v, want nil", err)
+		}
+		if len(lines) != 1 || len(lines[0]) != len(big) {
+			t.Fatalf("got %d lines (first len %d), want 1 line of len %d", len(lines), func() int {
+				if len(lines) > 0 {
+					return len(lines[0])
+				}
+				return -1
+			}(), len(big))
+		}
+	})
+
+	t.Run("line over cap", func(t *testing.T) {
+		tooBig := strings.Repeat("z", chathistory.MaxJSONLLineBytes+1)
+		lines, err := collect(tooBig + "\n")
+		if !errors.Is(err, chathistory.ErrLineTooLarge) {
+			t.Fatalf("Err = %v, want ErrLineTooLarge", err)
+		}
+		if len(lines) != 0 {
+			t.Fatalf("lines = %d, want 0 when line exceeds cap", len(lines))
+		}
+	})
+}
+
+// TestCodexLineScanner_NonEOFErrorYieldsPartialLine verifies that a partial
+// line followed by a non-EOF read error is yielded once (matching
+// bufio.Scanner) and the error is then reported via Err().
+func TestCodexLineScanner_NonEOFErrorYieldsPartialLine(t *testing.T) {
+	wantErr := io.ErrUnexpectedEOF
+	r := io.MultiReader(strings.NewReader("partial-no-newline"), &errReader{err: wantErr})
+	s := newCodexLineScanner(r)
+
+	if !s.Scan() {
+		t.Fatal("Scan() = false, want true (partial line must be yielded)")
+	}
+	if got := s.Text(); got != "partial-no-newline" {
+		t.Errorf("Text() = %q, want %q", got, "partial-no-newline")
+	}
+	if s.Scan() {
+		t.Error("second Scan() = true, want false")
+	}
+	if s.Err() != wantErr {
+		t.Errorf("Err() = %v, want %v", s.Err(), wantErr)
+	}
+}
+
+type errReader struct{ err error }
+
+func (e *errReader) Read([]byte) (int, error) { return 0, e.err }
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestParseCodexStream_OversizedLine is a regression test for the
+// "bufio.Scanner: token too long" hang: a single item/completed notification
+// carrying a multi-MB aggregatedOutput (e.g. a command that printed a huge
+// blob) must be read intact instead of killing the stream. bufio.Scanner with
+// a 1MB max token would have failed here; codexLineScanner must read it while
+// still enforcing its larger MaxJSONLLineBytes safety cap.
+func TestParseCodexStream_OversizedLine(t *testing.T) {
+	bigOutput := strings.Repeat("x", 3*1024*1024) // 3MB, well over the old 1MB cap
+	events, result := collectCodexEvents(t, 1,
+		rpcLine("item/completed", map[string]any{
+			"item": map[string]any{
+				"id":               "i1",
+				"type":             "commandExecution",
+				"command":          "cat huge.log",
+				"aggregatedOutput": bigOutput,
+				"exitCode":         0,
+			},
+		}),
+		rpcLine("turn/completed", map[string]any{
+			"turn": map[string]any{"status": "completed"},
+		}),
+	)
+
+	if !result.turnCompleted {
+		t.Fatal("expected turnCompleted = true (stream must survive the oversized line)")
+	}
+	var gotOutput string
+	for _, e := range events {
+		if e.Type == "tool_result" {
+			gotOutput = e.ToolOutput
+		}
+	}
+	if len(gotOutput) != len(bigOutput) {
+		t.Errorf("tool_result output length = %d, want %d (output truncated/lost)", len(gotOutput), len(bigOutput))
+	}
 }
 
 func TestParseCodexStream_TextDelta(t *testing.T) {
@@ -426,8 +585,7 @@ func TestParseCodexStream_Cancelled(t *testing.T) {
 		"itemId": "i1", "delta": "b",
 	}) + "\n"
 
-	scanner := bufio.NewScanner(strings.NewReader(input))
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	scanner := newCodexLineScanner(strings.NewReader(input))
 
 	callCount := 0
 	send := func(e ChatEvent) bool {

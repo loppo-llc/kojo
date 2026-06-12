@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -14,7 +16,120 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/chathistory"
 )
+
+// codexLineScanner reads newline-delimited JSON from an io.Reader with a
+// per-line cap large enough for real Codex command output. bufio.Scanner caps
+// each token at MaxScanTokenSize (and the Buffer max we set), failing with
+// "token too long" when Codex emits a single multi-MB item/completed line.
+// bufio.Reader.ReadSlice avoids that fixed scanner cap, while the explicit
+// MaxJSONLLineBytes bound prevents a corrupted/adversarial stream from growing
+// one line without limit.
+type codexLineScanner struct {
+	r    *bufio.Reader
+	line []byte
+	err  error
+	buf  []byte
+}
+
+func newCodexLineScanner(r io.Reader) *codexLineScanner {
+	return &codexLineScanner{r: bufio.NewReaderSize(r, 64*1024)}
+}
+
+// Scan advances to the next line, stripping the trailing CR/LF. It returns
+// false at EOF (after yielding any final unterminated line) or on a read error.
+func (s *codexLineScanner) Scan() bool {
+	if s.err != nil {
+		return false
+	}
+	for {
+		chunk, err := s.r.ReadSlice('\n')
+		switch {
+		case err == nil:
+			if len(s.buf) > 0 {
+				if !s.appendChunk(chunk) {
+					return false
+				}
+				s.line = bytes.TrimRight(s.buf, "\r\n")
+				s.buf = nil
+				return true
+			}
+			if len(chunk) > chathistory.MaxJSONLLineBytes {
+				s.err = codexLineTooLargeErr()
+				return false
+			}
+			s.line = bytes.TrimRight(chunk, "\r\n")
+			return true
+
+		case errors.Is(err, bufio.ErrBufferFull):
+			if !s.appendChunk(chunk) {
+				return false
+			}
+			continue
+
+		case errors.Is(err, io.EOF):
+			if len(chunk) > 0 && !s.appendChunk(chunk) {
+				return false
+			}
+			s.err = io.EOF
+			if len(s.buf) == 0 {
+				return false
+			}
+			s.line = bytes.TrimRight(s.buf, "\r\n")
+			s.buf = nil
+			return true
+
+		default:
+			if len(chunk) > 0 && !s.appendChunk(chunk) {
+				return false
+			}
+			s.err = err
+			if len(s.buf) == 0 {
+				return false
+			}
+			s.line = bytes.TrimRight(s.buf, "\r\n")
+			s.buf = nil
+			return true
+		}
+	}
+}
+
+func (s *codexLineScanner) Text() string { return string(s.line) }
+
+// Err returns the first non-EOF read error, or nil. EOF is the normal
+// termination and is not reported as an error (matching bufio.Scanner).
+func (s *codexLineScanner) Err() error {
+	if s.err == io.EOF {
+		return nil
+	}
+	return s.err
+}
+
+func (s *codexLineScanner) appendChunk(chunk []byte) bool {
+	if len(s.buf)+len(chunk) > chathistory.MaxJSONLLineBytes {
+		s.buf = nil
+		s.err = codexLineTooLargeErr()
+		return false
+	}
+	s.buf = append(s.buf, chunk...)
+	return true
+}
+
+func codexLineTooLargeErr() error {
+	return fmt.Errorf("codex app-server JSON-RPC line exceeds %d bytes: %w", chathistory.MaxJSONLLineBytes, chathistory.ErrLineTooLarge)
+}
+
+func codexReadErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, chathistory.ErrLineTooLarge) {
+		return fmt.Sprintf("codex app-server emitted a JSON-RPC line over %d bytes; refusing to buffer it", chathistory.MaxJSONLLineBytes)
+	}
+	return "codex app-server read error: " + err.Error()
+}
 
 // CodexBackend implements ChatBackend for the Codex CLI using app-server
 // (JSON-RPC 2.0 over stdio) for real streaming support.
@@ -47,6 +162,18 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	args := []string{"app-server"}
 	for name, srv := range opts.MCPServers {
 		args = append(args, "-c", fmt.Sprintf("mcp_servers.%s.url=%q", name, srv.URL))
+		// Codex's streamable HTTP MCP transport doesn't accept arbitrary request
+		// headers (`mcp_servers.<name>.http_headers` is rejected as an invalid
+		// transport); it only supports a bearer token read from an env var via
+		// `bearer_token_env_var`. kojo's auth middleware (extractBearer) accepts
+		// the per-agent token from either `X-Kojo-Token` or `Authorization:
+		// Bearer`, and filterEnv already exports that exact token into the codex
+		// process env as KOJO_AGENT_TOKEN, so point Codex at it. Without this the
+		// /mcp call lands as a Guest principal (403) and Codex silently drops the
+		// server from its tool list.
+		if srv.Headers["X-Kojo-Token"] != "" {
+			args = append(args, "-c", fmt.Sprintf("mcp_servers.%s.bearer_token_env_var=%q", name, "KOJO_AGENT_TOKEN"))
+		}
 	}
 	cmd := exec.CommandContext(ctx, codexPath, args...)
 	cmd.Dir = dir
@@ -120,11 +247,12 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			b.logger.Debug("codex rpc notify", "method", method)
 		}
 
-		shutdown := func() {
+		shutdown := func() error {
 			stdin.Close()
+			var waitErr error
 			done := make(chan struct{})
 			go func() {
-				cmd.Wait()
+				waitErr = cmd.Wait()
 				close(done)
 			}()
 			select {
@@ -133,6 +261,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				cmd.Process.Kill()
 				<-done
 			}
+			return waitErr
 		}
 
 		// Step 1: Initialize handshake
@@ -147,8 +276,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			},
 		})
 
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		scanner := newCodexLineScanner(stdout)
 
 		// Wait for initialize response
 		var threadStartID, turnStartID int64
@@ -174,7 +302,11 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			}
 		}
 		if !initDone {
-			send(ChatEvent{Type: "error", ErrorMessage: "codex app-server initialize failed"})
+			errMsg := "codex app-server initialize failed"
+			if err := scanner.Err(); err != nil {
+				errMsg = codexReadErrorMessage(err)
+			}
+			send(ChatEvent{Type: "error", ErrorMessage: errMsg})
 			shutdown()
 			return
 		}
@@ -217,7 +349,11 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				threadStartID = sendRPC("thread/resume", resumeParams)
 				msg, ok := waitCodexRPCResponse(scanner, threadStartID)
 				if !ok {
-					send(ChatEvent{Type: "error", ErrorMessage: "codex thread/resume failed: no response"})
+					errMsg := "codex thread/resume failed: no response"
+					if err := scanner.Err(); err != nil {
+						errMsg = "codex thread/resume failed: " + codexReadErrorMessage(err)
+					}
+					send(ChatEvent{Type: "error", ErrorMessage: errMsg})
 					shutdown()
 					return
 				}
@@ -242,7 +378,11 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			threadStartID = sendRPC("thread/start", threadParams)
 			msg, ok := waitCodexRPCResponse(scanner, threadStartID)
 			if !ok {
-				send(ChatEvent{Type: "error", ErrorMessage: "codex thread/start failed: no response"})
+				errMsg := "codex thread/start failed: no response"
+				if err := scanner.Err(); err != nil {
+					errMsg = "codex thread/start failed: " + codexReadErrorMessage(err)
+				}
+				send(ChatEvent{Type: "error", ErrorMessage: errMsg})
 				shutdown()
 				return
 			}
@@ -306,18 +446,33 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			return
 		}
 
-		// Scanner exited without turn/completed — abnormal exit
-		if err := scanner.Err(); err != nil {
-			b.logger.Warn("codex app-server scanner error", "err", err)
+		// Stream ended without turn/completed — abnormal exit.
+		scannerErr := scanner.Err()
+		if scannerErr != nil {
+			b.logger.Warn("codex app-server scanner error", "err", scannerErr)
 		}
 
-		var processError string
-		if err := cmd.Wait(); err != nil {
-			b.logger.Warn("codex app-server exited with error", "err", err, "stderr", stderrBuf.String())
+		// Reap the process via shutdown() rather than calling cmd.Wait()
+		// directly. Codex app-server is a persistent JSON-RPC server: it does
+		// not exit just because we stopped reading its stdout, so a bare
+		// cmd.Wait() here would block forever — leaking the process and hanging
+		// the Slack turn with no terminal event. shutdown() closes stdin to
+		// request a clean exit, then force-kills after a grace period, so we
+		// always reach the done/error send below.
+		waitErr := shutdown()
+
+		processError := ""
+		if scannerErr != nil {
+			processError = codexReadErrorMessage(scannerErr)
+		}
+		if processError == "" {
 			processError = strings.TrimSpace(stderrBuf.String())
-			if processError == "" {
-				processError = err.Error()
-			}
+		}
+		if processError == "" && waitErr != nil {
+			processError = waitErr.Error()
+		}
+		if waitErr != nil || processError != "" {
+			b.logger.Warn("codex app-server exited abnormally", "err", waitErr, "stderr", stderrBuf.String())
 		}
 
 		errMsg := processError
@@ -364,7 +519,7 @@ func (r *codexStreamResult) hasOutput() bool {
 // parseCodexStream reads Codex app-server JSON-RPC notifications from a scanner
 // and emits ChatEvents via the send callback. Returns the accumulated result.
 // If send returns false (context cancelled), parsing stops immediately.
-func parseCodexStream(scanner *bufio.Scanner, turnStartID int64, logger *slog.Logger, send func(ChatEvent) bool) *codexStreamResult {
+func parseCodexStream(scanner *codexLineScanner, turnStartID int64, logger *slog.Logger, send func(ChatEvent) bool) *codexStreamResult {
 	res := &codexStreamResult{}
 	itemPhases := make(map[string]string) // itemID -> phase ("commentary" or "final_answer")
 

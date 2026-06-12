@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -101,7 +100,7 @@ func cloneStringAnyMap(in map[string]any) map[string]any {
 	return out
 }
 
-func waitCodexRPCResponse(scanner *bufio.Scanner, id int64) (*rpcMessage, bool) {
+func waitCodexRPCResponse(scanner *codexLineScanner, id int64) (*rpcMessage, bool) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
