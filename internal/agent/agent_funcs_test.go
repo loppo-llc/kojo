@@ -151,11 +151,15 @@ func TestValidEffort(t *testing.T) {
 }
 
 func TestValidModelEffort(t *testing.T) {
-	// xhigh is valid for opus models
-	for _, m := range []string{"opus", "claude-opus-4-8", "claude-opus-4-7"} {
+	// xhigh is valid for opus models and Fable 5
+	for _, m := range []string{"opus", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"} {
 		if !ValidModelEffort(m, "xhigh") {
 			t.Errorf("expected xhigh to be valid for %q", m)
 		}
+	}
+	// Fable 5 supports max effort (Mythos-class, like opus)
+	if !ValidModelEffort("claude-fable-5", "max") {
+		t.Errorf("expected max to be valid for claude-fable-5")
 	}
 	// xhigh is invalid for non-opus/non-codex models
 	for _, m := range []string{"sonnet", "claude-opus-4-6", "haiku", ""} {
