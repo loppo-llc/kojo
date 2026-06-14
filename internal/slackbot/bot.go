@@ -1470,6 +1470,64 @@ func (b *Bot) clearAssistantStatus(ctx context.Context, channel, threadTS string
 	})
 }
 
+func postMessageOpts(threadTS string, opts ...slack.MsgOption) []slack.MsgOption {
+	if threadTS != "" {
+		opts = append(opts, slack.MsgOptionTS(threadTS))
+	}
+	return opts
+}
+
+func shouldFallbackToLegacyText(err error) bool {
+	var slackErr slack.SlackErrorResponse
+	if errors.As(err, &slackErr) {
+		switch slackErr.Err {
+		case "invalid_blocks_format", "markdown_text_conflict":
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Bot) postMessageWithRetry(ctx context.Context, channel, threadTS string, opts []slack.MsgOption) error {
+	for attempt := 0; attempt <= maxRateLimitRetry; attempt++ {
+		_, _, err := b.api.PostMessageContext(ctx, channel, opts...)
+		if err == nil {
+			return nil
+		}
+		var rlErr *slack.RateLimitedError
+		if errors.As(err, &rlErr) {
+			// No retries left — return immediately. Sleeping here would
+			// burn 1+ s of chunkPostTimeout for no subsequent attempt,
+			// exceeding the documented 1+2+3 s backoff chain and risking
+			// a cascade where later chunks lose their budget too.
+			if attempt == maxRateLimitRetry {
+				return err
+			}
+			wait := rlErr.RetryAfter
+			if wait <= 0 {
+				wait = time.Duration(attempt+1) * time.Second
+			}
+			b.logger.Debug("slack rate limited, waiting", "retryAfter", wait)
+			sleep := b.rateLimitSleep
+			if sleep == nil {
+				sleep = time.After
+			}
+			select {
+			case <-ctx.Done():
+				b.logger.Warn("slack post cancelled while waiting on rate limit",
+					"channel", channel, "threadTS", threadTS, "err", ctx.Err())
+				return ctx.Err()
+			case <-sleep(wait):
+				continue
+			}
+		}
+		return err
+	}
+	// Unreachable: the loop either succeeds, returns on a non-rate-limit
+	// error, or returns on the final rate-limit attempt.
+	return nil
+}
+
 // postMessage sends a message to Slack with rate-limit retry. Returns
 // true if Slack accepted the post, false if the call ultimately failed
 // (rate-limit retries exhausted, context cancelled, or any non-rate-limit
@@ -1500,59 +1558,36 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) b
 	// <@U…>, …) the same way as the chat.update path. Mention misuse
 	// is controlled by the agent's system prompt, not by escaping at
 	// this layer.
-	opts := []slack.MsgOption{
-		slack.MsgOptionMarkdownText(text),
-	}
-	if threadTS != "" {
-		opts = append(opts, slack.MsgOptionTS(threadTS))
-	}
-
-	for attempt := 0; attempt <= maxRateLimitRetry; attempt++ {
-		_, _, err := b.api.PostMessageContext(ctx, channel, opts...)
-		if err == nil {
-			return true
+	markdownOpts := postMessageOpts(threadTS, slack.MsgOptionMarkdownText(text))
+	if err := b.postMessageWithRetry(ctx, channel, threadTS, markdownOpts); err != nil {
+		if shouldFallbackToLegacyText(err) {
+			b.logger.Warn("slack markdown_text post rejected, retrying with legacy text",
+				"channel", channel, "threadTS", threadTS, "err", err)
+			legacyOpts := postMessageOpts(threadTS, slack.MsgOptionText(PlainToSlack(text), false))
+			if legacyErr := b.postMessageWithRetry(ctx, channel, threadTS, legacyOpts); legacyErr == nil {
+				return true
+			} else {
+				b.logger.Warn("failed to post slack message after legacy text fallback",
+					"channel", channel, "threadTS", threadTS,
+					"markdownErr", err, "err", legacyErr)
+				return false
+			}
 		}
 		var rlErr *slack.RateLimitedError
 		if errors.As(err, &rlErr) {
-			// No retries left — return immediately. Sleeping here
-			// would burn 1+ s of chunkPostTimeout for no subsequent
-			// attempt, exceeding the documented 1+2+3 s backoff
-			// chain and risking a cascade where later chunks lose
-			// their budget too.
-			if attempt == maxRateLimitRetry {
-				// Include err and RetryAfter so production logs
-				// can distinguish a Slack hard 429 from a slow
-				// recovery — without these the Warn is opaque.
-				b.logger.Warn("failed to post slack message after rate limit retries",
-					"channel", channel, "threadTS", threadTS,
-					"retryAfter", rlErr.RetryAfter, "err", err)
-				return false
-			}
-			wait := rlErr.RetryAfter
-			if wait <= 0 {
-				wait = time.Duration(attempt+1) * time.Second
-			}
-			b.logger.Debug("slack rate limited, waiting", "retryAfter", wait)
-			sleep := b.rateLimitSleep
-			if sleep == nil {
-				sleep = time.After
-			}
-			select {
-			case <-ctx.Done():
-				b.logger.Warn("slack post cancelled while waiting on rate limit",
-					"channel", channel, "threadTS", threadTS, "err", ctx.Err())
-				return false
-			case <-sleep(wait):
-				continue
-			}
+			// Include err and RetryAfter so production logs can
+			// distinguish a Slack hard 429 from a slow recovery —
+			// without these the Warn is opaque.
+			b.logger.Warn("failed to post slack message after rate limit retries",
+				"channel", channel, "threadTS", threadTS,
+				"retryAfter", rlErr.RetryAfter, "err", err)
+			return false
 		}
 		b.logger.Warn("failed to post slack message",
 			"channel", channel, "threadTS", threadTS, "err", err)
 		return false
 	}
-	// Unreachable: the rate-limited branch above returns on the final
-	// attempt rather than falling through. Kept to satisfy the compiler.
-	return false
+	return true
 }
 
 // threadLock is a reference-counted mutex for serializing per-thread processing.

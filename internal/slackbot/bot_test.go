@@ -268,6 +268,107 @@ func TestBotPostMessageSendsMarkdownTextOnly(t *testing.T) {
 	}
 }
 
+func TestBotPostMessageFallsBackToLegacyTextOnMarkdownTextErrors(t *testing.T) {
+	for _, slackError := range []string{"invalid_blocks_format", "markdown_text_conflict"} {
+		t.Run(slackError, func(t *testing.T) {
+			type captured struct {
+				text         string
+				markdownText string
+				threadTS     string
+			}
+			var calls []captured
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/chat.postMessage":
+					_ = r.ParseForm()
+					calls = append(calls, captured{
+						text:         r.FormValue("text"),
+						markdownText: r.FormValue("markdown_text"),
+						threadTS:     r.FormValue("thread_ts"),
+					})
+					if len(calls) == 1 {
+						fmt.Fprintf(w, `{"ok":false,"error":%q}`, slackError)
+						return
+					}
+					fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":"123.456"}`)
+				default:
+					fmt.Fprintf(w, `{"ok":true}`)
+				}
+			}))
+			defer srv.Close()
+
+			api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			bot := &Bot{
+				api:    api,
+				logger: testLogger,
+				ctx:    ctx,
+			}
+
+			body := "## Heading\n\n**bold** and [link](https://example.com)"
+			if !bot.postMessage(context.Background(), "C1", "thread.999", body) {
+				t.Fatal("postMessage should succeed via legacy text fallback")
+			}
+			if len(calls) != 2 {
+				t.Fatalf("chat.postMessage called %d times, want 2", len(calls))
+			}
+			if calls[0].markdownText != body {
+				t.Errorf("first call markdown_text = %q, want %q", calls[0].markdownText, body)
+			}
+			if calls[0].text != "" {
+				t.Errorf("first call text must be empty, got %q", calls[0].text)
+			}
+			if calls[1].markdownText != "" {
+				t.Errorf("fallback call markdown_text must be empty, got %q", calls[1].markdownText)
+			}
+			wantText := PlainToSlack(body)
+			if calls[1].text != wantText {
+				t.Errorf("fallback text = %q, want %q", calls[1].text, wantText)
+			}
+			for i, call := range calls {
+				if call.threadTS != "thread.999" {
+					t.Errorf("call %d thread_ts = %q, want thread.999", i+1, call.threadTS)
+				}
+			}
+		})
+	}
+}
+
+func TestBotPostMessageDoesNotFallbackToLegacyTextOnUnrelatedSlackError(t *testing.T) {
+	var called int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/chat.postMessage":
+			called++
+			fmt.Fprintf(w, `{"ok":false,"error":"invalid_auth"}`)
+		default:
+			fmt.Fprintf(w, `{"ok":true}`)
+		}
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bot := &Bot{
+		api:    api,
+		logger: testLogger,
+		ctx:    ctx,
+	}
+
+	if bot.postMessage(context.Background(), "C1", "", "hello") {
+		t.Fatal("postMessage should fail on invalid_auth")
+	}
+	if called != 1 {
+		t.Fatalf("chat.postMessage called %d times, want 1", called)
+	}
+}
+
 // TestFinalizeUpdateOptsSendsMarkdownTextOnly verifies that the stream-finalize
 // chat.update call wires markdown_text alone, with no text field. Pairing
 // MsgOptionText with MsgOptionMarkdownText was the root cause of the
