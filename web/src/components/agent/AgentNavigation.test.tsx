@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StrictMode } from "react";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { BrowserRouter, createMemoryRouter, Route, RouterProvider, Routes, useNavigate } from "react-router";
 import { AgentChat } from "./AgentChat";
 import { AgentCredentials } from "./AgentCredentials";
@@ -192,7 +192,7 @@ describe("agent route navigation", () => {
     expect(router.state.location.pathname).toBe("/");
   });
 
-  it("keeps BrowserRouter in sync after using browser back from a directly opened chat", async () => {
+  it("keeps BrowserRouter in sync after using the chat back button and reopening chat", async () => {
     window.history.replaceState({ idx: 0 }, "", "/agents/demo");
 
     render(
@@ -208,17 +208,13 @@ describe("agent route navigation", () => {
 
     await waitFor(() => expect(screen.getAllByText("Demo Agent").length).toBeGreaterThan(0));
 
-    await act(async () => {
-      window.history.back();
-    });
+    fireEvent.click(screen.getByRole("button", { name: "←" }));
     expect(await screen.findByText("Open demo")).toBeInTheDocument();
 
     fireEvent.click(screen.getByText("Open demo"));
     await waitFor(() => expect(screen.getAllByText("Demo Agent").length).toBeGreaterThan(0));
 
-    await act(async () => {
-      window.history.back();
-    });
+    fireEvent.click(screen.getByRole("button", { name: "←" }));
     expect(await screen.findByText("Open demo")).toBeInTheDocument();
   });
 });

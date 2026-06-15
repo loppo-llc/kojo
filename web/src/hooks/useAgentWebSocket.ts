@@ -51,9 +51,9 @@ export function useAgentWebSocket({
 
     ws.onclose = () => {
       if (wsRef.current !== ws) return;
+      if (!activeRef.current) return;
       setConnected(false);
       onDisconnectRef.current?.();
-      if (!activeRef.current) return;
       const delay = Math.min(backoffRef.current, 30000);
       backoffRef.current = delay * 2;
       reconnectRef.current = setTimeout(connect, delay);
@@ -72,7 +72,18 @@ export function useAgentWebSocket({
     return () => {
       activeRef.current = false;
       if (reconnectRef.current) clearTimeout(reconnectRef.current);
-      wsRef.current?.close();
+      const ws = wsRef.current;
+      if (!ws) return;
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close(1000, "route change");
+      }
+      if (wsRef.current === ws) {
+        wsRef.current = null;
+      }
     };
   }, [connect]);
 

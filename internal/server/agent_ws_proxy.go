@@ -199,7 +199,7 @@ func (s *Server) proxyAgentWebSocket(w http.ResponseWriter, r *http.Request, age
 	}()
 	wg.Wait()
 
-	s.logger.Info("agent ws proxy: closed",
+	s.logger.Debug("agent ws proxy: closed",
 		"agent", agentID, "target", targetDeviceID)
 }
 

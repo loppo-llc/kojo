@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
-import { useParams, useNavigate, useLocation } from "react-router";
+import { useParams, useNavigate } from "react-router";
 import { agentApi, type AgentInfo, type AgentMessage, type AgentMessageAttachment, type ChatEvent } from "../../lib/agentApi";
 import { api, isThumbSupported } from "../../lib/api";
 import { localRFC3339 } from "../../lib/utils";
@@ -21,7 +21,6 @@ const PAGE_SIZE = 30;
 export function AgentChat() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const location = useLocation();
   const [agent, setAgent] = useState<AgentInfo | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [input, setInput] = useState(() => sessionStorage.getItem(`agent-draft:${id}`) ?? "");
@@ -54,20 +53,6 @@ export function AgentChat() {
   const liveStreamThinkingRef = useRef("");
   const liveStreamToolsRef = useRef<Array<{ id: string; name: string; input: string; output: string | null }>>([]);
   const liveStreamAttachmentsRef = useRef<AgentMessageAttachment[]>([]);
-
-  useEffect(() => {
-    if (!id || typeof window === "undefined") return;
-    if (location.pathname !== `/agents/${id}`) return;
-    const state = window.history.state as { idx?: number } | null;
-    if (state && state.idx !== 0) return;
-
-    // Direct-opened chat should still back to kojo home before leaving kojo.
-    // Route through React Router so its internal location and history index
-    // stay in sync with the browser entries.
-    const current = location.pathname + location.search + location.hash;
-    navigate("/", { replace: true });
-    navigate(current);
-  }, [id, location.hash, location.pathname, location.search, navigate]);
 
   // TTS — auto-play toggle (per agent, persisted in localStorage) and
   // shared player. The player is only "enabled" when both the agent has

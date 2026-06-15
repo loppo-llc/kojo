@@ -47,7 +47,7 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	s.logger.Info("agent websocket connected", "agent", agentID)
+	s.logger.Debug("agent websocket connected", "agent", agentID)
 
 	bgEvents, bgUnsub := s.resumeBackgroundChat(ctx, conn, agentID)
 	defer func() {
@@ -85,7 +85,7 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 					// browser-reload churn at Debug.
 					if ctx.Err() == nil {
 						switch websocket.CloseStatus(err) {
-						case websocket.StatusNormalClosure, websocket.StatusGoingAway:
+						case websocket.StatusNormalClosure, websocket.StatusGoingAway, websocket.StatusNoStatusRcvd:
 							s.logger.Debug("agent websocket ping closed by client",
 								"agent", agentID, "err", err)
 						default:
@@ -114,16 +114,17 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 				// non-nil means we initiated the close ourselves
 				// (e.g. ping goroutine cancelled) — skip the log
 				// in that case to avoid duplicating the ping-fail
-				// entry. websocket.StatusNormalClosure /
-				// StatusGoingAway are the clean closes browsers
-				// emit on tab navigation / shutdown — log them at
-				// Debug so noisy environments stay readable.
+				// entry. websocket.StatusNormalClosure,
+				// StatusGoingAway, and StatusNoStatusRcvd are the
+				// normal close shapes browsers emit on tab navigation
+				// / shutdown — log them at Debug so noisy environments
+				// stay readable.
 				// Everything else (read timeouts, frame errors,
 				// peer-side resets) is Info so the abnormal
 				// disconnects show up in production logs.
 				if ctx.Err() == nil {
 					switch websocket.CloseStatus(err) {
-					case websocket.StatusNormalClosure, websocket.StatusGoingAway:
+					case websocket.StatusNormalClosure, websocket.StatusGoingAway, websocket.StatusNoStatusRcvd:
 						s.logger.Debug("agent websocket closed by client",
 							"agent", agentID, "err", err)
 					default:
