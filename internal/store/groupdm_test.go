@@ -260,6 +260,67 @@ func TestLatestGroupDMMessageIDForCAS(t *testing.T) {
 	}
 }
 
+func TestSoftDeleteGroupDMMessages(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	seedAgent(t, s, "a1")
+	if _, err := s.InsertGroupDM(ctx, &GroupDMRecord{
+		ID: "g", Name: "n", Members: []GroupDMMember{{AgentID: "a1"}},
+	}, GroupDMInsertOptions{}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	for _, id := range []string{"m1", "m2"} {
+		if _, err := s.AppendGroupDMMessage(ctx, &GroupDMMessageRecord{
+			ID: id, GroupDMID: "g", AgentID: "a1", Content: id,
+		}, GroupDMMessageInsertOptions{}); err != nil {
+			t.Fatalf("append %s: %v", id, err)
+		}
+	}
+
+	deleted, err := s.SoftDeleteGroupDMMessages(ctx, "g")
+	if err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted = %d, want 2", deleted)
+	}
+	if _, err := s.GetGroupDM(ctx, "g"); err != nil {
+		t.Fatalf("group should remain live: %v", err)
+	}
+	list, err := s.ListGroupDMMessages(ctx, "g", GroupDMMessageListOptions{})
+	if err != nil {
+		t.Fatalf("list after clear: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("list len = %d, want 0", len(list))
+	}
+	latest, seq, err := s.LatestGroupDMMessageID(ctx, "g")
+	if err != nil {
+		t.Fatalf("latest after clear: %v", err)
+	}
+	if latest != "" || seq != 0 {
+		t.Fatalf("latest = (%q, %d), want empty", latest, seq)
+	}
+
+	rec, err := s.AppendGroupDMMessage(ctx, &GroupDMMessageRecord{
+		ID: "m3", GroupDMID: "g", AgentID: "a1", Content: "new",
+	}, GroupDMMessageInsertOptions{})
+	if err != nil {
+		t.Fatalf("append after clear: %v", err)
+	}
+	if rec.Seq != 3 {
+		t.Fatalf("new seq = %d, want 3", rec.Seq)
+	}
+}
+
+func TestSoftDeleteGroupDMMessagesMissingGroup(t *testing.T) {
+	s := openTestStore(t)
+	_, err := s.SoftDeleteGroupDMMessages(context.Background(), "missing")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
 func TestAppendGroupDMMessageAllowMissingAuthor(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

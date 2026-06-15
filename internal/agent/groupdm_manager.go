@@ -745,6 +745,34 @@ func (m *GroupDMManager) Messages(groupID string, limit int, before string) ([]*
 	return msgs, hasMore, head, nil
 }
 
+// ClearMessages deletes the visible transcript for a live group without
+// deleting the group itself. Pending notification buffers for the group are
+// dropped so already-cleared messages are not delivered later.
+func (m *GroupDMManager) ClearMessages(ctx context.Context, groupID string) (int64, error) {
+	m.mu.Lock()
+	if _, err := m.liveGroupLocked(groupID); err != nil {
+		m.mu.Unlock()
+		return 0, err
+	}
+	if db := getGlobalStore(); db != nil {
+		n, err := db.SoftDeleteGroupDMMessages(ctx, groupID)
+		if err != nil {
+			m.mu.Unlock()
+			return 0, err
+		}
+		delete(m.latestMsgID, groupID)
+		m.mu.Unlock()
+		m.cleanNotifyKeys(groupID)
+		m.logger.Info("group DM messages cleared", "id", groupID, "count", n)
+		return n, nil
+	}
+	delete(m.latestMsgID, groupID)
+	m.mu.Unlock()
+	m.cleanNotifyKeys(groupID)
+	m.logger.Info("group DM messages cleared", "id", groupID, "count", 0)
+	return 0, nil
+}
+
 // LatestMessageID returns the cached head message ID for a group, or "" if
 // the group has no messages (or does not exist — the caller is expected to
 // check existence separately when that distinction matters).

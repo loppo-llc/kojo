@@ -1280,6 +1280,51 @@ func TestGroupDMManager_Messages_ReturnsLatestID(t *testing.T) {
 	}
 }
 
+func TestGroupDMManager_ClearMessages(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
+
+	first, err := gdm.PostMessage(context.Background(), g.ID, "ag_alice", "first", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gdm.PostUserMessage(context.Background(), g.ID, "second", nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := gdm.LatestMessageID(g.ID); got == "" {
+		t.Fatal("latest should be populated before clear")
+	}
+
+	deleted, err := gdm.ClearMessages(context.Background(), g.ID)
+	if err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted = %d, want 2", deleted)
+	}
+	if got := gdm.LatestMessageID(g.ID); got != "" {
+		t.Fatalf("latest after clear = %q, want empty", got)
+	}
+	msgs, hasMore, latest, err := gdm.Messages(g.ID, 50, "")
+	if err != nil {
+		t.Fatalf("messages after clear: %v", err)
+	}
+	if len(msgs) != 0 || hasMore || latest != "" {
+		t.Fatalf("after clear = (%d msgs, hasMore=%v, latest=%q), want empty", len(msgs), hasMore, latest)
+	}
+
+	next, err := gdm.PostMessage(context.Background(), g.ID, "ag_bob", "after", "", false)
+	if err != nil {
+		t.Fatalf("post after clear: %v", err)
+	}
+	if next.ID == first.ID {
+		t.Fatal("post after clear reused old message ID")
+	}
+	if got := gdm.LatestMessageID(g.ID); got != next.ID {
+		t.Fatalf("latest after new post = %q, want %q", got, next.ID)
+	}
+}
+
 func TestGroupDMManager_PostUserMessage_AdvancesLatestForCAS(t *testing.T) {
 	// A user post must advance the cursor so a subsequent agent post that
 	// references the pre-user head gets rejected with the user message in

@@ -38,6 +38,10 @@ export function GroupDMChat() {
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState("");
   const deleteDialogRef = useRef<HTMLDivElement>(null);
+  const [showClearDialog, setShowClearDialog] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [clearError, setClearError] = useState("");
+  const clearDialogRef = useRef<HTMLDivElement>(null);
 
   // User input
   const [input, setInput] = useState(() =>
@@ -47,6 +51,7 @@ export function GroupDMChat() {
   const [sendError, setSendError] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [enterSends] = useEnterSends();
+  const pollGenerationRef = useRef(0);
 
   // File attachments — uploaded to /api/v1/blobs, attached to the user
   // message on send, then cleared on success.
@@ -78,8 +83,14 @@ export function GroupDMChat() {
     if (showDeleteDialog) deleteDialogRef.current?.focus();
   }, [showDeleteDialog]);
 
+  // Focus clear-history dialog overlay for Escape key
+  useEffect(() => {
+    if (showClearDialog) clearDialogRef.current?.focus();
+  }, [showClearDialog]);
+
   // Reset state when id changes
   useEffect(() => {
+    pollGenerationRef.current += 1;
     setGroup(null);
     setMessages([]);
     setHasMore(false);
@@ -87,6 +98,9 @@ export function GroupDMChat() {
     setShowDeleteDialog(false);
     setDeleteNotify(false);
     setDeleteError("");
+    setShowClearDialog(false);
+    setClearing(false);
+    setClearError("");
     setPendingFiles([]);
     setUploadError(null);
   }, [id]);
@@ -101,15 +115,19 @@ export function GroupDMChat() {
     });
   }, [id]);
 
-  // Poll for new messages — merge with already-loaded older messages
-  // Only set hasMore on initial load; polling preserves older pages
+  // Poll for new messages — merge with already-loaded older messages when
+  // the server still reports older pages. A fully-covered page replaces the
+  // local transcript so remote clears do not keep stale rows on screen.
   const initialLoadDone = useRef(false);
   useEffect(() => {
     if (!id || notFound) return;
     initialLoadDone.current = false;
-    const load = () =>
+    const load = () => {
+      const generation = pollGenerationRef.current;
       groupdmApi.messages(id, PAGE_SIZE).then((r) => {
+        if (generation !== pollGenerationRef.current) return;
         setMessages((prev) => {
+          if (!r.hasMore) return r.messages;
           const newIds = new Set(r.messages.map((m) => m.id));
           const older = prev.filter((m) => !newIds.has(m.id));
           return [...older, ...r.messages];
@@ -117,8 +135,11 @@ export function GroupDMChat() {
         if (!initialLoadDone.current) {
           setHasMore(r.hasMore);
           initialLoadDone.current = true;
+        } else if (!r.hasMore) {
+          setHasMore(false);
         }
       }).catch(console.error);
+    };
     load();
     const interval = setInterval(load, 3000);
     return () => clearInterval(interval);
@@ -432,6 +453,19 @@ export function GroupDMChat() {
         </div>
         <button
           onClick={() => {
+            setClearError("");
+            setShowClearDialog(true);
+          }}
+          className="p-2 text-neutral-600 hover:text-amber-300 rounded"
+          title="Clear message history"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
+            <path d="M5.25 3A2.25 2.25 0 003 5.25v9.5A2.25 2.25 0 005.25 17h5.378a2.25 2.25 0 001.591-.659l4.122-4.122A2.25 2.25 0 0017 10.628V5.25A2.25 2.25 0 0014.75 3h-9.5zM4.5 5.25c0-.414.336-.75.75-.75h9.5c.414 0 .75.336.75.75v4.5H12.25a2.5 2.5 0 00-2.5 2.5v3.25h-4.5a.75.75 0 01-.75-.75v-9.5zm6.75 10.06v-3.06c0-.552.448-1 1-1h3.06l-4.06 4.06z" />
+            <path d="M7.25 6.5a.75.75 0 000 1.5h5.5a.75.75 0 000-1.5h-5.5zM7.25 9.5a.75.75 0 000 1.5h1.5a.75.75 0 000-1.5h-1.5z" />
+          </svg>
+        </button>
+        <button
+          onClick={() => {
             setDeleteNotify(false);
             setDeleteError("");
             setShowDeleteDialog(true);
@@ -621,6 +655,61 @@ export function GroupDMChat() {
           {enterSends ? "Enter to send, Shift+Enter for newline" : "Shift+Enter to send, Enter for newline"}
         </div>
       </div>
+
+      {/* Clear history confirmation dialog */}
+      {showClearDialog && (
+        <div
+          ref={clearDialogRef}
+          tabIndex={-1}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 outline-none"
+          onClick={(e) => { if (e.target === e.currentTarget && !clearing) setShowClearDialog(false); }}
+          onKeyDown={(e) => { if (e.key === "Escape" && !clearing) setShowClearDialog(false); }}
+        >
+          <div className="bg-neutral-900 border border-neutral-700 rounded-lg p-5 w-80 shadow-xl">
+            <h3 className="text-sm font-medium text-neutral-200 mb-2">
+              Clear history?
+            </h3>
+            <p className="text-xs text-neutral-400 mb-4">
+              Messages in &ldquo;{group.name}&rdquo; will be deleted. The group stays open.
+            </p>
+            {clearError && (
+              <p className="text-xs text-red-400 mb-3">{clearError}</p>
+            )}
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setShowClearDialog(false)}
+                disabled={clearing}
+                className="px-3 py-1.5 text-xs text-neutral-400 hover:text-neutral-200 rounded disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  setClearing(true);
+                  setClearError("");
+                  try {
+                    await groupdmApi.clearMessages(group.id);
+                    pollGenerationRef.current += 1;
+                    setMessages([]);
+                    setHasMore(false);
+                    lastMessageIdRef.current = undefined;
+                    suppressAutoScrollRef.current = false;
+                    setShowClearDialog(false);
+                  } catch (e) {
+                    setClearError(e instanceof Error ? e.message : "Failed to clear history");
+                  } finally {
+                    setClearing(false);
+                  }
+                }}
+                disabled={clearing}
+                className="px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-500 text-white rounded disabled:opacity-50"
+              >
+                {clearing ? "Clearing…" : "Clear"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Delete confirmation dialog */}
       {showDeleteDialog && (

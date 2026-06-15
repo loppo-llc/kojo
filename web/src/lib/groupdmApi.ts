@@ -78,6 +78,9 @@ export const groupdmApi = {
   delete: (id: string, notify = false) =>
     del<{ ok: boolean }>(`/api/v1/groupdms/${id}${notify ? "?notify=true" : ""}`),
 
+  clearMessages: (id: string) =>
+    del<{ ok: boolean; deleted: number }>(`/api/v1/groupdms/${id}/messages`),
+
   messages: (id: string, limit = 50, before?: string) => {
     const params = new URLSearchParams({ limit: String(limit) });
     if (before) params.set("before", before);

@@ -401,6 +401,27 @@ func (s *Server) handleGetGroupMessages(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func (s *Server) handleClearGroupMessages(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.requireMemberOrOwner(w, r, id) {
+		return
+	}
+	deleted, err := s.groupdms.ClearMessages(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, agent.ErrGroupNotFound) || errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+			return
+		}
+		s.logger.Error("clear groupdm messages failed", "id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"deleted": deleted,
+	})
+}
+
 func (s *Server) handlePostGroupMessage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req struct {

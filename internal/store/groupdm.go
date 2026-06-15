@@ -560,7 +560,7 @@ func sameCanonicalMembers(a, b []GroupDMMember) bool {
 type GroupDMMessageRecord struct {
 	ID          string
 	GroupDMID   string
-	Seq         int64 // per-group
+	Seq         int64  // per-group
 	AgentID     string // "" for system messages (NULL in DB)
 	Content     string
 	Attachments json.RawMessage
@@ -857,6 +857,49 @@ SELECT m.id, m.groupdm_id, m.seq, COALESCE(m.agent_id,''),
 		out = append(out, rec)
 	}
 	return out, rows.Err()
+}
+
+// SoftDeleteGroupDMMessages tombstones every live message in groupID and
+// returns the number of rows newly marked deleted. The parent group must be
+// live; deleting a transcript for an unknown or tombstoned group is treated
+// as ErrNotFound so callers don't silently clear stale views.
+func (s *Store) SoftDeleteGroupDMMessages(ctx context.Context, groupID string) (int64, error) {
+	if groupID == "" {
+		return 0, errors.New("store.SoftDeleteGroupDMMessages: groupdm_id required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var alive int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT 1 FROM groupdms WHERE id = ? AND deleted_at IS NULL`, groupID,
+	).Scan(&alive); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, err
+	}
+
+	now := NowMillis()
+	const q = `
+UPDATE groupdm_messages
+   SET deleted_at = ?, updated_at = ?, version = version + 1
+ WHERE groupdm_id = ? AND deleted_at IS NULL`
+	res, err := tx.ExecContext(ctx, q, now, now, groupID)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 func scanGroupDMMessageRow(r rowScanner) (*GroupDMMessageRecord, error) {
