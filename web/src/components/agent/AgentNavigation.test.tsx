@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { createMemoryRouter, RouterProvider } from "react-router";
+import { StrictMode } from "react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { BrowserRouter, createMemoryRouter, Route, RouterProvider, Routes, useNavigate } from "react-router";
 import { AgentChat } from "./AgentChat";
 import { AgentCredentials } from "./AgentCredentials";
 import { AgentSettings } from "./AgentSettings";
@@ -95,6 +96,11 @@ function homeRoute() {
   return <div>Home</div>;
 }
 
+function BrowserHomeRoute() {
+  const navigate = useNavigate();
+  return <button onClick={() => navigate("/agents/demo")}>Open demo</button>;
+}
+
 beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn();
   mocks.agentGet.mockResolvedValue(demoAgent());
@@ -113,6 +119,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  window.history.replaceState(null, "", "/");
   vi.clearAllMocks();
 });
 
@@ -183,5 +190,35 @@ describe("agent route navigation", () => {
 
     await router.navigate(-1);
     expect(router.state.location.pathname).toBe("/");
+  });
+
+  it("keeps BrowserRouter in sync after using browser back from a directly opened chat", async () => {
+    window.history.replaceState({ idx: 0 }, "", "/agents/demo");
+
+    render(
+      <StrictMode>
+        <BrowserRouter>
+          <Routes>
+            <Route path="/" element={<BrowserHomeRoute />} />
+            <Route path="/agents/:id" element={<AgentChat />} />
+          </Routes>
+        </BrowserRouter>
+      </StrictMode>,
+    );
+
+    await waitFor(() => expect(screen.getAllByText("Demo Agent").length).toBeGreaterThan(0));
+
+    await act(async () => {
+      window.history.back();
+    });
+    expect(await screen.findByText("Open demo")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("Open demo"));
+    await waitFor(() => expect(screen.getAllByText("Demo Agent").length).toBeGreaterThan(0));
+
+    await act(async () => {
+      window.history.back();
+    });
+    expect(await screen.findByText("Open demo")).toBeInTheDocument();
   });
 });
