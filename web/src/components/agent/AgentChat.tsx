@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
-import { useParams, useNavigate } from "react-router";
+import { useParams, useNavigate, useLocation } from "react-router";
 import { agentApi, type AgentInfo, type AgentMessage, type AgentMessageAttachment, type ChatEvent } from "../../lib/agentApi";
 import { api, isThumbSupported } from "../../lib/api";
 import { localRFC3339 } from "../../lib/utils";
@@ -21,6 +21,7 @@ const PAGE_SIZE = 30;
 export function AgentChat() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   // BrowserRouter's useNavigate returns an unstable reference (recreated
   // on every location change). Putting it in useEffect deps would cause
   // spurious re-runs. Stash it in a ref so effects can call it without
@@ -546,10 +547,20 @@ export function AgentChat() {
             // navigate(-1) pops the real history entry instead of
             // replacing with "/", which avoids accumulating dead "/"
             // entries after repeated Home → Chat → Back cycles.
-            // Fall back to replace when this is the first entry (idx 0,
-            // e.g. opened directly from a bookmark or notification).
+            // Fall back to replace when this is the first entry
+            // (e.g. opened directly from a bookmark or notification).
+            //
+            // React Router stores {idx, key} in history.state. idx is
+            // the stack position — stable across replace navigations
+            // (tab switches, settings→chat). location.key changes on
+            // every replace, which would falsely allow navigate(-1)
+            // after a direct load + replace. NaN > 0 is false, so
+            // NaN-idx (hash URLs) falls through safely.
             const state = window.history.state as { idx?: number } | null;
-            if (state && typeof state.idx === "number" && state.idx > 0) {
+            const canGoBack = typeof state?.idx === "number"
+              ? state.idx > 0
+              : location.key !== "default"; // fallback when idx absent
+            if (canGoBack) {
               navigate(-1);
             } else {
               navigate("/", { replace: true });
