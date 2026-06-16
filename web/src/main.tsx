@@ -21,7 +21,7 @@ bootstrapTokenFromURL();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <BrowserRouter>
+    <BrowserRouter unstable_useTransitions={false}>
       <Routes>
         <Route path="/" element={<Dashboard />} />
         <Route path="/session/:id" element={<SessionPage />} />

@@ -25,6 +25,11 @@ const TABS: { key: SessionTab; label: string }[] = [
 export function SessionPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  // BrowserRouter's useNavigate returns an unstable reference (recreated
+  // on every location change). Stash in a ref so effects can call it
+  // without listing it as a dependency.
+  const navigateRef = useRef(navigate);
+  navigateRef.current = navigate;
   const location = useLocation();
   const [searchParams] = useSearchParams();
   // peerId, when present, tells the Hub's WS proxy which peer
@@ -175,9 +180,9 @@ export function SessionPage() {
     api.sessions.get(id!, peerId).then((s) => {
       setSession(s);
       if (s.status === "exited") setExited(true);
-    }).catch(() => navigate("/"));
+    }).catch(() => navigateRef.current("/"));
     api.sessions.attachments(id!, peerId).then(mergeAttachments).catch(() => {});
-  }, [id, navigate, peerId]);
+  }, [id, peerId]);
 
   // Show persisted lastOutput for exited sessions when no live scrollback arrived
   useEffect(() => {
@@ -281,7 +286,17 @@ export function SessionPage() {
     <div ref={containerRef} className="h-full flex flex-col bg-neutral-950">
       {/* Header */}
       <header className="flex items-center gap-2 px-3 py-2 border-b border-neutral-800 shrink-0">
-        <button onClick={() => navigate("/")} className="text-neutral-400 hover:text-neutral-200">
+        <button
+          onClick={() => {
+            const state = window.history.state as { idx?: number } | null;
+            if (state && typeof state.idx === "number" && state.idx > 0) {
+              navigate(-1);
+            } else {
+              navigate("/", { replace: true });
+            }
+          }}
+          className="text-neutral-400 hover:text-neutral-200"
+        >
           &larr;
         </button>
         <span className="font-mono font-bold">{session?.tool}</span>
@@ -482,7 +497,14 @@ export function SessionPage() {
             New Session
           </button>
           <button
-            onClick={() => navigate("/")}
+            onClick={() => {
+              const state = window.history.state as { idx?: number } | null;
+              if (state && typeof state.idx === "number" && state.idx > 0) {
+                navigate(-1);
+              } else {
+                navigate("/", { replace: true });
+              }
+            }}
             className="w-full py-2.5 text-sm text-neutral-500 hover:text-neutral-400"
           >
             Back

@@ -43,6 +43,8 @@ interface GitPanelProps {
 export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelProps = {}) {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const navigateRef = useRef(navigate);
+  navigateRef.current = navigate;
   const [session, setSession] = useState<SessionInfo>();
   const [status, setStatus] = useState<GitStatus | null>(null);
   const [commits, setCommits] = useState<GitLogEntry[]>([]);
@@ -61,9 +63,9 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
 
   useEffect(() => {
     if (!embedded && id) {
-      api.sessions.get(id, peerId).then(setSession).catch(() => navigate("/"));
+      api.sessions.get(id, peerId).then(setSession).catch(() => navigateRef.current("/"));
     }
-  }, [id, navigate, embedded, peerId]);
+  }, [id, embedded, peerId]);
 
   const LOG_LIMIT = 10;
   const refreshIdRef = useRef(0);

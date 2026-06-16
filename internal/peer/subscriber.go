@@ -252,9 +252,16 @@ func (s *Subscriber) runOne(ctx context.Context, t SubscriberTarget) {
 			return
 		}
 		if err != nil && s.logger != nil {
-			s.logger.Warn("peer.Subscriber: connection dropped",
-				"target", t.DeviceID, "addr", t.Address,
-				"backoff", backoff.String(), "err", err)
+			switch websocket.CloseStatus(err) {
+			case websocket.StatusNormalClosure, websocket.StatusGoingAway:
+				s.logger.Debug("peer.Subscriber: connection closed by peer",
+					"target", t.DeviceID, "addr", t.Address,
+					"backoff", backoff.String(), "err", err)
+			default:
+				s.logger.Warn("peer.Subscriber: connection dropped",
+					"target", t.DeviceID, "addr", t.Address,
+					"backoff", backoff.String(), "err", err)
+			}
 		}
 		// Backoff with jitter (±25%).
 		jittered := jitter(backoff)

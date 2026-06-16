@@ -21,6 +21,12 @@ const PAGE_SIZE = 30;
 export function AgentChat() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  // BrowserRouter's useNavigate returns an unstable reference (recreated
+  // on every location change). Putting it in useEffect deps would cause
+  // spurious re-runs. Stash it in a ref so effects can call it without
+  // listing it as a dependency.
+  const navigateRef = useRef(navigate);
+  navigateRef.current = navigate;
   const [agent, setAgent] = useState<AgentInfo | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [input, setInput] = useState(() => sessionStorage.getItem(`agent-draft:${id}`) ?? "");
@@ -98,12 +104,12 @@ export function AgentChat() {
   useEffect(() => {
     if (!id) return;
     abortedIdRef.current = null; // Clear stale abort state on agent change
-    agentApi.get(id).then(setAgent).catch(() => navigate("/"));
+    agentApi.get(id).then(setAgent).catch(() => navigateRef.current("/"));
     agentApi.messages(id, PAGE_SIZE).then((r) => {
       setMessages(r.messages);
       setHasMore(r.hasMore);
     }).catch(console.error);
-  }, [id, navigate]);
+  }, [id]);
 
   // §3.7 device-switch: when the agent's runtime lives on a remote
   // peer that is currently offline, the WS proxy + GET /messages
@@ -536,7 +542,19 @@ export function AgentChat() {
       {/* Header */}
       <header className="flex items-center gap-3 px-4 py-3 border-b border-neutral-800 shrink-0">
         <button
-          onClick={() => navigate("/", { replace: true })}
+          onClick={() => {
+            // navigate(-1) pops the real history entry instead of
+            // replacing with "/", which avoids accumulating dead "/"
+            // entries after repeated Home → Chat → Back cycles.
+            // Fall back to replace when this is the first entry (idx 0,
+            // e.g. opened directly from a bookmark or notification).
+            const state = window.history.state as { idx?: number } | null;
+            if (state && typeof state.idx === "number" && state.idx > 0) {
+              navigate(-1);
+            } else {
+              navigate("/", { replace: true });
+            }
+          }}
           className="text-neutral-400 hover:text-neutral-200"
         >
           &larr;

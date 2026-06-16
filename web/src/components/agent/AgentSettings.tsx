@@ -13,6 +13,8 @@ import { buildAgentSavePayload } from "./agentSettingsPayload";
 export function AgentSettings() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const navigateRef = useRef(navigate);
+  navigateRef.current = navigate;
   const [agent, setAgent] = useState<AgentInfo | null>(null);
   const [name, setName] = useState("");
   const [persona, setPersona] = useState("");
@@ -184,7 +186,7 @@ export function AgentSettings() {
       agentApi.getUserContext(id),
     ]).then(([agentRes, checkinRes, userCtxRes]) => {
       if (agentRes.status !== "fulfilled") {
-        navigate("/");
+        navigateRef.current("/");
         return;
       }
       const a = agentRes.value;
@@ -249,7 +251,7 @@ export function AgentSettings() {
         setUserContextEtag("");
       }
     });
-  }, [id, navigate]);
+  }, [id]);
 
   // Keep nextCronAt fresh. The initial GET captures a snapshot; without
   // this the displayed time drifts into the past (e.g. user leaves the

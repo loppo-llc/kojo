@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 import { FileDataBrowser } from "../FileDataBrowser";
 import { agentApi, type AgentInfo } from "../../lib/agentApi";
@@ -7,6 +7,8 @@ import { AgentAvatar } from "./AgentAvatar";
 export function AgentDataBrowser() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const navigateRef = useRef(navigate);
+  navigateRef.current = navigate;
   const [agent, setAgent] = useState<AgentInfo | null>(null);
 
   useEffect(() => {
@@ -19,12 +21,12 @@ export function AgentDataBrowser() {
         if (!cancelled) setAgent(a);
       })
       .catch(() => {
-        if (!cancelled) navigate("/");
+        if (!cancelled) navigateRef.current("/");
       });
     return () => {
       cancelled = true;
     };
-  }, [id, navigate]);
+  }, [id]);
 
   const dataSource = useMemo(() => {
     if (!id) return null;

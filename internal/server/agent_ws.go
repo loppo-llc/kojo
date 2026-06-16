@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"mime"
 	"net/http"
 	"os"
@@ -89,8 +91,13 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 							s.logger.Debug("agent websocket ping closed by client",
 								"agent", agentID, "err", err)
 						default:
-							s.logger.Info("agent websocket ping failed, closing",
-								"agent", agentID, "err", err)
+							if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+								s.logger.Debug("agent websocket ping closed (EOF)",
+									"agent", agentID, "err", err)
+							} else {
+								s.logger.Info("agent websocket ping failed, closing",
+									"agent", agentID, "err", err)
+							}
 						}
 					}
 					pingCancel()
@@ -128,8 +135,16 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 						s.logger.Debug("agent websocket closed by client",
 							"agent", agentID, "err", err)
 					default:
-						s.logger.Info("agent websocket read ended",
-							"agent", agentID, "err", err)
+						// EOF-family errors without a close frame are the
+						// norm for mobile browsers that drop the TCP
+						// connection on navigate / background. Not actionable.
+						if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+							s.logger.Debug("agent websocket closed (EOF)",
+								"agent", agentID, "err", err)
+						} else {
+							s.logger.Info("agent websocket read ended",
+								"agent", agentID, "err", err)
+						}
 					}
 				}
 				return

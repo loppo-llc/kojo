@@ -208,12 +208,15 @@ describe("agent route navigation", () => {
 
     await waitFor(() => expect(screen.getAllByText("Demo Agent").length).toBeGreaterThan(0));
 
+    // First back: idx === 0, so the button falls back to navigate("/", { replace: true }).
     fireEvent.click(screen.getByRole("button", { name: "←" }));
     expect(await screen.findByText("Open demo")).toBeInTheDocument();
 
     fireEvent.click(screen.getByText("Open demo"));
     await waitFor(() => expect(screen.getAllByText("Demo Agent").length).toBeGreaterThan(0));
 
+    // Second back: idx > 0, so the button uses navigate(-1) to pop the
+    // real history entry instead of accumulating dead "/" entries.
     fireEvent.click(screen.getByRole("button", { name: "←" }));
     expect(await screen.findByText("Open demo")).toBeInTheDocument();
   });
