@@ -268,10 +268,14 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 			"invalid venue: must be \"chatroom\" or \"colocated\"")
 		return
 	}
-	// Rename requires agentId (membership authorization).
+	// Rename requires agentId for membership authorization — unless
+	// the caller is Owner, who is authorized to rename any group.
 	if req.Name != "" && req.AgentID == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "agentId is required for name changes")
-		return
+		p := auth.FromContext(r.Context())
+		if !p.IsOwner() {
+			writeError(w, http.StatusBadRequest, "bad_request", "agentId is required for name changes")
+			return
+		}
 	}
 	// Per-group patch lock spans the atomic mutation and ETag echo so
 	// same-process PATCH/DELETE callers serialize at the group boundary.

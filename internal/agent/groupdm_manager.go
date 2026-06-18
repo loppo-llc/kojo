@@ -1047,9 +1047,8 @@ func (m *GroupDMManager) UpdateSettings(ctx context.Context, id string, patch Gr
 	if patch.Name != nil && *patch.Name == "" {
 		return nil, "", errors.New("name must not be empty")
 	}
-	if patch.Name != nil && patch.CallerAgentID == "" {
-		return nil, "", errors.New("agentId is required for name changes")
-	}
+	// CallerAgentID may be empty when the Owner renames via the GUI.
+	// The HTTP handler validates authorization before reaching here.
 	var cooldown int
 	if patch.Cooldown != nil {
 		cooldown = clampCooldown(*patch.Cooldown)
