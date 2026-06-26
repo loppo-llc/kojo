@@ -14,6 +14,7 @@ import (
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/chathistory"
 	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
 )
 
@@ -39,6 +40,7 @@ func newTestBot(t *testing.T, cfg agent.SlackBotConfig) *Bot {
 		cancel:       cancel,
 		done:         make(chan struct{}),
 		threadLocks:  make(map[string]*threadLock),
+		activeTurns:  make(map[string]*activeTurn),
 		userCache:    make(map[string]string),
 		sem:          make(chan struct{}, maxConcurrentChats),
 	}
@@ -211,6 +213,138 @@ func TestBotShouldAutoReplyEmptyDataDir(t *testing.T) {
 
 	if bot.shouldAutoReply("C1", "ts1", "hello") {
 		t.Fatal("should not auto-reply with empty agentDataDir")
+	}
+}
+
+// --- Slack stop command tests ---
+
+func TestIsStopCommandExactMatchOnly(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"!stop", true},
+		{" !STOP \n", true},
+		{"!cancel", true},
+		{"!stop please", false},
+		{"please !stop", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := isStopCommand(tc.in); got != tc.want {
+			t.Errorf("isStopCommand(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestActiveTurnCancelIsThreadScoped(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel1()
+	defer cancel2()
+
+	turn1 := bot.registerActiveTurn("C1", "thread.1", cancel1)
+	turn2 := bot.registerActiveTurn("C1", "thread.2", cancel2)
+	defer bot.unregisterActiveTurn("C1", "thread.1", turn1)
+	defer bot.unregisterActiveTurn("C1", "thread.2", turn2)
+
+	if !bot.cancelActiveTurn("C1", "thread.1") {
+		t.Fatal("cancelActiveTurn returned false for a registered turn")
+	}
+
+	select {
+	case <-ctx1.Done():
+		// expected
+	case <-time.After(time.Second):
+		t.Fatal("thread.1 context was not cancelled")
+	}
+	if !turn1.stopRequested() {
+		t.Fatal("thread.1 should be marked as user-stopped")
+	}
+	select {
+	case <-ctx2.Done():
+		t.Fatal("thread.2 must not be cancelled when stopping thread.1")
+	default:
+		// expected
+	}
+	if turn2.stopRequested() {
+		t.Fatal("thread.2 must not be marked stopped")
+	}
+}
+
+func TestHandleMessageEventStopCommandBypassesAutoReply(t *testing.T) {
+	var postCalls atomic.Int32
+	var gotThread, gotMarkdown string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/chat.postMessage" {
+			postCalls.Add(1)
+			_ = r.ParseForm()
+			gotThread = r.FormValue("thread_ts")
+			gotMarkdown = r.FormValue("markdown_text")
+		}
+		fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":"post.1"}`)
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bot := &Bot{
+		agentID:      "test-agent",
+		agentDataDir: t.TempDir(),
+		config:       agent.SlackBotConfig{Enabled: true, ThreadReplies: true},
+		api:          api,
+		mgr:          &mockMgr{},
+		logger:       testLogger,
+		botUserID:    "UBOTTEST",
+		ctx:          ctx,
+		cancel:       cancel,
+		done:         make(chan struct{}),
+		threadLocks:  make(map[string]*threadLock),
+		activeTurns:  make(map[string]*activeTurn),
+		userCache:    make(map[string]string),
+		sem:          make(chan struct{}, maxConcurrentChats),
+	}
+
+	turnCtx, turnCancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurn("C1", "thread.123", turnCancel)
+	defer bot.unregisterActiveTurn("C1", "thread.123", turn)
+	defer turnCancel()
+
+	// ReactThread is false, and there is no chat_history entry. A normal
+	// thread reply would be ignored by shouldAutoReply, but the command must
+	// still cancel the in-flight turn immediately.
+	bot.config.ThreadReplies = false
+	bot.handleMessageEvent(context.Background(), &slackevents.MessageEvent{
+		User:            "U123",
+		Channel:         "C1",
+		ChannelType:     "channel",
+		ThreadTimeStamp: "thread.123",
+		TimeStamp:       "msg.456",
+		Text:            "!stop",
+	})
+
+	select {
+	case <-turnCtx.Done():
+		// expected
+	case <-time.After(time.Second):
+		t.Fatal("active turn was not cancelled")
+	}
+	if !turn.stopRequested() {
+		t.Fatal("active turn should be marked as user-stopped")
+	}
+	if got := postCalls.Load(); got != 1 {
+		t.Fatalf("chat.postMessage calls = %d, want 1", got)
+	}
+	if gotThread != "thread.123" {
+		t.Errorf("stop ack thread_ts = %q, want %q", gotThread, "thread.123")
+	}
+	if gotMarkdown != stopCommandAck {
+		t.Errorf("stop ack markdown_text = %q, want %q", gotMarkdown, stopCommandAck)
 	}
 }
 
@@ -473,6 +607,7 @@ type streamScript struct {
 	appendOnTS   []string // ts the bot tried to append to (in order)
 	lastUpdateTS string
 	lastUpdateMD string
+	lastPostMD   string
 }
 
 // newStreamServer returns a mock Slack server that delegates streaming
@@ -519,6 +654,7 @@ func newStreamServer(t *testing.T, script *streamScript) *httptest.Server {
 			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":%q}`, r.FormValue("ts"))
 		case "/chat.postMessage":
 			script.postCalls++
+			script.lastPostMD = r.FormValue("markdown_text")
 			if script.failPost {
 				fmt.Fprintf(w, `{"ok":false,"error":"channel_not_found"}`)
 				return
@@ -561,6 +697,7 @@ func newBotWithStream(t *testing.T, mgr ChatManager, srv *httptest.Server) *Bot 
 		cancel:       cancel,
 		done:         make(chan struct{}),
 		threadLocks:  make(map[string]*threadLock),
+		activeTurns:  make(map[string]*activeTurn),
 		userCache:    make(map[string]string),
 		sem:          make(chan struct{}, maxConcurrentChats),
 		// Run the dead-stream cleanup goroutine synchronously so the
@@ -717,6 +854,30 @@ func TestSendToAgentKeepsDeadStreamWhenDeliveryFails(t *testing.T) {
 	}
 	if !containsString(script.stoppedTS, "stream.1") {
 		t.Errorf("dead stream.1 should be StopStream'd as a retry artifact; stoppedTS=%v", script.stoppedTS)
+	}
+}
+
+func TestSendToAgentPreservesCancelledDoneContent(t *testing.T) {
+	script := &streamScript{}
+	srv := newStreamServer(t, script)
+
+	mgr := &scriptedMgr{events: []agent.ChatEvent{
+		{Type: "text", Delta: "partial"},
+		{
+			Type:         "done",
+			Message:      &agent.Message{Content: "partial work completed before stop"},
+			ErrorMessage: agent.ErrMsgCancelled,
+		},
+	}}
+	bot := newBotWithStream(t, mgr, srv)
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	if script.postCalls == 0 {
+		t.Fatal("expected cancelled done content to be delivered via chat.postMessage")
+	}
+	if !strings.Contains(script.lastPostMD, "partial work completed before stop") {
+		t.Errorf("last post markdown_text = %q, want partial done content", script.lastPostMD)
 	}
 }
 

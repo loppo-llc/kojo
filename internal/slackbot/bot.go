@@ -67,6 +67,14 @@ type Bot struct {
 	threadLocksMu sync.Mutex
 	threadLocks   map[string]*threadLock // key: "channel:threadTS"
 
+	// activeTurns tracks the currently executing ChatOneShot per Slack
+	// conversation. It is intentionally separate from threadLocks:
+	// command messages like "!stop" must be able to cancel the running
+	// turn immediately rather than queue behind the same per-thread mutex
+	// they are trying to interrupt.
+	activeTurnsMu sync.Mutex
+	activeTurns   map[string]*activeTurn // key: "channel:threadTS"
+
 	// userCache caches Slack user ID → display name for the Bot's lifetime.
 	// Display names rarely change; the cache is cleared on Bot restart.
 	userCacheMu sync.RWMutex
@@ -173,6 +181,7 @@ func NewBot(parentCtx context.Context, agentID string, agentDataDir string, cfg 
 		cancel:       cancel,
 		done:         make(chan struct{}),
 		threadLocks:  make(map[string]*threadLock),
+		activeTurns:  make(map[string]*activeTurn),
 		userCache:    make(map[string]string),
 		sem:          make(chan struct{}, maxConcurrentChats),
 	}
@@ -298,7 +307,18 @@ func (b *Bot) handleMessageEvent(ctx context.Context, ev *slackevents.MessageEve
 		if !b.config.ReactDM() {
 			return
 		}
+		if b.handleSlackCommand(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text) {
+			return
+		}
 		b.processIncoming(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text, ev.User)
+		return
+	}
+
+	// Thread-level commands must bypass shouldAutoReply and the per-thread
+	// sendToAgent lock. A stop command is most useful while the current turn
+	// is still running, before the bot response has been appended to
+	// chat_history; shouldAutoReply would often reject exactly that case.
+	if ev.ThreadTimeStamp != "" && b.handleSlackCommand(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text) {
 		return
 	}
 
@@ -361,7 +381,47 @@ func (b *Bot) handleAppMentionEvent(ctx context.Context, ev *slackevents.AppMent
 		text = appendFileInfo(text, downloaded, errs)
 	}
 
+	if b.handleSlackCommand(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text) {
+		return
+	}
+
 	b.processIncoming(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text, ev.User)
+}
+
+const (
+	stopCommandAck      = "_Stopping current turn…_"
+	stopCommandNoActive = "_No active turn in this thread._"
+)
+
+func isStopCommand(text string) bool {
+	switch strings.ToLower(strings.TrimSpace(text)) {
+	case "!stop", "!cancel":
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, messageTS, text string) bool {
+	// Command detection runs before shouldAutoReply for every threaded
+	// message, including messages the bot will otherwise ignore. Avoid
+	// resolving user mentions here: SlackToPlain with b.resolveUserName can
+	// issue users.info calls just to reject a non-command message.
+	if !isStopCommand(SlackToPlain(text, nil)) {
+		return false
+	}
+
+	replyTS := threadTS
+	if replyTS == "" && b.config.ThreadReplies {
+		replyTS = messageTS
+	}
+
+	if b.cancelActiveTurn(channel, replyTS) {
+		b.postMessage(ctx, channel, replyTS, stopCommandAck)
+	} else {
+		b.postMessage(ctx, channel, replyTS, stopCommandNoActive)
+	}
+	return true
 }
 
 func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS, text, userID string) {
@@ -450,16 +510,29 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		}
 	}
 
+	// From here on, the thread handle used for posting/streaming.
+	threadTS := replyTS
+
+	// Register the active turn before any Slack history fetch or backend
+	// startup so a concurrent "!stop" in this Slack thread can interrupt
+	// long preflight work as well as the model/tool run itself. The
+	// registry is keyed by the same threadTS used for SessionKey and
+	// chat_history, so stopping one Slack thread does not affect another
+	// thread handled by the same agent.
+	turnCtx, turnCancel := context.WithCancel(ctx)
+	active := b.registerActiveTurn(channel, threadTS, turnCancel)
+	defer func() {
+		b.unregisterActiveTurn(channel, threadTS, active)
+		turnCancel()
+	}()
+
 	// Fetch conversation history from Slack for context injection.
 	var history []chathistory.HistoryMessage
 	if origThreadTS != "" {
-		history = FetchThreadHistory(ctx, b.api, b.agentDataDir, channel, origThreadTS, b.resolveUserName, b.logger)
+		history = FetchThreadHistory(turnCtx, b.api, b.agentDataDir, channel, origThreadTS, b.resolveUserName, b.logger)
 	} else {
-		history = FetchChannelHistory(ctx, b.api, b.agentDataDir, channel, channelHistoryLimit, b.resolveUserName, b.logger)
+		history = FetchChannelHistory(turnCtx, b.api, b.agentDataDir, channel, channelHistoryLimit, b.resolveUserName, b.logger)
 	}
-
-	// From here on, the thread handle used for posting/streaming.
-	threadTS := replyTS
 
 	// Drop the current user message from `history` before it feeds the
 	// injection formatters. FetchThreadHistory pulls the just-arrived
@@ -589,20 +662,24 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	systemPromptExtra := buildSlackSystemPromptExtra(channel, threadTS, displayName, userID)
 
 	// Show typing indicator (best-effort; requires Agents & Assistants + assistant:write scope)
-	_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
+	_ = b.api.SetAssistantThreadsStatusContext(turnCtx, slack.AssistantThreadsSetStatusParameters{
 		ChannelID: channel,
 		ThreadTS:  threadTS,
 		Status:    typingStatus,
 	})
 
-	events, err := b.mgr.ChatOneShot(ctx, b.agentID, message, agent.OneShotOpts{
+	events, err := b.mgr.ChatOneShot(turnCtx, b.agentID, message, agent.OneShotOpts{
 		SessionKey:        sessionKey,
 		SystemPromptExtra: systemPromptExtra,
 	})
 	if err != nil {
 		b.clearAssistantStatus(ctx, channel, threadTS)
 		b.logger.Warn("failed to start agent chat from slack", "err", err)
-		b.postMessage(ctx, channel, threadTS, "Sorry, I couldn't process your message right now. Please try again later.")
+		if active.stopRequested() {
+			b.postMessage(ctx, channel, threadTS, "_Stopped current turn._")
+		} else {
+			b.postMessage(ctx, channel, threadTS, "Sorry, I couldn't process your message right now. Please try again later.")
+		}
 		return
 	}
 
@@ -613,6 +690,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	var lastAppend time.Time
 	hasError := false
 	streamFailed := false // true if StartStream failed permanently, use batch-post fallback
+	stopped := false
 
 	// dropStream parks the current streamTS in deadStreams and clears
 	// streamTS so the next startStream() opens a fresh streaming
@@ -659,7 +737,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		if threadTS != "" {
 			opts = append(opts, slack.MsgOptionTS(threadTS))
 		}
-		_, ts, err := b.api.StartStreamContext(ctx, channel, opts...)
+		_, ts, err := b.api.StartStreamContext(turnCtx, channel, opts...)
 		if err != nil {
 			b.logger.Warn("failed to start slack stream, falling back to batch post", "err", err)
 			streamFailed = true
@@ -691,7 +769,7 @@ streamLoop:
 			// append failing). Rate-limit / transient errors keep the
 			// streamTS, so a 429 storm won't churn the stream here.
 			if streamTS != "" && time.Since(lastAppend) >= streamHeartbeatInterval {
-				if b.appendStream(ctx, channel, streamTS, streamHeartbeatPayload) {
+				if b.appendStream(turnCtx, channel, streamTS, streamHeartbeatPayload) {
 					lastAppend = time.Now()
 				} else {
 					dropStream()
@@ -722,7 +800,7 @@ streamLoop:
 				delta := pendingDelta.String()
 				pendingDelta.Reset()
 				lastAppend = time.Now()
-				if !b.appendStream(ctx, channel, streamTS, delta) {
+				if !b.appendStream(turnCtx, channel, streamTS, delta) {
 					// Stream died mid-response. Park it and carry the
 					// unflushed delta into pendingDelta so the NEXT
 					// text event opens a fresh stream and flushes the
@@ -743,7 +821,7 @@ streamLoop:
 
 			// Update assistant typing status (plain text) to show which
 			// tool is running.
-			_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
+			_ = b.api.SetAssistantThreadsStatusContext(turnCtx, slack.AssistantThreadsSetStatusParameters{
 				ChannelID: channel,
 				ThreadTS:  threadTS,
 				Status:    toolStatusText(evt.ToolName, evt.ToolInput),
@@ -772,13 +850,13 @@ streamLoop:
 			if pendingDelta.Len() > 0 {
 				delta := pendingDelta.String()
 				pendingDelta.Reset()
-				if !b.appendStream(ctx, channel, streamTS, delta) {
+				if !b.appendStream(turnCtx, channel, streamTS, delta) {
 					pendingDelta.WriteString(delta)
 					dropStream()
 					continue
 				}
 			}
-			if !b.appendStream(ctx, channel, streamTS, indicator) {
+			if !b.appendStream(turnCtx, channel, streamTS, indicator) {
 				// Indicator append died. The indicator itself is
 				// ephemeral (finalize chat.update overwrites it),
 				// so no need to carry it forward. We deliberately
@@ -800,7 +878,7 @@ streamLoop:
 		case "tool_result":
 			// Revert the assistant status to "Thinking…" while the agent
 			// processes the tool result and decides the next action.
-			_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
+			_ = b.api.SetAssistantThreadsStatusContext(turnCtx, slack.AssistantThreadsSetStatusParameters{
 				ChannelID: channel,
 				ThreadTS:  threadTS,
 				Status:    typingStatus,
@@ -809,7 +887,33 @@ streamLoop:
 		case "error":
 			hasError = true
 			b.logger.Warn("agent returned error during slack chat", "err", evt.ErrorMessage)
+
+		case "done":
+			if evt.Message != nil && evt.Message.Content != "" && len(evt.Message.Content) > response.Len() {
+				// Cancellation can terminate the backend before all text
+				// deltas have been observed by the Slack loop. Backends
+				// still emit a terminal done event carrying their
+				// accumulated partial assistant message; preserve it so
+				// Slack history and final delivery keep the work completed
+				// up to the stop point.
+				response.Reset()
+				response.WriteString(evt.Message.Content)
+			}
+			if evt.ErrorMessage == agent.ErrMsgCancelled {
+				stopped = true
+			} else if evt.ErrorMessage != "" {
+				hasError = true
+				b.logger.Warn("agent returned terminal error during slack chat", "err", evt.ErrorMessage)
+			}
 		}
+	}
+	// The backend event stream is over; from this point on we are only
+	// doing Slack delivery/cleanup. Stop advertising the turn as
+	// cancellable so a late "!stop" does not claim to cancel work that has
+	// already completed.
+	b.unregisterActiveTurn(channel, threadTS, active)
+	if active.stopRequested() {
+		stopped = true
 	}
 
 	// Use a separate context for finalization so cleanup API calls
@@ -940,6 +1044,9 @@ streamLoop:
 			// chat.update failure, we posted chunks[0] as a fresh message).
 			// Either way, dead partials are now superseded.
 			finalDelivered = deliveredAll
+		} else if stopped {
+			b.postMessage(finCtx, channel, threadTS, "_Stopped current turn._")
+			finalDelivered = true
 		} else {
 			// Stream was started — usually by the first tool_use event —
 			// but the assistant never produced any reply text. Keep the
@@ -977,6 +1084,9 @@ streamLoop:
 		// Batch post carried the full reply (StartStream failed or every
 		// stream died and we fell back). Dead partials are superseded.
 		finalDelivered = deliveredAll
+	} else if stopped {
+		b.postMessage(finCtx, channel, threadTS, "_Stopped current turn._")
+		finalDelivered = true
 	} else if hasError || streamFailed || len(deadStreams) > 0 {
 		// Either an explicit agent error, StartStream failed, or a stream
 		// was opened and then died (every streamTS dropped, so streamTS is
@@ -1590,6 +1700,67 @@ func (b *Bot) releaseThreadLock(channel, threadTS string, tl *threadLock) {
 	if tl.waiters == 0 {
 		delete(b.threadLocks, key)
 	}
+}
+
+type activeTurn struct {
+	mu       sync.Mutex
+	cancel   context.CancelFunc
+	stopUser bool
+}
+
+func (t *activeTurn) requestStop() {
+	t.mu.Lock()
+	t.stopUser = true
+	cancel := t.cancel
+	t.mu.Unlock()
+	cancel()
+}
+
+func (t *activeTurn) stopRequested() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.stopUser
+}
+
+func activeTurnKey(channel, threadTS string) string {
+	return channel + ":" + threadTS
+}
+
+func (b *Bot) registerActiveTurn(channel, threadTS string, cancel context.CancelFunc) *activeTurn {
+	turn := &activeTurn{cancel: cancel}
+	key := activeTurnKey(channel, threadTS)
+	b.activeTurnsMu.Lock()
+	if b.activeTurns == nil {
+		b.activeTurns = make(map[string]*activeTurn)
+	}
+	b.activeTurns[key] = turn
+	b.activeTurnsMu.Unlock()
+	return turn
+}
+
+func (b *Bot) unregisterActiveTurn(channel, threadTS string, turn *activeTurn) {
+	key := activeTurnKey(channel, threadTS)
+	b.activeTurnsMu.Lock()
+	if b.activeTurns[key] == turn {
+		delete(b.activeTurns, key)
+	}
+	b.activeTurnsMu.Unlock()
+}
+
+func (b *Bot) cancelActiveTurn(channel, threadTS string) bool {
+	key := activeTurnKey(channel, threadTS)
+	b.activeTurnsMu.Lock()
+	defer b.activeTurnsMu.Unlock()
+	turn := b.activeTurns[key]
+	if turn == nil {
+		return false
+	}
+	// Request the stop while holding activeTurnsMu so it is ordered
+	// against unregisterActiveTurn. Either sendToAgent unregisters first
+	// and this returns false, or this marks stopRequested before the turn
+	// can unregister and move into final Slack delivery.
+	turn.requestStop()
+	return true
 }
 
 // resolveUserName resolves a Slack user ID to a display name, with caching.
