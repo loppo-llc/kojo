@@ -8,7 +8,7 @@ export interface ToolModelConfig {
 export const toolModels: Record<string, ToolModelConfig> = {
   claude: {
     default: "sonnet",
-    models: ["sonnet", "opus", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "haiku"],
+    models: ["sonnet", "claude-sonnet-5", "claude-sonnet-4-6", "opus", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "haiku"],
   },
   codex: {
     default: "gpt-5.5",
@@ -49,7 +49,7 @@ export const effortLevels = ["low", "medium", "high", "xhigh", "max"] as const;
 export type EffortLevel = (typeof effortLevels)[number];
 
 /** Models that support the xhigh effort level. */
-const xhighModels = new Set(["opus", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "grok-build", "grok-composer-2.5-fast"]);
+const xhighModels = new Set(["opus", "claude-sonnet-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "grok-build", "grok-composer-2.5-fast"]);
 const codexEffortModels = new Set(toolModels.codex.models);
 
 /**

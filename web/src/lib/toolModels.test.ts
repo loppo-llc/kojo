@@ -45,6 +45,26 @@ describe("toolModels — Opus 4.8 / effort defaults", () => {
     expect(defaultEffortForModel("sonnet")).toBe("high");
   });
 
+  it("lists claude-sonnet-5 as a claude model", () => {
+    expect(modelsForTool("claude")).toContain("claude-sonnet-5");
+  });
+
+  it("Sonnet 5 supports xhigh and max but defaults to high", () => {
+    expect(effortLevelsForModel("claude-sonnet-5")).toContain("xhigh");
+    expect(effortLevelsForModel("claude-sonnet-5")).toContain("max");
+    expect(defaultEffortForModel("claude-sonnet-5")).toBe("high");
+  });
+
+  it("lists claude-sonnet-4-6 as a claude model", () => {
+    expect(modelsForTool("claude")).toContain("claude-sonnet-4-6");
+  });
+
+  it("Sonnet 4.6 has no xhigh, supports max, and defaults to high", () => {
+    expect(effortLevelsForModel("claude-sonnet-4-6")).not.toContain("xhigh");
+    expect(effortLevelsForModel("claude-sonnet-4-6")).toContain("max");
+    expect(defaultEffortForModel("claude-sonnet-4-6")).toBe("high");
+  });
+
   it("codex models support xhigh, default to medium, and omit max", () => {
     expect(effortLevelsForModel("gpt-5.5")).toContain("xhigh");
     expect(effortLevelsForModel("gpt-5.5")).not.toContain("max");
