@@ -153,7 +153,7 @@ When you run `kojo` (without `--local`):
 ```bash
 $ kojo
 
-  kojo v0.103.0 running at:
+  kojo v0.110.0 running at:
 
     https://kojo.tail1234.ts.net
     https://100.x.y.z:8080

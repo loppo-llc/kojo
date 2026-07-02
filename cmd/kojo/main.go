@@ -38,7 +38,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-var version = "0.103.0"
+var version = "0.110.0"
 
 // newCLILogger builds the stderr text logger used by every subcommand and
 // the main boot path, at the given level.
