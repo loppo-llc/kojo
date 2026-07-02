@@ -4,6 +4,8 @@ import {
   supportsEffort,
   type EffortLevel,
 } from "../../../lib/toolModels";
+import { Field } from "../../ui/Field";
+import { Select } from "../../ui/Select";
 
 /**
  * The "Effort" field. Rendered only for backends that support an effort
@@ -23,12 +25,10 @@ export function EffortPicker({
 }) {
   if (!supportsEffort(tool)) return null;
   return (
-    <div>
-      <label className="block text-sm text-neutral-400 mb-2">Effort</label>
-      <select
+    <Field label="Effort">
+      <Select
         value={effort}
         onChange={(e) => setEffort(e.target.value as EffortLevel | "")}
-        className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
       >
         <option value="">default ({defaultEffortForModel(model)})</option>
         {effortLevelsForModel(model).map((e) => (
@@ -36,7 +36,7 @@ export function EffortPicker({
             {e}
           </option>
         ))}
-      </select>
-    </div>
+      </Select>
+    </Field>
   );
 }

@@ -35,7 +35,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -415,22 +414,15 @@ func (d *Discovery) resolveHubURL(ctx context.Context) (string, error) {
 	return fmt.Sprintf("https://kojo.%s:%d", tailnet, port), nil
 }
 
+// canonicalHubURL normalises a raw Hub address (CLI --hub flag or
+// KOJO_HUB_URL) into a dialable base URL. It delegates to
+// NormalizeAddress, whose acceptance set is a strict superset of what
+// this used to do (scheme defaulting to https, http/https allowed,
+// path/query stripped) AND correctly brackets a bare IPv6 literal
+// ("::1" → "https://[::1]"), which the previous hand-rolled version
+// mangled into an unparseable host.
 func (d *Discovery) canonicalHubURL(raw string) (string, error) {
-	if !strings.Contains(raw, "://") {
-		raw = "https://" + raw
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "", fmt.Errorf("parse: %w", err)
-	}
-	if u.Host == "" {
-		return "", errors.New("missing host")
-	}
-	scheme := strings.ToLower(u.Scheme)
-	if scheme != "http" && scheme != "https" {
-		return "", fmt.Errorf("unsupported scheme %q", scheme)
-	}
-	return scheme + "://" + u.Host, nil
+	return NormalizeAddress(raw)
 }
 
 // fetchHubInfo GETs /api/v1/peers/hub-info.

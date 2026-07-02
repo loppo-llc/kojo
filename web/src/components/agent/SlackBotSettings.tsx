@@ -1,6 +1,33 @@
 import { useEffect, useState } from "react";
 import { agentApi, type SlackBotStatus } from "../../lib/agentApi";
 import { errMsg } from "../../lib/utils";
+import { Field } from "../ui/Field";
+import { Input } from "../ui/Input";
+import { Toggle } from "../ui/Toggle";
+import { Button } from "../ui/Button";
+import { Banner } from "../ui/Banner";
+
+function CheckRow({
+  checked,
+  onChange,
+  children,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <label className="flex cursor-pointer items-center gap-2 py-1">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="h-4 w-4 rounded border-hairline bg-raised accent-[color:var(--color-copper)]"
+      />
+      <span className="text-[13px] text-ink-dim">{children}</span>
+    </label>
+  );
+}
 
 export function SlackBotSettings({ agentId }: { agentId: string }) {
   const [status, setStatus] = useState<SlackBotStatus | null>(null);
@@ -91,154 +118,102 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
     <div>
       {/* Header with toggle */}
       <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold text-neutral-300">Slack Bot</h2>
+        <h3 className="text-[13px] font-semibold text-ink">Slack Bot</h3>
         <div className="flex items-center gap-2">
           {status?.connected && (
-            <span className="text-xs text-green-400">Connected</span>
+            <span className="text-[12px] text-lamp-run">Connected</span>
           )}
-          <button
-            type="button"
-            role="switch"
-            aria-checked={enabled}
-            onClick={() => setEnabled(!enabled)}
-            className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full transition-colors duration-200 ${
-              enabled ? "bg-green-600" : "bg-neutral-700"
-            }`}
-          >
-            <span
-              className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-200 mt-0.5 ${
-                enabled ? "translate-x-[22px]" : "translate-x-0.5"
-              }`}
-            />
-          </button>
+          <Toggle checked={enabled} onChange={setEnabled} aria-label="Enable Slack bot" />
         </div>
       </div>
 
       {/* Collapsible settings */}
       {enabled && (
         <div className="mt-4 space-y-3">
-          {/* App Token */}
-          <div>
-            <label className="block text-xs text-neutral-500 mb-1">
-              App-Level Token (xapp-...)
-              {status?.hasAppToken && !appToken && (
-                <span className="text-green-500 ml-1">configured</span>
-              )}
-            </label>
-            <input
+          <Field
+            label={
+              <>
+                App-Level Token (xapp-...)
+                {status?.hasAppToken && !appToken && (
+                  <span className="ml-1 text-lamp-run">configured</span>
+                )}
+              </>
+            }
+          >
+            <Input
+              mono
               type="password"
               value={appToken}
               onChange={(e) => setAppToken(e.target.value)}
               placeholder={status?.hasAppToken ? "••••••••" : "xapp-..."}
-              className="w-full px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-xs font-mono focus:outline-none focus:border-neutral-500"
             />
-          </div>
+          </Field>
 
-          {/* Bot Token */}
-          <div>
-            <label className="block text-xs text-neutral-500 mb-1">
-              Bot Token (xoxb-...)
-              {status?.hasBotToken && !botToken && (
-                <span className="text-green-500 ml-1">configured</span>
-              )}
-            </label>
-            <input
+          <Field
+            label={
+              <>
+                Bot Token (xoxb-...)
+                {status?.hasBotToken && !botToken && (
+                  <span className="ml-1 text-lamp-run">configured</span>
+                )}
+              </>
+            }
+          >
+            <Input
+              mono
               type="password"
               value={botToken}
               onChange={(e) => setBotToken(e.target.value)}
               placeholder={status?.hasBotToken ? "••••••••" : "xoxb-..."}
-              className="w-full px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-xs font-mono focus:outline-none focus:border-neutral-500"
             />
-          </div>
+          </Field>
 
-          {/* Thread replies toggle */}
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={threadReplies}
-              onChange={(e) => setThreadReplies(e.target.checked)}
-              className="rounded border-neutral-600"
-            />
-            <span className="text-xs text-neutral-400">Always reply in thread</span>
-          </label>
+          <CheckRow checked={threadReplies} onChange={setThreadReplies}>
+            Always reply in thread
+          </CheckRow>
 
           {/* Reaction patterns */}
           <div>
-            <div className="text-xs text-neutral-500 mb-2">Respond to:</div>
-            <div className="space-y-1.5 ml-1">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={respondDM}
-                  onChange={(e) => setRespondDM(e.target.checked)}
-                  className="rounded border-neutral-600"
-                />
-                <span className="text-xs text-neutral-400">Direct messages</span>
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={respondMention}
-                  onChange={(e) => setRespondMention(e.target.checked)}
-                  className="rounded border-neutral-600"
-                />
-                <span className="text-xs text-neutral-400">@mentions in channels</span>
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={respondThread}
-                  onChange={(e) => setRespondThread(e.target.checked)}
-                  className="rounded border-neutral-600"
-                />
-                <span className="text-xs text-neutral-400">Thread follow-ups (auto-reply without mention)</span>
-              </label>
+            <div className="mb-1 text-[12px] font-medium text-ink-dim">Respond to</div>
+            <div className="ml-1">
+              <CheckRow checked={respondDM} onChange={setRespondDM}>
+                Direct messages
+              </CheckRow>
+              <CheckRow checked={respondMention} onChange={setRespondMention}>
+                @mentions in channels
+              </CheckRow>
+              <CheckRow checked={respondThread} onChange={setRespondThread}>
+                Thread follow-ups (auto-reply without mention)
+              </CheckRow>
             </div>
           </div>
 
-          {error && (
-            <div className="p-2 bg-red-950 border border-red-800 rounded text-xs text-red-300">
-              {error}
-            </div>
-          )}
-          {testResult && (
-            <div className="p-2 bg-green-950 border border-green-800 rounded text-xs text-green-300">
-              {testResult}
-            </div>
-          )}
+          {error && <Banner tone="error">{error}</Banner>}
+          {testResult && <Banner tone="success">{testResult}</Banner>}
 
           <div className="flex gap-2">
-            <button
-              onClick={handleSave}
-              disabled={saving}
-              className="flex-1 py-2 bg-neutral-800 hover:bg-neutral-700 rounded text-xs font-medium disabled:opacity-40"
-            >
+            <Button onClick={handleSave} disabled={saving} className="flex-1">
               {saving ? "Saving..." : "Save"}
-            </button>
-            <button
+            </Button>
+            <Button
               onClick={handleTest}
               disabled={
                 testing ||
                 (!status?.hasAppToken && !appToken) ||
                 (!status?.hasBotToken && !botToken)
               }
-              className="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 rounded text-xs font-medium disabled:opacity-40"
             >
               {testing ? "Testing..." : "Test Connection"}
-            </button>
+            </Button>
           </div>
 
           {(status?.hasAppToken || status?.hasBotToken) && (
-            <button
-              onClick={handleDelete}
-              disabled={saving}
-              className="w-full py-2 bg-red-950/50 hover:bg-red-950 border border-red-900 rounded text-xs text-red-400 disabled:opacity-40"
-            >
+            <Button variant="danger" onClick={handleDelete} disabled={saving} className="w-full">
               Remove Slack Bot
-            </button>
+            </Button>
           )}
 
-          <p className="text-xs text-neutral-600">
+          <p className="text-[12px] text-ink-faint">
             Create a Slack App with Socket Mode enabled. Required scopes: chat:write, app_mentions:read, im:history.
             Subscribe to events: message.im, app_mention.
           </p>

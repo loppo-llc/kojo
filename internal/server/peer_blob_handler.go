@@ -2,7 +2,6 @@ package server
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -252,24 +251,23 @@ func (s *Server) relayPeerBlob(w http.ResponseWriter, r *http.Request, sourceDev
 	// of MB on slow tailnet links. The request context is the only
 	// deadline (caller side enforces switchDeviceOpTimeout). Codex
 	// review: fixed 5-minute cap could chop long transfers.
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstreamURL, nil)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal",
-			"build relay request: "+err.Error())
-		return
-	}
-	client := peer.NoKeepAliveHTTPClient(0)
-	resp, err := client.Do(upReq)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway",
-			fmt.Sprintf("source dial failed: %v", err))
-		return
-	}
-	defer resp.Body.Close()
-	// Preserve the digest + size headers so the caller's sha256
+	//
+	// Digest + size headers are preserved so the caller's sha256
 	// check still works.
-	copyResponseHeaders(w.Header(), resp.Header,
-		"Content-Type", "ETag", "X-Kojo-Blob-SHA256", "Content-Length", "Cache-Control")
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	s.forwardHTTPToPeer(w, r.Context(), peerHTTPForward{
+		method:         http.MethodGet,
+		url:            upstreamURL,
+		body:           nil,
+		contentLength:  0,
+		timeout:        0,
+		buildErrStatus: http.StatusInternalServerError,
+		buildErrCode:   "internal",
+		buildErrPrefix: "build relay request: ",
+		dialErrStatus:  http.StatusBadGateway,
+		dialErrCode:    "bad_gateway",
+		dialErrPrefix:  "source dial failed: ",
+		respHeaderKeys: []string{
+			"Content-Type", "ETag", "X-Kojo-Blob-SHA256", "Content-Length", "Cache-Control",
+		},
+	})
 }

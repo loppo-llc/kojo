@@ -231,12 +231,44 @@ func (s *Service) callGemini(ctx context.Context, model, voice, style, text stri
 	}
 
 	pcm, err := s.doGemini(ctx, model, apiKey, mkBody(off))
-	if err != nil && strings.Contains(strings.ToLower(err.Error()), "invalid") {
-		// Some surfaces still reject OFF; retry with BLOCK_NONE which is
-		// the next-loosest documented value.
+	if err != nil && rejectsSafetyThreshold(err) {
+		// Some model surfaces don't accept the `OFF` safety threshold and
+		// reject the whole request with HTTP 400 / status INVALID_ARGUMENT.
+		// Retry with BLOCK_NONE (the next-loosest documented threshold)
+		// only for that specific rejection — never for other 4xx/5xx or
+		// decode failures that happen to contain the word "invalid".
 		pcm, err = s.doGemini(ctx, model, apiKey, mkBody("BLOCK_NONE"))
 	}
 	return pcm, err
+}
+
+// apiError carries the structured Gemini (Google API) error envelope so
+// callers can branch on the canonical status code instead of substring-
+// matching a formatted message. Gemini returns errors as:
+//
+//	{"error": {"code": 400, "message": "...", "status": "INVALID_ARGUMENT"}}
+//
+// where `status` is a google.rpc.Code name.
+type apiError struct {
+	HTTPStatus int
+	Status     string // canonical status name, e.g. "INVALID_ARGUMENT"
+	Message    string
+}
+
+func (e *apiError) Error() string {
+	return fmt.Sprintf("gemini http %d (%s): %s", e.HTTPStatus, e.Status, truncate(e.Message, 400))
+}
+
+// rejectsSafetyThreshold reports whether err is the specific API rejection
+// of the requested safety threshold: HTTP 400 with canonical status
+// INVALID_ARGUMENT. This is the only condition the BLOCK_NONE retry was
+// designed for.
+func rejectsSafetyThreshold(err error) bool {
+	var apiErr *apiError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.HTTPStatus == http.StatusBadRequest && apiErr.Status == "INVALID_ARGUMENT"
 }
 
 func (s *Service) doGemini(ctx context.Context, model, apiKey string, payload any) ([]byte, error) {
@@ -260,7 +292,26 @@ func (s *Service) doGemini(ctx context.Context, model, apiKey string, payload an
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 32<<20)) // 32 MiB cap
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("gemini http %d: %s", resp.StatusCode, truncate(string(body), 400))
+		// Parse the structured Google API error envelope so callers can
+		// branch on the canonical `status` field. Fall back to the raw
+		// body in the message when the envelope is absent/unparseable.
+		var errEnvelope struct {
+			Error struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+				Status  string `json:"status"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(body, &errEnvelope)
+		msg := errEnvelope.Error.Message
+		if msg == "" {
+			msg = string(body)
+		}
+		return nil, &apiError{
+			HTTPStatus: resp.StatusCode,
+			Status:     errEnvelope.Error.Status,
+			Message:    msg,
+		}
 	}
 
 	type respPart struct {

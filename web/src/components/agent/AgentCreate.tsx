@@ -11,6 +11,13 @@ import { ToolPicker } from "./fields/ToolPicker";
 import { ModelPicker } from "./fields/ModelPicker";
 import { EffortPicker } from "./fields/EffortPicker";
 import { WorkDirInput } from "./fields/WorkDirInput";
+import { PageHeader } from "../ui/PageHeader";
+import { SectionCard } from "../ui/SectionCard";
+import { Field } from "../ui/Field";
+import { Input } from "../ui/Input";
+import { Select } from "../ui/Select";
+import { Button } from "../ui/Button";
+import { Banner } from "../ui/Banner";
 
 type GenPhase = "idle" | "persona" | "name" | "avatar" | "all-name" | "all-avatar";
 
@@ -270,244 +277,230 @@ export function AgentCreate() {
           : "";
 
   return (
-    <div className="min-h-full bg-neutral-950 text-neutral-200">
-      <header className="flex items-center gap-2 px-4 py-3 border-b border-neutral-800">
-        <button
-          onClick={() => navigate("/")}
-          className="text-neutral-400 hover:text-neutral-200"
-        >
-          &larr;
-        </button>
-        <h1 className="text-lg font-bold">New Agent</h1>
-      </header>
+    <div className="min-h-full bg-app text-ink">
+      <PageHeader title="New Agent" onBack={() => navigate("/")} />
 
-      <main className="p-4 space-y-5 max-w-md mx-auto">
-        {/* Persona */}
-        <PersonaField
-          persona={persona}
-          setPersona={setPersona}
-          textareaRows={5}
-          textareaPlaceholder="Describe the agent's personality, speaking style, interests..."
-          personaPrompt={personaPrompt}
-          setPersonaPrompt={setPersonaPrompt}
-          promptPlaceholder="e.g. ツンデレな女の子にして"
-          busy={isGenerating}
-          spinning={genPhase === "persona"}
-          onGenerate={handleGeneratePersona}
-        />
+      <main className="mx-auto max-w-[560px] space-y-6 px-4 py-6">
+        {/* ── Identity ── */}
+        <SectionCard id="identity" title="Identity">
+          <div className="space-y-5">
+            <PersonaField
+              persona={persona}
+              setPersona={setPersona}
+              textareaRows={5}
+              textareaPlaceholder="Describe the agent's personality, speaking style, interests..."
+              personaPrompt={personaPrompt}
+              setPersonaPrompt={setPersonaPrompt}
+              promptPlaceholder="e.g. ツンデレな女の子にして"
+              busy={isGenerating}
+              spinning={genPhase === "persona"}
+              onGenerate={handleGeneratePersona}
+            />
 
-        {/* Avatar + Name + Hint */}
-        <div className="flex gap-4">
-          {/* Avatar preview */}
-          <div className="relative shrink-0">
-            <button
-              type="button"
-              onClick={handleAvatarClick}
-              disabled={isGenerating}
-              className="w-24 h-24 rounded-full bg-neutral-800 border border-neutral-700 overflow-hidden flex items-center justify-center hover:border-neutral-500 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
-              title="Click to upload avatar"
-            >
-              {avatarPreviewUrl ? (
-                <img
-                  src={avatarPreviewUrl}
-                  alt="Avatar"
-                  className="w-full h-full object-cover"
-                />
-              ) : (
-                <svg
-                  className="w-7 h-7 text-neutral-600"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                  strokeWidth={1.5}
+            {/* Avatar + Name + Hint */}
+            <div className="flex gap-4">
+              {/* Avatar preview */}
+              <div className="relative shrink-0">
+                <button
+                  type="button"
+                  onClick={handleAvatarClick}
+                  disabled={isGenerating}
+                  className="flex h-24 w-24 items-center justify-center overflow-hidden rounded-full border border-hairline bg-raised transition-colors hover:border-ink-faint disabled:cursor-not-allowed disabled:opacity-60"
+                  title="Click to upload avatar"
                 >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M15.75 6a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0ZM4.501 20.118a7.5 7.5 0 0 1 14.998 0A17.933 17.933 0 0 1 12 21.75c-2.676 0-5.216-.584-7.499-1.632Z"
-                  />
-                </svg>
-              )}
-            </button>
-            {/* Re-generate avatar only */}
-            {avatarPreviewUrl && (
-              <button
-                type="button"
-                onClick={() => handleGenerateAvatar()}
+                  {avatarPreviewUrl ? (
+                    <img
+                      src={avatarPreviewUrl}
+                      alt="Avatar"
+                      className="h-full w-full object-cover"
+                    />
+                  ) : (
+                    <svg
+                      className="h-7 w-7 text-ink-faint"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={1.5}
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M15.75 6a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0ZM4.501 20.118a7.5 7.5 0 0 1 14.998 0A17.933 17.933 0 0 1 12 21.75c-2.676 0-5.216-.584-7.499-1.632Z"
+                      />
+                    </svg>
+                  )}
+                </button>
+                {/* Re-generate avatar only */}
+                {avatarPreviewUrl && (
+                  <button
+                    type="button"
+                    onClick={() => handleGenerateAvatar()}
+                    disabled={isGenerating || !persona.trim()}
+                    className="absolute -bottom-1 -right-1 flex h-6 w-6 items-center justify-center rounded-full border border-hairline bg-raised text-xs transition-colors hover:bg-hover disabled:opacity-40"
+                    title="Regenerate avatar"
+                  >
+                    {genPhase === "avatar" ? <span className="animate-spin">↻</span> : "✨"}
+                  </button>
+                )}
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept="image/*"
+                  onChange={handleAvatarFileChange}
+                  className="hidden"
+                />
+              </div>
+
+              {/* Name + Hint */}
+              <div className="flex-1 space-y-2">
+                <Field label="Name">
+                  <div className="flex gap-2">
+                    <Input
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                      placeholder="Name"
+                      className="flex-1"
+                    />
+                    <Button
+                      onClick={() => handleGenerateName()}
+                      disabled={isGenerating || !persona.trim()}
+                      title="Generate name from persona"
+                      className="shrink-0"
+                    >
+                      {genPhase === "name" ? (
+                        <span className="inline-block animate-spin">↻</span>
+                      ) : (
+                        "✨"
+                      )}
+                    </Button>
+                  </div>
+                </Field>
+                <Input
+                  aria-label="Generation hint"
+                  value={genPrompt}
+                  onChange={(e) => setGenPrompt(e.target.value)}
+                  placeholder="Generation hint (optional)"
+                />
+              </div>
+            </div>
+
+            {/* Generate All / Avatar only */}
+            <div className="flex gap-2">
+              <Button
+                onClick={handleGenerateAll}
                 disabled={isGenerating || !persona.trim()}
-                className="absolute -bottom-1 -right-1 w-6 h-6 rounded-full bg-neutral-700 hover:bg-neutral-600 border border-neutral-600 flex items-center justify-center text-xs disabled:opacity-40"
-                title="Regenerate avatar"
+                className="flex flex-1 items-center justify-center gap-2"
+              >
+                {genPhase.startsWith("all-") ? (
+                  <>
+                    <span className="animate-spin">↻</span>
+                    {genStatusText}
+                  </>
+                ) : (
+                  <>✨ Name & Avatar</>
+                )}
+              </Button>
+              <Button
+                onClick={() => handleGenerateAvatar()}
+                disabled={isGenerating || !persona.trim() || !name.trim()}
+                className="flex items-center justify-center gap-2"
+                title={!name.trim() ? "Set a name first" : "Generate avatar only"}
               >
                 {genPhase === "avatar" ? (
-                  <span className="animate-spin">↻</span>
+                  <>
+                    <span className="animate-spin">↻</span>
+                    Avatar...
+                  </>
                 ) : (
-                  "✨"
+                  <>✨ Avatar</>
                 )}
-              </button>
-            )}
-            <input
-              ref={fileRef}
-              type="file"
-              accept="image/*"
-              onChange={handleAvatarFileChange}
-              className="hidden"
-            />
-          </div>
-
-          {/* Name + Hint */}
-          <div className="flex-1 space-y-2">
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="Name"
-                className="flex-1 px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-              />
-              <button
-                onClick={() => handleGenerateName()}
-                disabled={isGenerating || !persona.trim()}
-                className="px-2.5 py-2 bg-neutral-800 hover:bg-neutral-700 rounded text-sm disabled:opacity-40"
-                title="Generate name from persona"
-              >
-                {genPhase === "name" ? (
-                  <span className="animate-spin inline-block">↻</span>
-                ) : (
-                  "✨"
-                )}
-              </button>
+              </Button>
             </div>
-            <input
-              type="text"
-              value={genPrompt}
-              onChange={(e) => setGenPrompt(e.target.value)}
-              placeholder="Generation hint (optional)"
-              className="w-full px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-xs focus:outline-none focus:border-neutral-500"
+          </div>
+        </SectionCard>
+
+        {/* ── Model & Tools ── */}
+        <SectionCard id="model" title="Model & Tools">
+          <div className="space-y-4">
+            <ToolPicker
+              tool={tool}
+              setTool={setTool}
+              setModel={setModel}
+              effort={effort}
+              setEffort={setEffort}
+              isDisabled={(t) => (info ? !(info.tools[t]?.available || info.agentBackends?.[t]) : false)}
             />
-          </div>
-        </div>
 
-        {/* Generate All / Avatar only */}
-        <div className="flex gap-2">
-          <button
-            onClick={handleGenerateAll}
-            disabled={isGenerating || !persona.trim()}
-            className="flex-1 py-2.5 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded-lg text-sm font-medium disabled:opacity-40 flex items-center justify-center gap-2"
-          >
-            {genPhase.startsWith("all-") ? (
-              <>
-                <span className="animate-spin">↻</span>
-                {genStatusText}
-              </>
-            ) : (
-              <>✨ Name & Avatar</>
+            {needsCustomURL && (
+              <Field label="API Base URL">
+                <Input
+                  mono
+                  value={customBaseURL}
+                  onChange={(e) => setCustomBaseURL(e.target.value)}
+                  placeholder="http://localhost:8080"
+                />
+              </Field>
             )}
-          </button>
-          <button
-            onClick={() => handleGenerateAvatar()}
-            disabled={isGenerating || !persona.trim() || !name.trim()}
-            className="px-4 py-2.5 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded-lg text-sm font-medium disabled:opacity-40 flex items-center justify-center gap-2"
-            title={!name.trim() ? "Set a name first" : "Generate avatar only"}
-          >
-            {genPhase === "avatar" ? (
-              <>
-                <span className="animate-spin">↻</span>
-                Avatar...
-              </>
-            ) : (
-              <>✨ Avatar</>
-            )}
-          </button>
-        </div>
 
-        {/* Tool */}
-        <ToolPicker
-          tool={tool}
-          setTool={setTool}
-          setModel={setModel}
-          effort={effort}
-          setEffort={setEffort}
-          isDisabled={(t) => (info ? !(info.tools[t]?.available || info.agentBackends?.[t]) : false)}
-        />
-
-        {/* Custom Base URL */}
-        {needsCustomURL && (
-          <div>
-            <label className="block text-sm text-neutral-400 mb-2">API Base URL</label>
-            <input
-              type="text"
-              value={customBaseURL}
-              onChange={(e) => setCustomBaseURL(e.target.value)}
-              placeholder="http://localhost:8080"
-              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm font-mono focus:outline-none focus:border-neutral-500"
+            <ModelPicker
+              model={model}
+              setModel={setModel}
+              effort={effort}
+              setEffort={setEffort}
+              models={needsCustomURL ? customModels : modelsForTool(tool)}
             />
+
+            <EffortPicker tool={tool} effort={effort} setEffort={setEffort} model={model} />
+
+            {tool === "llama.cpp" && (
+              <Field label="Thinking">
+                <Select value={thinkingMode} onChange={(e) => setThinkingMode(e.target.value)}>
+                  <option value="">auto (server default)</option>
+                  <option value="on">on</option>
+                  <option value="off">off</option>
+                </Select>
+              </Field>
+            )}
+
+            <WorkDirInput workDir={workDir} setWorkDir={setWorkDir} />
           </div>
-        )}
+        </SectionCard>
 
-        {/* Model */}
-        <ModelPicker
-          model={model}
-          setModel={setModel}
-          effort={effort}
-          setEffort={setEffort}
-          models={needsCustomURL ? customModels : modelsForTool(tool)}
-        />
+        {/* ── Schedule ── */}
+        <SectionCard id="schedule" title="Schedule">
+          <ScheduleEditor
+            cronExpr={cronExpr}
+            onCronExprChange={(v) => {
+              setCronExpr(v);
+              setCronExprDirty(true);
+            }}
+            timeoutMinutes={timeoutMinutes}
+            onTimeoutChange={setTimeoutMinutes}
+            resumeIdleMinutes={resumeIdleMinutes}
+            onResumeIdleChange={setResumeIdleMinutes}
+            tool={tool}
+            silentStart={silentStart}
+            silentEnd={silentEnd}
+            onSilentStartChange={setSilentStart}
+            onSilentEndChange={setSilentEnd}
+            cronMessage={cronMessage}
+            onCronMessageChange={setCronMessage}
+          />
+        </SectionCard>
 
-        {/* Effort */}
-        <EffortPicker tool={tool} effort={effort} setEffort={setEffort} model={model} />
+        {error && <Banner tone="error">{error}</Banner>}
 
-        {/* Thinking Mode (llama.cpp only) */}
-        {tool === "llama.cpp" && (
-          <div>
-            <label className="block text-sm text-neutral-400 mb-2">Thinking</label>
-            <select
-              value={thinkingMode}
-              onChange={(e) => setThinkingMode(e.target.value)}
-              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-            >
-              <option value="">auto (server default)</option>
-              <option value="on">on</option>
-              <option value="off">off</option>
-            </select>
-          </div>
-        )}
-
-        {/* File Storage */}
-        <WorkDirInput workDir={workDir} setWorkDir={setWorkDir} />
-
-        {/* Schedule */}
-        <ScheduleEditor
-          cronExpr={cronExpr}
-          onCronExprChange={(v) => {
-            setCronExpr(v);
-            setCronExprDirty(true);
-          }}
-          timeoutMinutes={timeoutMinutes}
-          onTimeoutChange={setTimeoutMinutes}
-          resumeIdleMinutes={resumeIdleMinutes}
-          onResumeIdleChange={setResumeIdleMinutes}
-          tool={tool}
-          silentStart={silentStart}
-          silentEnd={silentEnd}
-          onSilentStartChange={setSilentStart}
-          onSilentEndChange={setSilentEnd}
-          cronMessage={cronMessage}
-          onCronMessageChange={setCronMessage}
-        />
-
-        {error && (
-          <div className="p-3 bg-red-950 border border-red-800 rounded-lg text-sm text-red-300">
-            {error}
-          </div>
-        )}
-
-        <button
-          onClick={handleCreate}
-          disabled={loading || !name.trim()}
-          className="w-full py-3 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm font-medium disabled:opacity-40"
-        >
-          {loading ? "Creating..." : "Create Agent"}
-        </button>
+        {/* Primary action — sticky above the fold on mobile. */}
+        <div className="sticky bottom-0 -mx-4 border-t border-hairline bg-app/90 px-4 py-3 backdrop-blur sm:static sm:mx-0 sm:border-0 sm:bg-transparent sm:p-0 sm:backdrop-blur-none">
+          <Button
+            variant="primary"
+            onClick={handleCreate}
+            disabled={loading || !name.trim()}
+            className="w-full py-3"
+          >
+            {loading ? "Creating..." : "Create agent"}
+          </Button>
+        </div>
       </main>
     </div>
   );

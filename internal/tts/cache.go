@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/configdir"
@@ -124,21 +123,26 @@ func cachePut(hash, format string, data []byte) error {
 	return nil
 }
 
-// startCacheSweep removes expired entries every hour. The first sweep
-// runs immediately so a long-stale cache is trimmed at startup.
-var sweepOnce sync.Once
-
-func StartCacheSweep() {
-	sweepOnce.Do(func() {
-		go func() {
-			sweepCache()
-			t := time.NewTicker(1 * time.Hour)
-			defer t.Stop()
-			for range t.C {
+// StartCacheSweep removes expired entries every hour. The first sweep
+// runs immediately so a long-stale cache is trimmed at startup. The
+// background goroutine runs until the supplied done channel is closed,
+// mirroring thumbnail.StartPurger so the server shutdown path can stop
+// it. Each call starts its own goroutine tied to its own done channel
+// (one per Server); sweeps are idempotent, so overlap is harmless.
+func StartCacheSweep(done <-chan struct{}) {
+	sweepCache()
+	go func() {
+		t := time.NewTicker(1 * time.Hour)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
 				sweepCache()
 			}
-		}()
-	})
+		}
+	}()
 }
 
 func sweepCache() {

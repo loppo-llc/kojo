@@ -13,9 +13,9 @@ func TestDir(t *testing.T) {
 	}
 }
 
-// TestSanitizeName pins the upload-sanitization security invariant: the
-// output must be byte-identical to filepath.Base followed by a Replacer
-// mapping "/", "\\" and NUL to "_".
+// TestSanitizeName pins the unified upload-sanitization security
+// invariant: filepath.Base, then map "/", "\\", NUL and any control
+// character to "_", then collapse "", "." and ".." to "_".
 func TestSanitizeName(t *testing.T) {
 	tests := []struct {
 		name string
@@ -29,7 +29,14 @@ func TestSanitizeName(t *testing.T) {
 		{"nul to underscore", "a\x00b.txt", "a_b.txt"},
 		{"traversal", "../../secret", "secret"},
 		{"mixed", "dir\\sub\x00name.png", "dir_sub_name.png"},
-		{"empty", "", "."}, // filepath.Base("") == "."
+		{"newline to underscore", "a\nb.txt", "a_b.txt"},
+		{"tab to underscore", "a\tb.txt", "a_b.txt"},
+		{"escape to underscore", "a\x1bb.txt", "a_b.txt"},
+		{"empty to underscore", "", "_"},    // filepath.Base("") == "." → collapsed
+		{"dot to underscore", ".", "_"},     // bare "." is unsafe
+		{"dotdot to underscore", "..", "_"}, // bare ".." is unsafe
+		{"dotdot slash", "foo/..", "_"},     // filepath.Base → ".." → collapsed
+		{"only control", "\n", "_"},         // Base → "\n" → "_" (not collapsed further)
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

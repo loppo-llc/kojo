@@ -44,26 +44,26 @@ function GroupDMNotificationPill({
   // as "" after the regex capture rather than undefined.
   const senderLabel = sender && sender.trim() !== "" ? sender : "?";
   return (
-    <div className="flex justify-center my-1.5">
-      <div className="flex flex-col items-center max-w-[90%] w-full">
+    <div className="my-1.5 flex justify-center">
+      <div className="flex w-full max-w-[90%] flex-col items-center">
         <button
           type="button"
           onClick={() => setExpanded((v) => !v)}
-          className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-neutral-900/60 border border-neutral-800 hover:border-neutral-700 text-[11px] text-neutral-500 transition-colors cursor-pointer"
+          className="flex items-center gap-1.5 rounded-full border border-hairline bg-surface px-3 py-1 font-mono text-[11px] text-ink-faint transition-colors hover:text-ink"
           title={expanded ? "Hide notification body" : "Show notification body"}
         >
-          <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <svg className="h-3 w-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M20.25 8.511c.884.284 1.5 1.128 1.5 2.097v4.286c0 1.136-.847 2.1-1.98 2.193-.34.027-.68.052-1.02.072v3.091l-3-3c-1.354 0-2.694-.055-4.02-.163a2.115 2.115 0 01-.825-.242m9.345-8.334a2.126 2.126 0 00-.476-.095 48.64 48.64 0 00-8.048 0c-1.131.094-1.976 1.057-1.976 2.192v4.286c0 .837.46 1.58 1.155 1.951m9.345-8.334V6.637c0-1.621-1.152-3.026-2.76-3.235A48.455 48.455 0 0011.25 3c-2.115 0-4.198.137-6.24.402-1.608.209-2.76 1.614-2.76 3.235v6.226c0 1.621 1.152 3.026 2.76 3.235.577.075 1.157.14 1.74.194V21l4.155-4.155" />
           </svg>
           <span>
-            <span className="text-neutral-400">{senderLabel}</span> &rarr; {groupName}
+            <span className="text-ink-dim">{senderLabel}</span> &rarr; {groupName}
           </span>
           {count != null && count > 1 && (
-            <span className="text-neutral-600">{count} msgs</span>
+            <span className="text-ink-faint">{count} msgs</span>
           )}
-          <span className="text-neutral-600">{formatTime(message.timestamp)}</span>
+          <span className="text-ink-faint">{formatTime(message.timestamp)}</span>
           <svg
-            className={`w-3 h-3 transition-transform ${expanded ? "rotate-90" : ""}`}
+            className={`h-3 w-3 transition-transform ${expanded ? "rotate-90" : ""}`}
             fill="none"
             viewBox="0 0 24 24"
             stroke="currentColor"
@@ -73,7 +73,7 @@ function GroupDMNotificationPill({
           </svg>
         </button>
         {expanded && (
-          <pre className="mt-1.5 w-full min-w-0 px-3 py-2 rounded bg-neutral-900/80 border border-neutral-800 text-[10px] leading-relaxed text-neutral-400 whitespace-pre-wrap wrap-anywhere overflow-x-auto">
+          <pre className="mt-1.5 w-full min-w-0 overflow-x-auto rounded-[10px] border border-hairline bg-surface px-3 py-2 text-[10px] leading-relaxed text-ink-dim whitespace-pre-wrap wrap-anywhere">
             {message.content}
           </pre>
         )}
@@ -121,18 +121,18 @@ export function SystemMessage({ message }: { message: AgentMessage }) {
   }
 
   return (
-    <div className="flex justify-center my-2">
+    <div className="my-2 flex justify-center">
       <div
-        className={`max-w-[90%] px-4 py-2.5 rounded-lg text-xs leading-relaxed ${
+        className={`max-w-[90%] rounded-[10px] border px-4 py-2.5 text-xs leading-relaxed ${
           isError
-            ? "bg-red-950/50 border border-red-900/50 text-red-300"
-            : "bg-neutral-900/60 border border-neutral-800 text-neutral-400"
+            ? "border-lamp-err/40 bg-lamp-err/10 text-lamp-err"
+            : "border-hairline bg-surface text-ink-dim"
         }`}
       >
         <div className="flex items-start gap-2">
           {isError ? (
             <svg
-              className="w-4 h-4 text-red-400 shrink-0 mt-0.5"
+              className="mt-0.5 h-4 w-4 shrink-0 text-lamp-err"
               fill="none"
               viewBox="0 0 24 24"
               stroke="currentColor"
@@ -146,7 +146,7 @@ export function SystemMessage({ message }: { message: AgentMessage }) {
             </svg>
           ) : (
             <svg
-              className="w-4 h-4 text-neutral-500 shrink-0 mt-0.5"
+              className="mt-0.5 h-4 w-4 shrink-0 text-ink-faint"
               fill="none"
               viewBox="0 0 24 24"
               stroke="currentColor"
@@ -161,7 +161,7 @@ export function SystemMessage({ message }: { message: AgentMessage }) {
           )}
           <span className="whitespace-pre-wrap wrap-anywhere">{content}</span>
         </div>
-        <div className="text-[10px] text-neutral-600 mt-1.5 text-right">
+        <div className="mt-1.5 text-right font-mono text-[10px] text-ink-faint">
           {formatTime(message.timestamp)}
         </div>
       </div>
@@ -190,17 +190,17 @@ function CollapsibleSystemPill({
   // soft heuristic — past that the pill almost certainly has a body.
   const hasMore = firstLineEnd >= 0 || firstLine.length > 80;
   return (
-    <div className="flex justify-center my-2">
-      <div className="max-w-[90%] bg-neutral-900/60 border border-neutral-800 text-neutral-400 rounded-lg text-xs leading-relaxed">
+    <div className="my-2 flex justify-center">
+      <div className="max-w-[90%] rounded-[10px] border border-hairline bg-surface text-xs leading-relaxed text-ink-dim">
         <button
           type="button"
           onClick={() => hasMore && setExpanded((v) => !v)}
-          className={`w-full px-4 py-2.5 flex items-start gap-2 text-left ${
-            hasMore ? "cursor-pointer hover:bg-neutral-900/80" : "cursor-default"
+          className={`flex w-full items-start gap-2 px-4 py-2.5 text-left ${
+            hasMore ? "cursor-pointer hover:bg-hover" : "cursor-default"
           }`}
         >
           <svg
-            className="w-4 h-4 text-neutral-500 shrink-0 mt-0.5"
+            className="mt-0.5 h-4 w-4 shrink-0 text-ink-faint"
             fill="none"
             viewBox="0 0 24 24"
             stroke="currentColor"
@@ -219,7 +219,7 @@ function CollapsibleSystemPill({
           </span>
           {hasMore && (
             <svg
-              className={`w-3.5 h-3.5 text-neutral-500 shrink-0 mt-1 transition-transform ${
+              className={`mt-1 h-3.5 w-3.5 shrink-0 text-ink-faint transition-transform ${
                 expanded ? "rotate-180" : ""
               }`}
               fill="none"
@@ -231,7 +231,7 @@ function CollapsibleSystemPill({
             </svg>
           )}
         </button>
-        <div className="text-[10px] text-neutral-600 px-4 pb-1.5 text-right">
+        <div className="px-4 pb-1.5 text-right font-mono text-[10px] text-ink-faint">
           {formatTime(message.timestamp)}
         </div>
       </div>

@@ -215,22 +215,25 @@ func (b *Browser) View(path string) (*FileView, error) {
 	}, nil
 }
 
-func (b *Browser) ServeRaw(w http.ResponseWriter, r *http.Request, path string) {
+// ServeRaw streams the file at path after expanding ~ and validating the
+// resolved absolute path against the allowed roots. It does not write error
+// responses itself: a pre-stream failure is returned as *thumbnail.HTTPError
+// carrying the status/message the caller should deliver (in the server's JSON
+// envelope). Returns nil once http.ServeFile has taken over the response.
+func (b *Browser) ServeRaw(w http.ResponseWriter, r *http.Request, path string) error {
 	path, err := expandHome(path)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return thumbnail.NewHTTPError(http.StatusBadRequest, err.Error(), err)
 	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		http.Error(w, "invalid path", http.StatusBadRequest)
-		return
+		return thumbnail.NewHTTPError(http.StatusBadRequest, "invalid path", err)
 	}
 	if err := b.validatePath(absPath); err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
+		return thumbnail.NewHTTPError(http.StatusForbidden, err.Error(), err)
 	}
 	http.ServeFile(w, r, absPath)
+	return nil
 }
 
 // ServeThumb serves a low-resolution JPEG thumbnail of the image at path.
@@ -238,44 +241,44 @@ func (b *Browser) ServeRaw(w http.ResponseWriter, r *http.Request, path string) 
 // extensions return 415 immediately so unsupported types don't hit the
 // decoder. `size` is the requested longer-edge in pixels (clamped by the
 // thumbnail package).
-func (b *Browser) ServeThumb(w http.ResponseWriter, r *http.Request, path string, size int) {
+//
+// Like ServeRaw, ServeThumb does not write error responses itself: a
+// pre-stream failure is returned as *thumbnail.HTTPError so the caller can
+// deliver it in the server's JSON envelope. Returns nil once http.ServeFile
+// has taken over the response.
+func (b *Browser) ServeThumb(w http.ResponseWriter, r *http.Request, path string, size int) error {
 	path, err := expandHome(path)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return thumbnail.NewHTTPError(http.StatusBadRequest, err.Error(), err)
 	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		http.Error(w, "invalid path", http.StatusBadRequest)
-		return
+		return thumbnail.NewHTTPError(http.StatusBadRequest, "invalid path", err)
 	}
 	if err := b.validatePath(absPath); err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
+		return thumbnail.NewHTTPError(http.StatusForbidden, err.Error(), err)
 	}
 	ext := strings.ToLower(filepath.Ext(absPath))
 	if _, ok := imageExts[ext]; !ok || !thumbnail.IsSupportedExt(ext) {
-		http.Error(w, "unsupported image format", http.StatusUnsupportedMediaType)
-		return
+		return thumbnail.NewHTTPError(http.StatusUnsupportedMediaType, "unsupported image format", nil)
 	}
 	cached, err := thumbnail.Generate(absPath, size)
 	if err != nil {
 		switch {
 		case errors.Is(err, thumbnail.ErrUnsupportedFormat):
-			http.Error(w, err.Error(), http.StatusUnsupportedMediaType)
+			return thumbnail.NewHTTPError(http.StatusUnsupportedMediaType, err.Error(), err)
 		case errors.Is(err, thumbnail.ErrSourceTooLarge):
 			// Source exceeds the byte/pixel budget — don't blow RAM
 			// decoding it. 413 lets the client decide whether to fall
 			// back to the raw image (which is then their decision to
 			// pay the bandwidth).
-			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+			return thumbnail.NewHTTPError(http.StatusRequestEntityTooLarge, err.Error(), err)
 		case os.IsNotExist(err):
-			http.Error(w, "file not found", http.StatusNotFound)
+			return thumbnail.NewHTTPError(http.StatusNotFound, "file not found", err)
 		default:
 			b.logger.Warn("thumbnail generation failed", "path", absPath, "err", err)
-			http.Error(w, "thumbnail generation failed", http.StatusInternalServerError)
+			return thumbnail.NewHTTPError(http.StatusInternalServerError, "thumbnail generation failed", err)
 		}
-		return
 	}
 	// Generated thumbnails are content-addressed by (path, modtime, size,
 	// filesize). Let the browser cache aggressively; callers that know
@@ -288,6 +291,7 @@ func (b *Browser) ServeThumb(w http.ResponseWriter, r *http.Request, path string
 	// reload returns 304 once the browser has the bytes.
 	w.Header().Set("ETag", `"`+strings.TrimSuffix(filepath.Base(cached), ".jpg")+`"`)
 	http.ServeFile(w, r, cached)
+	return nil
 }
 
 // ValidatePath checks that the given path is under an allowed root directory.

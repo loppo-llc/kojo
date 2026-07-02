@@ -8,6 +8,19 @@ import {
   isCronExprSyntaxValid,
   parseCronExpr,
 } from "../../lib/cronExpr";
+import { Field } from "../ui/Field";
+import { Input } from "../ui/Input";
+import { Textarea } from "../ui/Textarea";
+import { Toggle } from "../ui/Toggle";
+
+// Shared chip style for the preset / tab / day-of-week toggles.
+function chipClass(selected: boolean): string {
+  return `rounded-lg border px-3 py-1.5 text-[13px] transition-colors ${
+    selected
+      ? "border-copper bg-copper/15 text-copper-bright"
+      : "border-hairline bg-raised text-ink-dim hover:border-ink-faint hover:text-ink"
+  }`;
+}
 
 interface Props {
   // 5-field standard cron expression. "" = scheduling disabled.
@@ -64,8 +77,8 @@ function toMinutes(hhmm: string): number {
 
 /** Build CSS gradient showing the silent window on a 24h bar. */
 function timelineGradient(start: string, end: string): string {
-  const silent = "rgb(38 38 38)";
-  const active = "rgb(217 119 6 / 0.5)";
+  const silent = "rgb(38 43 51)"; // hairline
+  const active = "rgb(208 139 85 / 0.4)"; // copper
 
   if (!start || !end) {
     return active;
@@ -232,17 +245,17 @@ export function ScheduleEditor({
     <div className="space-y-4">
       {/* Mode tabs */}
       <div>
-        <label className="block text-sm text-neutral-400 mb-2">Schedule</label>
-        <div className="flex gap-1 mb-3 bg-neutral-900 rounded p-1 border border-neutral-800">
+        <label className="mb-2 block text-[12px] font-medium text-ink-dim">Schedule</label>
+        <div className="mb-3 flex gap-1 rounded-lg border border-hairline bg-raised p-1">
           {TABS.map((t) => (
             <button
               key={t.id}
               type="button"
               onClick={() => setTab(t.id)}
-              className={`flex-1 px-2 py-1 rounded text-xs transition-colors ${
+              className={`flex-1 rounded-md px-2 py-1 text-[12px] transition-colors ${
                 tab === t.id
-                  ? "bg-amber-900/60 border border-amber-700/80 text-amber-200"
-                  : "text-neutral-400 hover:text-neutral-200"
+                  ? "bg-copper/15 text-copper-bright"
+                  : "text-ink-dim hover:text-ink"
               }`}
             >
               {t.label}
@@ -251,7 +264,7 @@ export function ScheduleEditor({
         </div>
 
         {tab === "preset" && (
-          <div className="flex gap-1.5 flex-wrap">
+          <div className="flex flex-wrap gap-1.5">
             {SCHEDULE_PRESETS.map((opt) => {
               // cronEquivalentToPreset (NOT ===) so a Save round-trip
               // that expanded "@preset:30" into "7,37 * * * *" still
@@ -262,11 +275,7 @@ export function ScheduleEditor({
                   key={opt.label}
                   type="button"
                   onClick={() => onCronExprChange(opt.cron)}
-                  className={`px-3 py-1.5 rounded text-sm transition-colors ${
-                    selected
-                      ? "bg-amber-900/60 border border-amber-700/80 text-amber-200"
-                      : "bg-neutral-900 border border-neutral-800 text-neutral-400 hover:border-neutral-600"
-                  }`}
+                  className={chipClass(selected)}
                 >
                   {opt.label}
                 </button>
@@ -320,132 +329,99 @@ export function ScheduleEditor({
         )}
 
         {/* Live human-readable preview — shown across all tabs. */}
-        <p className="mt-2 text-[11px] text-neutral-500">
+        <p className="mt-2 text-[11px] text-ink-faint">
           {humanizeCron(cronExpr)}
         </p>
       </div>
 
       {/* Timeout */}
       {(enabled || onCheckin) && (
-        <div>
-          <label className="block text-sm text-neutral-400 mb-2">Timeout</label>
-          <div className="flex gap-1.5 flex-wrap">
+        <Field label="Timeout" help="Max duration for each scheduled or manual check-in run.">
+          <div className="flex flex-wrap gap-1.5">
             {TIMEOUT_PRESETS.map((opt) => (
               <button
                 key={opt.value}
                 type="button"
                 onClick={() => onTimeoutChange(opt.value)}
-                className={`px-3 py-1.5 rounded text-sm transition-colors ${
-                  timeoutMinutes === opt.value
-                    ? "bg-amber-900/60 border border-amber-700/80 text-amber-200"
-                    : "bg-neutral-900 border border-neutral-800 text-neutral-400 hover:border-neutral-600"
-                }`}
+                className={chipClass(timeoutMinutes === opt.value)}
               >
                 {opt.label}
               </button>
             ))}
           </div>
-          <p className="mt-1.5 text-[11px] text-neutral-600">
-            Max duration for each scheduled or manual check-in run.
-          </p>
-        </div>
+        </Field>
       )}
 
       {/* Resume Idle (claude only) */}
       {showResumeIdle && (
-        <div>
-          <label className="block text-sm text-neutral-400 mb-2">
-            Resume Window
-            <span className="text-xs text-neutral-600 ml-2">(claude session reset threshold)</span>
-          </label>
-          <div className="flex gap-1.5 flex-wrap">
+        <Field
+          label={
+            <>
+              Resume Window
+              <span className="ml-2 text-ink-faint">(claude session reset threshold)</span>
+            </>
+          }
+          help="How long an over-context session keeps being resumed after the last interactive turn. Smaller resets sooner; larger keeps context across longer pauses. Default matches Anthropic's prompt-cache TTL."
+        >
+          <div className="flex flex-wrap gap-1.5">
             {RESUME_IDLE_PRESETS.map((opt) => (
               <button
                 key={opt.value}
                 type="button"
                 onClick={() => onResumeIdleChange?.(opt.value)}
-                className={`px-3 py-1.5 rounded text-sm transition-colors ${
-                  (resumeIdleMinutes ?? 0) === opt.value
-                    ? "bg-amber-900/60 border border-amber-700/80 text-amber-200"
-                    : "bg-neutral-900 border border-neutral-800 text-neutral-400 hover:border-neutral-600"
-                }`}
+                className={chipClass((resumeIdleMinutes ?? 0) === opt.value)}
               >
                 {opt.label}
               </button>
             ))}
           </div>
-          <p className="mt-1.5 text-[11px] text-neutral-600">
-            How long an over-context session keeps being resumed after the last
-            interactive turn. Smaller resets sooner; larger keeps context across
-            longer pauses. Default matches Anthropic's prompt-cache TTL.
-          </p>
-        </div>
+        </Field>
       )}
 
       {/* Silent Hours */}
       {enabled && (
         <div>
-          <div className="flex items-center justify-between mb-2">
-            <label className="text-sm text-neutral-400">Silent Hours</label>
-            <button
-              type="button"
-              onClick={toggleSilentHours}
-              className="flex items-center gap-1.5"
-            >
-              <span
-                className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors duration-200 ${
-                  silentEnabled ? "bg-amber-600/60" : "bg-neutral-700"
-                }`}
-              >
-                <span
-                  className={`inline-block h-2.5 w-2.5 rounded-full bg-white transition-transform duration-200 ${
-                    silentEnabled ? "translate-x-[14px]" : "translate-x-[3px]"
-                  }`}
-                />
-              </span>
-            </button>
+          <div className="mb-2 flex items-center justify-between">
+            <label className="text-[12px] font-medium text-ink-dim">Silent Hours</label>
+            <Toggle checked={silentEnabled} onChange={toggleSilentHours} aria-label="Silent hours" />
           </div>
 
           {silentEnabled && (
             <div className="space-y-3">
               <div className="flex items-center gap-3">
-                <div className="flex-1">
-                  <label className="block text-[11px] text-neutral-500 mb-1">From</label>
-                  <input
+                <Field label="From" className="flex-1">
+                  <Input
                     type="time"
                     value={localStart}
                     onChange={(e) => onSilentStartChange(e.target.value)}
-                    className="w-full px-2.5 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 focus:outline-none focus:border-amber-700/60 [color-scheme:dark]"
                   />
-                </div>
-                <span className="text-neutral-600 mt-4">—</span>
-                <div className="flex-1">
-                  <label className="block text-[11px] text-neutral-500 mb-1">To</label>
-                  <input
+                </Field>
+                <span className="mt-6 text-ink-faint">—</span>
+                <Field label="To" className="flex-1">
+                  <Input
                     type="time"
                     value={localEnd}
                     onChange={(e) => onSilentEndChange(e.target.value)}
-                    className="w-full px-2.5 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 focus:outline-none focus:border-amber-700/60 [color-scheme:dark]"
                   />
-                </div>
+                </Field>
               </div>
 
               <div>
                 <div
-                  className="h-3 rounded-full overflow-hidden border border-neutral-800"
+                  className="h-3 overflow-hidden rounded-full border border-hairline"
                   style={{ background: timelineGradient(localStart, localEnd) }}
                 />
-                <div className="flex justify-between mt-1 px-0.5">
+                <div className="mt-1 flex justify-between px-0.5">
                   {HOUR_MARKS.map((h) => (
-                    <span key={h} className="text-[9px] text-neutral-600 tabular-nums">
+                    <span key={h} className="text-[9px] tabular-nums text-ink-faint">
                       {h}
                     </span>
                   ))}
-                  <span className="text-[9px] text-neutral-600 tabular-nums">24</span>
+                  <span className="text-[9px] tabular-nums text-ink-faint">24</span>
                 </div>
               </div>
 
-              <p className="text-[11px] text-neutral-600">
+              <p className="text-[11px] text-ink-faint">
                 {toMinutes(localStart) <= toMinutes(localEnd)
                   ? `Silent ${localStart}–${localEnd}. Paused during this window. (server time)`
                   : `Silent ${localStart}–24:00 & 0:00–${localEnd} (overnight, server time).`}
@@ -454,7 +430,7 @@ export function ScheduleEditor({
           )}
 
           {!silentEnabled && (
-            <p className="text-[11px] text-neutral-600">
+            <p className="text-[11px] text-ink-faint">
               Runs 24/7. Enable to set quiet hours.
             </p>
           )}
@@ -469,27 +445,27 @@ export function ScheduleEditor({
           the whole block hidden in create mode — even though `enabled` is
           true there via the default cron preset. */}
       {onCheckin && (
-        <div className="rounded-md border border-neutral-800 bg-neutral-900/50 p-3 space-y-2">
+        <div className="space-y-2 rounded-[10px] border border-hairline bg-raised p-3">
           {enabled && (() => {
             const next = scheduleDirty ? null : formatNextCron(nextCronAt, now);
             return (
               <div className="flex items-center justify-between gap-3">
-                <span className="text-xs text-neutral-500">
+                <span className="text-[12px] text-ink-dim">
                   Next check-in
                   {cronPausedGlobal && (
-                    <span className="ml-1.5 text-amber-500/80">(paused)</span>
+                    <span className="ml-1.5 text-lamp-warn">(paused)</span>
                   )}
                 </span>
-                <span className="text-xs text-neutral-300 tabular-nums">
+                <span className="text-[12px] tabular-nums text-ink">
                   {scheduleDirty ? (
-                    <span className="text-neutral-600">save to update</span>
+                    <span className="text-ink-faint">save to update</span>
                   ) : next ? (
                     <>
                       {next.abs}
-                      <span className="text-neutral-500 ml-1.5">({next.rel})</span>
+                      <span className="ml-1.5 text-ink-dim">({next.rel})</span>
                     </>
                   ) : (
-                    <span className="text-neutral-600">—</span>
+                    <span className="text-ink-faint">—</span>
                   )}
                 </span>
               </div>
@@ -502,7 +478,7 @@ export function ScheduleEditor({
             type="button"
             onClick={onCheckin}
             disabled={checkingIn}
-            className="w-full px-3 py-1.5 rounded text-xs bg-amber-900/40 hover:bg-amber-900/60 border border-amber-800/60 text-amber-200 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            className="w-full rounded-lg border border-copper/50 bg-copper/10 px-3 py-2 text-[13px] text-copper-bright transition-colors hover:bg-copper/20 disabled:cursor-not-allowed disabled:opacity-50"
           >
             {checkingIn ? "Checking in…" : "Check in now"}
           </button>
@@ -510,25 +486,24 @@ export function ScheduleEditor({
       )}
 
       {/* Custom Check-in Message */}
-      <div>
-        <label className="block text-sm text-neutral-400 mb-2">
-          Check-in Message
-        </label>
-        <textarea
+      <Field
+        label="Check-in Message"
+        help={
+          <>
+            Replaces the trailing instruction in periodic and manual check-in
+            prompts. Use <code className="text-ink-dim">{"{date}"}</code> as a
+            placeholder for today (YYYY-MM-DD). Leave blank for the default.
+          </>
+        }
+      >
+        <Textarea
           value={cronMessage}
           onChange={(e) => onCronMessageChange(e.target.value)}
           rows={3}
           maxLength={CRON_MESSAGE_MAX_LEN}
           placeholder={DEFAULT_CRON_MESSAGE_HINT}
-          className="w-full px-2.5 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 resize-none focus:outline-none focus:border-amber-700/60"
         />
-        <p className="mt-1.5 text-[11px] text-neutral-600">
-          Replaces the trailing instruction in periodic and manual check-in
-          prompts. Use <code className="text-neutral-500">{"{date}"}</code>{" "}
-          as a placeholder for today (YYYY-MM-DD). Leave blank for the
-          default.
-        </p>
-      </div>
+      </Field>
     </div>
   );
 }
@@ -546,8 +521,8 @@ function HourlyEditor({
   useEffect(() => setM(initialMinute), [initialMinute]);
   return (
     <div className="flex items-center gap-3">
-      <label className="text-sm text-neutral-400">毎時</label>
-      <input
+      <label className="text-[13px] text-ink-dim">毎時</label>
+      <Input
         type="number"
         min={0}
         max={59}
@@ -557,9 +532,9 @@ function HourlyEditor({
           setM(v);
           onChange(v);
         }}
-        className="w-20 px-2 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 focus:outline-none focus:border-amber-700/60"
+        className="w-20"
       />
-      <span className="text-sm text-neutral-500">分</span>
+      <span className="text-[13px] text-ink-dim">分</span>
     </div>
   );
 }
@@ -582,8 +557,8 @@ function DailyEditor({
   const value = `${pad(h)}:${pad(m)}`;
   return (
     <div className="flex items-center gap-3">
-      <label className="text-sm text-neutral-400">毎日</label>
-      <input
+      <label className="text-[13px] text-ink-dim">毎日</label>
+      <Input
         type="time"
         value={value}
         onChange={(e) => {
@@ -594,7 +569,7 @@ function DailyEditor({
             onChange(nh, nm);
           }
         }}
-        className="px-2.5 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 focus:outline-none focus:border-amber-700/60 [color-scheme:dark]"
+        className="w-auto"
       />
     </div>
   );
@@ -628,7 +603,7 @@ function WeeklyEditor({
 
   return (
     <div className="space-y-2">
-      <div className="flex gap-1.5 flex-wrap">
+      <div className="flex flex-wrap gap-1.5">
         {DOW_NAMES.map((label, i) => {
           const selected = d.includes(i);
           return (
@@ -636,11 +611,7 @@ function WeeklyEditor({
               key={i}
               type="button"
               onClick={() => toggleDow(i)}
-              className={`px-2.5 py-1.5 rounded text-sm transition-colors ${
-                selected
-                  ? "bg-amber-900/60 border border-amber-700/80 text-amber-200"
-                  : "bg-neutral-900 border border-neutral-800 text-neutral-400 hover:border-neutral-600"
-              }`}
+              className={chipClass(selected)}
             >
               {label}
             </button>
@@ -648,7 +619,7 @@ function WeeklyEditor({
         })}
       </div>
       <div className="flex items-center gap-3">
-        <input
+        <Input
           type="time"
           value={`${pad(h)}:${pad(m)}`}
           onChange={(e) => {
@@ -659,11 +630,11 @@ function WeeklyEditor({
               onChange(nh, nm, d);
             }
           }}
-          className="px-2.5 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 focus:outline-none focus:border-amber-700/60 [color-scheme:dark]"
+          className="w-auto"
         />
       </div>
       {d.length === 0 && (
-        <p className="text-xs text-amber-400/80">
+        <p className="text-[12px] text-lamp-warn">
           曜日を 1 つ以上選んで。空のまま保存するとスケジュール無効になる。
         </p>
       )}
@@ -682,9 +653,13 @@ function AdvancedEditor({
 }) {
   const valid = isCronExprSyntaxValid(value);
   return (
-    <div>
-      <input
-        type="text"
+    <Field
+      help="5-field cron (minute hour day-of-month month day-of-week). Empty = off. Press Enter or tab away to apply."
+      error={!valid ? "Invalid syntax — must be 5 whitespace-separated fields." : undefined}
+    >
+      <Input
+        mono
+        invalid={!valid}
         value={value}
         onChange={(e) => {
           onLocalChange(e.target.value);
@@ -699,22 +674,8 @@ function AdvancedEditor({
           }
         }}
         placeholder="*/15 * * * *"
-        className={`w-full px-2.5 py-1.5 bg-neutral-900 border rounded text-sm text-neutral-200 font-mono focus:outline-none ${
-          valid
-            ? "border-neutral-700 focus:border-amber-700/60"
-            : "border-red-700/60 focus:border-red-500/80"
-        }`}
       />
-      <p className="mt-1 text-[11px] text-neutral-600">
-        5-field cron (minute hour day-of-month month day-of-week). Empty = off.
-        Press Enter or tab away to apply.
-      </p>
-      {!valid && (
-        <p className="mt-1 text-[11px] text-red-400">
-          Invalid syntax — must be 5 whitespace-separated fields.
-        </p>
-      )}
-    </div>
+    </Field>
   );
 }
 

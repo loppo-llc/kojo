@@ -2,6 +2,11 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { useParams, useNavigate } from "react-router";
 import { agentApi, type AgentInfo, type Credential, type OTPEntry } from "../../lib/agentApi";
 import { errMsg } from "../../lib/utils";
+import { PageHeader } from "../ui/PageHeader";
+import { Input } from "../ui/Input";
+import { Textarea } from "../ui/Textarea";
+import { Button } from "../ui/Button";
+import { Banner } from "../ui/Banner";
 
 function TOTPDisplay({ agentId, credId }: { agentId: string; credId: string }) {
   const [code, setCode] = useState<string | null>(null);
@@ -55,7 +60,7 @@ function TOTPDisplay({ agentId, credId }: { agentId: string; credId: string }) {
       <button
         onClick={handleReveal}
         disabled={loading}
-        className="text-xs px-2 py-1 rounded text-blue-400 hover:bg-neutral-800"
+        className="rounded-md px-2 py-1 text-[12px] text-copper transition-colors hover:bg-hover"
       >
         {loading ? "..." : "TOTP"}
       </button>
@@ -64,12 +69,12 @@ function TOTPDisplay({ agentId, credId }: { agentId: string; credId: string }) {
 
   return (
     <div className="flex items-center gap-2">
-      <span className="font-mono text-sm text-blue-300 tracking-widest">{code}</span>
-      <span className="text-xs text-neutral-500 w-5 text-right">{remaining}s</span>
+      <span className="font-mono text-[14px] tracking-widest text-copper-bright">{code}</span>
+      <span className="w-5 text-right text-[12px] text-ink-faint">{remaining}s</span>
       <button
         onClick={handleCopy}
-        className={`text-xs px-1.5 py-0.5 rounded ${
-          copied ? "text-green-400 bg-green-950" : "text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800"
+        className={`rounded-md px-1.5 py-0.5 text-[12px] transition-colors ${
+          copied ? "text-lamp-run" : "text-ink-faint hover:bg-hover hover:text-ink-dim"
         }`}
       >
         {copied ? "OK" : "Copy"}
@@ -131,31 +136,31 @@ function QRImportModal({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
-      <div className="bg-neutral-900 border border-neutral-700 rounded-lg w-full max-w-md max-h-[80vh] flex flex-col">
-        <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-800">
-          <h2 className="text-sm font-bold">Import TOTP</h2>
-          <button onClick={onClose} className="text-neutral-500 hover:text-neutral-300">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+      <div className="flex max-h-[80vh] w-full max-w-md flex-col rounded-[10px] border border-hairline bg-raised">
+        <div className="flex items-center justify-between border-b border-hairline px-4 py-3">
+          <h2 className="text-[14px] font-semibold text-ink">Import TOTP</h2>
+          <button onClick={onClose} className="text-ink-faint transition-colors hover:text-ink" aria-label="Close">
             &times;
           </button>
         </div>
 
-        <div className="p-4 space-y-3 overflow-y-auto flex-1">
+        <div className="flex-1 space-y-3 overflow-y-auto p-4">
           {entries.length === 0 ? (
             <>
-              <div className="flex gap-2">
+              <div className="flex gap-1 rounded-lg border border-hairline bg-app p-1">
                 <button
                   onClick={() => setMode("upload")}
-                  className={`flex-1 py-1.5 text-xs rounded ${
-                    mode === "upload" ? "bg-neutral-700 text-neutral-200" : "text-neutral-500 hover:bg-neutral-800"
+                  className={`flex-1 rounded-md py-1.5 text-[12px] transition-colors ${
+                    mode === "upload" ? "bg-copper/15 text-copper-bright" : "text-ink-dim hover:text-ink"
                   }`}
                 >
                   QR Image
                 </button>
                 <button
                   onClick={() => setMode("uri")}
-                  className={`flex-1 py-1.5 text-xs rounded ${
-                    mode === "uri" ? "bg-neutral-700 text-neutral-200" : "text-neutral-500 hover:bg-neutral-800"
+                  className={`flex-1 rounded-md py-1.5 text-[12px] transition-colors ${
+                    mode === "uri" ? "bg-copper/15 text-copper-bright" : "text-ink-dim hover:text-ink"
                   }`}
                 >
                   URI Text
@@ -177,55 +182,54 @@ function QRImportModal({
                   <button
                     onClick={() => fileRef.current?.click()}
                     disabled={loading}
-                    className="w-full py-8 border-2 border-dashed border-neutral-700 rounded-lg text-neutral-500 hover:border-neutral-500 hover:text-neutral-300 text-sm"
+                    className="w-full rounded-lg border-2 border-dashed border-hairline py-8 text-[14px] text-ink-faint transition-colors hover:border-ink-faint hover:text-ink-dim"
                   >
                     {loading ? "Decoding..." : "Tap to select QR image"}
                   </button>
                 </div>
               ) : (
                 <div className="space-y-2">
-                  <textarea
+                  <Textarea
+                    mono
                     value={uri}
                     onChange={(e) => setUri(e.target.value)}
                     placeholder="otpauth://totp/... or otpauth-migration://..."
                     rows={3}
-                    className="w-full px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-xs font-mono focus:outline-none focus:border-neutral-500 resize-none"
                   />
-                  <button
+                  <Button
+                    variant="primary"
                     onClick={handleURI}
                     disabled={loading || !uri.trim()}
-                    className="w-full py-2 bg-neutral-700 hover:bg-neutral-600 rounded text-sm font-medium disabled:opacity-40"
+                    className="w-full"
                   >
                     {loading ? "Parsing..." : "Parse"}
-                  </button>
+                  </Button>
                 </div>
               )}
             </>
           ) : (
             <>
-              <div className="text-xs text-neutral-500">
+              <div className="text-[12px] text-ink-dim">
                 {entries.length} entries found &mdash; select one
               </div>
               {entries.map((entry, i) => (
                 <button
                   key={i}
                   onClick={() => onSelect(entry)}
-                  className="w-full flex items-start gap-3 p-3 rounded-lg border border-neutral-800 bg-neutral-950 hover:border-neutral-600 text-left"
+                  className="flex w-full items-start gap-3 rounded-[10px] border border-hairline bg-app p-3 text-left transition-colors hover:border-ink-faint"
                 >
                   <div className="min-w-0 flex-1">
-                    <div className="text-sm font-medium text-neutral-300 truncate">
+                    <div className="truncate text-[14px] font-medium text-ink">
                       {entry.issuer || entry.label || "Unknown"}
                     </div>
-                    <div className="text-xs text-neutral-500 font-mono truncate">{entry.username}</div>
+                    <div className="truncate font-mono text-[12px] text-ink-faint">{entry.username}</div>
                   </div>
                 </button>
               ))}
             </>
           )}
 
-          {error && (
-            <div className="p-2 bg-red-950 border border-red-800 rounded text-xs text-red-300">{error}</div>
-          )}
+          {error && <Banner tone="error">{error}</Banner>}
         </div>
       </div>
     </div>
@@ -297,63 +301,48 @@ function CredentialEdit({
   };
 
   return (
-    <div className="p-4 bg-neutral-900 border border-neutral-700 rounded-lg space-y-3">
-      <input
-        type="text"
+    <div className="space-y-3 rounded-[10px] border border-hairline bg-surface p-4">
+      <Input
         value={label}
         onChange={(e) => setLabel(e.target.value)}
         placeholder="Label"
-        className="w-full px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
         autoFocus
       />
-      <input
-        type="text"
+      <Input
         value={username}
         onChange={(e) => setUsername(e.target.value)}
         placeholder="Username / ID"
-        className="w-full px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
       />
-      <input
+      <Input
         type="password"
         value={password}
         onChange={(e) => setPassword(e.target.value)}
         placeholder="New password (leave empty to keep)"
-        className="w-full px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
       />
       <div className="flex gap-2">
-        <input
+        <Input
           type="password"
           value={totpSecret}
           onChange={(e) => setTotpSecret(e.target.value)}
           placeholder={hasTOTP ? "New TOTP secret (leave empty to keep)" : "TOTP Secret (optional)"}
-          className="flex-1 px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+          className="flex-1"
         />
-        <button
-          onClick={() => setShowQR(true)}
-          disabled={isSwitching}
-          className="px-3 py-2 bg-neutral-800 hover:bg-neutral-700 rounded text-xs whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed"
-        >
+        <Button onClick={() => setShowQR(true)} disabled={isSwitching} className="shrink-0">
           QR
-        </button>
+        </Button>
       </div>
-      {error && (
-        <div className="p-2 bg-red-950 border border-red-800 rounded text-xs text-red-300">{error}</div>
-      )}
+      {error && <Banner tone="error">{error}</Banner>}
       <div className="flex gap-2">
-        <button
+        <Button
+          variant="primary"
           onClick={handleSave}
           disabled={saving || isSwitching || !label.trim() || !username.trim()}
           title={isSwitching ? "デバイス転移中。完了するまで保存できない。" : undefined}
-          className="flex-1 py-2 bg-neutral-700 hover:bg-neutral-600 rounded text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
+          className="flex-1"
         >
           {saving ? "Saving..." : "Save"}
-        </button>
-        <button
-          onClick={onCancel}
-          className="px-4 py-2 text-neutral-500 hover:text-neutral-300 rounded text-sm"
-        >
-          Cancel
-        </button>
+        </Button>
+        <Button onClick={onCancel}>Cancel</Button>
       </div>
 
       {showQR && (
@@ -544,97 +533,80 @@ export function AgentCredentials() {
   };
 
   return (
-    <div className="min-h-full bg-neutral-950 text-neutral-200">
-      <header className="flex items-center justify-between px-4 py-3 border-b border-neutral-800">
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => navigate(`/agents/${id}`, { replace: true })}
-            className="text-neutral-400 hover:text-neutral-200"
-          >
-            &larr;
-          </button>
-          <h1 className="text-lg font-bold">Credentials</h1>
-        </div>
-        <button
+    <div className="min-h-full bg-app text-ink">
+      <PageHeader title="Credentials" onBack={() => navigate(`/agents/${id}`, { replace: true })}>
+        <Button
           onClick={() => { setShowForm((v) => !v); setEditingId(null); }}
           disabled={isSwitching}
           title={isSwitching ? "デバイス転移中。完了するまで追加できない。" : undefined}
-          className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-sm disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-neutral-800"
         >
           {showForm ? "Cancel" : "+ Add"}
-        </button>
-      </header>
+        </Button>
+      </PageHeader>
 
-      <main className="p-4 space-y-3 max-w-md mx-auto">
+      <main className="mx-auto max-w-[560px] space-y-3 px-4 py-6">
         {isSwitching && (
-          <div className="p-3 bg-amber-950 border border-amber-800 rounded-lg text-sm text-amber-200">
+          <Banner tone="warn">
             デバイス転移中。完了するまで credential は編集できない。
-          </div>
+          </Banner>
         )}
 
         {listError && (
-          <div className="p-3 bg-red-950 border border-red-800 rounded-lg text-sm text-red-300 flex items-center justify-between gap-2">
-            <span className="break-all">{listError}</span>
-            <button
-              onClick={reload}
-              className="px-2 py-1 bg-red-900 hover:bg-red-800 rounded text-xs whitespace-nowrap"
-            >
-              Retry
-            </button>
-          </div>
+          <Banner
+            tone="error"
+            action={
+              <Button onClick={reload} variant="danger" className="shrink-0">
+                Retry
+              </Button>
+            }
+          >
+            {listError}
+          </Banner>
         )}
 
         {/* Add form */}
         {showForm && (
-          <div className="p-4 bg-neutral-900 border border-neutral-700 rounded-lg space-y-3">
-            <input
-              type="text"
+          <div className="space-y-3 rounded-[10px] border border-hairline bg-surface p-4">
+            <Input
               value={label}
               onChange={(e) => setLabel(e.target.value)}
               placeholder="Label (e.g. GitHub)"
-              className="w-full px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
               autoFocus
             />
-            <input
-              type="text"
+            <Input
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               placeholder="Username / ID"
-              className="w-full px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
             />
-            <input
+            <Input
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="Password"
-              className="w-full px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
             />
             <div className="flex gap-2">
-              <input
+              <Input
                 type="password"
                 value={totpSecret}
                 onChange={(e) => setTotpSecret(e.target.value)}
                 placeholder="TOTP Secret (optional)"
-                className="flex-1 px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+                className="flex-1"
               />
-              <button
-                onClick={() => setShowAddQR(true)}
-                disabled={isSwitching}
-                className="px-3 py-2 bg-neutral-800 hover:bg-neutral-700 rounded text-xs whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed"
-              >
+              <Button onClick={() => setShowAddQR(true)} disabled={isSwitching} className="shrink-0">
                 QR
-              </button>
+              </Button>
             </div>
-            <button
+            <Button
+              variant="primary"
               onClick={handleAdd}
               disabled={
                 adding || isSwitching || !label.trim() || !username.trim() || (!password && !totpSecret.trim())
               }
               title={isSwitching ? "デバイス転移中。完了するまで追加できない。" : undefined}
-              className="w-full py-2 bg-neutral-700 hover:bg-neutral-600 rounded text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
+              className="w-full"
             >
               {adding ? "Adding..." : "Add"}
-            </button>
+            </Button>
           </div>
         )}
 
@@ -652,25 +624,25 @@ export function AgentCredentials() {
           ) : (
             <div
               key={cred.id}
-              className="p-3 bg-neutral-900 border border-neutral-800 rounded-lg"
+              className="rounded-[10px] border border-hairline bg-surface p-3"
             >
-              <div className="text-sm font-medium text-neutral-300">
+              <div className="text-[14px] font-medium text-ink">
                 {cred.label}
               </div>
-              <div className="text-xs text-neutral-500 mt-1 font-mono">
+              <div className="mt-1 font-mono text-[12px] text-ink-faint">
                 {cred.username}
               </div>
-              <div className="flex items-center justify-between mt-2">
-                <span className="text-xs text-neutral-600 tracking-widest select-none">
+              <div className="mt-2 flex items-center justify-between">
+                <span className="select-none tracking-widest text-ink-faint">
                   ••••••••
                 </span>
                 <div className="flex gap-1">
                   <button
                     onClick={() => handleCopy(cred.id)}
-                    className={`text-xs px-2 py-1 rounded ${
+                    className={`rounded-md px-2 py-1 text-[12px] transition-colors ${
                       copied === cred.id
-                        ? "text-green-400 bg-green-950"
-                        : "text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800"
+                        ? "text-lamp-run"
+                        : "text-ink-faint hover:bg-hover hover:text-ink-dim"
                     }`}
                   >
                     {copied === cred.id ? "Copied" : "Copy PW"}
@@ -679,7 +651,7 @@ export function AgentCredentials() {
                     onClick={() => { setEditingId(cred.id); setShowForm(false); }}
                     disabled={isSwitching}
                     title={isSwitching ? "デバイス転移中。完了するまで編集できない。" : undefined}
-                    className="text-xs text-neutral-500 hover:text-neutral-300 px-2 py-1 rounded hover:bg-neutral-800 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                    className="rounded-md px-2 py-1 text-[12px] text-ink-faint transition-colors hover:bg-hover hover:text-ink-dim disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
                   >
                     Edit
                   </button>
@@ -687,14 +659,14 @@ export function AgentCredentials() {
                     onClick={() => handleDelete(cred.id)}
                     disabled={isSwitching}
                     title={isSwitching ? "デバイス転移中。完了するまで削除できない。" : undefined}
-                    className="text-xs text-neutral-600 hover:text-red-400 px-2 py-1 rounded hover:bg-neutral-800 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                    className="rounded-md px-2 py-1 text-[12px] text-ink-faint transition-colors hover:bg-hover hover:text-lamp-err disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
                   >
                     Delete
                   </button>
                 </div>
               </div>
               {cred.totpSecret && id && (
-                <div className="mt-2 pt-2 border-t border-neutral-800">
+                <div className="mt-2 border-t border-hairline pt-2">
                   <TOTPDisplay agentId={id} credId={cred.id} />
                 </div>
               )}
@@ -703,16 +675,12 @@ export function AgentCredentials() {
         )}
 
         {!loading && !listError && credentials.length === 0 && !showForm && (
-          <div className="text-sm text-neutral-600 text-center py-12">
+          <div className="py-12 text-center text-[14px] text-ink-faint">
             No credentials registered
           </div>
         )}
 
-        {error && (
-          <div className="p-3 bg-red-950 border border-red-800 rounded-lg text-sm text-red-300">
-            {error}
-          </div>
-        )}
+        {error && <Banner tone="error">{error}</Banner>}
       </main>
 
       {showAddQR && id && (

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useNavigate, useLocation } from "react-router";
 import { agentApi, type AgentInfo, type AgentMessage, type AgentMessageAttachment, type ChatEvent } from "../../lib/agentApi";
 import { errMsg, localRFC3339 } from "../../lib/utils";
@@ -8,9 +8,20 @@ import { useTTSAutoToggle, useTTSPlayer } from "../../hooks/useTTS";
 import { useFileUpload } from "../../hooks/useFileUpload";
 import { useDraftInput } from "../../hooks/useDraftInput";
 import { useAutoGrowTextarea } from "../../hooks/useAutoGrowTextarea";
-import { DismissibleError, PendingAttachments, enterToSend } from "../chatComposer";
+import { useChatScroll } from "../../hooks/useChatScroll";
+import { useChatPagination } from "../../hooks/useChatPagination";
+import {
+  DismissibleError,
+  PendingAttachments,
+  LoadMoreButton,
+  AttachButton,
+  SendButton,
+  StopButton,
+  enterToSend,
+} from "../chatComposer";
 import { ChatMessage, StreamingMessage } from "./ChatMessage";
 import { AgentAvatar } from "./AgentAvatar";
+import { Lamp } from "../ui/Lamp";
 import {
   appendSystemErrorIfNew,
   appendUniqueMessage,
@@ -54,12 +65,27 @@ export function AgentChat() {
     handleFileSelect,
     removePendingFile,
   } = useFileUpload();
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const { textareaRef, resize: handleTextareaInput } = useAutoGrowTextarea();
-  const loadingMoreRef = useRef(false);
-  const suppressAutoScrollRef = useRef(false);
-  const scrollRestoreRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
+  // Canonical auto-scroll + pagination shared with GroupDMChat. The suppress /
+  // restore refs are owned by useChatScroll; the holder-peer refetch effect
+  // below and the pager both drive them through the same layout effect.
+  const { messagesEndRef, scrollContainerRef, suppressAutoScrollRef, scrollRestoreRef } =
+    useChatScroll(messages, id);
+  const fetchOlder = useCallback(
+    (oldestId: string) => agentApi.messages(id!, PAGE_SIZE, oldestId),
+    [id],
+  );
+  const { loadOlderMessages, loadingMoreRef } = useChatPagination<AgentMessage>({
+    enabled: !!id,
+    hasMore,
+    messages,
+    scrollContainerRef,
+    suppressAutoScrollRef,
+    scrollRestoreRef,
+    fetchOlder,
+    setMessages,
+    setHasMore,
+  });
   // ID of the synthetic abort message committed by handleAbort.
   // When the server's "done" arrives later, the aborted message can be
   // upgraded to the server's (potentially more complete) version.
@@ -237,51 +263,6 @@ export function AgentChat() {
     }, 5000);
     return () => clearInterval(t);
   }, [id, agent?.holderPeer]);
-
-  const scrollToBottom = useCallback(() => {
-    if (suppressAutoScrollRef.current) return;
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, []);
-
-  useLayoutEffect(() => {
-    if (suppressAutoScrollRef.current && scrollRestoreRef.current) {
-      const container = scrollContainerRef.current;
-      if (container) {
-        const { prevScrollHeight, prevScrollTop } = scrollRestoreRef.current;
-        const delta = container.scrollHeight - prevScrollHeight;
-        container.scrollTop = prevScrollTop + delta;
-      }
-      scrollRestoreRef.current = null;
-      suppressAutoScrollRef.current = false;
-      return;
-    }
-    scrollToBottom();
-  }, [messages, scrollToBottom]);
-
-  const loadOlderMessages = useCallback(async () => {
-    if (!id || loadingMoreRef.current || !hasMore || messages.length === 0) return;
-    loadingMoreRef.current = true;
-
-    const oldestId = messages[0].id;
-
-    try {
-      const r = await agentApi.messages(id, PAGE_SIZE, oldestId);
-      setHasMore(r.hasMore);
-      if (r.messages.length > 0) {
-        const container = scrollContainerRef.current;
-        suppressAutoScrollRef.current = true;
-        scrollRestoreRef.current = {
-          prevScrollHeight: container?.scrollHeight ?? 0,
-          prevScrollTop: container?.scrollTop ?? 0,
-        };
-        setMessages((prev) => [...r.messages, ...prev]);
-      }
-    } catch (e) {
-      console.error(e);
-    } finally {
-      loadingMoreRef.current = false;
-    }
-  }, [id, hasMore, messages]);
 
   const resetStream = useCallback(() => {
     setStreaming(false);
@@ -490,9 +471,9 @@ export function AgentChat() {
   if (!agent) return null;
 
   return (
-    <div className="flex flex-col h-full bg-neutral-950 text-neutral-200">
+    <div className="flex flex-col h-full bg-app text-ink">
       {/* Header */}
-      <header className="flex items-center gap-3 px-4 py-3 border-b border-neutral-800 shrink-0">
+      <header className="sticky top-0 z-40 flex h-[52px] shrink-0 items-center gap-2 border-b border-hairline bg-app/85 px-2 backdrop-blur sm:px-3">
         <button
           onClick={() => {
             // navigate(-1) pops the real history entry instead of
@@ -517,30 +498,40 @@ export function AgentChat() {
               navigate("/", { replace: true });
             }
           }}
-          className="text-neutral-400 hover:text-neutral-200"
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] text-ink-dim transition-colors hover:bg-hover hover:text-ink lg:hidden"
+          aria-label="Back"
         >
-          &larr;
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
+            <path d="M12.5 5l-5 5 5 5" />
+          </svg>
         </button>
-        <AgentAvatar agentId={agent.id} name={agent.name} size="md" cacheBust={agent.avatarHash} />
-        <div className="flex-1 min-w-0">
-          <div className="font-medium text-sm truncate">{agent.name}</div>
-          <div className="text-xs text-neutral-500">
-            {holderOffline
-              ? `host offline @ ${agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)}`
-              : connected
-                ? streaming
-                  ? "typing..."
-                  : "online"
-                : "connecting..."}
+        <AgentAvatar agentId={agent.id} name={agent.name} size="xs" cacheBust={agent.avatarHash} />
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-[15px] font-semibold text-ink">{agent.name}</div>
+          <div className="flex items-center gap-1.5 text-[11px] text-ink-dim">
+            <Lamp
+              state={holderOffline ? "err" : connected ? (streaming ? "warn" : "run") : "off"}
+              pulse={!holderOffline && connected && streaming}
+              size={6}
+            />
+            <span className="truncate">
+              {holderOffline
+                ? `host offline @ ${agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)}`
+                : connected
+                  ? streaming
+                    ? "typing…"
+                    : "online"
+                  : "connecting…"}
+            </span>
           </div>
         </div>
         {ttsAgentEnabled && (
           <button
             onClick={() => setTTSAuto((v) => !v)}
-            className={`p-2 rounded ${
+            className={`rounded-[10px] p-2 transition-colors ${
               ttsAuto
-                ? "text-blue-400 hover:text-blue-300"
-                : "text-neutral-500 hover:text-neutral-300"
+                ? "text-copper hover:text-copper-bright"
+                : "text-ink-faint hover:text-ink"
             }`}
             title={ttsAuto ? "Auto TTS: ON" : "Auto TTS: OFF"}
             aria-pressed={ttsAuto}
@@ -593,12 +584,10 @@ export function AgentChat() {
                 }
               }
             }}
-            className={`px-2 py-1 rounded text-xs font-mono ${
+            className={`rounded-[10px] border px-2 py-1 font-mono text-[11px] transition-colors ${
               agent.thinkingMode === "on"
-                ? "bg-blue-900/50 text-blue-300 border border-blue-700"
-                : agent.thinkingMode === "off"
-                  ? "bg-neutral-800 text-neutral-500 border border-neutral-700"
-                  : "bg-neutral-800 text-neutral-400 border border-neutral-700"
+                ? "border-copper/50 bg-copper/10 text-copper"
+                : "border-hairline bg-surface text-ink-faint hover:text-ink"
             }`}
             title={`Thinking: ${agent.thinkingMode || "auto"}`}
           >
@@ -607,7 +596,7 @@ export function AgentChat() {
         )}
         <button
           onClick={() => navigate(`/agents/${agent.id}/credentials`, { replace: true })}
-          className="p-2 text-neutral-500 hover:text-neutral-300 rounded"
+          className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink"
           title="Credentials"
           aria-label="Credentials"
         >
@@ -618,8 +607,9 @@ export function AgentChat() {
             replace: true,
             state: { kojoFileBrowser: "root", kojoFileBrowserDepth: 0 },
           })}
-          className="p-2 text-neutral-500 hover:text-neutral-300 rounded"
+          className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink"
           title="Data folder"
+          aria-label="Data folder"
         >
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
             <path d="M3.75 3A1.75 1.75 0 002 4.75v1.5c0 .199.034.39.096.568A1.75 1.75 0 002 8.25v7A1.75 1.75 0 003.75 17h12.5A1.75 1.75 0 0018 15.25v-7a1.75 1.75 0 00-.096-.932c.062-.179.096-.37.096-.568v-1.5A1.75 1.75 0 0016.25 3h-4.086a1.75 1.75 0 01-1.237-.513l-.707-.707A1.75 1.75 0 009.086 1.28L8.914 1.28H3.75z" />
@@ -627,8 +617,9 @@ export function AgentChat() {
         </button>
         <button
           onClick={() => navigate(`/agents/${agent.id}/settings`, { replace: true })}
-          className="p-2 text-neutral-500 hover:text-neutral-300 rounded"
+          className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink"
           title="Settings"
+          aria-label="Settings"
         >
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
             <path fillRule="evenodd" d="M7.84 1.804A1 1 0 018.82 1h2.36a1 1 0 01.98.804l.331 1.652a6.993 6.993 0 011.929 1.115l1.598-.54a1 1 0 011.186.447l1.18 2.044a1 1 0 01-.205 1.251l-1.267 1.113a7.047 7.047 0 010 2.228l1.267 1.113a1 1 0 01.206 1.25l-1.18 2.045a1 1 0 01-1.187.447l-1.598-.54a6.993 6.993 0 01-1.929 1.115l-.33 1.652a1 1 0 01-.98.804H8.82a1 1 0 01-.98-.804l-.331-1.652a6.993 6.993 0 01-1.929-1.115l-1.598.54a1 1 0 01-1.186-.447l-1.18-2.044a1 1 0 01.205-1.251l1.267-1.114a7.05 7.05 0 010-2.227L1.821 7.773a1 1 0 01-.206-1.25l1.18-2.045a1 1 0 011.187-.447l1.598.54A6.993 6.993 0 017.51 3.456l.33-1.652zM10 13a3 3 0 100-6 3 3 0 000 6z" clipRule="evenodd" />
@@ -637,29 +628,14 @@ export function AgentChat() {
       </header>
 
       {/* Messages */}
-      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto">
+        <div className="mx-auto max-w-[760px] space-y-4 px-4 py-4">
         {/* Load more button */}
-        {hasMore && (
-          <div className="flex justify-center pt-1 pb-3">
-            <button
-              onClick={loadOlderMessages}
-              disabled={loadingMoreRef.current}
-              className="group relative px-4 py-1.5 text-xs text-neutral-500 hover:text-neutral-300 transition-colors disabled:opacity-50"
-            >
-              <span className="absolute inset-x-0 top-1/2 h-px bg-neutral-800" />
-              <span className="relative inline-flex items-center gap-1.5 bg-neutral-950 px-3">
-                <svg className="w-3 h-3 transition-transform group-hover:-translate-y-0.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-                  <path d="M8 12V4M4 7l4-4 4 4" />
-                </svg>
-                older messages
-              </span>
-            </button>
-          </div>
-        )}
+        {hasMore && <LoadMoreButton onClick={loadOlderMessages} loading={loadingMoreRef.current} />}
 
         {messages.length === 0 && !streaming && (
-          <div className="text-center text-neutral-600 py-16">
-            <p className="text-lg mb-1">{agent.name}</p>
+          <div className="py-16 text-center text-ink-faint">
+            <p className="mb-1 text-lg text-ink-dim">{agent.name}</p>
             <p className="text-sm">Send a message to start chatting</p>
           </div>
         )}
@@ -838,18 +814,20 @@ export function AgentChat() {
           />
         )}
         <div ref={messagesEndRef} />
+        </div>
       </div>
 
-      {/* Input */}
-      <div className="border-t border-neutral-800 px-4 py-3 shrink-0">
+      {/* Composer */}
+      <div className="sticky bottom-0 z-30 shrink-0 border-t border-hairline bg-app/92 backdrop-blur">
+        <div className="mx-auto max-w-[760px] px-4 py-3">
         {/* Holder offline banner — replaces the live indicator while the
             §3.7 device-switch target is unreachable. The transcript shown
             above this banner is whatever Hub has locally; latest messages
             from the holder will land once it reconnects (see status-flip
             refetch in the holderPeerStatus effect). */}
         {holderOffline && (
-          <div className="flex items-center gap-2 mb-2 px-3 py-1.5 bg-amber-950/60 border border-amber-900/60 rounded-lg text-xs text-amber-200">
-            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-3.5 h-3.5 shrink-0">
+          <div className="mb-2 flex items-center gap-2 rounded-[10px] border border-lamp-warn/40 bg-lamp-warn/10 px-3 py-1.5 text-xs text-lamp-warn">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-3.5 w-3.5 shrink-0">
               <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 5a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 5zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
             </svg>
             <span className="flex-1">
@@ -869,53 +847,34 @@ export function AgentChat() {
             onChange={handleFileSelect}
             className="hidden"
           />
-          <button
+          <AttachButton
             onClick={() => fileInputRef.current?.click()}
+            uploading={uploading}
             disabled={uploading || streaming || holderOffline}
-            className="p-2 text-neutral-500 hover:text-neutral-300 disabled:opacity-40 shrink-0"
             title={holderOffline ? "Holder peer offline" : "Attach files"}
-          >
-            {uploading ? (
-              <svg className="w-5 h-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-              </svg>
-            ) : (
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
-                <path fillRule="evenodd" d="M15.621 4.379a3 3 0 00-4.242 0l-7 7a3 3 0 004.241 4.243h.001l.497-.5a.75.75 0 011.064 1.057l-.498.501-.002.002a4.5 4.5 0 01-6.364-6.364l7-7a4.5 4.5 0 016.368 6.36l-3.455 3.553A2.625 2.625 0 119.52 9.52l3.45-3.451a.75.75 0 111.061 1.06l-3.45 3.451a1.125 1.125 0 001.587 1.595l3.454-3.553a3 3 0 000-4.242z" clipRule="evenodd" />
-              </svg>
-            )}
-          </button>
-          <textarea
-            ref={textareaRef}
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onInput={handleTextareaInput}
-            onKeyDown={handleKeyDown}
-            placeholder="Message..."
-            rows={1}
-            className="flex-1 px-3 py-2 bg-neutral-900 border border-neutral-700 rounded-xl text-sm resize-none focus:outline-none focus:border-neutral-500 max-h-[150px]"
           />
+          <div className="min-w-0 flex-1 rounded-xl border border-hairline bg-raised px-1 focus-within:border-copper/50">
+            <textarea
+              ref={textareaRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onInput={handleTextareaInput}
+              onKeyDown={handleKeyDown}
+              placeholder={`Message… (${enterSends ? "Enter" : "Shift+Enter"} to send)`}
+              rows={1}
+              className="max-h-[150px] w-full resize-none bg-transparent px-3 py-2 text-[14px] text-ink placeholder:text-ink-faint focus:outline-none"
+            />
+          </div>
           {streaming ? (
-            <button
-              onClick={handleAbort}
-              className="px-4 py-2 bg-red-600 hover:bg-red-500 rounded-xl text-sm font-medium shrink-0"
-            >
-              Stop
-            </button>
+            <StopButton onClick={handleAbort} />
           ) : (
-            <button
+            <SendButton
               onClick={handleSend}
               disabled={(!input.trim() && pendingFiles.length === 0) || !connected || holderOffline}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-xl text-sm font-medium disabled:opacity-40 shrink-0"
               title={holderOffline ? `Holder peer is offline — send disabled until @ ${agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)} reconnects` : undefined}
-            >
-              Send
-            </button>
+            />
           )}
         </div>
-        <div className="text-[10px] text-neutral-600 mt-1 text-center">
-          {enterSends ? "Enter to send, Shift+Enter for newline" : "Shift+Enter to send, Enter for newline"}
         </div>
       </div>
     </div>

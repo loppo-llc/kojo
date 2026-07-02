@@ -24,7 +24,7 @@ export const KIND_STYLES: Record<FileKind, { bg: string; icon: string }> = {
   data:     { bg: "bg-amber-500/10",    icon: "text-amber-400" },
   archive:  { bg: "bg-orange-500/10",   icon: "text-orange-400" },
   pdf:      { bg: "bg-red-500/10",      icon: "text-red-400" },
-  text:     { bg: "bg-neutral-700/40",  icon: "text-neutral-300" },
+  text:     { bg: "bg-surface",         icon: "text-ink-dim" },
 };
 
 export function fileKind(name: string): FileKind {

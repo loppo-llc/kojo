@@ -11,8 +11,40 @@ import (
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/filebrowser"
+	"github.com/loppo-llc/kojo/internal/thumbnail"
 	"github.com/loppo-llc/kojo/internal/uploadpath"
 )
+
+// codeForStatus maps an HTTP status onto the canonical error code used in the
+// JSON envelope for the raw/thumb file-serving endpoints.
+func codeForStatus(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "bad_request"
+	case http.StatusForbidden:
+		return "forbidden"
+	case http.StatusNotFound:
+		return "not_found"
+	case http.StatusRequestEntityTooLarge:
+		return "too_large"
+	case http.StatusUnsupportedMediaType:
+		return "unsupported_media_type"
+	default:
+		return "internal_error"
+	}
+}
+
+// writeServeErr delivers a filebrowser/thumbnail serving error (returned as
+// *thumbnail.HTTPError before any bytes were streamed) as the server's JSON
+// error envelope. A non-HTTPError is treated as an internal error.
+func writeServeErr(w http.ResponseWriter, err error) {
+	var he *thumbnail.HTTPError
+	if errors.As(err, &he) {
+		writeError(w, he.Status, codeForStatus(he.Status), he.Message)
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+}
 
 // --- File Browser Handlers ---
 
@@ -57,7 +89,9 @@ func (s *Server) handleRawFile(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("download") == "1" {
 		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(path)}))
 	}
-	s.files.ServeRaw(w, r, path)
+	if err := s.files.ServeRaw(w, r, path); err != nil {
+		writeServeErr(w, err)
+	}
 }
 
 // handleThumbFile serves a JPEG thumbnail for an arbitrary user-space
@@ -67,7 +101,9 @@ func (s *Server) handleRawFile(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleThumbFile(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	size, _ := strconv.Atoi(r.URL.Query().Get("size"))
-	s.files.ServeThumb(w, r, path, size)
+	if err := s.files.ServeThumb(w, r, path, size); err != nil {
+		writeServeErr(w, err)
+	}
 }
 
 // --- Upload Handler ---
@@ -115,7 +151,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	safeName := sanitizeFilename(filepath.Base(header.Filename))
+	safeName := uploadpath.SanitizeName(header.Filename)
 	filename := fmt.Sprintf("%d_%s", time.Now().UnixNano(), safeName)
 	destPath := filepath.Join(uploadDir, filename)
 

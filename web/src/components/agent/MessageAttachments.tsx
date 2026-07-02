@@ -68,7 +68,7 @@ function ImageAttachmentChip({
   return (
     <button
       onClick={onPreview}
-      className="relative block rounded-lg overflow-hidden hover:opacity-80 transition-opacity bg-neutral-700/40 min-w-[80px] min-h-[60px]"
+      className="relative block rounded-[10px] overflow-hidden hover:opacity-80 transition-opacity bg-surface min-w-[80px] min-h-[60px]"
       title={att.name}
     >
       <img
@@ -76,12 +76,12 @@ function ImageAttachmentChip({
         alt={att.name}
         onLoad={() => setLoaded(true)}
         onError={() => setFailed(true)}
-        className={`max-w-[200px] max-h-[150px] object-cover rounded-lg ${
+        className={`max-w-[200px] max-h-[150px] object-cover rounded-[10px] ${
           failed || !loaded ? "invisible" : ""
         }`}
       />
       {!loaded && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 px-2 text-[10px] text-neutral-300">
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 px-2 text-[10px] text-ink-dim">
           {failed ? (
             <>
               <svg
@@ -99,7 +99,7 @@ function ImageAttachmentChip({
               <span className="opacity-60">image unavailable</span>
             </>
           ) : (
-            <div className="w-4 h-4 rounded-full border-2 border-neutral-500 border-t-transparent animate-spin" />
+            <div className="w-4 h-4 rounded-full border-2 border-ink-faint border-t-transparent animate-spin" />
           )}
         </div>
       )}
@@ -151,8 +151,8 @@ export function AttachmentList({ attachments, isUser }: { attachments: AgentMess
               <button
                 key={att.path}
                 onClick={() => setPreviewPath(att.path)}
-                className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs hover:opacity-80 transition-opacity ${
-                  isUser ? "bg-blue-500/30" : "bg-neutral-700/50"
+                className={`flex items-center gap-1.5 px-2 py-1 rounded-[10px] text-xs hover:opacity-80 transition-opacity ${
+                  isUser ? "bg-copper/20 text-ink" : "bg-surface text-ink-dim"
                 }`}
               >
                 <svg className="w-4 h-4 opacity-60" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -171,8 +171,8 @@ export function AttachmentList({ attachments, isUser }: { attachments: AgentMess
               key={att.path}
               href={url}
               download={att.name}
-              className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs hover:opacity-80 transition-opacity no-underline ${
-                isUser ? "bg-blue-500/30 text-white" : "bg-neutral-700/50 text-neutral-200"
+              className={`flex items-center gap-1.5 px-2 py-1 rounded-[10px] text-xs hover:opacity-80 transition-opacity no-underline ${
+                isUser ? "bg-copper/20 text-ink" : "bg-surface text-ink-dim"
               }`}
               title={`Download ${att.name}`}
             >

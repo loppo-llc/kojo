@@ -104,12 +104,14 @@ var diaryAnyHeading = regexp.MustCompile(`^#{1,6}\s`)
 // markdown parsers that treat `\t` as <=4 spaces.
 var diaryFenceLine = regexp.MustCompile("^[ \t]{0,3}(```+|~~~+)")
 
-// syncDir delegates to fsyncdir.DirLenient: open failures propagate, Sync
-// errors are deliberately swallowed (the historical best-effort policy).
-// Tightening it to surface fsync failures is a pending proposal, not this
-// refactor.
+// syncDir delegates to fsyncdir.Dir: open failures propagate, and a real
+// (non-"unsupported") Sync error propagates too so a genuine fsync failure
+// on the diary/session directory surfaces into the caller's firstErr
+// collection instead of being silently swallowed. Platforms that refuse
+// fsync on a directory handle (Windows, some network filesystems) still
+// report success — the preceding rename/unlink is already on disk there.
 func syncDir(dir string) error {
-	return fsyncdir.DirLenient(dir)
+	return fsyncdir.Dir(dir)
 }
 
 // TruncateMemoryFromMessage truncates the agent's memory using the message

@@ -181,24 +181,24 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
 
   if (attachments.length === 0) {
     return (
-      <div className="flex items-center justify-center h-full text-neutral-600 text-sm">
+      <div className="flex h-full items-center justify-center bg-app text-sm text-ink-faint">
         No attachments detected
       </div>
     );
   }
 
   return (
-    <div className="h-full flex flex-col">
+    <div className="flex h-full flex-col bg-app">
       {/* Sort bar */}
-      <div className="flex items-center gap-1 px-3 py-2 border-b border-neutral-800/50 shrink-0">
+      <div className="flex shrink-0 items-center gap-1 border-b border-hairline px-3 py-2">
         {SORT_OPTIONS.map((opt) => (
           <button
             key={opt.key}
             onClick={() => handleSortToggle(opt.key)}
-            className={`px-2 py-1 text-xs rounded transition-colors ${
+            className={`rounded-[10px] px-2 py-1 font-mono text-[11px] transition-colors ${
               sortField === opt.key
-                ? "bg-neutral-800 text-neutral-200"
-                : "text-neutral-500 hover:text-neutral-400"
+                ? "bg-copper/10 text-copper"
+                : "text-ink-faint hover:text-ink-dim"
             }`}
           >
             {opt.label}
@@ -207,19 +207,19 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
             )}
           </button>
         ))}
-        <span className="ml-auto text-xs text-neutral-600">{attachments.length}</span>
+        <span className="ml-auto font-mono text-[11px] text-ink-faint">{attachments.length}</span>
       </div>
 
       {/* Grid */}
       <div className="flex-1 overflow-y-auto p-2">
         <div className="grid grid-cols-2 gap-2">
           {sorted.map((att) => (
-            <div key={att.path} className="bg-neutral-900/80 rounded-lg overflow-hidden">
+            <div key={att.path} className="overflow-hidden rounded-[10px] border border-hairline bg-surface">
               {/* Thumbnail */}
               {isImage(att.mime) ? (
                 <button
                   onClick={() => setPreviewPath(att.path)}
-                  className="w-full aspect-square bg-neutral-900 relative block"
+                  className="relative block aspect-square w-full bg-app"
                 >
                   <img
                     src={
@@ -233,7 +233,7 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
                     decoding="async"
                   />
                   {feedback?.path === att.path && (
-                    <div className="absolute inset-0 bg-black/60 flex items-center justify-center text-xs text-green-400 pointer-events-none">
+                    <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/60 font-mono text-xs text-lamp-run">
                       {feedback.msg}
                     </div>
                   )}
@@ -241,44 +241,44 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
               ) : isVideo(att.mime) ? (
                 <button
                   onClick={() => setPreviewPath(att.path)}
-                  className="w-full aspect-square bg-neutral-900 flex items-center justify-center"
+                  className="flex aspect-square w-full items-center justify-center bg-app"
                 >
-                  <span className="text-3xl text-neutral-600">&#x25B6;</span>
+                  <span className="text-3xl text-ink-faint">&#x25B6;</span>
                 </button>
               ) : (
-                <div className="w-full aspect-square bg-neutral-900 flex items-center justify-center">
-                  <span className="text-2xl text-neutral-700">&#x1F4CE;</span>
+                <div className="flex aspect-square w-full items-center justify-center bg-app">
+                  <span className="text-2xl text-ink-faint">&#x1F4CE;</span>
                 </div>
               )}
 
               {/* Info */}
-              <div className="px-2 pt-1.5 pb-1">
-                <div className="text-xs text-neutral-300 truncate">{att.name}</div>
-                <div className="text-[10px] text-neutral-600">{formatSize(att.size)}</div>
+              <div className="px-2 pb-1 pt-1.5">
+                <div className="truncate text-xs text-ink-dim">{att.name}</div>
+                <div className="font-mono text-[10px] text-ink-faint">{formatSize(att.size)}</div>
               </div>
 
               {/* Actions */}
-              <div className="flex border-t border-neutral-800/50">
+              <div className="flex border-t border-hairline">
                 {isImage(att.mime) && (
                   <button
                     onClick={() => handleCopyImage(att)}
-                    className="flex-1 py-1.5 text-[10px] text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50 transition-colors"
+                    className="flex-1 py-1.5 font-mono text-[10px] text-ink-faint transition-colors hover:bg-hover hover:text-ink"
                   >
                     Copy
                   </button>
                 )}
                 <button
                   onClick={() => handleCopyPath(att.path)}
-                  className="flex-1 py-1.5 text-[10px] text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50 transition-colors"
+                  className="flex-1 py-1.5 font-mono text-[10px] text-ink-faint transition-colors hover:bg-hover hover:text-ink"
                 >
                   Path
                 </button>
                 <button
                   onClick={() => handleDelete(att.path)}
-                  className={`flex-1 py-1.5 text-[10px] transition-colors ${
+                  className={`flex-1 py-1.5 font-mono text-[10px] transition-colors ${
                     confirmDelete === att.path
-                      ? "bg-red-950 text-red-400"
-                      : "text-neutral-500 hover:text-red-400 hover:bg-red-950/30"
+                      ? "bg-lamp-err/10 text-lamp-err"
+                      : "text-ink-faint hover:bg-lamp-err/10 hover:text-lamp-err"
                   }`}
                 >
                   {confirmDelete === att.path ? "OK?" : "Del"}
@@ -292,7 +292,7 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
       {/* Preview overlay */}
       {previewPath && previewAttachment && (
         <div
-          className="fixed inset-0 z-50 bg-black/90 flex items-center justify-center"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur-sm"
           onClick={() => setPreviewPath(null)}
           onTouchStart={(e) => { touchStartX.current = e.touches[0].clientX; }}
           onTouchEnd={(e) => {
@@ -306,14 +306,17 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
           {/* Close */}
           <button
             onClick={() => setPreviewPath(null)}
-            className="absolute top-4 right-4 text-neutral-400 hover:text-white text-2xl z-10"
+            aria-label="Close preview"
+            className="absolute right-4 top-4 z-10 flex h-8 w-8 items-center justify-center rounded-full bg-raised text-ink-dim shadow-lg transition-colors hover:bg-hover hover:text-ink"
           >
-            &times;
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
+              <path d="M6 18L18 6M6 6l12 12" />
+            </svg>
           </button>
 
           {/* Counter */}
           {previewable.length > 1 && (
-            <div className="absolute top-4 left-0 right-0 text-center text-xs text-neutral-500 pointer-events-none">
+            <div className="pointer-events-none absolute inset-x-0 top-4 text-center font-mono text-[11px] text-ink-faint">
               {previewIdx + 1} / {previewable.length}
             </div>
           )}
@@ -323,39 +326,45 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
             <>
               <button
                 onClick={(e) => { e.stopPropagation(); navigatePreview(-1); }}
-                className="absolute left-2 top-1/2 -translate-y-1/2 z-10 w-10 h-10 flex items-center justify-center text-neutral-500 hover:text-white text-xl"
+                aria-label="Previous"
+                className="absolute left-2 top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/40 text-ink-dim transition-colors hover:bg-black/60 hover:text-ink"
               >
-                &#x2039;
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
+                  <path d="M15 19l-7-7 7-7" />
+                </svg>
               </button>
               <button
                 onClick={(e) => { e.stopPropagation(); navigatePreview(1); }}
-                className="absolute right-2 top-1/2 -translate-y-1/2 z-10 w-10 h-10 flex items-center justify-center text-neutral-500 hover:text-white text-xl"
+                aria-label="Next"
+                className="absolute right-2 top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/40 text-ink-dim transition-colors hover:bg-black/60 hover:text-ink"
               >
-                &#x203A;
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
+                  <path d="M9 5l7 7-7 7" />
+                </svg>
               </button>
             </>
           )}
 
           {/* Content */}
-          <div className="max-w-full max-h-full p-4" onClick={(e) => e.stopPropagation()}>
+          <div className="max-h-full max-w-full p-4" onClick={(e) => e.stopPropagation()}>
             {isImage(previewAttachment.mime) && (
               <img
                 src={api.files.rawUrl(previewPath, false, peerId)}
                 alt={previewAttachment.name}
-                className="max-w-full max-h-[85vh] object-contain"
+                className="max-h-[85vh] max-w-full rounded-lg object-contain shadow-2xl"
               />
             )}
             {isVideo(previewAttachment.mime) && (
               <video
                 src={api.files.rawUrl(previewPath, false, peerId)}
                 controls
-                className="max-w-full max-h-[85vh]"
+                className="max-h-[85vh] max-w-full rounded-lg shadow-2xl"
               />
             )}
           </div>
 
           {/* Filename */}
-          <div className="absolute bottom-4 left-0 right-0 text-center text-xs text-neutral-500 pointer-events-none truncate px-8">
+          <div className="pointer-events-none absolute inset-x-0 bottom-4 truncate px-8 text-center font-mono text-[11px] text-ink-dim">
             {previewAttachment.name}
           </div>
         </div>

@@ -6,12 +6,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
-	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/loppo-llc/kojo/internal/auth"
-	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/session"
 )
 
@@ -345,67 +343,19 @@ func (s *Server) proxySessionWebSocket(w http.ResponseWriter, r *http.Request, s
 			"peer routing not available on this host")
 		return
 	}
-	targetRec, err := s.agents.Store().GetPeer(r.Context(), targetDeviceID)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway",
-			"target peer not in registry: "+err.Error())
+	addr, ok := s.resolvePeerDialAddr(w, r.Context(), s.agents.Store(), targetDeviceID)
+	if !ok {
 		return
 	}
-	addr, err := peer.NormalizeAddress(targetRec.URL)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway",
-			"target peer has no usable dial address: "+err.Error())
-		return
-	}
-	targetURL, err := url.Parse(addr)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway",
-			"target address unparseable: "+err.Error())
-		return
-	}
-	if !rewriteHTTPSchemeToWS(w, targetURL) {
-		return
-	}
-	targetURL.Path = "/api/v1/ws"
-	q := targetURL.Query()
+	q := url.Values{}
 	q.Set("session", sessionID)
-	targetURL.RawQuery = q.Encode()
-
-	upgrade, err := http.NewRequestWithContext(r.Context(),
-		http.MethodGet, targetURL.String(), nil)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", err.Error())
-		return
-	}
-
-	targetConn, _, err := websocket.Dial(r.Context(), targetURL.String(),
-		&websocket.DialOptions{
-			HTTPHeader: upgrade.Header,
-			HTTPClient: peer.NoKeepAliveHTTPClient(10 * time.Second),
-		})
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway",
-			"connect to peer: "+err.Error())
-		return
-	}
-	defer targetConn.CloseNow()
-
-	clientConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: wsOriginPatterns,
+	s.forwardWebSocketToPeer(w, r, peerWSForward{
+		addr:          addr,
+		path:          "/api/v1/ws",
+		query:         q,
+		dialErrPrefix: "connect to peer: ",
+		onAcceptErr: func(err error) {
+			s.logger.Error("session ws proxy: accept inbound failed", "session", sessionID, "err", err)
+		},
 	})
-	if err != nil {
-		s.logger.Error("session ws proxy: accept inbound failed", "session", sessionID, "err", err)
-		return
-	}
-	defer clientConn.CloseNow()
-	clientConn.SetReadLimit(256 * 1024)
-	targetConn.SetReadLimit(256 * 1024)
-
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); defer cancel(); copyWS(ctx, clientConn, targetConn) }()
-	go func() { defer wg.Done(); defer cancel(); copyWS(ctx, targetConn, clientConn) }()
-	wg.Wait()
 }

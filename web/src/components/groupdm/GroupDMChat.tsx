@@ -10,10 +10,20 @@ import {
   type GroupMessage,
 } from "../../lib/groupdmApi";
 import { useEnterSends } from "../../lib/preferences";
+import { formatTime } from "../../lib/utils";
 import { useFileUpload } from "../../hooks/useFileUpload";
 import { useDraftInput } from "../../hooks/useDraftInput";
 import { useAutoGrowTextarea } from "../../hooks/useAutoGrowTextarea";
-import { DismissibleError, PendingAttachments, enterToSend } from "../chatComposer";
+import { useChatScroll } from "../../hooks/useChatScroll";
+import { useChatPagination } from "../../hooks/useChatPagination";
+import {
+  DismissibleError,
+  PendingAttachments,
+  LoadMoreButton,
+  AttachButton,
+  SendButton,
+  enterToSend,
+} from "../chatComposer";
 import { AgentAvatar } from "../agent/AgentAvatar";
 import { AttachmentList, MessageContent } from "../agent/ChatMessage";
 
@@ -25,10 +35,24 @@ export function GroupDMChat() {
   const [group, setGroup] = useState<GroupDMInfo | null>(null);
   const [messages, setMessages] = useState<GroupMessage[]>([]);
   const [hasMore, setHasMore] = useState(false);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const scrollContainerRef = useRef<HTMLDivElement>(null);
-  const loadingMoreRef = useRef(false);
-  const suppressAutoScrollRef = useRef(false);
+  // Canonical auto-scroll + pagination shared with AgentChat.
+  const { messagesEndRef, scrollContainerRef, suppressAutoScrollRef, scrollRestoreRef } =
+    useChatScroll(messages, id);
+  const fetchOlder = useCallback(
+    (oldestId: string) => groupdmApi.messages(id!, PAGE_SIZE, oldestId),
+    [id],
+  );
+  const { loadOlderMessages, loadingMoreRef } = useChatPagination<GroupMessage>({
+    enabled: !!id,
+    hasMore,
+    messages,
+    scrollContainerRef,
+    suppressAutoScrollRef,
+    scrollRestoreRef,
+    fetchOlder,
+    setMessages,
+    setHasMore,
+  });
 
   const [notFound, setNotFound] = useState(false);
   const [showStyleMenu, setShowStyleMenu] = useState(false);
@@ -152,46 +176,6 @@ export function GroupDMChat() {
     return () => clearInterval(interval);
   }, [id, notFound]);
 
-  // Auto-scroll only when new messages arrive at the bottom
-  const lastMessageIdRef = useRef<string | undefined>(undefined);
-  useEffect(() => {
-    const lastId = messages[messages.length - 1]?.id;
-    if (lastId && lastId !== lastMessageIdRef.current && !suppressAutoScrollRef.current) {
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    }
-    lastMessageIdRef.current = lastId;
-  }, [messages]);
-
-  const loadOlderMessages = useCallback(async () => {
-    if (!id || loadingMoreRef.current || !hasMore || messages.length === 0) return;
-    loadingMoreRef.current = true;
-
-    const oldestId = messages[0].id;
-    const container = scrollContainerRef.current;
-    const prevScrollHeight = container?.scrollHeight ?? 0;
-    const prevScrollTop = container?.scrollTop ?? 0;
-
-    try {
-      const r = await groupdmApi.messages(id, PAGE_SIZE, oldestId);
-      setHasMore(r.hasMore);
-      if (r.messages.length > 0) {
-        suppressAutoScrollRef.current = true;
-        setMessages((prev) => [...r.messages, ...prev]);
-        requestAnimationFrame(() => {
-          if (container) {
-            const delta = container.scrollHeight - prevScrollHeight;
-            container.scrollTop = prevScrollTop + delta;
-          }
-          suppressAutoScrollRef.current = false;
-        });
-      }
-    } catch (e) {
-      console.error(e);
-    } finally {
-      loadingMoreRef.current = false;
-    }
-  }, [id, hasMore, messages]);
-
   const handleSend = useCallback(async () => {
     const text = input.trim();
     if ((!text && pendingFiles.length === 0) || sending || !id) return;
@@ -232,11 +216,11 @@ export function GroupDMChat() {
   // initial groupdmApi.get failure) and React would throw.
   if (notFound) {
     return (
-      <div className="min-h-full bg-neutral-950 text-neutral-200 flex flex-col items-center justify-center gap-3">
-        <p className="text-neutral-500">Group not found</p>
+      <div className="flex min-h-full flex-col items-center justify-center gap-3 bg-app text-ink">
+        <p className="text-ink-faint">Group not found</p>
         <button
           onClick={() => navigate("/")}
-          className="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 rounded text-sm"
+          className="rounded-[10px] border border-hairline bg-surface px-4 py-2 text-sm text-ink-dim transition-colors hover:bg-hover hover:text-ink"
         >
           Back
         </button>
@@ -262,21 +246,24 @@ export function GroupDMChat() {
   );
 
   return (
-    <div className="flex flex-col h-full bg-neutral-950 text-neutral-200">
+    <div className="flex flex-col h-full bg-app text-ink">
       {/* Header */}
-      <header className="flex items-center gap-3 px-4 py-3 border-b border-neutral-800 shrink-0">
+      <header className="sticky top-0 z-40 flex h-[52px] shrink-0 items-center gap-2 border-b border-hairline bg-app/85 px-2 backdrop-blur sm:px-3">
         <button
           onClick={() => navigate("/")}
-          className="text-neutral-400 hover:text-neutral-200"
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] text-ink-dim transition-colors hover:bg-hover hover:text-ink lg:hidden"
+          aria-label="Back"
         >
-          &larr;
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
+            <path d="M12.5 5l-5 5 5 5" />
+          </svg>
         </button>
-        <div className="flex -space-x-2">
+        <div className="flex shrink-0 -space-x-1.5">
           {group.members.slice(0, 3).map((m) => (
-            <AgentAvatar key={m.agentId} agentId={m.agentId} name={m.agentName} size="sm" />
+            <AgentAvatar key={m.agentId} agentId={m.agentId} name={m.agentName} size="xs" />
           ))}
         </div>
-        <div className="flex-1 min-w-0">
+        <div className="min-w-0 flex-1">
           {editingName ? (
             <input
               ref={nameInputRef}
@@ -301,14 +288,14 @@ export function GroupDMChat() {
                   (e.target as HTMLInputElement).blur();
                 }
               }}
-              className="w-full px-1.5 py-0.5 text-sm font-medium bg-neutral-800 border border-neutral-600 rounded text-neutral-200 focus:outline-none focus:border-neutral-400"
+              className="w-full rounded-[10px] border border-hairline bg-raised px-1.5 py-0.5 text-[15px] font-semibold text-ink focus:border-copper focus:outline-none"
               aria-label="Group name"
               maxLength={100}
             />
           ) : (
             <button
               type="button"
-              className="font-medium text-sm truncate cursor-pointer hover:text-neutral-100 bg-transparent border-none p-0 text-left text-neutral-200 w-full"
+              className="w-full truncate border-none bg-transparent p-0 text-left text-[15px] font-semibold text-ink transition-colors hover:text-copper"
               onClick={() => {
                 setNameInput(group.name);
                 setEditingName(true);
@@ -318,7 +305,7 @@ export function GroupDMChat() {
               {group.name}
             </button>
           )}
-          <div className="text-xs text-neutral-500 truncate">
+          <div className="truncate text-[11px] text-ink-dim">
             {group.members.length <= 3
               ? group.members.map((m) => m.agentName).join(", ")
               : group.members.slice(0, 2).map((m) => m.agentName).join(", ") + `, +${group.members.length - 2}`}
@@ -328,7 +315,7 @@ export function GroupDMChat() {
         <div className="shrink-0 relative">
           <button
             onClick={() => setShowStyleMenu((v) => !v)}
-            className="text-base leading-none px-1 py-0.5 rounded hover:bg-neutral-700 cursor-pointer"
+            className="cursor-pointer rounded-[10px] px-1.5 py-1 text-base leading-none text-ink-faint transition-colors hover:bg-hover hover:text-ink"
             title={`Style: ${group.style || "efficient"}`}
           >
             {(group.style || "efficient") === "efficient" ? "⚡" : "💬"}
@@ -336,7 +323,7 @@ export function GroupDMChat() {
           {showStyleMenu && (
             <>
               <div className="fixed inset-0 z-10" onClick={() => setShowStyleMenu(false)} />
-              <div className="absolute right-0 top-full mt-1 z-20 bg-neutral-800 border border-neutral-700 rounded shadow-lg py-1 min-w-[140px]">
+              <div className="absolute right-0 top-full mt-1 z-20 min-w-[140px] rounded-[10px] border border-hairline bg-raised py-1 shadow-xl shadow-black/40">
                 {([["efficient", "⚡ Efficient"], ["expressive", "💬 Expressive"]] as const).map(([value, label]) => (
                   <button
                     key={value}
@@ -350,8 +337,8 @@ export function GroupDMChat() {
                         console.error("Failed to set style", err);
                       }
                     }}
-                    className={`w-full text-left px-3 py-1.5 text-xs hover:bg-neutral-700 cursor-pointer ${
-                      value === (group.style || "efficient") ? "text-white" : "text-neutral-400"
+                    className={`w-full cursor-pointer px-3 py-1.5 text-left text-xs transition-colors hover:bg-hover ${
+                      value === (group.style || "efficient") ? "text-ink" : "text-ink-dim"
                     }`}
                   >
                     {label}
@@ -366,7 +353,7 @@ export function GroupDMChat() {
         <div className="shrink-0 relative">
           <button
             onClick={() => setShowVenueMenu((v) => !v)}
-            className="text-base leading-none px-1 py-0.5 rounded hover:bg-neutral-700 cursor-pointer"
+            className="cursor-pointer rounded-[10px] px-1.5 py-1 text-base leading-none text-ink-faint transition-colors hover:bg-hover hover:text-ink"
             title={`Venue: ${group.venue || DEFAULT_GROUPDM_VENUE}`}
           >
             {(group.venue || DEFAULT_GROUPDM_VENUE) === "colocated" ? "🏠" : "💻"}
@@ -374,7 +361,7 @@ export function GroupDMChat() {
           {showVenueMenu && (
             <>
               <div className="fixed inset-0 z-10" onClick={() => setShowVenueMenu(false)} />
-              <div className="absolute right-0 top-full mt-1 z-20 bg-neutral-800 border border-neutral-700 rounded shadow-lg py-1 min-w-[200px]">
+              <div className="absolute right-0 top-full mt-1 z-20 min-w-[200px] rounded-[10px] border border-hairline bg-raised py-1 shadow-xl shadow-black/40">
                 {(
                   [
                     ["chatroom", "💻 Closed chat room", "Text-only, not co-present"],
@@ -393,12 +380,12 @@ export function GroupDMChat() {
                         console.error("Failed to set venue", err);
                       }
                     }}
-                    className={`w-full text-left px-3 py-1.5 text-xs hover:bg-neutral-700 cursor-pointer ${
-                      value === (group.venue || DEFAULT_GROUPDM_VENUE) ? "text-white" : "text-neutral-400"
+                    className={`w-full cursor-pointer px-3 py-1.5 text-left text-xs transition-colors hover:bg-hover ${
+                      value === (group.venue || DEFAULT_GROUPDM_VENUE) ? "text-ink" : "text-ink-dim"
                     }`}
                   >
                     <div>{label}</div>
-                    <div className="text-[10px] text-neutral-500">{hint}</div>
+                    <div className="text-[10px] text-ink-faint">{hint}</div>
                   </button>
                 ))}
               </div>
@@ -428,11 +415,11 @@ export function GroupDMChat() {
                 min="0"
                 value={cooldownInput}
                 onChange={(e) => setCooldownInput(e.target.value)}
-                className="w-16 px-1.5 py-0.5 text-xs bg-neutral-800 border border-neutral-700 rounded text-neutral-200 text-center"
+                className="w-16 rounded-[10px] border border-hairline bg-raised px-1.5 py-0.5 text-center text-xs text-ink focus:border-copper focus:outline-none"
                 autoFocus
                 onBlur={() => setEditingCooldown(false)}
               />
-              <span className="text-[10px] text-neutral-500">s</span>
+              <span className="text-[10px] text-ink-faint">s</span>
             </form>
           ) : (
             <button
@@ -440,7 +427,7 @@ export function GroupDMChat() {
                 setCooldownInput(String(group.cooldown || 50));
                 setEditingCooldown(true);
               }}
-              className="text-[10px] text-neutral-600 hover:text-neutral-400 px-1.5 py-0.5 rounded"
+              className="rounded-[10px] px-1.5 py-0.5 font-mono text-[10px] text-ink-faint transition-colors hover:text-ink"
               title="Notification cooldown (seconds)"
             >
               {group.cooldown || 50}s
@@ -452,7 +439,7 @@ export function GroupDMChat() {
             setClearError("");
             setShowClearDialog(true);
           }}
-          className="p-2 text-neutral-600 hover:text-amber-300 rounded"
+          className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-lamp-warn"
           title="Clear message history"
         >
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
@@ -466,7 +453,7 @@ export function GroupDMChat() {
             setDeleteError("");
             setShowDeleteDialog(true);
           }}
-          className="p-2 text-neutral-600 hover:text-red-400 rounded"
+          className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-lamp-err"
           title="Delete group"
         >
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
@@ -476,77 +463,74 @@ export function GroupDMChat() {
       </header>
 
       {/* Messages */}
-      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
-        {hasMore && (
-          <div className="flex justify-center pt-1 pb-3">
-            <button
-              onClick={loadOlderMessages}
-              className="group relative px-4 py-1.5 text-xs text-neutral-500 hover:text-neutral-300 transition-colors"
-            >
-              <span className="absolute inset-x-0 top-1/2 h-px bg-neutral-800" />
-              <span className="relative inline-flex items-center gap-1.5 bg-neutral-950 px-3">
-                <svg className="w-3 h-3 transition-transform group-hover:-translate-y-0.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-                  <path d="M8 12V4M4 7l4-4 4 4" />
-                </svg>
-                older messages
-              </span>
-            </button>
-          </div>
-        )}
+      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto">
+        <div className="mx-auto max-w-[760px] space-y-4 px-4 py-4">
+        {hasMore && <LoadMoreButton onClick={loadOlderMessages} loading={loadingMoreRef.current} />}
 
         {messages.length === 0 && (
-          <div className="text-center text-neutral-600 py-16">
-            <p className="text-lg mb-1">{group.name}</p>
+          <div className="py-16 text-center text-ink-faint">
+            <p className="mb-1 text-lg text-ink-dim">{group.name}</p>
             <p className="text-sm">No messages yet</p>
           </div>
         )}
 
         {messages.map((msg) => {
           const isUser = msg.agentId === USER_SENDER_ID;
+          if (isUser) {
+            return (
+              <div key={msg.id} className="flex justify-end">
+                <div className="min-w-0 max-w-[85%] rounded-2xl rounded-br-md border border-copper/25 bg-raised px-3.5 py-2.5 text-[14px] text-ink lg:max-w-[70%]">
+                  {msg.attachments && msg.attachments.length > 0 && (
+                    <AttachmentList attachments={msg.attachments} isUser />
+                  )}
+                  <MessageContent
+                    messageId={msg.id}
+                    content={msg.content}
+                    isUser
+                    timestamp={msg.timestamp}
+                  />
+                </div>
+              </div>
+            );
+          }
           return (
-            <div key={msg.id} className={`flex gap-3 ${isUser ? "flex-row-reverse" : "flex-row"}`}>
-              {!isUser && (
-                <AgentAvatar
-                  agentId={msg.agentId}
-                  name={msg.agentName}
-                  size="sm"
-                  className="mt-1 shrink-0"
-                />
-              )}
-              <div
-                className={`max-w-[80%] min-w-0 px-3.5 py-2.5 ${
-                  isUser
-                    ? "bg-blue-600/90 text-white rounded-2xl rounded-tr-sm"
-                    : "bg-neutral-800/80 text-neutral-200 rounded-2xl rounded-tl-sm"
-                }`}
-              >
-                {!isUser && (
-                  <div
-                    className={`mb-1 text-[11px] font-medium ${
-                      agentColors.get(msg.agentId) ?? "text-neutral-300"
-                    }`}
-                  >
+            <div key={msg.id} className="flex gap-3">
+              <AgentAvatar
+                agentId={msg.agentId}
+                name={msg.agentName}
+                size="xs"
+                className="mt-0.5 shrink-0"
+              />
+              <div className="min-w-0 flex-1">
+                <div className="mb-1 flex items-baseline gap-2">
+                  <span className={`text-[13px] font-semibold ${agentColors.get(msg.agentId) ?? "text-ink"}`}>
                     {msg.agentName}
-                  </div>
-                )}
+                  </span>
+                  <span className="font-mono text-[11px] text-ink-faint">{formatTime(msg.timestamp)}</span>
+                </div>
                 {msg.attachments && msg.attachments.length > 0 && (
-                  <AttachmentList attachments={msg.attachments} isUser={isUser} />
+                  <AttachmentList attachments={msg.attachments} isUser={false} />
                 )}
-                <MessageContent
-                  messageId={msg.id}
-                  content={msg.content}
-                  isUser={isUser}
-                  timestamp={msg.timestamp}
-                />
+                <div className="text-[14px] text-ink">
+                  <MessageContent
+                    messageId={msg.id}
+                    content={msg.content}
+                    isUser={false}
+                    timestamp={msg.timestamp}
+                    showTime={false}
+                  />
+                </div>
               </div>
             </div>
           );
         })}
         <div ref={messagesEndRef} />
+        </div>
       </div>
 
-      {/* Input */}
-      <div className="border-t border-neutral-800 px-4 py-3 shrink-0">
+      {/* Composer */}
+      <div className="sticky bottom-0 z-30 shrink-0 border-t border-hairline bg-app/92 backdrop-blur">
+        <div className="mx-auto max-w-[760px] px-4 py-3">
         {sendError && <DismissibleError message={sendError} onDismiss={() => setSendError(null)} />}
         {uploadError && <DismissibleError message={uploadError} onDismiss={() => setUploadError(null)} />}
         <PendingAttachments files={pendingFiles} onRemove={removePendingFile} thumb={false} />
@@ -558,43 +542,28 @@ export function GroupDMChat() {
             onChange={handleFileSelect}
             className="hidden"
           />
-          <button
+          <AttachButton
             onClick={() => fileInputRef.current?.click()}
+            uploading={uploading}
             disabled={uploading || sending}
-            className="p-2 text-neutral-500 hover:text-neutral-300 disabled:opacity-40 shrink-0"
-            title="Attach files"
-          >
-            {uploading ? (
-              <svg className="w-5 h-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-              </svg>
-            ) : (
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
-                <path fillRule="evenodd" d="M15.621 4.379a3 3 0 00-4.242 0l-7 7a3 3 0 004.241 4.243h.001l.497-.5a.75.75 0 011.064 1.057l-.498.501-.002.002a4.5 4.5 0 01-6.364-6.364l7-7a4.5 4.5 0 016.368 6.36l-3.455 3.553A2.625 2.625 0 119.52 9.52l3.45-3.451a.75.75 0 111.061 1.06l-3.45 3.451a1.125 1.125 0 001.587 1.595l3.454-3.553a3 3 0 000-4.242z" clipRule="evenodd" />
-              </svg>
-            )}
-          </button>
-          <textarea
-            ref={textareaRef}
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onInput={handleTextareaInput}
-            onKeyDown={handleKeyDown}
-            placeholder="Message the group..."
-            rows={1}
-            className="flex-1 px-3 py-2 bg-neutral-900 border border-neutral-700 rounded-xl text-sm resize-none focus:outline-none focus:border-neutral-500 max-h-[150px]"
           />
-          <button
+          <div className="min-w-0 flex-1 rounded-xl border border-hairline bg-raised px-1 focus-within:border-copper/50">
+            <textarea
+              ref={textareaRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onInput={handleTextareaInput}
+              onKeyDown={handleKeyDown}
+              placeholder={`Message the group… (${enterSends ? "Enter" : "Shift+Enter"} to send)`}
+              rows={1}
+              className="max-h-[150px] w-full resize-none bg-transparent px-3 py-2 text-[14px] text-ink placeholder:text-ink-faint focus:outline-none"
+            />
+          </div>
+          <SendButton
             onClick={() => void handleSend()}
             disabled={(!input.trim() && pendingFiles.length === 0) || sending}
-            className="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-xl text-sm font-medium disabled:opacity-40 shrink-0"
-          >
-            {sending ? "Sending…" : "Send"}
-          </button>
+          />
         </div>
-        <div className="text-[10px] text-neutral-600 mt-1 text-center">
-          {enterSends ? "Enter to send, Shift+Enter for newline" : "Shift+Enter to send, Enter for newline"}
         </div>
       </div>
 
@@ -607,21 +576,21 @@ export function GroupDMChat() {
           onClick={(e) => { if (e.target === e.currentTarget && !clearing) setShowClearDialog(false); }}
           onKeyDown={(e) => { if (e.key === "Escape" && !clearing) setShowClearDialog(false); }}
         >
-          <div className="bg-neutral-900 border border-neutral-700 rounded-lg p-5 w-80 shadow-xl">
-            <h3 className="text-sm font-medium text-neutral-200 mb-2">
+          <div className="w-80 rounded-[10px] border border-hairline bg-raised p-5 shadow-xl shadow-black/50">
+            <h3 className="mb-2 text-sm font-medium text-ink">
               Clear history?
             </h3>
-            <p className="text-xs text-neutral-400 mb-4">
+            <p className="mb-4 text-xs text-ink-dim">
               Messages in &ldquo;{group.name}&rdquo; will be deleted. The group stays open.
             </p>
             {clearError && (
-              <p className="text-xs text-red-400 mb-3">{clearError}</p>
+              <p className="mb-3 text-xs text-lamp-err">{clearError}</p>
             )}
             <div className="flex justify-end gap-2">
               <button
                 onClick={() => setShowClearDialog(false)}
                 disabled={clearing}
-                className="px-3 py-1.5 text-xs text-neutral-400 hover:text-neutral-200 rounded disabled:opacity-50"
+                className="rounded-[10px] px-3 py-1.5 text-xs text-ink-dim transition-colors hover:text-ink disabled:opacity-50"
               >
                 Cancel
               </button>
@@ -634,7 +603,6 @@ export function GroupDMChat() {
                     pollGenerationRef.current += 1;
                     setMessages([]);
                     setHasMore(false);
-                    lastMessageIdRef.current = undefined;
                     suppressAutoScrollRef.current = false;
                     setShowClearDialog(false);
                   } catch (e) {
@@ -644,7 +612,7 @@ export function GroupDMChat() {
                   }
                 }}
                 disabled={clearing}
-                className="px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-500 text-white rounded disabled:opacity-50"
+                className="rounded-[10px] border border-lamp-warn/50 bg-lamp-warn/10 px-3 py-1.5 text-xs text-lamp-warn transition-colors hover:bg-lamp-warn/20 disabled:opacity-50"
               >
                 {clearing ? "Clearing…" : "Clear"}
               </button>
@@ -662,28 +630,28 @@ export function GroupDMChat() {
           onClick={(e) => { if (e.target === e.currentTarget && !deleting) setShowDeleteDialog(false); }}
           onKeyDown={(e) => { if (e.key === "Escape" && !deleting) setShowDeleteDialog(false); }}
         >
-          <div className="bg-neutral-900 border border-neutral-700 rounded-lg p-5 w-80 shadow-xl">
-            <h3 className="text-sm font-medium text-neutral-200 mb-3">
+          <div className="w-80 rounded-[10px] border border-hairline bg-raised p-5 shadow-xl shadow-black/50">
+            <h3 className="mb-3 text-sm font-medium text-ink">
               Delete &ldquo;{group.name}&rdquo;?
             </h3>
-            <label className="flex items-center gap-2 text-sm text-neutral-400 mb-4 cursor-pointer select-none">
+            <label className="mb-4 flex cursor-pointer select-none items-center gap-2 text-sm text-ink-dim">
               <input
                 type="checkbox"
                 checked={deleteNotify}
                 onChange={(e) => setDeleteNotify(e.target.checked)}
                 disabled={deleting}
-                className="rounded border-neutral-600 bg-neutral-800 text-blue-500 focus:ring-blue-500/30"
+                className="rounded border-hairline bg-surface accent-[color:var(--color-copper)]"
               />
               Notify members
             </label>
             {deleteError && (
-              <p className="text-xs text-red-400 mb-3">{deleteError}</p>
+              <p className="mb-3 text-xs text-lamp-err">{deleteError}</p>
             )}
             <div className="flex justify-end gap-2">
               <button
                 onClick={() => setShowDeleteDialog(false)}
                 disabled={deleting}
-                className="px-3 py-1.5 text-xs text-neutral-400 hover:text-neutral-200 rounded disabled:opacity-50"
+                className="rounded-[10px] px-3 py-1.5 text-xs text-ink-dim transition-colors hover:text-ink disabled:opacity-50"
               >
                 Cancel
               </button>
@@ -701,7 +669,7 @@ export function GroupDMChat() {
                   }
                 }}
                 disabled={deleting}
-                className="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-500 text-white rounded disabled:opacity-50"
+                className="rounded-[10px] border border-lamp-err/50 bg-lamp-err/10 px-3 py-1.5 text-xs text-lamp-err transition-colors hover:bg-lamp-err/20 disabled:opacity-50"
               >
                 {deleting ? "Deleting…" : "Delete"}
               </button>

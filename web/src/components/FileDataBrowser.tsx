@@ -309,25 +309,27 @@ export function FileDataBrowser({
   };
 
   return (
-    <div className="flex flex-col h-full min-h-full bg-neutral-950 text-neutral-200 relative">
+    <div className="relative flex h-full min-h-full flex-col bg-app text-ink">
       {showHeader && (
-        <header className="flex items-center gap-3 px-4 py-3 border-b border-neutral-800 shrink-0">
+        <header className="flex shrink-0 items-center gap-3 border-b border-hairline px-4 py-3">
           <button
             onClick={handleBack}
-            className="text-neutral-400 hover:text-neutral-200"
+            className="-ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] text-ink-dim transition-colors hover:bg-hover hover:text-ink"
             aria-label="Back"
           >
-            &larr;
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
+              <path d="M12.5 15l-5-5 5-5" />
+            </svg>
           </button>
           {leading}
-          <div className="flex-1 min-w-0">
-            <div className="font-medium text-sm truncate">{title}</div>
-            {subtitle && <div className="text-[11px] text-neutral-500">{subtitle}</div>}
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-sm font-medium text-ink">{title}</div>
+            {subtitle && <div className="text-[11px] text-ink-faint">{subtitle}</div>}
           </div>
           <button
             onClick={() => copyFolderPath && copyText(copyFolderPath)}
             disabled={!copyFolderPath}
-            className="text-[11px] px-2 py-1 rounded bg-neutral-900 hover:bg-neutral-800 text-neutral-400 border border-neutral-800 disabled:opacity-40"
+            className="rounded-[10px] border border-hairline bg-raised px-2 py-1 font-mono text-[11px] text-ink-dim transition-colors hover:bg-hover hover:text-ink disabled:opacity-40"
             title="Copy absolute path of current folder"
           >
             {copied ? "copied" : "copy path"}
@@ -335,22 +337,24 @@ export function FileDataBrowser({
         </header>
       )}
 
-      <div className="flex items-center gap-1 px-4 py-2 border-b border-neutral-900 overflow-x-auto shrink-0 text-xs">
+      <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-hairline px-4 py-2 font-mono text-[12px]">
         {!showHeader && (
           <button
             onClick={handleBack}
             disabled={!canGoUp}
-            className="mr-1 text-neutral-500 hover:text-neutral-300 disabled:opacity-30 disabled:hover:text-neutral-500"
+            className="mr-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-ink-faint transition-colors hover:text-ink-dim disabled:opacity-30 disabled:hover:text-ink-faint"
             aria-label="Back"
           >
-            &larr;
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
+              <path d="M12.5 15l-5-5 5-5" />
+            </svg>
           </button>
         )}
         {breadcrumbs.map((c, i) => {
           const last = i === breadcrumbs.length - 1;
           return (
-            <div key={`${c.path}:${i}`} className="flex items-center gap-1 shrink-0">
-              {i > 0 && <span className="text-neutral-700">/</span>}
+            <div key={`${c.path}:${i}`} className="flex shrink-0 items-center gap-1">
+              {i > 0 && <span className="text-ink-faint">/</span>}
               <button
                 onClick={() => {
                   if (last) return;
@@ -362,10 +366,10 @@ export function FileDataBrowser({
                 }}
                 disabled={last}
                 className={`flex items-center gap-1 ${
-                  last ? "text-neutral-200" : "text-neutral-500 hover:text-neutral-300"
+                  last ? "text-copper" : "text-ink-faint hover:text-ink-dim"
                 }`}
               >
-                {c.isRoot && <FolderIcon className="w-3.5 h-3.5 text-blue-400" />}
+                {c.isRoot && <FolderIcon className="h-3.5 w-3.5 text-blue-400" />}
                 <span>{c.label}</span>
               </button>
             </div>
@@ -373,22 +377,22 @@ export function FileDataBrowser({
         })}
       </div>
 
-      <div className="flex items-center gap-2 px-4 py-2 border-b border-neutral-900 shrink-0">
-        <div className="relative flex-1 min-w-0">
+      <div className="flex shrink-0 items-center gap-2 border-b border-hairline px-4 py-2">
+        <div className="relative min-w-0 flex-1">
           <svg
             xmlns="http://www.w3.org/2000/svg"
             viewBox="0 0 20 20"
             fill="currentColor"
-            className="w-4 h-4 absolute left-2.5 top-1/2 -translate-y-1/2 text-neutral-600"
+            className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-faint"
           >
             <path fillRule="evenodd" d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z" clipRule="evenodd" />
           </svg>
           <input
             type="text"
-            placeholder="Filter..."
+            placeholder="Filter…"
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
-            className="w-full pl-8 pr-2 py-1.5 bg-neutral-900 border border-neutral-800 rounded-lg text-xs focus:outline-none focus:border-neutral-600"
+            className="w-full rounded-lg border border-hairline bg-raised py-1.5 pl-8 pr-2 text-[12px] text-ink placeholder:text-ink-faint transition-colors focus:border-copper focus:outline-none"
           />
         </div>
         <SortButton label="Name" active={sortKey === "name"} dir={sortDir} onClick={() => toggleSort("name")} />
@@ -396,10 +400,10 @@ export function FileDataBrowser({
         <SortButton label="Mod" active={sortKey === "modified"} dir={sortDir} onClick={() => toggleSort("modified")} />
         <button
           onClick={() => setShowHidden((h) => !h)}
-          className={`text-[11px] px-2 py-1 rounded border ${
+          className={`shrink-0 rounded-lg border px-2 py-1 font-mono text-[11px] transition-colors ${
             showHidden
-              ? "bg-neutral-700/60 text-neutral-200 border-neutral-600"
-              : "bg-neutral-900 text-neutral-500 border-neutral-800 hover:text-neutral-300"
+              ? "border-copper/40 bg-copper/10 text-copper"
+              : "border-hairline bg-raised text-ink-faint hover:text-ink-dim"
           }`}
           title="Toggle hidden files"
         >
@@ -409,15 +413,15 @@ export function FileDataBrowser({
 
       <div className="flex-1 overflow-y-auto">
         {error ? (
-          <div className="px-4 py-8 text-center text-red-400 text-sm">{error}</div>
+          <div className="px-4 py-8 text-center text-sm text-lamp-err">{error}</div>
         ) : (!ready || loading) && entries.length === 0 ? (
-          <div className="px-4 py-16 text-center text-neutral-600 text-sm">Loading...</div>
+          <div className="px-4 py-16 text-center text-sm text-ink-faint">Loading…</div>
         ) : sortedEntries.length === 0 ? (
-          <div className="px-4 py-16 text-center text-neutral-600 text-sm">
+          <div className="px-4 py-16 text-center text-sm text-ink-faint">
             {filter ? "No matches." : "Empty folder."}
           </div>
         ) : (
-          <ul className="divide-y divide-neutral-900">
+          <ul className="divide-y divide-hairline">
             {sortedEntries.map((entry) => (
               <EntryRow
                 key={entry.name}
@@ -462,10 +466,10 @@ function SortButton({
   return (
     <button
       onClick={onClick}
-      className={`text-[11px] px-2 py-1 rounded border shrink-0 flex items-center gap-1 ${
+      className={`flex shrink-0 items-center gap-1 rounded-lg border px-2 py-1 font-mono text-[11px] transition-colors ${
         active
-          ? "bg-neutral-800 text-neutral-200 border-neutral-700"
-          : "bg-neutral-900 text-neutral-500 border-neutral-800 hover:text-neutral-300"
+          ? "border-copper/40 bg-copper/10 text-copper"
+          : "border-hairline bg-raised text-ink-faint hover:text-ink-dim"
       }`}
     >
       {label}
@@ -473,7 +477,7 @@ function SortButton({
         <svg
           viewBox="0 0 10 10"
           fill="currentColor"
-          className={`w-2.5 h-2.5 transition-transform ${dir === "desc" ? "rotate-180" : ""}`}
+          className={`h-2.5 w-2.5 transition-transform motion-reduce:transition-none ${dir === "desc" ? "rotate-180" : ""}`}
         >
           <path d="M5 2l3 4H2l3-4z" />
         </svg>
@@ -514,13 +518,13 @@ function EntryRow({
     <li>
       <button
         onClick={onClick}
-        className="w-full text-left px-4 py-2.5 hover:bg-neutral-900/80 active:bg-neutral-900 flex items-center gap-3 transition-colors"
+        className="flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors hover:bg-hover active:bg-hover"
       >
-        <div className={`shrink-0 w-10 h-10 rounded-lg flex items-center justify-center overflow-hidden ${
-          entry.type === "dir" ? "bg-blue-500/10" : style?.bg ?? "bg-neutral-800"
+        <div className={`flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg ${
+          entry.type === "dir" ? "bg-blue-500/10" : style?.bg ?? "bg-surface"
         }`}>
           {entry.type === "dir" ? (
-            <FolderIcon className="w-6 h-6 text-blue-400" />
+            <FolderIcon className="h-6 w-6 text-blue-400" />
           ) : showThumb ? (
             <img
               src={thumbSrc}
@@ -543,11 +547,11 @@ function EntryRow({
             <FileGlyph kind={kind!} className={`w-5 h-5 ${style?.icon}`} />
           )}
         </div>
-        <div className="flex-1 min-w-0">
-          <div className="text-sm truncate">{entry.name}</div>
-          <div className="text-[11px] text-neutral-500">{meta}</div>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-[14px] text-ink">{entry.name}</div>
+          <div className="font-mono text-[11px] text-ink-faint">{meta}</div>
         </div>
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-neutral-700 shrink-0">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-4 w-4 shrink-0 text-ink-faint">
           <path fillRule="evenodd" d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z" clipRule="evenodd" />
         </svg>
       </button>
@@ -584,28 +588,34 @@ function FileViewer({
   }, [path]);
 
   return (
-    <div className="absolute inset-0 bg-neutral-950 z-10 flex flex-col">
-      <header className="flex items-center gap-2 px-4 py-3 border-b border-neutral-800 shrink-0">
-        <button onClick={onClose} className="text-neutral-400 hover:text-neutral-200" aria-label="Back">
-          &larr;
+    <div className="absolute inset-0 z-10 flex flex-col bg-app">
+      <header className="flex shrink-0 items-center gap-2 border-b border-hairline px-4 py-3">
+        <button
+          onClick={onClose}
+          className="-ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] text-ink-dim transition-colors hover:bg-hover hover:text-ink"
+          aria-label="Back"
+        >
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
+            <path d="M12.5 15l-5-5 5-5" />
+          </svg>
         </button>
-        <div className="flex-1 min-w-0">
-          <div className="text-sm truncate">{name}</div>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm text-ink">{name}</div>
           {view && (
-            <div className="text-[11px] text-neutral-500">
+            <div className="font-mono text-[11px] text-ink-faint">
               {formatSize(view.size)}
               {view.language ? ` · ${view.language}` : view.mime ? ` · ${view.mime}` : ""}
             </div>
           )}
         </div>
         {isMarkdown && (
-          <div className="flex items-center rounded border border-neutral-800 overflow-hidden shrink-0">
+          <div className="flex shrink-0 items-center overflow-hidden rounded-lg border border-hairline">
             <button
               onClick={() => setMdView("rendered")}
-              className={`text-[11px] px-2 py-1 ${
+              className={`px-2 py-1 font-mono text-[11px] transition-colors ${
                 mdView === "rendered"
-                  ? "bg-neutral-800 text-neutral-200"
-                  : "bg-neutral-900 text-neutral-500 hover:text-neutral-300"
+                  ? "bg-copper/10 text-copper"
+                  : "bg-raised text-ink-faint hover:text-ink-dim"
               }`}
               title="Render markdown"
             >
@@ -613,10 +623,10 @@ function FileViewer({
             </button>
             <button
               onClick={() => setMdView("raw")}
-              className={`text-[11px] px-2 py-1 border-l border-neutral-800 ${
+              className={`border-l border-hairline px-2 py-1 font-mono text-[11px] transition-colors ${
                 mdView === "raw"
-                  ? "bg-neutral-800 text-neutral-200"
-                  : "bg-neutral-900 text-neutral-500 hover:text-neutral-300"
+                  ? "bg-copper/10 text-copper"
+                  : "bg-raised text-ink-faint hover:text-ink-dim"
               }`}
               title="Show raw source"
             >
@@ -626,13 +636,13 @@ function FileViewer({
         )}
         <button
           onClick={onCopyPath}
-          className="text-[11px] px-2 py-1 rounded bg-neutral-900 hover:bg-neutral-800 text-neutral-400 border border-neutral-800"
+          className="rounded-lg border border-hairline bg-raised px-2 py-1 font-mono text-[11px] text-ink-dim transition-colors hover:bg-hover hover:text-ink"
         >
           {copied ? "copied" : "copy path"}
         </button>
         <a
           href={dataSource.rawUrl(path, true)}
-          className="text-[11px] px-2 py-1 rounded bg-neutral-900 hover:bg-neutral-800 text-neutral-400 border border-neutral-800"
+          className="rounded-lg border border-hairline bg-raised px-2 py-1 font-mono text-[11px] text-ink-dim transition-colors hover:bg-hover hover:text-ink"
           title="Download"
         >
           download
@@ -640,13 +650,13 @@ function FileViewer({
       </header>
       <div className="flex-1 overflow-auto">
         {loading ? (
-          <div className="px-4 py-16 text-center text-neutral-600 text-sm">Loading...</div>
+          <div className="px-4 py-16 text-center text-sm text-ink-faint">Loading…</div>
         ) : error ? (
-          <div className="px-4 py-16 text-center text-sm space-y-3">
-            <div className="text-neutral-400">{error}</div>
+          <div className="space-y-3 px-4 py-16 text-center text-sm">
+            <div className="text-ink-dim">{error}</div>
             <a
               href={dataSource.rawUrl(path, true)}
-              className="inline-block px-3 py-1.5 text-xs rounded border border-neutral-800 bg-neutral-900 text-neutral-300 hover:bg-neutral-800"
+              className="inline-block rounded-lg border border-hairline bg-raised px-3 py-1.5 text-xs text-ink-dim transition-colors hover:bg-hover hover:text-ink"
             >
               Download instead
             </a>
@@ -656,15 +666,15 @@ function FileViewer({
             <MarkdownRenderer content={view!.content ?? ""} />
           </div>
         ) : view?.type === "text" ? (
-          <pre className="text-[12px] leading-relaxed font-mono p-4 whitespace-pre-wrap break-words text-neutral-200">
+          <pre className="whitespace-pre-wrap break-words p-4 font-mono text-[12px] leading-relaxed text-ink">
             {view.content}
           </pre>
         ) : view?.type === "image" ? (
-          <div className="flex items-center justify-center p-4 min-h-full">
+          <div className="flex min-h-full items-center justify-center p-4">
             <img
               src={dataSource.rawUrl(path)}
               alt={name}
-              className="max-w-full max-h-full object-contain rounded"
+              className="max-h-full max-w-full rounded-lg object-contain"
             />
           </div>
         ) : null}

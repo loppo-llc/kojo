@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -308,9 +307,7 @@ func (s *TokenStore) loadAgentTokens() error {
 			_ = os.Remove(legacyPath)
 		case errors.Is(migErr, store.ErrETagMismatch):
 			// Peer wrote first. Re-read just this row.
-			ctx, cancel := context.WithTimeout(context.Background(), authKVTimeout)
-			rec, gerr := s.kv.GetKV(ctx, authKVNamespace, authKVAgentTokenKey(id))
-			cancel()
+			rec, gerr := s.getAgentTokenRecord(id)
 			if gerr != nil {
 				continue
 			}
@@ -451,9 +448,7 @@ func (s *TokenStore) AgentToken(agentID string) (string, error) {
 	// security event, not a routine collision).
 	if err := s.persistAgentTokenHashCreateOnly(agentID, hash); err != nil {
 		if errors.Is(err, store.ErrETagMismatch) {
-			ctx, cancel := context.WithTimeout(context.Background(), authKVTimeout)
-			rec, gerr := s.kv.GetKV(ctx, authKVNamespace, authKVAgentTokenKey(agentID))
-			cancel()
+			rec, gerr := s.getAgentTokenRecord(agentID)
 			if gerr != nil {
 				return "", fmt.Errorf("auth: agent token collision; peer kv row unreadable: %w", gerr)
 			}
@@ -588,9 +583,7 @@ func (s *TokenStore) ReissueAgentToken(agentID string) (string, error) {
 	// with an empty $KOJO_AGENT_TOKEN rather than crashing.
 	var ifMatch string
 	if s.kv != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), authKVTimeout)
-		rec, gerr := s.kv.GetKV(ctx, authKVNamespace, authKVAgentTokenKey(agentID))
-		cancel()
+		rec, gerr := s.getAgentTokenRecord(agentID)
 		switch {
 		case gerr == nil:
 			// Liveness gate: if the kv row's hash diverged from the
@@ -603,10 +596,7 @@ func (s *TokenStore) ReissueAgentToken(agentID string) (string, error) {
 				return "", fmt.Errorf("auth: reissue: existing kv row malformed: %w", perr)
 			}
 			if localHash, ok := s.idIndex[agentID]; ok && localHash != kvHash {
-				delete(s.hashes, localHash)
-				s.hashes[kvHash] = agentID
-				s.idIndex[agentID] = kvHash
-				delete(s.rawByID, agentID)
+				s.swapVerifierLocked(agentID, kvHash, true)
 				return "", ErrTokenRawUnavailable
 			}
 			ifMatch = rec.ETag
@@ -636,11 +626,7 @@ func (s *TokenStore) ReissueAgentToken(agentID string) (string, error) {
 	// kv (or disk) write succeeded — NOW swap in-memory verifier.
 	// Doing this AFTER the persist ack means a failure above leaves
 	// the verifier intact.
-	if oldHash, ok := s.idIndex[agentID]; ok {
-		delete(s.hashes, oldHash)
-	}
-	s.hashes[newHash] = agentID
-	s.idIndex[agentID] = newHash
+	s.swapVerifierLocked(agentID, newHash, false)
 	s.rawByID[agentID] = tok
 	// Drop any surviving legacy disk file so a rollback to a pre-
 	// cutover binary doesn't read a hash that disagrees with kv.
@@ -688,9 +674,7 @@ func (s *TokenStore) AdoptAgentTokenFromPeer(agentID, rawToken string) error {
 	}
 
 	if s.kv != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), authKVTimeout)
-		rec, gerr := s.kv.GetKV(ctx, authKVNamespace, authKVAgentTokenKey(agentID))
-		cancel()
+		rec, gerr := s.getAgentTokenRecord(agentID)
 		var ifMatch string
 		switch {
 		case gerr == nil:
@@ -701,11 +685,7 @@ func (s *TokenStore) AdoptAgentTokenFromPeer(agentID, rawToken string) error {
 			if kvHash == newHash {
 				// kv already at the source's hash; just sync
 				// the in-memory state.
-				if old, ok := s.idIndex[agentID]; ok && old != newHash {
-					delete(s.hashes, old)
-				}
-				s.hashes[newHash] = agentID
-				s.idIndex[agentID] = newHash
+				s.swapVerifierLocked(agentID, newHash, false)
 				s.rawByID[agentID] = rawToken
 				return nil
 			}
@@ -726,11 +706,7 @@ func (s *TokenStore) AdoptAgentTokenFromPeer(agentID, rawToken string) error {
 		}
 	}
 
-	if oldHash, ok := s.idIndex[agentID]; ok && oldHash != newHash {
-		delete(s.hashes, oldHash)
-	}
-	s.hashes[newHash] = agentID
-	s.idIndex[agentID] = newHash
+	s.swapVerifierLocked(agentID, newHash, false)
 	s.rawByID[agentID] = rawToken
 	if s.kv != nil {
 		_ = os.Remove(filepath.Join(s.base, "agent_tokens", agentID))
@@ -748,9 +724,7 @@ func (s *TokenStore) AdoptAgentTokenFromPeer(agentID, rawToken string) error {
 //
 // MUST be called with s.mu held (write).
 func (s *TokenStore) adoptPeerAgentTokenLocked(agentID string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), authKVTimeout)
-	defer cancel()
-	rec, err := s.kv.GetKV(ctx, authKVNamespace, authKVAgentTokenKey(agentID))
+	rec, err := s.getAgentTokenRecord(agentID)
 	if err != nil {
 		return fmt.Errorf("auth: reissue: peer race re-read failed: %w", err)
 	}
@@ -758,16 +732,34 @@ func (s *TokenStore) adoptPeerAgentTokenLocked(agentID string) error {
 	if perr != nil {
 		return fmt.Errorf("auth: reissue: peer wrote malformed row: %w", perr)
 	}
-	if oldHash, ok := s.idIndex[agentID]; ok && oldHash != winner {
-		delete(s.hashes, oldHash)
-	}
-	s.hashes[winner] = agentID
-	s.idIndex[agentID] = winner
-	delete(s.rawByID, agentID)
+	s.swapVerifierLocked(agentID, winner, true)
 	return ErrTokenRawUnavailable
 }
 
 // --- internals -------------------------------------------------------
+
+// swapVerifierLocked repoints agentID at newHash in the in-memory
+// verifier maps, evicting any previously-mapped hash for that agent
+// (so hashes never accumulates an orphan entry for a rotated token).
+// When dropRaw is true the cached raw token is also removed — used on
+// adoption of a peer's hash, where THIS peer no longer holds the raw
+// that matches the winning hash.
+//
+// Caller MUST hold s.mu (write). This centralises only the "swap an
+// EXISTING mapping" pattern; pure inserts where the agent is known to
+// have no prior hash (AgentToken's and loadAgentTokens's collision
+// branches) stay inline so this helper's old-hash eviction can never
+// change their map state.
+func (s *TokenStore) swapVerifierLocked(agentID, newHash string, dropRaw bool) {
+	if oldHash, ok := s.idIndex[agentID]; ok && oldHash != newHash {
+		delete(s.hashes, oldHash)
+	}
+	s.hashes[newHash] = agentID
+	s.idIndex[agentID] = newHash
+	if dropRaw {
+		delete(s.rawByID, agentID)
+	}
+}
 
 // persistAgentTokenHashCreateOnly is the only helper on the
 // agent-token fresh-issue path; legacy disk migration writes

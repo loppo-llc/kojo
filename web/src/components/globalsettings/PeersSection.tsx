@@ -29,6 +29,10 @@ import {
   type PeerPendingInfo,
 } from "../../lib/peerApi";
 import { errMsg } from "../../lib/utils";
+import { SectionCard } from "../ui/SectionCard";
+import { Input } from "../ui/Input";
+import { Textarea } from "../ui/Textarea";
+import { Button } from "../ui/Button";
 
 interface Props {
   setError: (msg: string) => void;
@@ -36,9 +40,9 @@ interface Props {
 }
 
 const STATUS_COLOR: Record<PeerInfo["status"], string> = {
-  online: "text-emerald-400",
-  offline: "text-neutral-500",
-  degraded: "text-amber-400",
+  online: "text-lamp-run",
+  offline: "text-ink-faint",
+  degraded: "text-lamp-warn",
 };
 
 function formatLastSeen(ms?: number): string {
@@ -293,50 +297,36 @@ export function PeersSection({ setError, flashSuccess }: Props) {
 
   if (unavailable) {
     return (
-      <div>
-        <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider mb-3">
-          Peers
-        </h2>
-        <div className="p-3 bg-neutral-900 border border-neutral-800 rounded-lg text-xs text-neutral-500">
+      <SectionCard title="Peers">
+        <div className="rounded-[10px] border border-hairline bg-raised p-3 text-[12px] text-ink-dim">
           Peer registry is not available on this server. The local peer identity
           has not been bootstrapped yet, or the server was started without one.
         </div>
-      </div>
+      </SectionCard>
     );
   }
 
   return (
-    <div>
-      <div className="flex items-center justify-between mb-3">
-        <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">
-          Peers
-        </h2>
-        <button
-          onClick={() => setShowAdd((v) => !v)}
-          className="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-xs"
-        >
+    <SectionCard
+      title="Peers"
+      description="Known cluster members. A peer's NodeKey binding (what admits it on the privileged surface) is captured by its join-request: a request whose deviceId already has a row here is back-filled in place; an unregistered request waits in the Pending panel below until the operator Approves it. Manual Register pre-seeds a row but never captures a NodeKey on its own. The local device cannot be added or removed from this UI."
+      action={
+        <Button onClick={() => setShowAdd((v) => !v)}>
           {showAdd ? "Cancel" : "Register"}
-        </button>
-      </div>
-      <p className="text-xs text-neutral-600 mb-3">
-        Known cluster members. A peer's NodeKey binding (what admits it on the
-        privileged surface) is captured by its join-request: a request whose
-        deviceId already has a row here is back-filled in place; an unregistered
-        request waits in the Pending panel below until the operator Approves it.
-        Manual Register pre-seeds a row but never captures a NodeKey on its own.
-        The local device cannot be added or removed from this UI.
-      </p>
-
+        </Button>
+      }
+    >
       {showAdd && (
-        <div className="p-3 bg-neutral-900 border border-neutral-800 rounded-lg mb-2 space-y-2">
-          <p className="text-[11px] text-neutral-500 leading-snug">
+        <div className="mb-2 space-y-2 rounded-[10px] border border-hairline bg-raised p-3">
+          <p className="text-[11px] leading-snug text-ink-dim">
             Paste the pairing spec the other peer prints on startup
             (<code className="font-mono">kojo --peer-add</code> argument).
             Format: <code className="font-mono">deviceId | name | url</code>.
             Metadata only — the NodeKey binding is captured later when the
             peer sends a join-request (back-filled into this row on contact).
           </p>
-          <textarea
+          <Textarea
+            mono
             value={pairingSpec}
             onChange={(e) => {
               setPairingSpec(e.target.value);
@@ -344,27 +334,27 @@ export function PeersSection({ setError, flashSuccess }: Props) {
             }}
             placeholder="00000000-0000-4000-8000-000000000000|laptop|http://100.64.0.5:8080"
             rows={3}
-            className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-xs font-mono focus:outline-none focus:border-neutral-500"
           />
           {parseError && (
-            <div className="text-xs text-red-400">Parse: {parseError}</div>
+            <div className="text-[12px] text-lamp-err">Parse: {parseError}</div>
           )}
-          <button
+          <Button
+            variant="primary"
             onClick={submitAdd}
             disabled={busy || !pairingSpec.trim()}
-            className="w-full py-2 bg-neutral-700 hover:bg-neutral-600 rounded text-xs font-medium disabled:opacity-40"
+            className="w-full"
           >
             {busy ? "Registering..." : "Register peer"}
-          </button>
+          </Button>
         </div>
       )}
 
       {pending.length > 0 && (
         <div className="mb-3">
-          <h3 className="text-[11px] font-semibold text-amber-400 uppercase tracking-wider mb-2">
+          <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-lamp-warn">
             Pending join requests
           </h3>
-          <p className="text-[11px] text-neutral-500 mb-2 leading-snug">
+          <p className="mb-2 text-[11px] leading-snug text-ink-dim">
             Peers that auto-discovered this Hub via{" "}
             <code className="font-mono">kojo --peer</code> and are waiting for
             approval. Approve admits the peer to the privileged surface;
@@ -373,36 +363,28 @@ export function PeersSection({ setError, flashSuccess }: Props) {
           {pending.map((p) => (
             <div
               key={p.deviceId}
-              className="p-3 bg-amber-950/30 border border-amber-900/60 rounded-lg mb-2"
+              className="mb-2 rounded-[10px] border border-lamp-warn/40 bg-lamp-warn/5 p-3"
             >
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0 flex-1">
-                  <div className="text-sm font-medium truncate">{p.name}</div>
-                  <div className="text-[11px] font-mono text-neutral-500 truncate mt-0.5">
+                  <div className="truncate text-[13px] font-medium text-ink">{p.name}</div>
+                  <div className="mt-0.5 truncate font-mono text-[11px] text-ink-faint">
                     {p.deviceId}
                   </div>
-                  <div className="text-[11px] font-mono text-neutral-500 truncate">
+                  <div className="truncate font-mono text-[11px] text-ink-faint">
                     {p.url}
                   </div>
-                  <div className="text-xs text-neutral-500 mt-1">
+                  <div className="mt-1 text-[12px] text-ink-dim">
                     seen {formatLastSeen(p.lastSeen)}
                   </div>
                 </div>
-                <div className="flex flex-col gap-1 shrink-0">
-                  <button
-                    onClick={() => approvePending(p)}
-                    disabled={busy}
-                    className="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 rounded text-xs font-medium disabled:opacity-40"
-                  >
+                <div className="flex shrink-0 flex-col gap-1">
+                  <Button variant="primary" onClick={() => approvePending(p)} disabled={busy}>
                     {busy ? "..." : "Approve"}
-                  </button>
-                  <button
-                    onClick={() => rejectPending(p)}
-                    disabled={busy}
-                    className="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-xs text-neutral-400 hover:text-red-400 disabled:opacity-40"
-                  >
+                  </Button>
+                  <Button variant="danger" onClick={() => rejectPending(p)} disabled={busy}>
                     Reject
-                  </button>
+                  </Button>
                 </div>
               </div>
             </div>
@@ -411,99 +393,96 @@ export function PeersSection({ setError, flashSuccess }: Props) {
       )}
 
       {loading ? (
-        <div className="text-xs text-neutral-600">Loading...</div>
+        <div className="text-[12px] text-ink-faint">Loading...</div>
       ) : items.length === 0 ? (
-        <div className="text-xs text-neutral-600">No peers registered.</div>
+        <div className="text-[12px] text-ink-faint">No peers registered.</div>
       ) : (
         items.map((p) => {
           const isSelf = p.isSelf || p.deviceId === selfId;
           return (
             <div
               key={p.deviceId}
-              className="p-3 bg-neutral-900 border border-neutral-800 rounded-lg mb-2"
+              className="mb-2 rounded-[10px] border border-hairline bg-raised p-3"
             >
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0 flex-1">
-                  <div className="text-sm font-medium flex items-center gap-2">
+                  <div className="flex items-center gap-2 text-[13px] font-medium text-ink">
                     <span className="truncate">{p.name}</span>
                     {isSelf && (
-                      <span className="text-[10px] px-1.5 py-0.5 bg-neutral-800 text-neutral-400 rounded">
+                      <span className="rounded bg-hover px-1.5 py-0.5 text-[10px] text-ink-dim">
                         this device
                       </span>
                     )}
                   </div>
-                  <div className="text-[11px] font-mono text-neutral-600 truncate mt-0.5">
+                  <div className="mt-0.5 truncate font-mono text-[11px] text-ink-faint">
                     {p.deviceId}
                   </div>
                   {p.url && (
-                    <div className="text-[11px] font-mono text-neutral-500 truncate">
+                    <div className="truncate font-mono text-[11px] text-ink-faint">
                       {p.url}
                     </div>
                   )}
-                  <div className="text-xs mt-1 flex items-center gap-3">
-                    <span className={STATUS_COLOR[p.status] ?? "text-neutral-500"}>
+                  <div className="mt-1 flex items-center gap-3 text-[12px]">
+                    <span className={STATUS_COLOR[p.status] ?? "text-ink-faint"}>
                       {p.status}
                     </span>
-                    <span className="text-neutral-600">
+                    <span className="text-ink-faint">
                       seen {formatLastSeen(p.lastSeen)}
                     </span>
                   </div>
                 </div>
                 {!isSelf && (
-                  <div className="flex flex-col gap-1 shrink-0">
-                    <button
+                  <div className="flex shrink-0 flex-col gap-1">
+                    <Button
                       onClick={() => openEdit(p)}
-                      className="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-xs"
                       title="Edit this peer's display name and dial URL"
                     >
                       {editFor === p.deviceId ? "Cancel" : "Edit"}
-                    </button>
-                    <button
+                    </Button>
+                    <Button
+                      variant="danger"
                       onClick={() => remove(p.deviceId, p.name)}
-                      className="px-2 py-1 text-neutral-600 hover:text-red-400 rounded text-xs"
                       title="Remove this peer from the registry"
                     >
                       Delete
-                    </button>
+                    </Button>
                   </div>
                 )}
               </div>
 
               {!isSelf && editFor === p.deviceId && (
-                <div className="mt-3 space-y-2 border-t border-neutral-800 pt-3">
-                  <div className="text-[11px] text-neutral-500">
+                <div className="mt-3 space-y-2 border-t border-hairline pt-3">
+                  <div className="text-[11px] text-ink-dim">
                     Display name (free-form label; agents reference this peer by name):
                   </div>
-                  <input
-                    type="text"
+                  <Input
                     value={editName}
                     onChange={(e) => setEditName(e.target.value)}
                     placeholder="laptop"
-                    className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-xs focus:outline-none focus:border-neutral-500"
                   />
-                  <div className="text-[11px] text-neutral-500">
+                  <div className="text-[11px] text-ink-dim">
                     Dial URL (host:port or http(s)://host:port):
                   </div>
-                  <input
-                    type="text"
+                  <Input
+                    mono
                     value={editURL}
                     onChange={(e) => setEditURL(e.target.value)}
                     placeholder="http://100.64.0.5:8080"
-                    className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-xs font-mono focus:outline-none focus:border-neutral-500"
                   />
-                  <button
+                  <Button
+                    variant="primary"
                     onClick={() => submitEdit(p)}
                     disabled={busy || !editName.trim() || !editURL.trim()}
-                    className="w-full py-2 bg-neutral-700 hover:bg-neutral-600 rounded text-xs font-medium disabled:opacity-40"
+                    className="w-full"
                   >
                     {busy ? "Saving..." : "Save changes"}
-                  </button>
+                  </Button>
                 </div>
               )}
             </div>
           );
         })
       )}
-    </div>
+    </SectionCard>
   );
 }

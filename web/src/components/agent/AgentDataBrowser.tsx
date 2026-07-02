@@ -52,7 +52,7 @@ export function AgentDataBrowser() {
         agent ? (
           <AgentAvatar agentId={agent.id} name={agent.name} size="sm" cacheBust={agent.avatarHash} />
         ) : (
-          <div className="w-8 h-8 rounded-full bg-neutral-800" />
+          <div className="h-8 w-8 rounded-full bg-surface" />
         )
       }
       onExit={() => navigate(`/agents/${id}`, { replace: true })}

@@ -15,6 +15,88 @@ import { ModelPicker } from "./fields/ModelPicker";
 import { EffortPicker } from "./fields/EffortPicker";
 import { WorkDirInput } from "./fields/WorkDirInput";
 import { buildAgentSavePayload } from "./agentSettingsPayload";
+import { PageHeader } from "../ui/PageHeader";
+import { SectionCard } from "../ui/SectionCard";
+import { Field } from "../ui/Field";
+import { Input } from "../ui/Input";
+import { Textarea } from "../ui/Textarea";
+import { Select } from "../ui/Select";
+import { Toggle } from "../ui/Toggle";
+import { Banner } from "../ui/Banner";
+import { Button } from "../ui/Button";
+
+const SECTIONS = [
+  { id: "identity", label: "Identity" },
+  { id: "model", label: "Model & Tools" },
+  { id: "schedule", label: "Schedule" },
+  { id: "voice", label: "Voice" },
+  { id: "integrations", label: "Integrations" },
+  { id: "memory", label: "Memory" },
+  { id: "danger", label: "Danger" },
+] as const;
+
+// Stable id list so useScrollSpy's effect deps don't churn every render.
+const SECTION_IDS = SECTIONS.map((s) => s.id);
+
+/**
+ * Scroll-spy: tracks which SectionCard is currently in the reading zone so
+ * the section nav can highlight it. Guarded for jsdom (no IntersectionObserver
+ * in the test environment) — the nav simply stays on the first section there.
+ */
+function useScrollSpy(ids: readonly string[], enabled: boolean): string {
+  const [active, setActive] = useState(ids[0]);
+  useEffect(() => {
+    // Wait until the sections are actually in the DOM. The hook runs once
+    // while the agent is still loading (component returns null, no section
+    // elements exist); `enabled` flips to true on the first content render
+    // and re-runs this effect so the observer binds to real targets.
+    if (!enabled || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const visible = entries
+          .filter((e) => e.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+        if (visible[0]) setActive(visible[0].target.id);
+      },
+      { rootMargin: "-96px 0px -60% 0px", threshold: 0 },
+    );
+    for (const id of ids) {
+      const el = document.getElementById(id);
+      if (el) observer.observe(el);
+    }
+    return () => observer.disconnect();
+  }, [ids, enabled]);
+  return active;
+}
+
+function scrollToSection(id: string) {
+  document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+/** A labeled toggle row: title + description on the left, Toggle on the right. */
+function ToggleRow({
+  checked,
+  onChange,
+  disabled,
+  title,
+  desc,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+  title: string;
+  desc: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-start justify-between gap-3">
+      <div className="min-w-0">
+        <div className="text-[13px] text-ink">{title}</div>
+        <p className="mt-0.5 text-[12px] text-ink-faint">{desc}</p>
+      </div>
+      <Toggle checked={checked} onChange={onChange} disabled={disabled} aria-label={title} />
+    </div>
+  );
+}
 
 export function AgentSettings() {
   const { id } = useParams<{ id: string }>();
@@ -709,424 +791,401 @@ export function AgentSettings() {
     }
   };
 
+  const activeSection = useScrollSpy(SECTION_IDS, !!agent);
+
   if (!agent) return null;
 
   return (
-    <div className="min-h-full bg-neutral-950 text-neutral-200">
-      <header className="flex items-center gap-2 px-4 py-3 border-b border-neutral-800">
-        <button
-          onClick={() => navigate(`/agents/${id}`, { replace: true })}
-          className="text-neutral-400 hover:text-neutral-200"
+    <div className="min-h-full bg-app text-ink">
+      <PageHeader
+        title="Settings"
+        onBack={() => navigate(`/agents/${id}`, { replace: true })}
+        below={
+          // Mobile section nav: sticky, horizontally scrollable chip row.
+          <nav className="flex gap-1.5 overflow-x-auto border-t border-hairline px-4 py-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden lg:hidden">
+            {SECTIONS.map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => scrollToSection(s.id)}
+                className={`shrink-0 whitespace-nowrap rounded-full border px-2.5 py-1 font-mono text-[12px] transition-colors ${
+                  activeSection === s.id
+                    ? "border-copper bg-copper/15 text-copper-bright"
+                    : "border-hairline text-ink-dim hover:text-ink"
+                }`}
+              >
+                {s.label}
+              </button>
+            ))}
+          </nav>
+        }
+      />
+
+      <div className="mx-auto max-w-[900px] px-4 py-6 lg:grid lg:grid-cols-[180px_1fr] lg:gap-8">
+        {/* Desktop sticky section rail */}
+        <nav className="hidden lg:block">
+          <div className="sticky top-24 space-y-0.5">
+            {SECTIONS.map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => scrollToSection(s.id)}
+                className={`block w-full rounded-md px-2.5 py-1.5 text-left font-mono text-[12px] transition-colors ${
+                  activeSection === s.id
+                    ? "bg-copper/10 text-copper-bright"
+                    : "text-ink-dim hover:bg-hover hover:text-ink"
+                }`}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+        </nav>
+
+        <main className="min-w-0 space-y-6">
+        {/* ── Identity ── */}
+        <SectionCard
+          id="identity"
+          title="Identity"
+          description="Name, persona, and how this agent appears to others."
         >
-          &larr;
-        </button>
-        <h1 className="text-lg font-bold">Settings</h1>
-      </header>
-
-      <main className="p-4 space-y-6 max-w-md mx-auto">
-        {/* ── Agent Settings ── */}
-        <section className="rounded-xl border border-neutral-800 p-5 space-y-5">
-          <h2 className="text-sm font-semibold text-neutral-300">Agent</h2>
-
-        {/* Avatar */}
-        <div className="flex items-center gap-4">
-          <AgentAvatar agentId={agent.id} name={agent.name} size="xl" cacheBust={avatarToken} />
-          <div className="flex gap-2">
-            <button
-              onClick={() => fileRef.current?.click()}
-              className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-sm"
-            >
-              Change Avatar
-            </button>
-            <button
-              onClick={handleGenerateAvatar}
-              disabled={generatingAvatar || !persona.trim()}
-              className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-sm disabled:opacity-40 flex items-center gap-1.5"
-            >
-              {generatingAvatar ? (
-                <><span className="animate-spin">↻</span> Generating...</>
-              ) : (
-                <>✨ Generate</>
-              )}
-            </button>
-            <input
-              ref={fileRef}
-              type="file"
-              accept="image/*"
-              onChange={handleAvatarUpload}
-              className="hidden"
-            />
-          </div>
-        </div>
-
-        {/* Name */}
-        <div>
-          <label className="block text-sm text-neutral-400 mb-2">Name</label>
-          <input
-            type="text"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-          />
-        </div>
-
-        {/* Persona */}
-        <PersonaField
-          persona={persona}
-          setPersona={setPersona}
-          textareaRows={6}
-          personaPrompt={personaPrompt}
-          setPersonaPrompt={setPersonaPrompt}
-          promptPlaceholder="e.g. もっと毒舌にして"
-          busy={generatingPersona}
-          spinning={generatingPersona}
-          onGenerate={handleGeneratePersona}
-        />
-
-        {/* User Context (user.md) */}
-        <div>
-          <label className="block text-sm text-neutral-400 mb-2">
-            User Context
-          </label>
-          <textarea
-            value={userContext}
-            onChange={(e) => {
-              setUserContext(e.target.value);
-              // First keystroke off the default template — clear the
-              // default flag so Save persists the edit instead of
-              // treating it as a no-op against the in-memory template.
-              if (userContextIsDefault) setUserContextIsDefault(false);
-            }}
-            rows={6}
-            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm font-mono resize-y focus:outline-none focus:border-neutral-500"
-          />
-          <p className="mt-1 text-xs text-neutral-600">
-            Notes about the people this agent works with — name, timezone, communication preferences, etc. Injected into the system prompt as data (head/tail truncated above 1500 chars). {userContextIsDefault && "Template — not yet saved."}
-          </p>
-        </div>
-
-        {/* Public Profile */}
-        <div>
-          <div className="flex items-center justify-between mb-2">
-            <label className="text-sm text-neutral-400">
-              Public Profile
-            </label>
-            <label className="flex items-center gap-1.5 text-xs text-neutral-500 cursor-pointer">
+          {/* Avatar */}
+          <div className="mb-4 flex items-center gap-4">
+            <AgentAvatar agentId={agent.id} name={agent.name} size="xl" cacheBust={avatarToken} />
+            <div className="flex flex-wrap gap-2">
+              <Button onClick={() => fileRef.current?.click()}>Change Avatar</Button>
+              <Button
+                onClick={handleGenerateAvatar}
+                disabled={generatingAvatar || !persona.trim()}
+                className="flex items-center gap-1.5"
+              >
+                {generatingAvatar ? (
+                  <><span className="animate-spin">↻</span> Generating...</>
+                ) : (
+                  <>✨ Generate</>
+                )}
+              </Button>
               <input
-                type="checkbox"
-                checked={publicProfileOverride}
-                onChange={(e) => setPublicProfileOverride(e.target.checked)}
-                className="rounded border-neutral-600"
+                ref={fileRef}
+                type="file"
+                accept="image/*"
+                onChange={handleAvatarUpload}
+                className="hidden"
               />
-              Override
-            </label>
+            </div>
           </div>
-          <textarea
-            value={publicProfile}
-            onChange={(e) => setPublicProfile(e.target.value)}
-            rows={2}
-            disabled={!publicProfileOverride}
-            placeholder={publicProfileOverride ? "Enter custom public profile" : "Auto-generated from persona"}
-            className={`w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm resize-none focus:outline-none focus:border-neutral-500 ${
-              !publicProfileOverride ? "opacity-60 cursor-not-allowed" : ""
-            }`}
-          />
-          <p className="mt-1 text-xs text-neutral-600">
-            {publicProfileOverride
-              ? "Manual override — won't be replaced when persona changes."
-              : "Auto-generated from persona. Visible to other agents via directory."}
-          </p>
-        </div>
 
-        {/* Model */}
-        <ModelPicker
-          model={model}
-          setModel={setModel}
-          effort={effort}
-          setEffort={setEffort}
-          models={needsCustomURL ? customModels : modelsForTool(tool)}
-        />
+          <div className="space-y-4">
+            <Field label="Name">
+              <Input value={name} onChange={(e) => setName(e.target.value)} />
+            </Field>
 
-        {/* Effort */}
-        <EffortPicker tool={tool} effort={effort} setEffort={setEffort} model={model} />
-
-        {/* Tool */}
-        <ToolPicker
-          tool={tool}
-          setTool={setTool}
-          setModel={setModel}
-          effort={effort}
-          setEffort={setEffort}
-        />
-
-        {/* Custom Base URL */}
-        {needsCustomURL && (
-          <div>
-            <label className="block text-sm text-neutral-400 mb-2">Custom Base URL</label>
-            <input
-              type="text"
-              value={customBaseURL}
-              onChange={(e) => setCustomBaseURL(e.target.value)}
-              placeholder="http://localhost:8080"
-              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm font-mono focus:outline-none focus:border-neutral-500"
+            <PersonaField
+              persona={persona}
+              setPersona={setPersona}
+              textareaRows={6}
+              personaPrompt={personaPrompt}
+              setPersonaPrompt={setPersonaPrompt}
+              promptPlaceholder="e.g. もっと毒舌にして"
+              busy={generatingPersona}
+              spinning={generatingPersona}
+              onGenerate={handleGeneratePersona}
             />
-            <p className="text-xs text-neutral-600 mt-1">Anthropic Messages API compatible endpoint</p>
-          </div>
-        )}
 
-        {/* Allowed Tools (custom only) */}
-        {tool === "custom" && (
-          <div>
-            <label className="block text-sm text-neutral-400 mb-2">
-              Allowed Tools
-              <span className="text-xs text-neutral-600 ml-2">(empty = all)</span>
-            </label>
-            <div className="grid grid-cols-2 gap-1.5">
-              {["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Skill", "WebFetch", "WebSearch", "Agent", "NotebookEdit"].map((t) => (
-                <label key={t} className="flex items-center gap-2 px-2 py-1.5 bg-neutral-900 rounded text-xs font-mono cursor-pointer hover:bg-neutral-800">
-                  <input
-                    type="checkbox"
-                    checked={allowedTools.length === 0 || allowedTools.includes(t)}
-                    onChange={(e) => {
-                      if (allowedTools.length === 0) {
-                        // Switching from "all" to explicit: start with all checked except this one
-                        if (!e.target.checked) {
-                          setAllowedTools(["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Skill", "WebFetch", "WebSearch", "Agent", "NotebookEdit"].filter((x) => x !== t));
-                        }
-                      } else {
-                        if (e.target.checked) {
-                          setAllowedTools([...allowedTools, t]);
-                        } else {
-                          setAllowedTools(allowedTools.filter((x) => x !== t));
-                        }
-                      }
-                    }}
-                    className="accent-neutral-400"
-                  />
-                  {t}
-                </label>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* Protected Path Allow (claude / custom) */}
-        {(tool === "claude" || tool === "custom") && (
-          <div>
-            <label className="block text-sm text-neutral-400 mb-2">
-              Allow Edits in Protected Paths
-              <span className="text-xs text-neutral-600 ml-2">(bypass claude-code guard)</span>
-            </label>
-            <div className="grid grid-cols-3 gap-1.5">
-              {["claude", "git", "husky"].map((p) => (
-                <label key={p} className="flex items-center gap-2 px-2 py-1.5 bg-neutral-900 rounded text-xs font-mono cursor-pointer hover:bg-neutral-800">
-                  <input
-                    type="checkbox"
-                    checked={allowProtectedPaths.includes(p)}
-                    onChange={(e) => {
-                      if (e.target.checked) {
-                        setAllowProtectedPaths([...allowProtectedPaths, p]);
-                      } else {
-                        setAllowProtectedPaths(allowProtectedPaths.filter((x) => x !== p));
-                      }
-                    }}
-                    className="accent-neutral-400"
-                  />
-                  .{p}
-                </label>
-              ))}
-            </div>
-            <p className="text-xs text-neutral-600 mt-1">
-              Recent claude-code versions prompt on Edit/Write to .claude, .git, .husky even with bypassPermissions. Check to suppress.
-            </p>
-          </div>
-        )}
-
-        {/* Thinking Mode (llama.cpp only) */}
-        {tool === "llama.cpp" && (
-          <div>
-            <label className="block text-sm text-neutral-400 mb-2">Thinking</label>
-            <select
-              value={thinkingMode}
-              onChange={(e) => setThinkingMode(e.target.value)}
-              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+            {/* User Context (user.md) */}
+            <Field
+              label="User Context"
+              help={
+                <>
+                  Notes about the people this agent works with — name, timezone,
+                  communication preferences, etc. Injected into the system prompt as
+                  data (head/tail truncated above 1500 chars).{" "}
+                  {userContextIsDefault && "Template — not yet saved."}
+                </>
+              }
             >
-              <option value="">auto (server default)</option>
-              <option value="on">on</option>
-              <option value="off">off</option>
-            </select>
+              <Textarea
+                mono
+                value={userContext}
+                onChange={(e) => {
+                  setUserContext(e.target.value);
+                  // First keystroke off the default template — clear the
+                  // default flag so Save persists the edit instead of
+                  // treating it as a no-op against the in-memory template.
+                  if (userContextIsDefault) setUserContextIsDefault(false);
+                }}
+                rows={6}
+              />
+            </Field>
+
+            {/* Public Profile */}
+            <Field
+              label="Public Profile"
+              action={
+                <label className="flex cursor-pointer items-center gap-1.5 text-[12px] text-ink-dim">
+                  <input
+                    type="checkbox"
+                    checked={publicProfileOverride}
+                    onChange={(e) => setPublicProfileOverride(e.target.checked)}
+                    className="h-4 w-4 rounded border-hairline bg-raised accent-[color:var(--color-copper)]"
+                  />
+                  Override
+                </label>
+              }
+              help={
+                publicProfileOverride
+                  ? "Manual override — won't be replaced when persona changes."
+                  : "Auto-generated from persona. Visible to other agents via directory."
+              }
+            >
+              <Textarea
+                value={publicProfile}
+                onChange={(e) => setPublicProfile(e.target.value)}
+                rows={2}
+                disabled={!publicProfileOverride}
+                placeholder={publicProfileOverride ? "Enter custom public profile" : "Auto-generated from persona"}
+                className={!publicProfileOverride ? "resize-none opacity-60" : "resize-none"}
+              />
+            </Field>
           </div>
-        )}
+        </SectionCard>
 
-        {/* File Storage */}
-        <WorkDirInput workDir={workDir} setWorkDir={setWorkDir} />
-
-        {/* Schedule */}
-        <ScheduleEditor
-          cronExpr={cronExpr}
-          onCronExprChange={setCronExpr}
-          timeoutMinutes={timeoutMinutes}
-          onTimeoutChange={setTimeoutMinutes}
-          resumeIdleMinutes={resumeIdleMinutes}
-          onResumeIdleChange={setResumeIdleMinutes}
-          tool={tool}
-          silentStart={silentStart}
-          silentEnd={silentEnd}
-          onSilentStartChange={setSilentStart}
-          onSilentEndChange={setSilentEnd}
-          cronMessage={cronMessage}
-          onCronMessageChange={(v) => {
-            setCronMessage(v);
-            // First keystroke against the default template — flip the
-            // flag so Save persists the edit. checkinIsDefault stays
-            // true through the no-op case where the user just opened
-            // the form and didn't touch the textarea.
-            if (checkinIsDefault) setCheckinIsDefault(false);
-          }}
-          nextCronAt={agent.nextCronAt}
-          cronPausedGlobal={agent.cronPausedGlobal}
-          scheduleDirty={
-            // Schedule-affecting fields differ from the persisted agent —
-            // nextCronAt is computed against the saved schedule so showing
-            // it during edits would mislead.
-            (agent.cronExpr ?? "") !== cronExpr ||
-            (agent.silentStart ?? "") !== silentStart ||
-            (agent.silentEnd ?? "") !== silentEnd
-          }
-          onCheckin={handleCheckin}
-          // Keep the button disabled while the notice banner is up so the
-          // user doesn't fire repeated 409s in quick succession before the
-          // server-side run actually gets going.
-          checkingIn={checkingIn || checkinNotice !== ""}
-        />
-
-        {/* Notify During Silent Hours */}
-        <div>
-          <label className="flex items-start gap-3 cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={notifyDuringSilent}
-              onChange={(e) => setNotifyDuringSilent(e.target.checked)}
-              className="mt-1 accent-amber-500"
+        {/* ── Model & Tools ── */}
+        <SectionCard
+          id="model"
+          title="Model & Tools"
+          description="Backend, model, and capability permissions."
+        >
+          <div className="space-y-4">
+            <ToolPicker
+              tool={tool}
+              setTool={setTool}
+              setModel={setModel}
+              effort={effort}
+              setEffort={setEffort}
             />
-            <div className="flex-1">
-              <div className="text-sm text-neutral-300">Receive DM During Silent Hours</div>
-              <p className="text-xs text-neutral-600 mt-0.5">
-                When enabled, group DM notifications are delivered even
-                during silent hours. When disabled, notifications are
-                suppressed (messages remain in the transcript).
-              </p>
-            </div>
-          </label>
-        </div>
 
-        {/* Privilege.
+            <ModelPicker
+              model={model}
+              setModel={setModel}
+              effort={effort}
+              setEffort={setEffort}
+              models={needsCustomURL ? customModels : modelsForTool(tool)}
+            />
 
-            POST /api/v1/agents/{id}/privilege is Owner-only. The web UI
-            is only ever served to Owner principals (the public listener
-            is OwnerOnlyMiddleware on Tailscale; --local requires the
-            Owner Bearer for asset delivery), so the toggle has no
-            non-Owner code path to worry about and there is no
-            client-side role gate. If the asset gating is ever relaxed
-            we'd need to hide this control too — keep that in mind when
-            touching index.html / the Bearer bootstrap. */}
-        <div>
-          <label className="flex items-start gap-3 cursor-pointer select-none">
-            <input
-              type="checkbox"
+            <EffortPicker tool={tool} effort={effort} setEffort={setEffort} model={model} />
+
+            {needsCustomURL && (
+              <Field label="Custom Base URL" help="Anthropic Messages API compatible endpoint">
+                <Input
+                  mono
+                  value={customBaseURL}
+                  onChange={(e) => setCustomBaseURL(e.target.value)}
+                  placeholder="http://localhost:8080"
+                />
+              </Field>
+            )}
+
+            {/* Allowed Tools (custom only) */}
+            {tool === "custom" && (
+              <Field
+                label={
+                  <>
+                    Allowed Tools
+                    <span className="ml-2 text-ink-faint">(empty = all)</span>
+                  </>
+                }
+              >
+                <div className="grid grid-cols-2 gap-1.5">
+                  {["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Skill", "WebFetch", "WebSearch", "Agent", "NotebookEdit"].map((t) => (
+                    <label key={t} className="flex cursor-pointer items-center gap-2 rounded-lg border border-hairline bg-raised px-2 py-1.5 font-mono text-[12px] text-ink-dim hover:bg-hover">
+                      <input
+                        type="checkbox"
+                        checked={allowedTools.length === 0 || allowedTools.includes(t)}
+                        onChange={(e) => {
+                          if (allowedTools.length === 0) {
+                            // Switching from "all" to explicit: start with all checked except this one
+                            if (!e.target.checked) {
+                              setAllowedTools(["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Skill", "WebFetch", "WebSearch", "Agent", "NotebookEdit"].filter((x) => x !== t));
+                            }
+                          } else {
+                            if (e.target.checked) {
+                              setAllowedTools([...allowedTools, t]);
+                            } else {
+                              setAllowedTools(allowedTools.filter((x) => x !== t));
+                            }
+                          }
+                        }}
+                        className="h-4 w-4 accent-[color:var(--color-copper)]"
+                      />
+                      {t}
+                    </label>
+                  ))}
+                </div>
+              </Field>
+            )}
+
+            {/* Protected Path Allow (claude / custom) */}
+            {(tool === "claude" || tool === "custom") && (
+              <Field
+                label={
+                  <>
+                    Allow Edits in Protected Paths
+                    <span className="ml-2 text-ink-faint">(bypass claude-code guard)</span>
+                  </>
+                }
+                help="Recent claude-code versions prompt on Edit/Write to .claude, .git, .husky even with bypassPermissions. Check to suppress."
+              >
+                <div className="grid grid-cols-3 gap-1.5">
+                  {["claude", "git", "husky"].map((p) => (
+                    <label key={p} className="flex cursor-pointer items-center gap-2 rounded-lg border border-hairline bg-raised px-2 py-1.5 font-mono text-[12px] text-ink-dim hover:bg-hover">
+                      <input
+                        type="checkbox"
+                        checked={allowProtectedPaths.includes(p)}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setAllowProtectedPaths([...allowProtectedPaths, p]);
+                          } else {
+                            setAllowProtectedPaths(allowProtectedPaths.filter((x) => x !== p));
+                          }
+                        }}
+                        className="h-4 w-4 accent-[color:var(--color-copper)]"
+                      />
+                      .{p}
+                    </label>
+                  ))}
+                </div>
+              </Field>
+            )}
+
+            {/* Thinking Mode (llama.cpp only) */}
+            {tool === "llama.cpp" && (
+              <Field label="Thinking">
+                <Select value={thinkingMode} onChange={(e) => setThinkingMode(e.target.value)}>
+                  <option value="">auto (server default)</option>
+                  <option value="on">on</option>
+                  <option value="off">off</option>
+                </Select>
+              </Field>
+            )}
+
+            {/* File Storage */}
+            <WorkDirInput workDir={workDir} setWorkDir={setWorkDir} />
+
+            {/* Privilege.
+
+                POST /api/v1/agents/{id}/privilege is Owner-only. The web UI
+                is only ever served to Owner principals (the public listener
+                is OwnerOnlyMiddleware on Tailscale; --local requires the
+                Owner Bearer for asset delivery), so the toggle has no
+                non-Owner code path to worry about and there is no
+                client-side role gate. If the asset gating is ever relaxed
+                we'd need to hide this control too — keep that in mind when
+                touching index.html / the Bearer bootstrap. */}
+            <ToggleRow
               checked={privileged}
               disabled={privilegeSaving}
-              onChange={(e) => handleTogglePrivileged(e.target.checked)}
-              className="mt-1 accent-amber-500"
+              onChange={handleTogglePrivileged}
+              title="Privileged Agent"
+              desc="Allow this agent to delete / reset / archive other agents via the API. Cannot fork or read other agents' full record."
             />
-            <div className="flex-1">
-              <div className="text-sm text-neutral-300">Privileged Agent</div>
-              <p className="text-xs text-neutral-600 mt-0.5">
-                Allow this agent to delete / reset / archive other agents via
-                the API. Cannot fork or read other agents&apos; full record.
-              </p>
-            </div>
-          </label>
-        </div>
+          </div>
+        </SectionCard>
 
-        {error && (
-          <div className="p-3 bg-red-950 border border-red-800 rounded-lg text-sm text-red-300">
-            {error}
-          </div>
-        )}
-        {success && (
-          <div className="p-3 bg-green-950 border border-green-800 rounded-lg text-sm text-green-300">
-            Saved
-          </div>
-        )}
-        {checkinNotice && (
-          <div className="p-3 bg-amber-950/40 border border-amber-800/60 rounded-lg text-sm text-amber-200">
-            {checkinNotice}
-          </div>
-        )}
-
-        <button
-          onClick={handleSave}
-          disabled={saving}
-          className="w-full py-3 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm font-medium disabled:opacity-40"
+        {/* ── Schedule ── */}
+        <SectionCard
+          id="schedule"
+          title="Schedule"
+          description="When this agent runs on its own, and when it stays quiet."
         >
-          {saving ? "Saving..." : "Save Changes"}
-        </button>
-        </section>
+          <ScheduleEditor
+            cronExpr={cronExpr}
+            onCronExprChange={setCronExpr}
+            timeoutMinutes={timeoutMinutes}
+            onTimeoutChange={setTimeoutMinutes}
+            resumeIdleMinutes={resumeIdleMinutes}
+            onResumeIdleChange={setResumeIdleMinutes}
+            tool={tool}
+            silentStart={silentStart}
+            silentEnd={silentEnd}
+            onSilentStartChange={setSilentStart}
+            onSilentEndChange={setSilentEnd}
+            cronMessage={cronMessage}
+            onCronMessageChange={(v) => {
+              setCronMessage(v);
+              // First keystroke against the default template — flip the
+              // flag so Save persists the edit. checkinIsDefault stays
+              // true through the no-op case where the user just opened
+              // the form and didn't touch the textarea.
+              if (checkinIsDefault) setCheckinIsDefault(false);
+            }}
+            nextCronAt={agent.nextCronAt}
+            cronPausedGlobal={agent.cronPausedGlobal}
+            scheduleDirty={
+              // Schedule-affecting fields differ from the persisted agent —
+              // nextCronAt is computed against the saved schedule so showing
+              // it during edits would mislead.
+              (agent.cronExpr ?? "") !== cronExpr ||
+              (agent.silentStart ?? "") !== silentStart ||
+              (agent.silentEnd ?? "") !== silentEnd
+            }
+            onCheckin={handleCheckin}
+            // Keep the button disabled while the notice banner is up so the
+            // user doesn't fire repeated 409s in quick succession before the
+            // server-side run actually gets going.
+            checkingIn={checkingIn || checkinNotice !== ""}
+          />
 
-        {/* ── Text-to-Speech ── */}
-        <section className="rounded-xl border border-neutral-800 p-5 space-y-4">
-          <div>
-            <h2 className="text-sm font-semibold text-neutral-200">Text-to-Speech</h2>
-            <p className="text-xs text-neutral-500 mt-1">
-              Read assistant replies out loud via Gemini TTS. Manual playback per message; auto playback toggled in the chat header.
-            </p>
-          </div>
-
-          <label className="flex items-center gap-3 text-sm">
-            <input
-              type="checkbox"
-              checked={ttsEnabled}
-              onChange={(e) => setTTSEnabled(e.target.checked)}
-              className="w-4 h-4"
+          <div className="mt-4 border-t border-hairline pt-4">
+            <ToggleRow
+              checked={notifyDuringSilent}
+              onChange={setNotifyDuringSilent}
+              title="Receive DM During Silent Hours"
+              desc="When enabled, group DM notifications are delivered even during silent hours. When disabled, notifications are suppressed (messages remain in the transcript)."
             />
-            Enable TTS for this agent
-          </label>
+          </div>
+        </SectionCard>
 
+        {/* ── Voice ── */}
+        <SectionCard
+          id="voice"
+          title="Voice"
+          description="Read assistant replies out loud via Gemini TTS. Manual playback per message; auto playback toggled in the chat header."
+          action={<Toggle checked={ttsEnabled} onChange={setTTSEnabled} aria-label="Enable TTS" />}
+        >
           {ttsEnabled && (
-            <div className="space-y-4 pl-7">
-              <div>
-                <label className="block text-xs font-medium text-neutral-400 mb-1">Model</label>
-                <select
-                  value={ttsModel}
-                  onChange={(e) => setTTSModel(e.target.value)}
-                  className="w-full bg-neutral-900 border border-neutral-700 rounded px-3 py-2 text-sm"
-                >
+            <div className="space-y-4">
+              <Field label="Model">
+                <Select value={ttsModel} onChange={(e) => setTTSModel(e.target.value)}>
                   <option value="">Default ({ttsCapability?.defaults.model ?? "gemini-3.1-flash-tts-preview"})</option>
                   {(ttsCapability?.models ?? []).map((m) => (
                     <option key={m} value={m}>{m}</option>
                   ))}
-                </select>
-              </div>
+                </Select>
+              </Field>
 
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="block text-xs font-medium text-neutral-400">Voice</label>
-                  {ttsVoice && (
+              <Field
+                label="Voice"
+                action={
+                  ttsVoice ? (
                     <button
                       type="button"
                       onClick={() => playPreview(ttsVoice)}
-                      className="text-[11px] text-blue-400 hover:text-blue-300"
+                      className="text-[12px] text-copper transition-colors hover:text-copper-bright"
                     >
                       {ttsPreviewVoice === ttsVoice ? "▶ Playing..." : "▶ Preview"}
                     </button>
-                  )}
-                </div>
-                <select
-                  value={ttsVoice}
-                  onChange={(e) => setTTSVoice(e.target.value)}
-                  className="w-full bg-neutral-900 border border-neutral-700 rounded px-3 py-2 text-sm"
-                >
+                  ) : undefined
+                }
+                help={
+                  <>
+                    Gender from Cloud TTS Chirp3-HD mapping. Use{" "}
+                    <span className="text-ink-dim">Preview</span> to listen.
+                  </>
+                }
+                error={ttsPreviewError || undefined}
+              >
+                <Select value={ttsVoice} onChange={(e) => setTTSVoice(e.target.value)}>
                   <option value="">
                     Default ({ttsCapability?.defaults.voice ?? "Kore"})
                   </option>
@@ -1135,24 +1194,17 @@ export function AgentSettings() {
                       {v.name} ({v.gender || "?"}) — {v.trait}
                     </option>
                   ))}
-                </select>
-                <p className="text-[11px] text-neutral-600 mt-1">
-                  Gender from Cloud TTS Chirp3-HD mapping. Use{" "}
-                  <span className="text-neutral-400">Preview</span> to listen.
-                </p>
-                {ttsPreviewError && (
-                  <p className="text-[11px] text-red-400 mt-1">{ttsPreviewError}</p>
-                )}
-              </div>
+                </Select>
+              </Field>
 
               {/* All-voices preview grid — lets the user audition every voice
                   without leaving the settings page. Each row stays compact
                   so 30 voices fit without dominating the form. */}
-              <details className="bg-neutral-900/50 border border-neutral-800 rounded">
-                <summary className="px-3 py-2 text-xs text-neutral-400 cursor-pointer select-none">
+              <details className="overflow-hidden rounded-[10px] border border-hairline bg-raised">
+                <summary className="cursor-pointer select-none px-3 py-2 text-[12px] text-ink-dim">
                   Browse all 30 voices
                 </summary>
-                <div className="grid grid-cols-2 gap-1 p-2 max-h-64 overflow-y-auto">
+                <div className="grid max-h-64 grid-cols-2 gap-1 overflow-y-auto p-2">
                   {(ttsCapability?.voiceCatalog ?? []).map((v) => (
                     <button
                       type="button"
@@ -1161,28 +1213,28 @@ export function AgentSettings() {
                         setTTSVoice(v.name);
                         playPreview(v.name);
                       }}
-                      className={`flex items-center justify-between px-2 py-1.5 rounded text-left text-xs hover:bg-neutral-800 ${
-                        ttsVoice === v.name ? "bg-neutral-800 ring-1 ring-blue-500/40" : ""
+                      className={`flex items-center justify-between rounded-md px-2 py-1.5 text-left text-[12px] hover:bg-hover ${
+                        ttsVoice === v.name ? "bg-hover ring-1 ring-copper/40" : ""
                       }`}
                     >
-                      <span className="truncate flex items-center gap-1.5">
+                      <span className="flex items-center gap-1.5 truncate">
                         {v.gender && (
                           <span
-                            className={`inline-block w-3 text-center text-[10px] font-mono rounded-sm ${
+                            className={`inline-block w-3 rounded-sm text-center font-mono text-[10px] ${
                               v.gender === "F"
-                                ? "bg-pink-500/20 text-pink-300"
-                                : "bg-sky-500/20 text-sky-300"
+                                ? "bg-lamp-err/20 text-lamp-err"
+                                : "bg-copper/20 text-copper-bright"
                             }`}
                           >
                             {v.gender}
                           </span>
                         )}
-                        <span className="text-neutral-200">{v.name}</span>
-                        <span className="text-neutral-500"> — {v.trait}</span>
+                        <span className="text-ink">{v.name}</span>
+                        <span className="text-ink-faint"> — {v.trait}</span>
                       </span>
                       <span
                         className={`ml-2 text-[10px] ${
-                          ttsPreviewVoice === v.name ? "text-blue-400" : "text-neutral-600"
+                          ttsPreviewVoice === v.name ? "text-copper" : "text-ink-faint"
                         }`}
                       >
                         {ttsPreviewVoice === v.name ? "▶" : "▷"}
@@ -1192,41 +1244,44 @@ export function AgentSettings() {
                 </div>
               </details>
 
-              <div>
-                <label className="block text-xs font-medium text-neutral-400 mb-1">Style Prompt</label>
-                <textarea
+              <Field
+                label="Style Prompt"
+                help={
+                  <span className="space-y-1">
+                    <span className="block">
+                      Free-form prompt prepended to the text. Audio tags such as{" "}
+                      <code className="text-ink-dim">[whispers]</code>,{" "}
+                      <code className="text-ink-dim">[excited]</code>,{" "}
+                      <code className="text-ink-dim">[laughs]</code> can be embedded inline.
+                    </span>
+                    <span className="block">
+                      Reference:{" "}
+                      <a
+                        href="https://ai.google.dev/gemini-api/docs/speech-generation"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-copper hover:text-copper-bright"
+                      >
+                        Gemini TTS prompt guide
+                      </a>
+                    </span>
+                  </span>
+                }
+              >
+                <Textarea
+                  mono
                   value={ttsStylePrompt}
                   onChange={(e) => setTTSStylePrompt(e.target.value)}
                   placeholder={ttsCapability?.defaults.stylePrompt ?? "落ち着いた日本語で、淡々と短く読み上げて。"}
                   rows={3}
                   maxLength={500}
-                  className="w-full bg-neutral-900 border border-neutral-700 rounded px-3 py-2 text-sm font-mono resize-y"
                 />
-                <div className="text-[11px] text-neutral-600 mt-1 space-y-1">
-                  <p>
-                    Free-form prompt prepended to the text. Audio tags such as{" "}
-                    <code className="text-neutral-400">[whispers]</code>,{" "}
-                    <code className="text-neutral-400">[excited]</code>,{" "}
-                    <code className="text-neutral-400">[laughs]</code> can be embedded inline.
-                  </p>
-                  <p>
-                    Reference:{" "}
-                    <a
-                      href="https://ai.google.dev/gemini-api/docs/speech-generation"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-blue-400 hover:text-blue-300"
-                    >
-                      Gemini TTS prompt guide
-                    </a>
-                  </p>
-                </div>
-              </div>
+              </Field>
 
               {ttsCapability && !ttsCapability.ffmpeg && (
-                <div className="text-xs text-amber-400/80 bg-amber-950/20 border border-amber-900/40 rounded px-3 py-2">
+                <Banner tone="warn">
                   ffmpeg not detected — only WAV output is available. Install ffmpeg to enable Opus/MP3 (much smaller).
-                </div>
+                </Banner>
               )}
             </div>
           )}
@@ -1234,71 +1289,50 @@ export function AgentSettings() {
           {/* Local Save button so users editing TTS settings don't have
               to scroll up to the main Save Changes button. handleSave
               already includes the TTS payload, so this just re-uses it. */}
-          <button
+          <Button
+            variant="primary"
             onClick={handleSave}
             disabled={saving}
-            className="w-full py-2.5 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm font-medium disabled:opacity-40"
+            className="mt-4 w-full"
           >
             {saving ? "Saving..." : "Save TTS Settings"}
-          </button>
-        </section>
+          </Button>
+        </SectionCard>
 
-        {/* ── Slack Bot ── */}
-        <section className="rounded-xl border border-neutral-800 p-5">
+        {/* ── Integrations ── */}
+        <SectionCard id="integrations" title="Integrations">
           <SlackBotSettings agentId={id!} />
-        </section>
+        </SectionCard>
 
-        {/* ── Actions ── */}
-        <section className="rounded-xl border border-neutral-800 p-5">
-          <button
-            onClick={openForkDialog}
-            className="w-full py-3 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm font-medium"
-          >
-            Fork Agent
-          </button>
-          <p className="text-xs text-neutral-600 mt-1">
-            Create a copy with persona and memory carried over. Slack, notifications, and credentials are not transferred.
-          </p>
-        </section>
-
-        {/* ── Danger Zone ── */}
-        <section className="rounded-xl border border-red-900/30 bg-red-950/10 p-5 space-y-4">
-          <h2 className="text-sm font-semibold text-red-400/80">Danger Zone</h2>
-          <div>
-            <button
-              onClick={handleResetSession}
-              disabled={resettingSession}
-              className="w-full py-3 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded-lg text-sm font-medium disabled:opacity-40"
+        {/* ── Memory ── */}
+        <SectionCard
+          id="memory"
+          title="Memory"
+          description="Trim stored history. Persona, MEMORY.md, notes, and credentials are always kept."
+        >
+          <div className="space-y-4">
+            <Field
+              label="Truncate memory since"
+              help="Drop transcript records, Claude --resume session entries, the grok --resume session (dropped wholesale), and daily diary bullets recorded at or after this instant. Persona, MEMORY.md, project / people / topic notes, archive, and credentials are kept."
             >
-              {resettingSession ? "Resetting..." : "Reset CLI Session"}
-            </button>
-            <p className="text-xs text-neutral-600 mt-1">
-              Force a fresh context window. History and memory are kept, but the AI re-reads everything from scratch.
-            </p>
-          </div>
-          <div>
-            <label className="block text-xs text-neutral-400 mb-1">
-              Truncate memory since
-            </label>
-            <input
-              type="datetime-local"
-              value={truncateSince}
-              onChange={(e) => setTruncateSince(e.target.value)}
-              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded-lg text-sm text-neutral-200 mb-2"
-            />
-            <button
+              <Input
+                type="datetime-local"
+                value={truncateSince}
+                onChange={(e) => setTruncateSince(e.target.value)}
+                className="[color-scheme:dark]"
+              />
+            </Field>
+            <Button
+              variant="danger"
               onClick={handleTruncateMemory}
               disabled={truncating || !truncateSince}
-              className="w-full py-3 bg-amber-950 hover:bg-amber-900 border border-amber-800 rounded-lg text-sm font-medium text-amber-300 disabled:opacity-40"
+              className="w-full"
             >
               {truncating ? "Truncating..." : "Truncate Memory From This Time"}
-            </button>
-            <p className="text-xs text-neutral-600 mt-1">
-              Drop transcript records, Claude --resume session entries, the grok --resume session (dropped wholesale — see below), and daily diary bullets recorded at or after this instant. Persona, MEMORY.md, project / people / topic notes, archive, and credentials are kept.
-            </p>
+            </Button>
             {truncateResult && (
-              <div className="mt-2 text-xs text-neutral-400 bg-neutral-900/60 border border-neutral-800 rounded-lg p-2 space-y-0.5">
-                <div>Threshold: <span className="text-neutral-300">{truncateResult.since}</span></div>
+              <div className="space-y-0.5 rounded-[10px] border border-hairline bg-raised p-2 text-[12px] text-ink-dim">
+                <div>Threshold: <span className="text-ink">{truncateResult.since}</span></div>
                 <div>
                   Transcript: {truncateResult.messagesRemoved} ·
                   {" "}Claude session: {truncateResult.claudeSessionEntriesRemoved} entries / {truncateResult.claudeSessionFilesRemoved} files ·
@@ -1307,46 +1341,90 @@ export function AgentSettings() {
                 </div>
               </div>
             )}
+            <div>
+              <Button
+                variant="danger"
+                onClick={handleResetData}
+                disabled={resetting}
+                className="w-full"
+              >
+                {resetting ? "Resetting..." : "Reset Data"}
+              </Button>
+              <p className="mt-1.5 text-[12px] text-ink-faint">
+                Clear conversation logs and memory. Settings, persona, avatar, and credentials are kept.
+              </p>
+            </div>
           </div>
-          <div>
-            <button
-              onClick={handleResetData}
-              disabled={resetting}
-              className="w-full py-3 bg-amber-950 hover:bg-amber-900 border border-amber-800 rounded-lg text-sm font-medium text-amber-300 disabled:opacity-40"
-            >
-              {resetting ? "Resetting..." : "Reset Data"}
-            </button>
-            <p className="text-xs text-neutral-600 mt-1">
-              Clear conversation logs and memory. Settings, persona, avatar, and credentials are kept.
-            </p>
-          </div>
-          <div>
-            <button
-              onClick={handleArchive}
-              disabled={archiving}
-              className="w-full py-3 bg-neutral-900 hover:bg-neutral-800 border border-neutral-700 rounded-lg text-sm font-medium text-neutral-300 disabled:opacity-40"
-            >
-              {archiving ? "Archiving..." : "Archive Agent"}
-            </button>
-            <p className="text-xs text-neutral-600 mt-1">
-              Hide from the main list and stop runtime activity. Data is kept; restore from Settings. Removes the agent from all group DMs (memberships are NOT restored on unarchive).
-            </p>
-          </div>
-          <button
-            onClick={handleDelete}
-            disabled={deleting}
-            className="w-full py-3 bg-red-950 hover:bg-red-900 border border-red-800 rounded-lg text-sm font-medium text-red-300 disabled:opacity-40"
+        </SectionCard>
+
+        {/* Banners + primary save (covers every form field via handleSave). */}
+        <div className="space-y-3">
+          {error && <Banner tone="error">{error}</Banner>}
+          {success && <Banner tone="success">Saved</Banner>}
+          {checkinNotice && <Banner tone="warn">{checkinNotice}</Banner>}
+          <Button
+            variant="primary"
+            onClick={handleSave}
+            disabled={saving}
+            className="w-full py-3"
           >
-            {deleting ? "Deleting..." : "Delete Agent"}
-          </button>
-        </section>
+            {saving ? "Saving..." : "Save Changes"}
+          </Button>
+        </div>
+
+        {/* ── Danger Zone ── */}
+        <SectionCard id="danger" title="Danger Zone" danger>
+          <div className="space-y-4">
+            <div>
+              <Button
+                onClick={handleResetSession}
+                disabled={resettingSession}
+                className="w-full"
+              >
+                {resettingSession ? "Resetting..." : "Reset CLI Session"}
+              </Button>
+              <p className="mt-1.5 text-[12px] text-ink-faint">
+                Force a fresh context window. History and memory are kept, but the AI re-reads everything from scratch.
+              </p>
+            </div>
+            <div>
+              <Button onClick={openForkDialog} className="w-full">
+                Fork Agent
+              </Button>
+              <p className="mt-1.5 text-[12px] text-ink-faint">
+                Create a copy with persona and memory carried over. Slack, notifications, and credentials are not transferred.
+              </p>
+            </div>
+            <div>
+              <Button
+                onClick={handleArchive}
+                disabled={archiving}
+                className="w-full"
+              >
+                {archiving ? "Archiving..." : "Archive Agent"}
+              </Button>
+              <p className="mt-1.5 text-[12px] text-ink-faint">
+                Hide from the main list and stop runtime activity. Data is kept; restore from Settings. Removes the agent from all group DMs (memberships are NOT restored on unarchive).
+              </p>
+            </div>
+            <Button
+              variant="danger"
+              onClick={handleDelete}
+              disabled={deleting}
+              className="w-full border border-lamp-err/40"
+            >
+              {deleting ? "Deleting..." : "Delete Agent"}
+            </Button>
+          </div>
+        </SectionCard>
 
         {/* Info */}
-        <div className="text-xs text-neutral-600 space-y-1">
+        <div className="space-y-1 text-[12px] text-ink-faint">
           <div>ID: {agent.id}</div>
           <div>Created: {new Date(agent.createdAt).toLocaleString()}</div>
         </div>
-      </main>
+        </main>
+      </div>
 
       {showForkDialog && (
         <div
@@ -1356,51 +1434,48 @@ export function AgentSettings() {
           onClick={(e) => { if (e.target === e.currentTarget && !forking) setShowForkDialog(false); }}
           onKeyDown={(e) => { if (e.key === "Escape" && !forking) setShowForkDialog(false); }}
         >
-          <div className="bg-neutral-900 border border-neutral-700 rounded-lg p-5 w-[22rem] shadow-xl">
-            <h3 className="text-sm font-medium text-neutral-200 mb-3">Fork agent</h3>
-            <label className="block text-xs text-neutral-400 mb-1">Name</label>
-            <input
-              type="text"
-              value={forkName}
-              onChange={(e) => setForkName(e.target.value)}
-              disabled={forking}
-              autoFocus
-              className="w-full px-2 py-1.5 text-sm bg-neutral-800 border border-neutral-700 rounded text-neutral-200 focus:outline-none focus:ring-1 focus:ring-blue-500/50 mb-3"
-            />
-            <label className="flex items-start gap-2 text-sm text-neutral-400 mb-2 cursor-pointer select-none">
+          <div className="w-[22rem] max-w-[calc(100vw-2rem)] rounded-[10px] border border-hairline bg-raised p-5 shadow-xl shadow-black/50">
+            <h3 className="mb-3 text-[14px] font-semibold text-ink">Fork agent</h3>
+            <Field label="Name" className="mb-3">
+              <Input
+                value={forkName}
+                onChange={(e) => setForkName(e.target.value)}
+                disabled={forking}
+                autoFocus
+              />
+            </Field>
+            <label className="mb-2 flex cursor-pointer select-none items-start gap-2 text-[13px] text-ink-dim">
               <input
                 type="checkbox"
                 checked={forkIncludeTranscript}
                 onChange={(e) => setForkIncludeTranscript(e.target.checked)}
                 disabled={forking}
-                className="mt-0.5 rounded border-neutral-600 bg-neutral-800 text-blue-500 focus:ring-blue-500/30"
+                className="mt-0.5 h-4 w-4 rounded border-hairline bg-raised accent-[color:var(--color-copper)]"
               />
               <span>
                 Include conversation history
-                <span className="block text-xs text-neutral-600">Persona and memory are always copied.</span>
+                <span className="block text-[12px] text-ink-faint">Persona and memory are always copied.</span>
               </span>
             </label>
-            <p className="text-xs text-neutral-600 mb-4">
+            <p className="mb-4 text-[12px] text-ink-faint">
               Slack bot, notification sources, and credentials are not transferred.
             </p>
             {forkError && (
-              <p className="text-xs text-red-400 mb-3">{forkError}</p>
+              <div className="mb-3">
+                <Banner tone="error">{forkError}</Banner>
+              </div>
             )}
             <div className="flex justify-end gap-2">
-              <button
-                onClick={() => setShowForkDialog(false)}
-                disabled={forking}
-                className="px-3 py-1.5 text-xs text-neutral-400 hover:text-neutral-200 rounded disabled:opacity-50"
-              >
+              <Button onClick={() => setShowForkDialog(false)} disabled={forking}>
                 Cancel
-              </button>
-              <button
+              </Button>
+              <Button
+                variant="primary"
                 onClick={handleFork}
                 disabled={forking || !forkName.trim()}
-                className="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 text-white rounded disabled:opacity-50"
               >
                 {forking ? "Forking…" : "Fork"}
-              </button>
+              </Button>
             </div>
           </div>
         </div>

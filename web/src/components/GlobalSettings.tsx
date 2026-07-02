@@ -7,6 +7,8 @@ import { PeersSection } from "./globalsettings/PeersSection";
 import { useEmbeddingModel } from "./globalsettings/useEmbeddingModel";
 import { useGeminiApiKey } from "./globalsettings/useGeminiApiKey";
 import { useEnterSends } from "../lib/preferences";
+import { PageHeader } from "./ui/PageHeader";
+import { Banner } from "./ui/Banner";
 
 // How long the "Saved" banner stays visible after a successful mutation.
 const SUCCESS_BANNER_MS = 2000;
@@ -35,33 +37,17 @@ export function GlobalSettings() {
   );
 
   return (
-    <div className="min-h-full bg-neutral-950 text-neutral-200">
-      <header className="flex items-center gap-2 px-4 py-3 border-b border-neutral-800">
-        <button
-          onClick={() => navigate("/")}
-          className="text-neutral-400 hover:text-neutral-200"
-        >
-          &larr;
-        </button>
-        <h1 className="text-lg font-bold">Settings</h1>
-      </header>
+    <div className="min-h-full bg-app text-ink">
+      <PageHeader title="Settings" onBack={() => navigate("/")} />
 
-      <main className="p-4 space-y-5 max-w-md mx-auto">
+      <main className="mx-auto max-w-[560px] space-y-6 px-4 py-6">
         <ApiKeysSection gemini={gemini} embedding={embedding} />
         <ChatPreferencesSection enterSends={enterSends} setEnterSends={setEnterSends} />
         <PeersSection setError={setError} flashSuccess={flashSuccess} />
         <ArchivedAgentsSection setError={setError} flashSuccess={flashSuccess} />
 
-        {error && (
-          <div className="p-3 bg-red-950 border border-red-800 rounded-lg text-sm text-red-300">
-            {error}
-          </div>
-        )}
-        {success && (
-          <div className="p-3 bg-green-950 border border-green-800 rounded-lg text-sm text-green-300">
-            Saved
-          </div>
-        )}
+        {error && <Banner tone="error">{error}</Banner>}
+        {success && <Banner tone="success">Saved</Banner>}
       </main>
     </div>
   );

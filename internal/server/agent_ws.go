@@ -11,10 +11,10 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/coder/websocket"
 	"github.com/loppo-llc/kojo/internal/agent"
+	"github.com/loppo-llc/kojo/internal/uploadpath"
 )
 
 // Agent WebSocket message types
@@ -396,7 +396,7 @@ func validateAttachments(atts []agent.MessageAttachment) []agent.MessageAttachme
 
 		// Derive metadata from disk, not client. Strip control characters
 		// from filenames to prevent prompt injection via crafted names.
-		name := sanitizeFilename(filepath.Base(resolved))
+		name := uploadpath.SanitizeName(resolved)
 		mimeType := mime.TypeByExtension(filepath.Ext(name))
 		if mimeType == "" {
 			mimeType = "application/octet-stream"
@@ -494,14 +494,4 @@ func drainAfterAbort(ctx context.Context, events <-chan agent.ChatEvent) *agent.
 			return nil
 		}
 	}
-}
-
-// sanitizeFilename removes control characters and newlines from a filename.
-func sanitizeFilename(name string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
-			return -1
-		}
-		return r
-	}, name)
 }

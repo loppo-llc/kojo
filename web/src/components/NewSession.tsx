@@ -4,6 +4,14 @@ import { api, type ServerInfo } from "../lib/api";
 import { peersApi, type PeerInfo } from "../lib/peerApi";
 import { modelsForTool } from "../lib/toolModels";
 import { errMsg } from "../lib/utils";
+import { PageHeader } from "./ui/PageHeader";
+import { SectionCard } from "./ui/SectionCard";
+import { Field } from "./ui/Field";
+import { Input } from "./ui/Input";
+import { Select } from "./ui/Select";
+import { Button } from "./ui/Button";
+import { Banner } from "./ui/Banner";
+import { Toggle } from "./ui/Toggle";
 
 export function NewSession() {
   const navigate = useNavigate();
@@ -163,186 +171,177 @@ export function NewSession() {
   };
 
   return (
-    <div className="min-h-full bg-neutral-950 text-neutral-200">
-      <header className="flex items-center justify-between px-4 py-3 border-b border-neutral-800">
-        <div className="flex items-center gap-2">
-          <button onClick={() => navigate("/", { replace: true })} className="text-neutral-400 hover:text-neutral-200">
-            &larr;
-          </button>
-          <h1 className="text-lg font-bold">New Session</h1>
-        </div>
-      </header>
+    <div className="min-h-full bg-app text-ink">
+      <PageHeader title="New Session" onBack={() => navigate("/", { replace: true })} />
 
-      <main className="p-4 space-y-6 max-w-md mx-auto">
-        {/* Peer selection (only when 2+ peers are registered) */}
-        {peers.length > 1 && (
-          <div>
-            <label className="block text-sm text-neutral-400 mb-2">Host</label>
-            <select
-              value={selectedPeerId || selfPeerId}
-              onChange={(e) => setSelectedPeerId(e.target.value)}
-              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-            >
-              {peers.map((p) => {
-                const isSelf = p.deviceId === selfPeerId;
-                const offline = p.status !== "online";
-                // A non-self peer needs to be paired (registered on
-                // both sides via the join-request flow). The local
-                // UI can only hint at what we know: status + name.
-                // The Hub-side proxy will 403 if the pairing is
-                // missing on the other side — surface it as a
-                // runtime error rather than disabling here.
-                const disabled = !isSelf && offline;
-                return (
-                  <option key={p.deviceId} value={p.deviceId} disabled={disabled}>
-                    {p.name}
-                    {isSelf ? " (this device)" : ""}
-                    {offline && !isSelf ? " — offline" : ""}
-                  </option>
-                );
-              })}
-            </select>
-          </div>
-        )}
-
-        {/* Tool selection */}
-        <div>
-          <label className="block text-sm text-neutral-400 mb-2">Tool</label>
-          <div className="space-y-2">
-            {info &&
-              Object.entries(info.tools).map(([name, t]) => (
-                <label
-                  key={name}
-                  className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer ${
-                    tool === name
-                      ? "border-neutral-500 bg-neutral-800"
-                      : "border-neutral-800 bg-neutral-900"
-                  } ${!t.available ? "opacity-40 cursor-not-allowed" : ""}`}
+      <main className="mx-auto max-w-[560px] px-4 py-4">
+        <SectionCard>
+          <div className="space-y-5">
+            {/* Peer selection (only when 2+ peers are registered) */}
+            {peers.length > 1 && (
+              <Field label="Host">
+                <Select
+                  value={selectedPeerId || selfPeerId}
+                  onChange={(e) => setSelectedPeerId(e.target.value)}
                 >
-                  <input
-                    type="radio"
-                    name="tool"
-                    value={name}
-                    checked={tool === name}
-                    disabled={!t.available}
-                    onChange={() => {
-                      setTool(name);
-                      setModel("");
-                    }}
-                    className="accent-neutral-400"
-                  />
-                  <span className="font-mono">{name}</span>
-                  {!t.available && (
-                    <span className="text-xs text-neutral-600">(not available)</span>
-                  )}
-                </label>
-              ))}
-          </div>
-        </div>
+                  {peers.map((p) => {
+                    const isSelf = p.deviceId === selfPeerId;
+                    const offline = p.status !== "online";
+                    // A non-self peer needs to be paired (registered on
+                    // both sides via the join-request flow). The local
+                    // UI can only hint at what we know: status + name.
+                    // The Hub-side proxy will 403 if the pairing is
+                    // missing on the other side — surface it as a
+                    // runtime error rather than disabling here.
+                    const disabled = !isSelf && offline;
+                    return (
+                      <option key={p.deviceId} value={p.deviceId} disabled={disabled}>
+                        {p.name}
+                        {isSelf ? " (this device)" : ""}
+                        {offline && !isSelf ? " — offline" : ""}
+                      </option>
+                    );
+                  })}
+                </Select>
+              </Field>
+            )}
 
-        {/* Model (tools with a known whitelist) */}
-        {modelsForTool(tool).length > 0 && (
-          <div>
-            <label className="block text-sm text-neutral-400 mb-2">Model</label>
-            <select
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-            >
-              <option value="">(default)</option>
-              {modelsForTool(tool).map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
+            {/* Tool selection */}
+            <Field label="Tool">
+              <div className="space-y-2">
+                {info &&
+                  Object.entries(info.tools).map(([name, t]) => (
+                    <label
+                      key={name}
+                      className={`flex cursor-pointer items-center gap-3 rounded-[10px] border p-3 transition-colors ${
+                        tool === name
+                          ? "border-copper/50 bg-copper/10"
+                          : "border-hairline bg-raised hover:bg-hover"
+                      } ${!t.available ? "cursor-not-allowed opacity-40" : ""}`}
+                    >
+                      <input
+                        type="radio"
+                        name="tool"
+                        value={name}
+                        checked={tool === name}
+                        disabled={!t.available}
+                        onChange={() => {
+                          setTool(name);
+                          setModel("");
+                        }}
+                        className="accent-[color:var(--color-copper)]"
+                      />
+                      <span className="font-mono text-[14px] text-ink">{name}</span>
+                      {!t.available && (
+                        <span className="text-[11px] text-ink-faint">(not available)</span>
+                      )}
+                    </label>
+                  ))}
+              </div>
+            </Field>
 
-        {/* Working directory */}
-        <div ref={wrapperRef} className="relative">
-          <label className="block text-sm text-neutral-400 mb-2">Working Directory</label>
-          <input
-            type="text"
-            value={workDir}
-            onChange={(e) => handleWorkDirChange(e.target.value)}
-            onFocus={() => suggestions.length > 0 && setShowSuggestions(true)}
-            placeholder="/path/to/your/project"
-            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-          />
-          {showSuggestions && (
-            <ul className="absolute z-10 left-0 right-0 mt-1 bg-neutral-900 border border-neutral-700 rounded max-h-48 overflow-y-auto">
-              {suggestions.map((dir) => (
-                <li key={dir}>
-                  <button
-                    type="button"
-                    onClick={() => selectSuggestion(dir)}
-                    className="w-full text-left px-3 py-2 text-sm font-mono hover:bg-neutral-800 truncate"
-                  >
-                    {dir}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
+            {/* Model (tools with a known whitelist) */}
+            {modelsForTool(tool).length > 0 && (
+              <Field label="Model">
+                <Select value={model} onChange={(e) => setModel(e.target.value)} mono>
+                  <option value="">(default)</option>
+                  {modelsForTool(tool).map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+            )}
 
-        {/* Additional arguments */}
-        <div>
-          <label className="block text-sm text-neutral-400 mb-2">Additional Arguments</label>
-          <input
-            type="text"
-            value={args}
-            onChange={(e) => setArgs(e.target.value)}
-            placeholder="--model opus"
-            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-          />
-        </div>
+            {/* Working directory */}
+            <Field label="Working directory">
+              <div ref={wrapperRef} className="relative">
+                <Input
+                  mono
+                  type="text"
+                  value={workDir}
+                  onChange={(e) => handleWorkDirChange(e.target.value)}
+                  onFocus={() => suggestions.length > 0 && setShowSuggestions(true)}
+                  placeholder="/path/to/your/project"
+                />
+                {showSuggestions && (
+                  <ul className="absolute inset-x-0 z-20 mt-1 max-h-48 overflow-y-auto rounded-[10px] border border-hairline bg-raised py-1 shadow-xl shadow-black/40">
+                    {suggestions.map((dir) => (
+                      <li key={dir}>
+                        <button
+                          type="button"
+                          onClick={() => selectSuggestion(dir)}
+                          className="block w-full truncate px-3 py-2 text-left font-mono text-[13px] text-ink-dim transition-colors hover:bg-hover hover:text-ink focus:bg-hover focus:text-ink focus:outline-none"
+                        >
+                          {dir}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </Field>
 
-        {/* Yolo mode */}
-        <label className="flex items-center gap-3 p-3 bg-neutral-900 rounded-lg border border-neutral-800 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={yoloMode}
-            onChange={(e) => setYoloMode(e.target.checked)}
-            className="accent-yellow-500"
-          />
-          <span>&#x26A1; Yolo Mode</span>
-          <span className="text-xs text-neutral-500 ml-auto">{yoloMode ? "ON" : "OFF"}</span>
-        </label>
-
-        {/* Minimal system prompt (claude / custom only) */}
-        {(tool === "claude" || tool === "custom") && (
-          <div>
-            <label className="flex items-center gap-3 p-3 bg-neutral-900 rounded-lg border border-neutral-800 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={simpleSystemPrompt}
-                onChange={(e) => setSimpleSystemPrompt(e.target.checked)}
-                className="accent-neutral-400"
+            {/* Additional arguments */}
+            <Field label="Additional arguments">
+              <Input
+                mono
+                type="text"
+                value={args}
+                onChange={(e) => setArgs(e.target.value)}
+                placeholder="--model opus"
               />
-              <span>Minimal System Prompt</span>
-              <span className="text-xs text-neutral-500 ml-auto">{simpleSystemPrompt ? "ON" : "OFF"}</span>
-            </label>
-            <p className="text-xs text-neutral-500 mt-1 px-1">
-              Override claude&apos;s default system prompt with just a working-directory note (<code>--system-prompt</code>).
-            </p>
-          </div>
-        )}
+            </Field>
 
-        {error && (
-          <div className="p-3 bg-red-950 border border-red-800 rounded-lg text-sm text-red-300">
-            {error}
-          </div>
-        )}
+            {/* Yolo mode */}
+            <div
+              onClick={() => setYoloMode(!yoloMode)}
+              className="flex cursor-pointer items-center justify-between gap-3 rounded-[10px] border border-hairline bg-raised px-3 py-2.5"
+            >
+              <div className="min-w-0">
+                <div className="text-[13px] text-ink">Yolo Mode</div>
+                <div className="text-[11px] text-ink-faint">Skip permission prompts</div>
+              </div>
+              <span onClick={(e) => e.stopPropagation()}>
+                <Toggle checked={yoloMode} onChange={setYoloMode} aria-label="Yolo Mode" />
+              </span>
+            </div>
 
-        <button
-          onClick={handleCreate}
-          disabled={loading || infoLoading || !tool || !workDir}
-          className="w-full py-3 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm font-medium disabled:opacity-40"
-        >
-          {loading ? "Starting..." : "Start Session"}
-        </button>
+            {/* Minimal system prompt (claude / custom only) */}
+            {(tool === "claude" || tool === "custom") && (
+              <div
+                onClick={() => setSimpleSystemPrompt(!simpleSystemPrompt)}
+                className="flex cursor-pointer items-center justify-between gap-3 rounded-[10px] border border-hairline bg-raised px-3 py-2.5"
+              >
+                <div className="min-w-0">
+                  <div className="text-[13px] text-ink">Minimal system prompt</div>
+                  <div className="text-[11px] text-ink-faint">
+                    Replace the default prompt with just a working-directory note (<code>--system-prompt</code>).
+                  </div>
+                </div>
+                <span onClick={(e) => e.stopPropagation()}>
+                  <Toggle
+                    checked={simpleSystemPrompt}
+                    onChange={setSimpleSystemPrompt}
+                    aria-label="Minimal system prompt"
+                  />
+                </span>
+              </div>
+            )}
+
+            {error && <Banner tone="error">{error}</Banner>}
+
+            <Button
+              variant="primary"
+              onClick={handleCreate}
+              disabled={loading || infoLoading || !tool || !workDir}
+              className="w-full py-2.5"
+            >
+              {loading ? "Creating…" : "Create session"}
+            </Button>
+          </div>
+        </SectionCard>
       </main>
     </div>
   );

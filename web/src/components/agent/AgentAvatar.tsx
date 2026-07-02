@@ -4,7 +4,7 @@ import { agentApi } from "../../lib/agentApi";
 interface AgentAvatarProps {
   agentId: string;
   name: string;
-  size?: "sm" | "md" | "lg" | "xl";
+  size?: "xs" | "sm" | "md" | "lg" | "xl";
   className?: string;
   preview?: boolean;
   /** Append ?t=<value> to bust browser cache after avatar change */
@@ -12,6 +12,7 @@ interface AgentAvatarProps {
 }
 
 const sizes = {
+  xs: "w-10 h-10",
   sm: "w-12 h-12",
   md: "w-14 h-14",
   lg: "w-16 h-16",
@@ -19,8 +20,9 @@ const sizes = {
 };
 
 // Thumbnail resolution per size tier. 2x DPR so Retina doesn't blur.
-// sm=48px → 128, md=56px → 128, lg=64px → 128, xl=96px → 256.
+// xs=40px → 128, sm=48px → 128, md=56px → 128, lg=64px → 128, xl=96px → 256.
 const thumbRes: Record<string, number> = {
+  xs: 128,
   sm: 128,
   md: 128,
   lg: 128,

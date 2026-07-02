@@ -1,12 +1,10 @@
 package server
 
 import (
-	"io"
 	"net/http"
 	"strings"
 
 	"github.com/loppo-llc/kojo/internal/auth"
-	"github.com/loppo-llc/kojo/internal/peer"
 )
 
 // sessionPeerProxyMiddleware forwards a peer-aware request whose
@@ -72,16 +70,8 @@ func (s *Server) proxySessionRequest(w http.ResponseWriter, r *http.Request, pee
 	if !ok {
 		return
 	}
-	rec, err := st.GetPeer(r.Context(), peerID)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway",
-			"target peer not in registry: "+err.Error())
-		return
-	}
-	addr, err := peer.NormalizeAddress(rec.URL)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway",
-			"target peer has no usable dial address: "+err.Error())
+	addr, ok := s.resolvePeerDialAddr(w, r.Context(), st, peerID)
+	if !ok {
 		return
 	}
 	// Strip `peer=` from the forwarded query so the peer's local
@@ -112,41 +102,33 @@ func (s *Server) proxySessionRequest(w http.ResponseWriter, r *http.Request, pee
 	// straight through; the local upload / blob handlers downstream
 	// apply their own per-route MaxBytesReader. ContentLength is
 	// copied so the receiver gets the same framing the client sent.
-	ctx := r.Context()
-	proxyReq, err := http.NewRequestWithContext(ctx, r.Method, target, r.Body)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "proxy_build", err.Error())
-		return
-	}
-	proxyReq.ContentLength = r.ContentLength
-	for _, h := range []string{"Content-Type", "If-Match", "Idempotency-Key"} {
-		if v := r.Header.Get(h); v != "" {
-			proxyReq.Header.Set(h, v)
-		}
-	}
-
+	//
 	// No HTTP client timeout: large uploads (multi-GiB blobs,
-	// attachments) easily blow past any fixed budget. The
-	// request context (request-scoped, cancelled when the
-	// client disconnects) provides the upper bound.
-	client := peer.NoKeepAliveHTTPClient(0)
-	resp, err := client.Do(proxyReq)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway", "peer unreachable: "+err.Error())
-		return
-	}
-	defer resp.Body.Close()
-	// Preserve every header a browser would key off — raw file
-	// downloads need Content-Disposition + Content-Length to land
-	// as proper saves rather than inline string blobs, and the
-	// existing Content-Type / ETag entries stay for JSON
-	// responses. Stream the body instead of buffering it so big
-	// downloads aren't silently truncated at an arbitrary cap.
-	copyResponseHeaders(w.Header(), resp.Header,
-		"Content-Type", "ETag",
-		"Content-Disposition", "Content-Length",
-		"Last-Modified", "Cache-Control",
-	)
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	// attachments) easily blow past any fixed budget. The request
+	// context (request-scoped, cancelled when the client disconnects)
+	// provides the upper bound.
+	//
+	// Response headers preserve every field a browser keys off — raw
+	// file downloads need Content-Disposition + Content-Length to land
+	// as proper saves; the body is streamed, not buffered, so big
+	// downloads aren't silently truncated.
+	s.forwardHTTPToPeer(w, r.Context(), peerHTTPForward{
+		method:         r.Method,
+		url:            target,
+		body:           r.Body,
+		contentLength:  r.ContentLength,
+		srcHeader:      r.Header,
+		reqHeaderKeys:  []string{"Content-Type", "If-Match", "Idempotency-Key"},
+		timeout:        0,
+		buildErrStatus: http.StatusBadGateway,
+		buildErrCode:   "proxy_build",
+		dialErrStatus:  http.StatusBadGateway,
+		dialErrCode:    "bad_gateway",
+		dialErrPrefix:  "peer unreachable: ",
+		respHeaderKeys: []string{
+			"Content-Type", "ETag",
+			"Content-Disposition", "Content-Length",
+			"Last-Modified", "Cache-Control",
+		},
+	})
 }

@@ -21,6 +21,20 @@ import (
 // Mirrors internal/auth/store.go agentIDPattern.
 var pathSafeAgentIDPattern = regexp.MustCompile(`^[A-Za-z0-9_\-]{1,128}$`)
 
+// renameOverwrite moves src onto dst, first removing anything at dst.
+// os.Rename fails on Windows when the destination already exists, so
+// the Remove-then-Rename ordering is load-bearing and must NOT be
+// reordered — this is the hand-tuned Windows backup-rename step shared
+// by the claude/codex/grok session stagers. The pre-Remove error is
+// intentionally swallowed: a missing dst is the normal case, and the
+// subsequent Rename surfaces any real failure. Callers own the
+// os.Stat guard, the backup-name creation, their error wrapping, and
+// their rollback.
+func renameOverwrite(src, dst string) error {
+	_ = os.Remove(dst)
+	return os.Rename(src, dst)
+}
+
 // IsPathSafeAgentID reports whether id is safe to embed in an
 // on-disk path or filename. Exported so HTTP handlers can reject
 // peer-sync payloads with a malformed agent.id at the boundary,
@@ -248,8 +262,7 @@ func StageClaudeSessionFiles(agentID string, files []ClaudeSessionFile) (commit 
 			}
 			backupPath = bf.Name()
 			_ = bf.Close()
-			_ = os.Remove(backupPath) // Rename needs the target to not exist on Windows
-			if rerr := os.Rename(s.final, backupPath); rerr != nil {
+			if rerr := renameOverwrite(s.final, backupPath); rerr != nil {
 				rollbackBackups()
 				cleanupTmps()
 				return nil, nil, fmt.Errorf("agent.StageClaudeSessionFiles: backup %s: %w", s.final, rerr)

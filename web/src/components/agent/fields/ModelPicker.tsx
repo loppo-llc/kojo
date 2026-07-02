@@ -1,4 +1,7 @@
 import { effortLevelsForModel, type EffortLevel } from "../../../lib/toolModels";
+import { Field } from "../../ui/Field";
+import { Select } from "../../ui/Select";
+import { Input } from "../../ui/Input";
 
 /**
  * The "Model" field: a <select> when the backend has a known model list,
@@ -24,14 +27,9 @@ export function ModelPicker({
     if (effort && !effortLevelsForModel(m).includes(effort)) setEffort("");
   };
   return (
-    <div>
-      <label className="block text-sm text-neutral-400 mb-2">Model</label>
+    <Field label="Model">
       {models.length > 0 ? (
-        <select
-          value={model}
-          onChange={(e) => onChange(e.target.value)}
-          className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-        >
+        <Select value={model} onChange={(e) => onChange(e.target.value)}>
           {model && !models.includes(model) && (
             <option value={model}>{model}</option>
           )}
@@ -40,16 +38,15 @@ export function ModelPicker({
               {m}
             </option>
           ))}
-        </select>
+        </Select>
       ) : (
-        <input
-          type="text"
+        <Input
+          mono
           value={model}
           onChange={(e) => onChange(e.target.value)}
           placeholder="model name"
-          className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
         />
       )}
-    </div>
+    </Field>
   );
 }

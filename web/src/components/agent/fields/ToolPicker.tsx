@@ -3,6 +3,7 @@ import {
   effortLevelsForModel,
   type EffortLevel,
 } from "../../../lib/toolModels";
+import { Field } from "../../ui/Field";
 
 const TOOLS = ["claude", "codex", "grok", "custom", "llama.cpp"];
 
@@ -12,9 +13,8 @@ const TOOLS = ["claude", "codex", "grok", "custom", "llama.cpp"];
  * level the new default model can't support.
  *
  * `isDisabled` is optional: when provided (AgentCreate gates on server
- * availability) each button gets a `disabled` attribute plus the
- * `disabled:opacity-30` style; when omitted (AgentSettings) neither is
- * rendered, preserving the exact original markup of each caller.
+ * availability) each button gets a `disabled` attribute plus a dimmed style;
+ * when omitted (AgentSettings) neither is rendered.
  */
 export function ToolPicker({
   tool,
@@ -31,37 +31,39 @@ export function ToolPicker({
   setEffort: (e: EffortLevel | "") => void;
   isDisabled?: (t: string) => boolean;
 }) {
-  const disabledCls = isDisabled ? " disabled:opacity-30" : "";
   return (
-    <div>
-      <label className="block text-sm text-neutral-400 mb-2">Tool</label>
+    <Field label="Tool">
       <div className="flex flex-wrap gap-2">
-        {TOOLS.map((t) => (
-          <button
-            key={t}
-            onClick={() => {
-              if (t !== tool) {
-                setTool(t);
-                if (t === "custom" || t === "llama.cpp") {
-                  setModel("");
-                } else {
-                  const m = defaultModelForTool(t);
-                  setModel(m);
-                  if (effort && !effortLevelsForModel(m).includes(effort)) setEffort("");
+        {TOOLS.map((t) => {
+          const selected = tool === t;
+          return (
+            <button
+              key={t}
+              type="button"
+              onClick={() => {
+                if (t !== tool) {
+                  setTool(t);
+                  if (t === "custom" || t === "llama.cpp") {
+                    setModel("");
+                  } else {
+                    const m = defaultModelForTool(t);
+                    setModel(m);
+                    if (effort && !effortLevelsForModel(m).includes(effort)) setEffort("");
+                  }
                 }
-              }
-            }}
-            disabled={isDisabled ? isDisabled(t) : undefined}
-            className={`px-3 py-2 rounded text-sm font-mono ${
-              tool === t
-                ? "bg-neutral-700 border border-neutral-500"
-                : "bg-neutral-900 border border-neutral-800"
-            }${disabledCls}`}
-          >
-            {t}
-          </button>
-        ))}
+              }}
+              disabled={isDisabled ? isDisabled(t) : undefined}
+              className={`rounded-lg border px-3 py-2 font-mono text-[13px] transition-colors disabled:opacity-30 ${
+                selected
+                  ? "border-copper bg-copper/15 text-copper-bright"
+                  : "border-hairline bg-raised text-ink-dim hover:border-ink-faint hover:text-ink"
+              }`}
+            >
+              {t}
+            </button>
+          );
+        })}
       </div>
-    </div>
+    </Field>
   );
 }

@@ -249,9 +249,9 @@ export function TerminalTab({ parentSessionId, workDir, visible, peerId }: Termi
 
   if (error) {
     return (
-      <div className="flex flex-col items-center justify-center h-full text-neutral-400 gap-2">
+      <div className="flex h-full flex-col items-center justify-center gap-2 bg-app px-6 text-center text-ink-dim">
         {error.split("\n").map((line, i) => (
-          <p key={i} className={i === 0 ? "text-sm" : "text-xs font-mono text-neutral-500"}>
+          <p key={i} className={i === 0 ? "text-sm" : "font-mono text-xs text-ink-faint"}>
             {line}
           </p>
         ))}
@@ -260,15 +260,15 @@ export function TerminalTab({ parentSessionId, workDir, visible, peerId }: Termi
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex h-full flex-col bg-app">
       {/* Terminal */}
-      <div className="flex-1 min-h-0 relative">
+      <div className="relative min-h-0 flex-1">
         <div ref={termContainerRef} className="absolute inset-0" style={{ touchAction: "none" }} />
       </div>
 
       {/* tmux shortcuts (only shown for tmux sessions) */}
       {shellTool === "tmux" && (
-        <div className="flex gap-1.5 px-2 py-1.5 border-t border-neutral-800 overflow-x-auto shrink-0">
+        <div className="flex shrink-0 gap-1.5 overflow-x-auto border-t border-hairline px-2 py-1.5">
           {TMUX_SHORTCUTS.map((s) => (
             <button
               key={s.action}
@@ -278,7 +278,7 @@ export function TerminalTab({ parentSessionId, workDir, visible, peerId }: Termi
                   api.sessions.tmux(sessionIdRef.current, { action: s.action }, peerId).catch(() => {});
                 }
               }}
-              className="px-3 py-2.5 text-xs rounded font-mono bg-neutral-800 text-neutral-400 active:bg-neutral-600 whitespace-nowrap"
+              className="whitespace-nowrap rounded-[10px] border border-hairline bg-raised px-3 py-2.5 font-mono text-xs text-ink-dim transition-colors active:bg-hover"
             >
               {s.label}
             </button>

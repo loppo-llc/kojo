@@ -1,7 +1,6 @@
 package server
 
 import (
-	"io"
 	"net/http"
 	"strings"
 
@@ -161,54 +160,45 @@ func (s *Server) proxyToHolderPeer(w http.ResponseWriter, r *http.Request, agent
 		targetURL += "?" + encoded
 	}
 
-	// Peer-auth no longer hashes the body, so we stream the
-	// request straight through instead of buffering it. Downstream
-	// handlers apply their own per-route MaxBytesReader.
-	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "proxy_build",
-			"failed to build proxy request: "+err.Error())
-		return
-	}
-	proxyReq.ContentLength = r.ContentLength
-
-	// Preserve content metadata so the target handler parses
-	// the body correctly (JSON, multipart, etc.).
-	for _, h := range []string{"Content-Type", "If-Match", "Idempotency-Key"} {
-		if v := r.Header.Get(h); v != "" {
-			proxyReq.Header.Set(h, v)
-		}
-	}
-
-	// No HTTP client timeout: avatar uploads can be 128 MiB and
-	// raw fetches stream arbitrary body sizes. The request
-	// context cancels the dispatch when the caller disconnects.
-	client := peer.NoKeepAliveHTTPClient(0)
-	resp, err := client.Do(proxyReq)
-	if err != nil {
-		if s.logger != nil {
-			s.logger.Debug("remote agent proxy failed",
-				"agent", agentID, "peer", holderDeviceID, "err", err)
-		}
-		writeError(w, http.StatusBadGateway, "proxy_failed",
-			"holder peer unreachable: "+err.Error())
-		return
-	}
-	defer resp.Body.Close()
-
-	// Stream the upstream response back to the caller. Preserve
+	// Peer-auth no longer hashes the body, so we stream the request
+	// straight through instead of buffering it. Downstream handlers
+	// apply their own per-route MaxBytesReader. Content metadata is
+	// preserved so the target parses the body correctly (JSON,
+	// multipart, etc.).
+	//
+	// No HTTP client timeout: avatar uploads can be 128 MiB and raw
+	// fetches stream arbitrary body sizes. The request context cancels
+	// the dispatch when the caller disconnects.
+	//
+	// The upstream response is streamed back unbounded, preserving
 	// every header a browser keys off — raw file downloads under
 	// /api/v1/agents/{id}/files/raw need Content-Disposition +
-	// Content-Length to land as proper saves, and the existing
-	// JSON / WS surfaces use Content-Type / ETag. Body is copied
-	// unbounded; a 32 MiB silent truncate would mangle big
-	// agent-side downloads.
-	copyResponseHeaders(w.Header(), resp.Header,
-		"Content-Type", "ETag",
-		"X-Kojo-No-Idempotency-Cache",
-		"Content-Disposition", "Content-Length",
-		"Last-Modified", "Cache-Control",
-	)
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	// Content-Length to land as proper saves.
+	s.forwardHTTPToPeer(w, r.Context(), peerHTTPForward{
+		method:         r.Method,
+		url:            targetURL,
+		body:           r.Body,
+		contentLength:  r.ContentLength,
+		srcHeader:      r.Header,
+		reqHeaderKeys:  []string{"Content-Type", "If-Match", "Idempotency-Key"},
+		timeout:        0,
+		buildErrStatus: http.StatusBadGateway,
+		buildErrCode:   "proxy_build",
+		buildErrPrefix: "failed to build proxy request: ",
+		dialErrStatus:  http.StatusBadGateway,
+		dialErrCode:    "proxy_failed",
+		dialErrPrefix:  "holder peer unreachable: ",
+		onDialErr: func(err error) {
+			if s.logger != nil {
+				s.logger.Debug("remote agent proxy failed",
+					"agent", agentID, "peer", holderDeviceID, "err", err)
+			}
+		},
+		respHeaderKeys: []string{
+			"Content-Type", "ETag",
+			"X-Kojo-No-Idempotency-Cache",
+			"Content-Disposition", "Content-Length",
+			"Last-Modified", "Cache-Control",
+		},
+	})
 }

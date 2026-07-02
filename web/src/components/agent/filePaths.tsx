@@ -89,7 +89,7 @@ export function FilePathChip({
         href={linkUrl}
         download={fileType === "other" ? fileName : undefined}
         onClick={handleClick}
-        className="inline px-1.5 py-0.5 mx-0.5 bg-neutral-700/50 hover:bg-neutral-600/50 rounded text-xs font-mono text-blue-300 hover:text-blue-200 transition-colors text-left wrap-anywhere box-decoration-clone cursor-pointer select-text"
+        className="inline px-1.5 py-0.5 mx-0.5 bg-surface hover:bg-hover rounded text-xs font-mono text-copper hover:text-copper-bright transition-colors text-left wrap-anywhere box-decoration-clone cursor-pointer select-text"
         title={fileType === "other" ? `Download ${fileName}` : `Preview ${fileName}`}
       >
         {fileType === "image" ? (
@@ -113,12 +113,12 @@ export function FilePathChip({
             <img
               src={thumbHoverUrl}
               alt={fileName}
-              className="max-w-[200px] max-h-[150px] object-contain rounded-lg shadow-lg border border-neutral-700 bg-neutral-900"
+              className="max-w-[200px] max-h-[150px] object-contain rounded-[10px] shadow-lg border border-hairline bg-surface"
               loading="lazy"
               decoding="async"
             />
           ) : (
-            <div className="px-2 py-1 bg-neutral-800 rounded text-xs text-neutral-300 shadow-lg border border-neutral-700 whitespace-nowrap">
+            <div className="px-2 py-1 bg-raised rounded text-xs text-ink-dim shadow-lg border border-hairline whitespace-nowrap">
               {fileSize || "…"}
             </div>
           )}

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Link, useNavigate } from "react-router";
+import { useLocation, useNavigate } from "react-router";
 import { api, type SessionInfo } from "../lib/api";
 import { agentApi, type AgentInfo } from "../lib/agentApi";
 import { groupdmApi, type GroupDMInfo } from "../lib/groupdmApi";
@@ -7,7 +7,18 @@ import { peersApi, type PeerInfo } from "../lib/peerApi";
 import { AgentAvatar } from "./agent/AgentAvatar";
 import { usePushNotifications } from "../hooks/usePushNotifications";
 import { useCollapsedSet } from "../hooks/useCollapsedSet";
-import { errMsg, timeAgo } from "../lib/utils";
+import { errMsg } from "../lib/utils";
+import { Header } from "./ui/Header";
+import { Lamp, type LampState } from "./ui/Lamp";
+import { Chip } from "./ui/Chip";
+import { RelTime } from "./ui/RelTime";
+import { Button } from "./ui/Button";
+
+function sessionLampState(s: SessionInfo): LampState {
+  if (s.status === "running") return "run";
+  if (s.exitCode !== undefined && s.exitCode !== 0) return "err";
+  return "off";
+}
 
 interface SessionGroup {
   key: string;
@@ -64,7 +75,31 @@ function groupSessions(sessions: SessionInfo[]): SessionGroup[] {
   return groups;
 }
 
-export function Dashboard() {
+interface DashboardProps {
+  /**
+   * "page" (default) is the standalone full-page list. "sidebar" is the
+   * persistent left pane of the lg+ two-pane shell: identical markup below
+   * lg (so 390px behavior is byte-identical), with lg: overrides for a
+   * full-width compact column and an active-row highlight derived from the
+   * current route. The active/compact styling is applied only via lg:
+   * utilities, so nothing changes below the lg boundary.
+   */
+  variant?: "page" | "sidebar";
+}
+
+export function Dashboard({ variant = "page" }: DashboardProps) {
+  const location = useLocation();
+  const sidebar = variant === "sidebar";
+  // Active row is derived from the URL so it survives remounts and stays in
+  // sync with the detail pane. Only meaningful in the sidebar (lg+), and the
+  // highlight is applied through lg: classes so mobile markup is untouched.
+  const activeAgentId = location.pathname.match(/^\/agents\/([^/]+)/)?.[1] ?? null;
+  const activeGroupId = location.pathname.match(/^\/groupdms\/([^/]+)/)?.[1] ?? null;
+  const activeSessionId = location.pathname.match(/^\/session\/([^/]+)/)?.[1] ?? null;
+  // Reserve a 2px left edge on every sidebar row (transparent when inactive)
+  // so switching the active row never shifts row content horizontally.
+  const rowEdge = (active: boolean) =>
+    sidebar ? (active ? " lg:border-l-2 lg:border-copper lg:bg-hover" : " lg:border-l-2 lg:border-l-transparent") : "";
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [groupDMs, setGroupDMs] = useState<GroupDMInfo[]>([]);
@@ -275,6 +310,8 @@ export function Dashboard() {
 
   const groups = groupSessions(sessions);
   const hasAnySessions = sessions.some((s) => !s.internal);
+  const visibleSessions = sessions.filter((s) => !s.internal);
+  const runningCount = visibleSessions.filter((s) => s.status === "running").length;
   // updatedAt is RFC3339 with seconds resolution, so agents touched in the
   // same second tie. Manager.List() iterates a map, so input order is random
   // per request; a 0-return comparator would let that randomness through
@@ -373,102 +410,110 @@ export function Dashboard() {
   };
 
   return (
-    <div className="min-h-full bg-neutral-950 text-neutral-200">
-      <header className="flex items-center justify-between px-4 py-3 border-b border-neutral-800">
-        <h1 className="text-lg font-bold">kojo</h1>
-        <div className="flex items-center gap-2">
-          <Link
-            to="/agents/new"
-            className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-sm"
-          >
-            + Agent
-          </Link>
-          <Link
-            to="/new"
-            className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-sm"
-          >
-            + Session
-          </Link>
-          <Link
-            to="/settings"
-            className="p-1.5 text-neutral-500 hover:text-neutral-300"
-            title="Settings"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
-              <path fillRule="evenodd" d="M7.84 1.804A1 1 0 018.82 1h2.36a1 1 0 01.98.804l.331 1.652a6.993 6.993 0 011.929 1.115l1.598-.54a1 1 0 011.186.447l1.18 2.044a1 1 0 01-.205 1.251l-1.267 1.113a7.047 7.047 0 010 2.228l1.267 1.113a1 1 0 01.206 1.25l-1.18 2.045a1 1 0 01-1.187.447l-1.598-.54a6.993 6.993 0 01-1.929 1.115l-.33 1.652a1 1 0 01-.98.804H8.82a1 1 0 01-.98-.804l-.331-1.652a6.993 6.993 0 01-1.929-1.115l-1.598.54a1 1 0 01-1.186-.447l-1.18-2.044a1 1 0 01.205-1.251l1.267-1.114a7.05 7.05 0 010-2.227L1.821 7.773a1 1 0 01-.206-1.25l1.18-2.045a1 1 0 011.187-.447l1.598.54A6.993 6.993 0 017.51 3.456l.33-1.652zM10 13a3 3 0 100-6 3 3 0 000 6z" clipRule="evenodd" />
-            </svg>
-          </Link>
-        </div>
-      </header>
+    <div className="min-h-full bg-app text-ink">
+      <Header />
 
-      {pushState === "default" && (
-        <div className="mx-4 mt-3 p-3 bg-neutral-900 border border-neutral-800 rounded-lg flex items-center gap-3">
-          <span className="text-sm flex-1">Enable notifications when sessions finish?</span>
-          <button
-            onClick={pushSubscribe}
-            disabled={pushLoading}
-            className="px-3 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-sm whitespace-nowrap disabled:opacity-40"
-          >
-            {pushLoading ? "..." : "Enable"}
-          </button>
+      <div className={`mx-auto max-w-[720px] px-4${sidebar ? " lg:max-w-none lg:px-3" : ""}`}>
+        {/* Fleet summary strip */}
+        <div className="flex items-center gap-1.5 pt-3 font-mono text-[12px] text-ink-dim">
+          <Lamp state="run" pulse={runningCount > 0} size={7} />
+          <span className="truncate">
+            {runningCount} running · {sortedAgents.length} agents · {visibleSessions.length} sessions
+            {groupDMs.length > 0 ? ` · ${groupDMs.length} DMs` : ""}
+          </span>
         </div>
-      )}
 
-      <main className="p-4 space-y-6">
+        {pushState === "default" && (
+          <div className="mt-3 flex items-center gap-3 rounded-[10px] border border-hairline bg-surface px-3 py-2">
+            <span className="flex-1 text-[13px] text-ink-dim">
+              Enable notifications when sessions finish?
+            </span>
+            <button
+              onClick={pushSubscribe}
+              disabled={pushLoading}
+              className="whitespace-nowrap text-[13px] font-medium text-copper transition-colors hover:text-copper-bright disabled:opacity-40"
+            >
+              {pushLoading ? "..." : "Enable"}
+            </button>
+          </div>
+        )}
+
+        <main className="space-y-6 py-4">
         {/* Agents Section */}
         <section>
-            <div className="flex items-center justify-between mb-2">
-              <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">Agents</h2>
-              {agents.some((a) => (a.cronExpr ?? "") !== "") && (
-                <button
-                  onClick={() => {
-                    const next = !cronPaused;
-                    setCronPaused(next);
-                    agentApi.setCronPaused(next).catch(() => setCronPaused(!next));
-                  }}
-                  className="flex items-center gap-1.5"
-                >
-                  <span className={`relative inline-flex h-3 w-6 shrink-0 items-center rounded-full transition-colors duration-200 ${
-                    cronPaused ? "bg-neutral-700" : "bg-emerald-600/60"
-                  }`}>
-                    <span className={`inline-block h-2 w-2 rounded-full bg-white transition-transform duration-200 ${
-                      cronPaused ? "translate-x-0.5" : "translate-x-[14px]"
-                    }`} />
-                  </span>
-                  <span className={`text-[10px] transition-colors ${
-                    cronPaused ? "text-neutral-500" : "text-neutral-500"
-                  }`}>
-                    {cronPaused ? "cron paused" : "cron running"}
-                  </span>
-                </button>
-              )}
-            </div>
-            {sortedAgents.length === 0 && (
-              <p className="text-neutral-500 text-center py-8 text-sm">No agents yet</p>
+          <div className="mb-2 flex items-center justify-between px-0.5">
+            <h2 className="font-mono text-[11px] uppercase tracking-wide text-ink-faint">
+              Agents · {sortedAgents.length}
+            </h2>
+            {agents.some((a) => (a.cronExpr ?? "") !== "") && (
+              <button
+                onClick={() => {
+                  const next = !cronPaused;
+                  setCronPaused(next);
+                  agentApi.setCronPaused(next).catch(() => setCronPaused(!next));
+                }}
+                className="flex items-center gap-1.5"
+              >
+                <span className={`relative inline-flex h-3 w-6 shrink-0 items-center rounded-full transition-colors duration-200 ${
+                  cronPaused ? "bg-hairline" : "bg-lamp-run/50"
+                }`}>
+                  <span className={`inline-block h-2 w-2 rounded-full bg-ink transition-transform duration-200 ${
+                    cronPaused ? "translate-x-0.5" : "translate-x-[14px]"
+                  }`} />
+                </span>
+                <span className="font-mono text-[10px] text-ink-faint">
+                  {cronPaused ? "cron paused" : "cron running"}
+                </span>
+              </button>
             )}
-            <div className="space-y-2">
+          </div>
+
+          {sortedAgents.length === 0 ? (
+            <p className="py-8 text-center text-sm text-ink-faint">No agents yet</p>
+          ) : (
+            <div className="divide-y divide-hairline overflow-hidden rounded-[10px] border border-hairline bg-surface">
               {sortedAgents.map((agent) => {
-                const isCollapsed = collapsedAgents.has(agent.id);
+                const open = !collapsedAgents.has(agent.id);
+                const ts = agent.lastMessage ? agent.lastMessage.timestamp : agent.createdAt;
+                const preview = agent.holderPeer
+                  ? `転移中 @ ${agent.holderPeerName || agent.holderPeer.slice(0, 8)} — 最新発言はこの端末では未反映`
+                  : agent.lastMessage
+                    ? `${agent.lastMessage.role === "user" ? "You: " : ""}${agent.lastMessage.content}`
+                    : agent.persona
+                      ? agent.persona.slice(0, 60) + (agent.persona.length > 60 ? "..." : "")
+                      : "No messages yet";
                 return (
-                  <div
-                    key={agent.id}
-                    className="flex items-center bg-neutral-900 hover:bg-neutral-800 rounded-lg border border-neutral-800 transition-colors"
-                  >
+                  <div key={agent.id} className={`flex items-stretch transition-colors hover:bg-hover${rowEdge(agent.id === activeAgentId)}`}>
                     <button
-                      onClick={(e) => toggleCollapseAgent(agent.id, e)}
-                      className="p-2 pl-3 text-neutral-600 hover:text-neutral-400 shrink-0 self-stretch flex items-center"
-                      title={isCollapsed ? "Expand" : "Collapse"}
+                      onClick={() => navigate(`/agents/${agent.id}`)}
+                      className="flex min-w-0 flex-1 items-center gap-3 py-3 pl-3 pr-1 text-left"
                     >
-                      <svg
-                        className={`w-3 h-3 transition-transform ${isCollapsed ? "" : "rotate-90"}`}
-                        fill="none"
-                        viewBox="0 0 24 24"
-                        stroke="currentColor"
-                        strokeWidth={2}
-                      >
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-                      </svg>
+                      <AgentAvatar agentId={agent.id} name={agent.name} size="xs" cacheBust={agent.avatarHash} />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-baseline gap-2">
+                          <span className="min-w-0 truncate text-[15px] font-semibold text-ink">{agent.name}</span>
+                          {agent.holderPeer && (
+                            <span className="shrink-0 text-[10px] text-copper" title={agent.holderPeer}>
+                              転移中 @ {agent.holderPeerName || agent.holderPeer.slice(0, 8)}
+                            </span>
+                          )}
+                          <RelTime value={ts} className="ml-auto" />
+                        </div>
+                        {open && (
+                          <>
+                            <div className="mt-0.5 truncate text-[13px] text-ink-dim">{preview}</div>
+                            <div className="mt-1 flex min-w-0 items-center gap-1.5 overflow-hidden">
+                              <Chip className="shrink-0">{agent.tool}</Chip>
+                              {agent.model && <Chip className="min-w-0 max-w-[45%]">{agent.model}</Chip>}
+                              {agent.workDir && (
+                                <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-ink-faint">{agent.workDir}</span>
+                              )}
+                            </div>
+                          </>
+                        )}
+                      </div>
                     </button>
+
                     {agent.holderPeer && (
                       <button
                         onClick={async (e) => {
@@ -489,110 +534,21 @@ export function Dashboard() {
                             window.alert(`Force-reclaim failed: ${errMsg(err)}`);
                           }
                         }}
-                        className="px-2 py-1 mr-1 bg-amber-900/60 hover:bg-amber-900 text-amber-200 rounded text-[10px] shrink-0"
+                        className="my-2 mr-1 shrink-0 self-start rounded-full border border-lamp-warn/40 px-2 py-1 text-[10px] text-lamp-warn transition-colors hover:bg-lamp-warn/10"
                         title="Force-reclaim: rewrite agent_locks back to this host and restart the runtime. Use when device-switch left the agent stuck on an unreachable peer."
                       >
                         強制復帰
                       </button>
                     )}
-                    <button
-                      onClick={() => navigate(`/agents/${agent.id}`)}
-                      className={`flex-1 flex items-center gap-3 text-left min-w-0 ${isCollapsed ? "py-1.5 pr-3 pl-1" : "p-3 pl-1"}`}
-                    >
-                      {!isCollapsed && (
-                        <AgentAvatar agentId={agent.id} name={agent.name} size="lg" cacheBust={agent.avatarHash} />
-                      )}
-                      {isCollapsed ? (
-                        <div className="flex items-center gap-2 flex-1 min-w-0">
-                          <span className="font-medium text-sm truncate">{agent.name}</span>
-                          {agent.holderPeer && (
-                            <span className="text-[10px] text-amber-400/80 shrink-0" title={agent.holderPeer}>
-                              転移中 @ {agent.holderPeerName || agent.holderPeer.slice(0, 8)}
-                            </span>
-                          )}
-                          <span className="text-[10px] text-neutral-600 font-mono">{agent.tool}</span>
-                          <span className="text-[10px] text-neutral-600 shrink-0 ml-auto">
-                            {agent.lastMessage
-                              ? timeAgo(agent.lastMessage.timestamp)
-                              : timeAgo(agent.createdAt)}
-                          </span>
-                        </div>
-                      ) : (
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center justify-between">
-                            <span className="font-medium text-sm truncate">{agent.name}</span>
-                            <span className="text-[10px] text-neutral-600 shrink-0 ml-2">
-                              {agent.lastMessage
-                                ? timeAgo(agent.lastMessage.timestamp)
-                                : timeAgo(agent.createdAt)}
-                            </span>
-                          </div>
-                          <div className="text-xs text-neutral-500 truncate mt-0.5">
-                            {agent.holderPeer
-                              ? `転移中 @ ${agent.holderPeerName || agent.holderPeer.slice(0, 8)} — 最新発言はこの端末では未反映`
-                              : agent.lastMessage
-                                ? `${agent.lastMessage.role === "user" ? "You: " : ""}${agent.lastMessage.content}`
-                                : agent.persona
-                                  ? agent.persona.slice(0, 60) + (agent.persona.length > 60 ? "..." : "")
-                                  : "No messages yet"}
-                          </div>
-                          <div className="flex items-center gap-2 mt-1">
-                            <span className="text-[10px] text-neutral-600 font-mono">{agent.tool}</span>
-                            {agent.model && (
-                              <span className="text-[10px] text-neutral-600 font-mono">{agent.model}</span>
-                            )}
-                            {agent.workDir && (
-                              <span className="text-[10px] text-neutral-600 font-mono truncate">{agent.workDir}</span>
-                            )}
-                          </div>
-                        </div>
-                      )}
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-          </section>
 
-        {/* Group DMs Section */}
-        <section>
-          <div className="flex items-center justify-between mb-2">
-            <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">Group DMs</h2>
-            <button
-              onClick={() => {
-                resetCreateGroupForm();
-                setShowCreateGroupDialog(true);
-              }}
-              disabled={sortedAgents.length < 2}
-              className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-xs disabled:opacity-40"
-            >
-              + Group
-            </button>
-          </div>
-          {groupDMs.length === 0 && (
-            <p className="text-neutral-500 text-center py-8 text-sm">No group DMs</p>
-          )}
-          <div className="space-y-2">
-            {[...groupDMs]
-              .sort((a, b) => {
-                const diff = new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
-                if (diff !== 0 && !Number.isNaN(diff)) return diff;
-                return a.id.localeCompare(b.id);
-              })
-              .map((g) => {
-                const isCollapsed = collapsedGroupDMs.has(g.id);
-                return (
-                  <div
-                    key={g.id}
-                    className="flex items-center bg-neutral-900 hover:bg-neutral-800 rounded-lg border border-neutral-800 transition-colors"
-                  >
                     <button
-                      onClick={(e) => toggleCollapseGroupDM(g.id, e)}
-                      className="p-2 pl-3 text-neutral-600 hover:text-neutral-400 shrink-0 self-stretch flex items-center"
-                      title={isCollapsed ? "Expand" : "Collapse"}
+                      onClick={(e) => toggleCollapseAgent(agent.id, e)}
+                      className="flex w-8 shrink-0 items-center justify-center text-ink-faint transition-colors hover:text-ink-dim"
+                      title={open ? "Collapse" : "Expand"}
+                      aria-label={open ? "Collapse" : "Expand"}
                     >
                       <svg
-                        className={`w-3 h-3 transition-transform ${isCollapsed ? "" : "rotate-90"}`}
+                        className={`h-3 w-3 transition-transform ${open ? "rotate-90" : ""}`}
                         fill="none"
                         viewBox="0 0 24 24"
                         stroke="currentColor"
@@ -601,148 +557,206 @@ export function Dashboard() {
                         <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
                       </svg>
                     </button>
-                    <button
-                      onClick={() => navigate(`/groupdms/${g.id}`)}
-                      className={`flex-1 flex items-center gap-3 text-left min-w-0 ${isCollapsed ? "py-1.5 pr-3 pl-1" : "p-3 pl-1"}`}
-                    >
-                      {!isCollapsed && (
-                        <div className="flex -space-x-1.5 shrink-0">
-                          {g.members.slice(0, 3).map((m) => (
-                            <AgentAvatar key={m.agentId} agentId={m.agentId} name={m.agentName} size="sm" />
-                          ))}
-                        </div>
-                      )}
-                      {isCollapsed ? (
-                        <div className="flex items-center gap-2 flex-1 min-w-0">
-                          <span className="font-medium text-sm truncate">{g.name}</span>
-                          <span className="text-[10px] text-neutral-600 shrink-0 ml-auto">
-                            {timeAgo(g.updatedAt)}
-                          </span>
-                        </div>
-                      ) : (
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center justify-between">
-                            <span className="font-medium text-sm truncate">{g.name}</span>
-                            <span className="text-[10px] text-neutral-600 shrink-0 ml-2">
-                              {timeAgo(g.updatedAt)}
-                            </span>
-                          </div>
-                          <div className="text-xs text-neutral-500 truncate mt-0.5">
-                            {g.members.map((m) => m.agentName).join(", ")}
-                          </div>
-                        </div>
-                      )}
-                    </button>
                   </div>
                 );
               })}
+            </div>
+          )}
+        </section>
+
+        {/* Group DMs Section */}
+        <section>
+          <div className="mb-2 flex items-center justify-between px-0.5">
+            <h2 className="font-mono text-[11px] uppercase tracking-wide text-ink-faint">
+              Group DMs · {groupDMs.length}
+            </h2>
+            <button
+              onClick={() => {
+                resetCreateGroupForm();
+                setShowCreateGroupDialog(true);
+              }}
+              disabled={sortedAgents.length < 2}
+              className="rounded-full border border-hairline px-2.5 py-1 font-mono text-[11px] text-ink-dim transition-colors hover:bg-hover hover:text-ink disabled:opacity-40"
+            >
+              + Group
+            </button>
           </div>
+
+          {groupDMs.length === 0 ? (
+            <p className="py-8 text-center text-sm text-ink-faint">No group DMs</p>
+          ) : (
+            <div className="divide-y divide-hairline overflow-hidden rounded-[10px] border border-hairline bg-surface">
+              {[...groupDMs]
+                .sort((a, b) => {
+                  const diff = new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+                  if (diff !== 0 && !Number.isNaN(diff)) return diff;
+                  return a.id.localeCompare(b.id);
+                })
+                .map((g) => {
+                  const open = !collapsedGroupDMs.has(g.id);
+                  return (
+                    <div key={g.id} className={`flex items-stretch transition-colors hover:bg-hover${rowEdge(g.id === activeGroupId)}`}>
+                      <button
+                        onClick={() => navigate(`/groupdms/${g.id}`)}
+                        className="flex min-w-0 flex-1 items-center gap-3 py-3 pl-3 pr-1 text-left"
+                      >
+                        <div className="flex shrink-0 -space-x-1.5">
+                          {g.members.slice(0, 3).map((m) => (
+                            <AgentAvatar key={m.agentId} agentId={m.agentId} name={m.agentName} size="xs" />
+                          ))}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-baseline gap-2">
+                            <span className="min-w-0 truncate text-[15px] font-semibold text-ink">{g.name}</span>
+                            <RelTime value={g.updatedAt} className="ml-auto" />
+                          </div>
+                          {open && (
+                            <div className="mt-0.5 truncate text-[13px] text-ink-dim">
+                              {g.members.map((m) => m.agentName).join(", ")}
+                            </div>
+                          )}
+                        </div>
+                      </button>
+
+                      <button
+                        onClick={(e) => toggleCollapseGroupDM(g.id, e)}
+                        className="flex w-8 shrink-0 items-center justify-center text-ink-faint transition-colors hover:text-ink-dim"
+                        title={open ? "Collapse" : "Expand"}
+                        aria-label={open ? "Collapse" : "Expand"}
+                      >
+                        <svg
+                          className={`h-3 w-3 transition-transform ${open ? "rotate-90" : ""}`}
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          stroke="currentColor"
+                          strokeWidth={2}
+                        >
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                        </svg>
+                      </button>
+                    </div>
+                  );
+                })}
+            </div>
+          )}
         </section>
 
         {/* Sessions Section */}
         <section>
-          <div className="flex items-center justify-between mb-2">
-            <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">Sessions</h2>
+          <div className="mb-2 flex items-center justify-between px-0.5">
+            <h2 className="font-mono text-[11px] uppercase tracking-wide text-ink-faint">
+              Sessions · {groups.length}
+            </h2>
           </div>
 
-          {!hasAnySessions && (
-            <p className="text-neutral-500 text-center py-8 text-sm">No sessions</p>
-          )}
-
-          <div className="space-y-3">
-            {groups.map((g) => {
-              const runningOthers = g.others.filter((s) => s.status === "running");
-              const stoppedOthers = g.others.filter((s) => s.status !== "running");
-              const allExited = g.primary.status !== "running" && runningOthers.length === 0;
-              return (
-                <div key={g.key} className="bg-neutral-900 rounded-lg border border-neutral-800 relative">
-                  <button
-                    onClick={() => navigate(sessionHref(g.primary))}
-                    className="w-full text-left p-4 hover:bg-neutral-800 rounded-lg"
-                  >
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className="font-mono font-bold">{g.tool}</span>
-                      {g.primary.toolSessionId && (
-                        <span className="text-[10px] text-neutral-600 font-mono truncate">{g.primary.toolSessionId.slice(0, 8)}</span>
-                      )}
-                    </div>
-                    <div className="text-sm text-neutral-400 truncate">{g.workDir}</div>
-                    <div className="flex items-center gap-2 mt-2 text-xs text-neutral-500">
-                      <span
-                        className={`inline-block w-2 h-2 rounded-full ${
-                          g.primary.status === "running" ? "bg-green-500" : "bg-neutral-600"
-                        }`}
-                      />
-                      <span>{g.primary.status}</span>
-                      {g.primary.exitCode !== undefined && <span>(exit {g.primary.exitCode})</span>}
-                      <span className="ml-auto">{timeAgo(g.primary.createdAt)}</span>
-                    </div>
-                  </button>
-                  <div className="absolute top-3 right-3 flex items-center gap-1">
-                    <button
-                      onClick={() => navigate(`/new?tool=${encodeURIComponent(g.tool)}&workDir=${encodeURIComponent(g.workDir)}`)}
-                      className="p-2 text-neutral-600 hover:text-neutral-300 rounded"
-                      title="New session"
-                      aria-label="New session"
-                    >
-                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
-                        <path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" />
-                      </svg>
-                    </button>
-                    {allExited && (
+          {!hasAnySessions ? (
+            <p className="py-8 text-center text-sm text-ink-faint">No sessions</p>
+          ) : (
+            <div className="divide-y divide-hairline overflow-hidden rounded-[10px] border border-hairline bg-surface">
+              {groups.map((g) => {
+                const runningOthers = g.others.filter((s) => s.status === "running");
+                const stoppedOthers = g.others.filter((s) => s.status !== "running");
+                const allExited = g.primary.status !== "running" && runningOthers.length === 0;
+                const groupActive =
+                  activeSessionId !== null &&
+                  [g.primary, ...g.others].some((s) => s.id === activeSessionId);
+                return (
+                  <div key={g.key}>
+                    <div className={`flex items-stretch transition-colors hover:bg-hover${rowEdge(groupActive)}`}>
                       <button
-                        onClick={(e) => deleteGroup(g, e)}
-                        className="p-2 text-neutral-600 hover:text-red-400 rounded"
-                        title="Remove"
-                        aria-label="Remove"
+                        onClick={() => navigate(sessionHref(g.primary))}
+                        className="flex min-w-0 flex-1 items-center gap-2.5 px-3 py-3 text-left"
                       >
-                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
-                          <path fillRule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.519.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" clipRule="evenodd" />
-                        </svg>
+                        <Lamp
+                          state={sessionLampState(g.primary)}
+                          pulse={g.primary.status === "running"}
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex min-w-0 items-center gap-2">
+                            <span className="font-mono text-[14px] font-semibold text-ink">{g.tool}</span>
+                            {g.primary.toolSessionId && (
+                              <span className="truncate font-mono text-[11px] text-ink-faint">
+                                {g.primary.toolSessionId.slice(0, 8)}
+                              </span>
+                            )}
+                            {g.primary.exitCode !== undefined && (
+                              <span className="shrink-0 font-mono text-[11px] text-ink-faint">
+                                exit {g.primary.exitCode}
+                              </span>
+                            )}
+                          </div>
+                          <div className="mt-0.5 truncate font-mono text-[12px] text-ink-dim">{g.workDir}</div>
+                        </div>
                       </button>
+                      <div className="flex shrink-0 items-center gap-0.5 pr-2">
+                        <RelTime value={g.primary.createdAt} className="mr-1" />
+                        <button
+                          onClick={() => navigate(`/new?tool=${encodeURIComponent(g.tool)}&workDir=${encodeURIComponent(g.workDir)}`)}
+                          className="rounded-[10px] p-2 text-ink-faint transition-colors hover:bg-hover hover:text-ink"
+                          title="New session"
+                          aria-label="New session"
+                        >
+                          <svg viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5">
+                            <path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" />
+                          </svg>
+                        </button>
+                        {allExited && (
+                          <button
+                            onClick={(e) => deleteGroup(g, e)}
+                            className="rounded-[10px] p-2 text-ink-faint transition-colors hover:bg-hover hover:text-lamp-err"
+                            title="Remove"
+                            aria-label="Remove"
+                          >
+                            <svg viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5">
+                              <path fillRule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.519.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" clipRule="evenodd" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    {runningOthers.map((s) => (
+                      <button
+                        key={s.id}
+                        onClick={() => navigate(sessionHref(s))}
+                        className="flex w-full items-center gap-2 border-t border-hairline px-3 py-2 text-left font-mono text-[11px] text-ink-faint transition-colors hover:bg-hover"
+                      >
+                        <Lamp state="run" pulse size={6} />
+                        <span>{s.status}</span>
+                        {s.toolSessionId && <span>{s.toolSessionId.slice(0, 8)}</span>}
+                        <RelTime value={s.createdAt} className="ml-auto" />
+                      </button>
+                    ))}
+                    {stoppedOthers.length > 0 && (
+                      <>
+                        <button
+                          onClick={() => toggleExpand(g.key)}
+                          className="w-full border-t border-hairline px-3 py-2 text-left font-mono text-[11px] text-ink-faint transition-colors hover:text-ink-dim"
+                        >
+                          {expanded.has(g.key) ? "Hide" : `+${stoppedOthers.length} more`}
+                        </button>
+                        {expanded.has(g.key) && stoppedOthers.map((s) => (
+                          <button
+                            key={s.id}
+                            onClick={() => navigate(sessionHref(s))}
+                            className="flex w-full items-center gap-2 border-t border-hairline px-3 py-2 text-left font-mono text-[11px] text-ink-faint transition-colors hover:bg-hover"
+                          >
+                            <Lamp state={sessionLampState(s)} size={6} />
+                            <span>{s.status}</span>
+                            {s.toolSessionId && <span>{s.toolSessionId.slice(0, 8)}</span>}
+                            {s.exitCode !== undefined && <span>(exit {s.exitCode})</span>}
+                            <RelTime value={s.createdAt} className="ml-auto" />
+                          </button>
+                        ))}
+                      </>
                     )}
                   </div>
-                  {runningOthers.map((s) => (
-                    <button
-                      key={s.id}
-                      onClick={() => navigate(sessionHref(s))}
-                      className="w-full text-left px-4 py-2.5 hover:bg-neutral-800 border-t border-neutral-800 flex items-center gap-2 text-xs text-neutral-500"
-                    >
-                      <span className="inline-block w-1.5 h-1.5 rounded-full shrink-0 bg-green-500" />
-                      <span>{s.status}</span>
-                      {s.toolSessionId && <span className="font-mono text-neutral-600">{s.toolSessionId.slice(0, 8)}</span>}
-                      <span className="ml-auto">{timeAgo(s.createdAt)}</span>
-                    </button>
-                  ))}
-                  {stoppedOthers.length > 0 && (
-                    <>
-                      <button
-                        onClick={() => toggleExpand(g.key)}
-                        className="w-full px-4 py-2 text-xs text-neutral-500 hover:text-neutral-400 border-t border-neutral-800 text-left"
-                      >
-                        {expanded.has(g.key) ? "Hide" : `+${stoppedOthers.length} more`}
-                      </button>
-                      {expanded.has(g.key) && stoppedOthers.map((s) => (
-                        <button
-                          key={s.id}
-                          onClick={() => navigate(sessionHref(s))}
-                          className="w-full text-left px-4 py-2.5 hover:bg-neutral-800 border-t border-neutral-800 flex items-center gap-2 text-xs text-neutral-500"
-                        >
-                          <span className="inline-block w-1.5 h-1.5 rounded-full shrink-0 bg-neutral-600" />
-                          <span>{s.status}</span>
-                          {s.toolSessionId && <span className="font-mono text-neutral-600">{s.toolSessionId.slice(0, 8)}</span>}
-                          {s.exitCode !== undefined && <span>(exit {s.exitCode})</span>}
-                          <span className="ml-auto">{timeAgo(s.createdAt)}</span>
-                        </button>
-                      ))}
-                    </>
-                  )}
-                </div>
-              );
-            })}
-          </div>
+                );
+              })}
+            </div>
+          )}
         </section>
-      </main>
+        </main>
+      </div>
 
       {showCreateGroupDialog && (
         <div
@@ -760,51 +774,51 @@ export function Dashboard() {
         >
           <form
             onSubmit={submitCreateGroup}
-            className="w-full max-w-[420px] max-h-[85vh] bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl flex flex-col"
+            className="flex max-h-[85vh] w-full max-w-[420px] flex-col rounded-[10px] border border-hairline bg-raised shadow-xl shadow-black/50"
           >
-            <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-800 shrink-0">
-              <h3 className="text-sm font-medium text-neutral-200">New group DM</h3>
+            <div className="flex shrink-0 items-center justify-between border-b border-hairline px-4 py-3">
+              <h3 className="text-sm font-medium text-ink">New group DM</h3>
               <button
                 type="button"
                 onClick={() => setShowCreateGroupDialog(false)}
                 disabled={creatingGroup}
-                className="p-1 text-neutral-500 hover:text-neutral-300 rounded disabled:opacity-40"
+                className="rounded p-1 text-ink-faint transition-colors hover:text-ink disabled:opacity-40"
                 aria-label="Close"
               >
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-4 h-4">
+                <svg viewBox="0 0 16 16" fill="currentColor" className="h-4 w-4">
                   <path d="M5.28 4.22a.75.75 0 00-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 101.06 1.06L8 9.06l2.72 2.72a.75.75 0 101.06-1.06L9.06 8l2.72-2.72a.75.75 0 00-1.06-1.06L8 6.94 5.28 4.22z" />
                 </svg>
               </button>
             </div>
 
-            <div className="p-4 space-y-4 overflow-y-auto">
+            <div className="space-y-4 overflow-y-auto p-4">
               <label className="block">
-                <span className="block text-xs text-neutral-500 mb-1">Name</span>
+                <span className="mb-1 block text-xs text-ink-dim">Name</span>
                 <input
                   value={newGroupName}
                   onChange={(e) => setNewGroupName(e.target.value)}
                   placeholder={selectedNewGroupMembers.map((a) => a.name).join(", ")}
                   disabled={creatingGroup}
-                  className="w-full px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm text-neutral-200 focus:outline-none focus:border-neutral-500 disabled:opacity-50"
+                  className="w-full rounded-[10px] border border-hairline bg-app px-3 py-2 text-sm text-ink placeholder:text-ink-faint focus:border-copper disabled:opacity-50"
                   autoFocus
                 />
               </label>
 
-              <label className="flex items-center gap-2 text-sm text-neutral-300 cursor-pointer select-none">
+              <label className="flex cursor-pointer select-none items-center gap-2 text-sm text-ink">
                 <input
                   type="checkbox"
                   checked={newGroupNotifyMembers}
                   onChange={(e) => setNewGroupNotifyMembers(e.target.checked)}
                   disabled={creatingGroup}
-                  className="rounded border-neutral-600 bg-neutral-800 text-blue-500 focus:ring-blue-500/30"
+                  className="rounded border-hairline bg-raised accent-[color:var(--color-copper)]"
                 />
                 Notify members
               </label>
 
               <div>
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs text-neutral-500">Members</span>
-                  <span className="text-[10px] text-neutral-600">{newGroupMemberIds.size} selected</span>
+                <div className="mb-2 flex items-center justify-between">
+                  <span className="text-xs text-ink-dim">Members</span>
+                  <span className="text-[10px] text-ink-faint">{newGroupMemberIds.size} selected</span>
                 </div>
                 <div className="space-y-1.5">
                   {sortedAgents.map((agent) => {
@@ -812,10 +826,10 @@ export function Dashboard() {
                     return (
                       <label
                         key={agent.id}
-                        className={`flex items-center gap-3 p-2 rounded border cursor-pointer select-none ${
+                        className={`flex cursor-pointer select-none items-center gap-3 rounded-[10px] border p-2 transition-colors ${
                           checked
-                            ? "bg-blue-950/30 border-blue-800/60"
-                            : "bg-neutral-950 border-neutral-800 hover:border-neutral-700"
+                            ? "border-copper/50 bg-copper/10"
+                            : "border-hairline bg-app hover:bg-hover"
                         }`}
                       >
                         <input
@@ -823,12 +837,12 @@ export function Dashboard() {
                           checked={checked}
                           onChange={() => toggleNewGroupMember(agent.id)}
                           disabled={creatingGroup}
-                          className="rounded border-neutral-600 bg-neutral-800 text-blue-500 focus:ring-blue-500/30"
+                          className="rounded border-hairline bg-raised accent-[color:var(--color-copper)]"
                         />
-                        <AgentAvatar agentId={agent.id} name={agent.name} size="sm" cacheBust={agent.avatarHash} />
+                        <AgentAvatar agentId={agent.id} name={agent.name} size="xs" cacheBust={agent.avatarHash} />
                         <div className="min-w-0 flex-1">
-                          <div className="text-sm text-neutral-200 truncate">{agent.name}</div>
-                          <div className="text-[10px] text-neutral-600 font-mono truncate">{agent.tool}</div>
+                          <div className="truncate text-sm text-ink">{agent.name}</div>
+                          <div className="truncate font-mono text-[10px] text-ink-faint">{agent.tool}</div>
                         </div>
                       </label>
                     );
@@ -837,26 +851,22 @@ export function Dashboard() {
               </div>
 
               {createGroupError && (
-                <p className="text-xs text-red-400">{createGroupError}</p>
+                <p className="text-xs text-lamp-err">{createGroupError}</p>
               )}
             </div>
 
-            <div className="flex justify-end gap-2 px-4 py-3 border-t border-neutral-800 shrink-0">
+            <div className="flex shrink-0 justify-end gap-2 border-t border-hairline px-4 py-3">
               <button
                 type="button"
                 onClick={() => setShowCreateGroupDialog(false)}
                 disabled={creatingGroup}
-                className="px-3 py-1.5 text-xs text-neutral-400 hover:text-neutral-200 rounded disabled:opacity-50"
+                className="rounded-[10px] px-3 py-1.5 text-sm text-ink-dim transition-colors hover:text-ink disabled:opacity-50"
               >
                 Cancel
               </button>
-              <button
-                type="submit"
-                disabled={creatingGroup || newGroupMemberIds.size < 2}
-                className="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 text-white rounded disabled:opacity-50"
-              >
+              <Button type="submit" variant="primary" disabled={creatingGroup || newGroupMemberIds.size < 2}>
                 {creatingGroup ? "Creating..." : "Create"}
-              </button>
+              </Button>
             </div>
           </form>
         </div>

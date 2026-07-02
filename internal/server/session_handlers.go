@@ -237,16 +237,11 @@ func (s *Server) proxyCreateSessionToPeer(w http.ResponseWriter, r *http.Request
 			"peer routing not available on this host")
 		return
 	}
-	rec, err := s.agents.Store().GetPeer(r.Context(), peerID)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway",
-			"target peer not in registry: "+err.Error())
-		return
-	}
-	addr, err := peer.NormalizeAddress(rec.URL)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway",
-			"target peer has no usable dial address: "+err.Error())
+	// Shared resolve prefix. The tail below is NOT shared with the
+	// other proxy sites: it buffers the response (1 MiB cap) and
+	// re-stamps the `peer` field into the JSON rather than streaming.
+	addr, ok := s.resolvePeerDialAddr(w, r.Context(), s.agents.Store(), peerID)
+	if !ok {
 		return
 	}
 	body, err := json.Marshal(original)

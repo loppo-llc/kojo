@@ -357,7 +357,7 @@ func (s *Server) handleDeleteGroupDM(w http.ResponseWriter, r *http.Request) {
 	// fan-out (notify=true), so a stale-view caller deleting a group
 	// that has just been renamed should get 412, not silently delete
 	// the renamed row. `*` rejected for the same reason as PATCH.
-	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest,
+	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r,
 		"If-Match: * is not supported on DELETE /groupdms/{id}; send a specific etag or omit the header")
 	if !ok {
 		return
@@ -566,7 +566,7 @@ func (s *Server) handleAddGroupMember(w http.ResponseWriter, r *http.Request) {
 
 	// If-Match optional. AddMember mutates the membership list (part
 	// of the group row). `*` rejected as elsewhere.
-	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest,
+	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r,
 		"If-Match: * is not supported on POST /groupdms/{id}/members; send a specific etag or omit the header")
 	if !ok {
 		return
@@ -711,7 +711,7 @@ func (s *Server) handleLeaveGroup(w http.ResponseWriter, r *http.Request) {
 	// If-Match optional. LeaveGroup bumps the group etag (member
 	// list change). `*` rejected — the membership row must already
 	// exist (we 404 below otherwise).
-	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest,
+	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r,
 		"If-Match: * is not supported on DELETE /groupdms/{id}/members/{agentId}; send a specific etag or omit the header")
 	if !ok {
 		return

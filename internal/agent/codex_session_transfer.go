@@ -547,8 +547,7 @@ func StageCodexSession(agentID string, transfer *CodexSessionTransfer) (commit f
 			}
 			s.backup = bk.Name()
 			_ = bk.Close()
-			_ = os.Remove(s.backup)
-			if err := os.Rename(s.final, s.backup); err != nil {
+			if err := renameOverwrite(s.final, s.backup); err != nil {
 				cleanupTmps()
 				rollbackFiles()
 				return nil, nil, fmt.Errorf("agent.StageCodexSession: backup %s: %w", s.final, err)

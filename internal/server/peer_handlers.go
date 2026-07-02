@@ -438,5 +438,20 @@ func (s *Server) handleDeletePeer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 		return
 	}
+	// Push a delete event so connected Subscribers drop the row from
+	// their live cache immediately instead of lingering on a stale
+	// entry until their next full snapshot (reconnect). Mirrors the
+	// upsert/expire publishes on the registrar/sweeper paths. Publish
+	// is nil-safe, so this is a no-op when the peer-events bus is
+	// disabled. Status is offline for the benefit of any subscriber
+	// that stores the event without acting on the delete op.
+	if s.peerEvents != nil {
+		s.peerEvents.Publish(peer.StatusEvent{
+			DeviceID: id,
+			Status:   store.PeerStatusOffline,
+			LastSeen: store.NowMillis(),
+			Op:       peer.StatusOpDelete,
+		})
+	}
 	w.WriteHeader(http.StatusNoContent)
 }

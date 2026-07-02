@@ -1,9 +1,24 @@
 package auth
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 )
+
+// writeJSONError writes the {"error":{"code","message"}} envelope used
+// by internal/server's writeError, but from the auth package so the
+// middleware refusals carry Content-Type: application/json instead of
+// the text/plain (plus trailing newline) that http.Error emits. The
+// status/code/message are the caller's; the wire shape matches
+// server.writeError exactly (map marshals "code" before "message").
+func writeJSONError(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]string{"code": code, "message": message},
+	})
+}
 
 // allowPeerSessionPath returns true when (method, path) names a
 // known RolePeer-callable session route. Explicit list — additions
@@ -63,7 +78,7 @@ func EnforceMiddleware(next http.Handler) http.Handler {
 		p := FromContext(r.Context())
 		if !p.IsOwner() && strings.HasPrefix(r.URL.Path, "/api/v1/") {
 			if !AllowNonOwner(p, r.Method, r.URL.Path) {
-				http.Error(w, `{"error":{"code":"forbidden","message":"forbidden"}}`, http.StatusForbidden)
+				writeJSONError(w, http.StatusForbidden, "forbidden", "forbidden")
 				return
 			}
 		}

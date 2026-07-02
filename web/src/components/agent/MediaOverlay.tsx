@@ -107,14 +107,14 @@ export function MediaOverlay({
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 bg-black/90 backdrop-blur-sm flex items-center justify-center p-4"
       onClick={handleBackdrop}
     >
       <div className="relative flex max-w-[90vw] max-h-[90vh] flex-col items-center">
         <button
           type="button"
           onClick={onClose}
-          className="absolute -top-3 -right-3 w-8 h-8 bg-neutral-800 hover:bg-neutral-700 rounded-full flex items-center justify-center text-neutral-300 hover:text-white z-10 shadow-lg"
+          className="absolute -top-3 -right-3 w-8 h-8 bg-raised hover:bg-hover rounded-full flex items-center justify-center text-ink-dim hover:text-ink z-10 shadow-lg"
           aria-label="Close preview"
         >
           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -123,7 +123,7 @@ export function MediaOverlay({
         </button>
 
         {canNavigate && currentIndex != null && total != null && (
-          <div className="absolute -top-7 left-0 right-0 text-center text-xs text-neutral-500 pointer-events-none">
+          <div className="absolute -top-7 left-0 right-0 text-center font-mono text-[11px] text-ink-faint pointer-events-none">
             {currentIndex + 1} / {total}
           </div>
         )}
@@ -136,7 +136,7 @@ export function MediaOverlay({
                 e.stopPropagation();
                 onNavigate?.(-1);
               }}
-              className="absolute left-2 top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/35 text-neutral-400 transition-colors hover:bg-black/55 hover:text-white"
+              className="absolute left-2 top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/40 text-ink-dim transition-colors hover:bg-black/60 hover:text-ink"
               aria-label="Previous preview"
               title="Previous"
             >
@@ -150,7 +150,7 @@ export function MediaOverlay({
                 e.stopPropagation();
                 onNavigate?.(1);
               }}
-              className="absolute right-2 top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/35 text-neutral-400 transition-colors hover:bg-black/55 hover:text-white"
+              className="absolute right-2 top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/40 text-ink-dim transition-colors hover:bg-black/60 hover:text-ink"
               aria-label="Next preview"
               title="Next"
             >
@@ -170,15 +170,15 @@ export function MediaOverlay({
               className="mx-auto block max-w-[90vw] max-h-[85vh] object-contain rounded-lg shadow-2xl"
             />
           ) : videoError ? (
-            <div className="flex flex-col items-center gap-3 p-8 bg-neutral-900 rounded-lg shadow-2xl">
-              <svg className="w-12 h-12 text-neutral-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+            <div className="flex flex-col items-center gap-3 p-8 bg-surface rounded-[10px] shadow-2xl">
+              <svg className="w-12 h-12 text-ink-faint" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
               </svg>
-              <p className="text-sm text-neutral-400">This video format cannot be played in the browser.</p>
+              <p className="text-sm text-ink-dim">This video format cannot be played in the browser.</p>
               <a
                 href={`${rawUrl}&download=1`}
                 download={fileName}
-                className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition-colors"
+                className="px-4 py-2 bg-copper hover:bg-copper-bright text-[#14100b] font-semibold text-sm rounded-[10px] transition-colors"
                 onClick={(e) => e.stopPropagation()}
               >
                 Download
@@ -198,7 +198,7 @@ export function MediaOverlay({
         </div>
 
         <div
-          className="mt-2 max-w-[90vw] whitespace-pre-wrap text-center text-xs text-neutral-400 font-mono wrap-anywhere"
+          className="mt-2 max-w-[90vw] whitespace-pre-wrap text-center text-xs text-ink-dim font-mono wrap-anywhere"
           style={{ width: mediaWidth ? `${mediaWidth}px` : "min(90vw, 32rem)" }}
         >
           {caption}

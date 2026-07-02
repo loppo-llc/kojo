@@ -159,13 +159,13 @@ func (s *Server) handleRawAgentFile(w http.ResponseWriter, r *http.Request) {
 	rel := r.URL.Query().Get("path")
 	_, abs, err := resolveAgentPath(id, rel)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
 	// Must be a real file, not a directory.
 	info, err := os.Stat(abs)
 	if err != nil || info.IsDir() {
-		http.Error(w, "file not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "not_found", "file not found")
 		return
 	}
 	if r.URL.Query().Get("download") == "1" {
@@ -173,7 +173,9 @@ func (s *Server) handleRawAgentFile(w http.ResponseWriter, r *http.Request) {
 			"filename": filepath.Base(abs),
 		}))
 	}
-	s.files.ServeRaw(w, r, abs)
+	if err := s.files.ServeRaw(w, r, abs); err != nil {
+		writeServeErr(w, err)
+	}
 }
 
 // handleThumbAgentFile serves a JPEG thumbnail for an agent-scoped image.
@@ -190,14 +192,16 @@ func (s *Server) handleThumbAgentFile(w http.ResponseWriter, r *http.Request) {
 	rel := r.URL.Query().Get("path")
 	_, abs, err := resolveAgentPath(id, rel)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
 	info, err := os.Stat(abs)
 	if err != nil || info.IsDir() {
-		http.Error(w, "file not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "not_found", "file not found")
 		return
 	}
 	size, _ := strconv.Atoi(r.URL.Query().Get("size"))
-	s.files.ServeThumb(w, r, abs, size)
+	if err := s.files.ServeThumb(w, r, abs, size); err != nil {
+		writeServeErr(w, err)
+	}
 }

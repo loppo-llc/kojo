@@ -1,3 +1,8 @@
+import { Field } from "../../ui/Field";
+import { Textarea } from "../../ui/Textarea";
+import { Input } from "../../ui/Input";
+import { Button } from "../../ui/Button";
+
 /**
  * The "Persona" field: a description textarea plus an inline "AI" prompt row
  * that regenerates/edits the persona. The per-caller differences (textarea
@@ -32,20 +37,16 @@ export function PersonaField({
   onGenerate: () => void;
 }) {
   return (
-    <div>
-      <label className="block text-sm text-neutral-400 mb-2">
-        Persona
-      </label>
-      <textarea
+    <Field label="Persona">
+      <Textarea
         value={persona}
         onChange={(e) => setPersona(e.target.value)}
         placeholder={textareaPlaceholder}
         rows={textareaRows}
-        className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm resize-none focus:outline-none focus:border-neutral-500"
       />
-      <div className="flex gap-2 mt-2">
-        <input
-          type="text"
+      <div className="mt-2 flex gap-2">
+        <Input
+          aria-label="Persona generation prompt"
           value={personaPrompt}
           onChange={(e) => setPersonaPrompt(e.target.value)}
           onKeyDown={(e) => {
@@ -55,20 +56,16 @@ export function PersonaField({
             }
           }}
           placeholder={promptPlaceholder}
-          className="flex-1 px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-xs focus:outline-none focus:border-neutral-500"
+          className="flex-1"
         />
-        <button
+        <Button
           onClick={onGenerate}
           disabled={busy || !personaPrompt.trim()}
-          className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-xs disabled:opacity-40 flex items-center gap-1"
+          className="flex shrink-0 items-center gap-1"
         >
-          {spinning ? (
-            <span className="animate-spin">↻</span>
-          ) : (
-            "✨ AI"
-          )}
-        </button>
+          {spinning ? <span className="animate-spin">↻</span> : "✨ AI"}
+        </Button>
       </div>
-    </div>
+    </Field>
   );
 }

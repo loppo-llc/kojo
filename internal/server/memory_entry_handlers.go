@@ -327,7 +327,7 @@ func (s *Server) handleUpdateAgentMemoryEntry(w http.ResponseWriter, r *http.Req
 	// `*` doesn't compose with the file-and-DB write trio (we'd
 	// silently overwrite a value the user didn't see). Mirror the
 	// MEMORY.md handler's policy.
-	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest, "If-Match wildcard is not supported")
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, "If-Match wildcard is not supported")
 	if !ok {
 		return
 	}
@@ -371,7 +371,7 @@ func (s *Server) handleDeleteAgentMemoryEntry(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusForbidden, "forbidden", "agents may only edit their own memory")
 		return
 	}
-	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest, "If-Match wildcard is not supported")
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, "If-Match wildcard is not supported")
 	if !ok {
 		return
 	}

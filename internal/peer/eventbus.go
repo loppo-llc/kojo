@@ -19,8 +19,9 @@ type StatusEvent struct {
 	LastSeen int64  `json:"last_seen,omitempty"` // unix millis
 	// Op is "upsert" for register / first-touch, "touch" for
 	// heartbeat status refreshes, "expire" for sweeper-driven
-	// stale flips. Lets a subscriber gate on which mutations matter
-	// without re-deriving from before/after rows.
+	// stale flips, "delete" for operator-driven row removal. Lets a
+	// subscriber gate on which mutations matter without re-deriving
+	// from before/after rows.
 	Op string `json:"op"`
 }
 
@@ -31,6 +32,12 @@ const (
 	StatusOpUpsert = "upsert"
 	StatusOpTouch  = "touch"
 	StatusOpExpire = "expire"
+	// StatusOpDelete signals the row was removed from peer_registry
+	// (operator DELETE). Unlike expire — which flips status to
+	// offline but keeps the row — delete means the peer is gone
+	// entirely, so a Subscriber drops it from its live cache rather
+	// than storing an offline entry that would linger forever.
+	StatusOpDelete = "delete"
 )
 
 // EventBus is the in-memory pub/sub for peer_registry status

@@ -4,9 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"net/url"
-	"sync"
-	"time"
 
 	"github.com/coder/websocket"
 	"github.com/loppo-llc/kojo/internal/auth"
@@ -108,92 +105,29 @@ func (s *Server) proxyAgentWebSocket(w http.ResponseWriter, r *http.Request, age
 			"target peer has no usable dial address: "+err.Error())
 		return
 	}
-	targetURL, err := url.Parse(addr)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway",
-			"target address unparseable: "+err.Error())
-		return
-	}
-	if !rewriteHTTPSchemeToWS(w, targetURL) {
-		return
-	}
-	targetURL.Path = "/api/v1/agents/" + agentID + "/ws"
 
-	// Build the upgrade request. Authentication is by Tailnet
-	// identity — the WS dial travels over tsnet and the target's
-	// ServeAuthTsnet stamps RolePeer from the WhoIs-resolved
-	// peer_registry row, so no Authorization header is required.
-	upgrade, err := http.NewRequestWithContext(r.Context(),
-		http.MethodGet, targetURL.String(), nil)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal",
-			"build upgrade request: "+err.Error())
-		return
-	}
-	// Dial the target's WS FIRST so a target-side reject (lock
-	// has rotated again, target down, etc.) surfaces as a clean
-	// HTTP error before we've upgraded the inbound conn.
-	//
-	// HTTPClient with keep-alives disabled: the legacy
-	// Ed25519-signed Authorization header carried a single-use
-	// nonce that the Go default transport would silently resend on
-	// stale idle connections, replaying the nonce and getting
-	// rejected. The signing path is retired, but keeping a fresh
-	// TCP/TLS handshake per upgrade is cheap (one extra round-trip
-	// matches the subscriber dial budget) and avoids surprises if
-	// future inter-peer auth reintroduces nonce-bearing headers.
-	targetConn, _, err := websocket.Dial(r.Context(), targetURL.String(),
-		&websocket.DialOptions{
-			HTTPHeader: upgrade.Header,
-			HTTPClient: peer.NoKeepAliveHTTPClient(10 * time.Second),
-		})
-	if err != nil {
-		s.logger.Warn("agent ws proxy: dial target failed",
-			"agent", agentID, "target", targetDeviceID, "err", err)
-		writeError(w, http.StatusBadGateway, "bad_gateway",
-			"connect to holder peer: "+err.Error())
-		return
-	}
-	defer targetConn.CloseNow()
-
-	// Now upgrade the inbound (UI) connection. Origin patterns
-	// match the local handler so a browser tab from the Hub UI
-	// is accepted; the cross-peer proxy doesn't change that
-	// gate.
-	clientConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: wsOriginPatterns,
+	// forwardWebSocketToPeer dials the target FIRST (so a target-side
+	// reject surfaces as a clean HTTP error before the inbound conn is
+	// upgraded), authenticates by Tailnet identity (no Authorization
+	// header), and disables keep-alives per hop. See its doc comment.
+	s.forwardWebSocketToPeer(w, r, peerWSForward{
+		addr:           addr,
+		path:           "/api/v1/agents/" + agentID + "/ws",
+		buildErrPrefix: "build upgrade request: ",
+		dialErrPrefix:  "connect to holder peer: ",
+		onDialErr: func(err error) {
+			s.logger.Warn("agent ws proxy: dial target failed",
+				"agent", agentID, "target", targetDeviceID, "err", err)
+		},
+		onAcceptErr: func(err error) {
+			s.logger.Error("agent ws proxy: accept inbound failed",
+				"agent", agentID, "err", err)
+		},
+		onClosed: func() {
+			s.logger.Debug("agent ws proxy: closed",
+				"agent", agentID, "target", targetDeviceID)
+		},
 	})
-	if err != nil {
-		s.logger.Error("agent ws proxy: accept inbound failed",
-			"agent", agentID, "err", err)
-		return
-	}
-	defer clientConn.CloseNow()
-	// Mirror the local handler's read limit so a buggy / hostile
-	// peer can't fan a multi-megabyte frame straight into the
-	// browser.
-	clientConn.SetReadLimit(256 * 1024)
-	targetConn.SetReadLimit(256 * 1024)
-
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		defer cancel()
-		copyWS(ctx, clientConn, targetConn)
-	}()
-	go func() {
-		defer wg.Done()
-		defer cancel()
-		copyWS(ctx, targetConn, clientConn)
-	}()
-	wg.Wait()
-
-	s.logger.Debug("agent ws proxy: closed",
-		"agent", agentID, "target", targetDeviceID)
 }
 
 // fencingAllowsAgentWrite returns true when the local peer is

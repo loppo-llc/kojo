@@ -199,6 +199,28 @@ func (r *Registrar) selfURL() string {
 	return r.publicURL
 }
 
+// selfIdentity returns the URL + NodeKey columns to write, read under
+// a single RLock so the two stay consistent. Start and tickOnce's
+// reseed path both stamp NodeKey via this helper so their UpsertPeer
+// records carry the same identity columns RefreshPublicName writes —
+// otherwise a reseed after the row vanished would drop node_key and
+// re-quarantine the self-row until the next RefreshPublicName lands.
+//
+// NodeKey is legitimately empty at Start (tsnet/tailscaled hasn't
+// reported its NodeKey yet; SetSelfNodeKey runs later once Status
+// resolves). UpsertPeer treats an empty node_key as "no change", so
+// stamping the empty value at Start is a safe no-op on the column,
+// while a later reseed — after SetSelfNodeKey has populated it —
+// correctly restamps the real NodeKey.
+func (r *Registrar) selfIdentity() (url, nodeKey string) {
+	if r == nil {
+		return "", ""
+	}
+	r.publicMu.RLock()
+	defer r.publicMu.RUnlock()
+	return r.publicURL, r.selfNodeKey
+}
+
 // Start performs the initial peer_registry upsert (online + last_seen
 // = now) and launches the heartbeat goroutine. Returns the upsert
 // error verbatim if the row write fails — callers SHOULD log and
@@ -209,16 +231,18 @@ func (r *Registrar) Start(ctx context.Context) error {
 		return errors.New("peer.Registrar.Start: nil deps")
 	}
 	nowMs := store.NowMillis()
+	url, nodeKey := r.selfIdentity()
 	if _, err := r.st.UpsertPeer(ctx, &store.PeerRecord{
 		DeviceID: r.id.DeviceID,
 		Name:     r.id.Name,
-		URL:      r.selfURL(),
+		URL:      url,
+		NodeKey:  nodeKey,
 		LastSeen: nowMs,
 		Status:   store.PeerStatusOnline,
 	}); err != nil {
 		return fmt.Errorf("peer.Registrar.Start: upsert: %w", err)
 	}
-	r.publishStatus(r.selfStatusEvent(r.selfURL(), store.PeerStatusOnline, nowMs, StatusOpUpsert))
+	r.publishStatus(r.selfStatusEvent(url, store.PeerStatusOnline, nowMs, StatusOpUpsert))
 	if r.logger != nil {
 		r.logger.Info("peer registered", "device_id", r.id.DeviceID, "name", r.id.Name)
 	}
@@ -347,12 +371,19 @@ func (r *Registrar) tickOnce() {
 		return
 	}
 	// Row vanished. Reseed via the same path Start uses so the row
-	// reappears at full identity (public_key + name + url + caps)
-	// instead of a header-only stub.
+	// reappears at full identity (name + url + node_key) instead of a
+	// header-only stub. Stamping node_key here matters: the reseed
+	// fires precisely because the row was deleted, so unlike Start the
+	// self-row's node_key is gone and a NodeKey-less reseed would leave
+	// the row quarantined (inbound peer requests 403) until the next
+	// RefreshPublicName. By this point SetSelfNodeKey has usually run,
+	// so selfIdentity carries the real NodeKey.
+	url, nodeKey := r.selfIdentity()
 	if _, upErr := r.st.UpsertPeer(ctx, &store.PeerRecord{
 		DeviceID: r.id.DeviceID,
 		Name:     r.id.Name,
-		URL:      r.selfURL(),
+		URL:      url,
+		NodeKey:  nodeKey,
 		LastSeen: nowMs,
 		Status:   store.PeerStatusOnline,
 	}); upErr != nil {
@@ -362,7 +393,7 @@ func (r *Registrar) tickOnce() {
 		}
 		return
 	}
-	r.publishStatus(r.selfStatusEvent(r.selfURL(), store.PeerStatusOnline, nowMs, StatusOpUpsert))
+	r.publishStatus(r.selfStatusEvent(url, store.PeerStatusOnline, nowMs, StatusOpUpsert))
 	if r.logger != nil {
 		r.logger.Info("peer.Registrar: self-row reseeded after disappearance",
 			"device_id", r.id.DeviceID)

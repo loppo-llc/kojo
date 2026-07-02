@@ -24,6 +24,19 @@ type memoryPutRequest struct {
 	Body string `json:"body"`
 }
 
+// logMemoryServerError logs an operational failure that the handler
+// maps to a generic 500. The wire response never carries err.Error()
+// (it can leak absolute paths / syscall detail); this emitter keeps
+// the real error in the daemon log for triage. Mirrors the sibling
+// logMemoryEntryServerError policy in memory_entry_handlers.go.
+func (s *Server) logMemoryServerError(ctx string, err error) {
+	if s.logger == nil {
+		return
+	}
+	s.logger.Error("memory handler: operational failure",
+		"context", ctx, "err", err)
+}
+
 // handleGetAgentMemory returns the current MEMORY.md state from the v1
 // store. Disk file is canonical for the local CLI but readers (Web UI,
 // other devices) consume the synced row so cross-device reads are
@@ -48,7 +61,8 @@ func (s *Server) handleGetAgentMemory(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, agent.ErrAgentResetting):
 			writeError(w, http.StatusConflict, "conflict", "agent is mid-reset; try again")
 		default:
-			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			s.logMemoryServerError("get", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 		}
 		return
 	}
@@ -85,7 +99,7 @@ func (s *Server) handlePutAgentMemory(w http.ResponseWriter, r *http.Request) {
 	// "any current state is acceptable" doesn't compose well with
 	// the file-and-DB write trio (we'd silently overwrite a value
 	// the user didn't see). Refuse rather than silently accept.
-	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest, "If-Match wildcard is not supported for MEMORY.md")
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, "If-Match wildcard is not supported for MEMORY.md")
 	if !ok {
 		return
 	}
@@ -112,7 +126,8 @@ func (s *Server) handlePutAgentMemory(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, agent.ErrAgentBusy), errors.Is(err, agent.ErrAgentResetting):
 			writeError(w, http.StatusConflict, "conflict", "agent is mid-reset or busy; try again")
 		default:
-			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			s.logMemoryServerError("put", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 		}
 		return
 	}
@@ -137,7 +152,7 @@ func (s *Server) handleDeleteAgentMemory(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusForbidden, "forbidden", "agents may only edit their own memory")
 		return
 	}
-	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest, "If-Match wildcard is not supported for MEMORY.md")
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, "If-Match wildcard is not supported for MEMORY.md")
 	if !ok {
 		return
 	}
@@ -157,7 +172,8 @@ func (s *Server) handleDeleteAgentMemory(w http.ResponseWriter, r *http.Request)
 		case errors.Is(err, agent.ErrAgentBusy), errors.Is(err, agent.ErrAgentResetting):
 			writeError(w, http.StatusConflict, "conflict", "agent is mid-reset or busy; try again")
 		default:
-			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			s.logMemoryServerError("delete", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 		}
 		return
 	}

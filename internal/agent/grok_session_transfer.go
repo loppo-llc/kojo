@@ -682,8 +682,7 @@ func StageGrokSession(agentID string, transfer *GrokSessionTransfer) (commit fun
 		}
 		pointerBackup = bf.Name()
 		_ = bf.Close()
-		_ = os.Remove(pointerBackup)
-		if rerr := os.Rename(pointerPath, pointerBackup); rerr != nil {
+		if rerr := renameOverwrite(pointerPath, pointerBackup); rerr != nil {
 			_ = os.RemoveAll(sessionRoot)
 			if sessionBackup != "" {
 				_ = os.Rename(sessionBackup, sessionRoot)

@@ -138,9 +138,8 @@ func AgentFencingMiddleware(st AgentFencingStore, selfPeerID string, logger *slo
 				}
 				logger.Error("agent fencing: lock read failed",
 					"agent", fenceID, "err", err)
-				http.Error(w,
-					`{"error":{"code":"unavailable","message":"agent lock read failed"}}`,
-					http.StatusServiceUnavailable)
+				writeJSONError(w, http.StatusServiceUnavailable,
+					"unavailable", "agent lock read failed")
 				return
 			}
 			if lock.HolderPeer != selfPeerID {
@@ -154,9 +153,8 @@ func AgentFencingMiddleware(st AgentFencingStore, selfPeerID string, logger *slo
 				// caching the 409 would let a stale 409
 				// shadow a perfectly valid retry.
 				w.Header().Set(HeaderNoIdempotencyCache, "1")
-				http.Error(w,
-					`{"error":{"code":"wrong_holder","message":"agent_lock is held by another peer; this peer is not authoritative for writes"}}`,
-					http.StatusConflict)
+				writeJSONError(w, http.StatusConflict, "wrong_holder",
+					"agent_lock is held by another peer; this peer is not authoritative for writes")
 				return
 			}
 			next.ServeHTTP(w, r)

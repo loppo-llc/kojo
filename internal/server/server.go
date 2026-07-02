@@ -185,6 +185,10 @@ type Server struct {
 	// thumbnail-cache sweeper goroutine.
 	thumbPurgeDone chan struct{}
 
+	// ttsSweepDone is closed on Shutdown to stop the background
+	// TTS-cache sweeper goroutine.
+	ttsSweepDone chan struct{}
+
 	// chunkedAgentSyncs accumulates in-flight chunked agent-sync
 	// uploads keyed by op_id. Populated by handlePeerAgentSyncChunkedBegin,
 	// extended by handlePeerAgentSyncChunkedChunk, drained by
@@ -343,6 +347,7 @@ func New(cfg Config) *Server {
 		version:              cfg.Version,
 		unsafePeer:           cfg.Unsafe,
 		thumbPurgeDone:       make(chan struct{}),
+		ttsSweepDone:         make(chan struct{}),
 		chunkedAgentSyncs:    make(map[string]*chunkedSyncEntry),
 		chunkedSyncSweepDone: make(chan struct{}),
 	}
@@ -399,7 +404,7 @@ func New(cfg Config) *Server {
 
 	// Start the TTS cache sweep at process startup so a stale cache
 	// from a previous run is trimmed before the first synthesize call.
-	tts.StartCacheSweep()
+	tts.StartCacheSweep(s.ttsSweepDone)
 
 	// Middleware order (innermost first):
 	//
@@ -1451,6 +1456,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		case <-s.thumbPurgeDone:
 		default:
 			close(s.thumbPurgeDone)
+		}
+	}
+	if s.ttsSweepDone != nil {
+		select {
+		case <-s.ttsSweepDone:
+		default:
+			close(s.ttsSweepDone)
 		}
 	}
 	if s.chunkedSyncSweepDone != nil {

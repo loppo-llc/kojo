@@ -48,6 +48,22 @@ func authKVAgentTokenKey(agentID string) string {
 	return authKVAgentTokenPrefix + agentID
 }
 
+// getAgentTokenRecord fetches the raw kv record for agentID's per-agent
+// token row using the shared auth timeout. It performs KV I/O ONLY —
+// callers own the s.mu locking and the parseAuthKVValue / adopt logic
+// that follows. Because it never touches s.mu, invoking it changes no
+// caller's lock scope: the lock-free boot path (loadAgentTokens) and the
+// under-s.mu collision/reissue/adopt paths each keep exactly the locking
+// they had inline. s.kv MUST be non-nil — every call site reaches this
+// helper only after a prior kv operation proved the store is configured
+// (a saveAgentTokenKV that returned ErrETagMismatch, or an explicit
+// s.kv != nil guard).
+func (s *TokenStore) getAgentTokenRecord(agentID string) (*store.KVRecord, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), authKVTimeout)
+	defer cancel()
+	return s.kv.GetKV(ctx, authKVNamespace, authKVAgentTokenKey(agentID))
+}
+
 // loadOwnerKV returns the owner-token hash from kv if present.
 // Returns ("", store.ErrNotFound) when no row exists; surface other
 // errors to the caller. Hash is the bare 64-hex form (the

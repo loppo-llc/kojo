@@ -380,6 +380,18 @@ func (s *Subscriber) handleFrame(target string, data []byte) {
 			return
 		}
 		s.mu.Lock()
+		if f.Event.Op == StatusOpDelete {
+			// Row removed on the remote — drop it from this target's
+			// contribution to the live view instead of parking a
+			// stale entry that would otherwise linger until the next
+			// full snapshot (reconnect). Unknown/other ops fall
+			// through and overwrite as before (forward-compat).
+			if perTarget, ok := s.live[target]; ok {
+				delete(perTarget, f.Event.DeviceID)
+			}
+			s.mu.Unlock()
+			return
+		}
 		perTarget, ok := s.live[target]
 		if !ok {
 			perTarget = make(map[string]StatusEvent)

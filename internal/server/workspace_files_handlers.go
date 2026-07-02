@@ -112,7 +112,7 @@ func (s *Server) handlePutWorkspaceFile(w http.ResponseWriter, r *http.Request, 
 	// the wildcard before the gate; the orders are observably identical
 	// because a wildcard request always carries If-Match, which
 	// satisfies the gate.
-	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest, "If-Match wildcard is not supported for workspace files")
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, "If-Match wildcard is not supported for workspace files")
 	if !ok {
 		return
 	}

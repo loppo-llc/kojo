@@ -1,5 +1,10 @@
 import type { EmbeddingModelHook } from "./useEmbeddingModel";
 import type { GeminiApiKeyHook } from "./useGeminiApiKey";
+import { SectionCard } from "../ui/SectionCard";
+import { Field } from "../ui/Field";
+import { Input } from "../ui/Input";
+import { Select } from "../ui/Select";
+import { Button } from "../ui/Button";
 
 interface Props {
   gemini: GeminiApiKeyHook;
@@ -9,39 +14,33 @@ interface Props {
 /** API Keys section — Gemini API key + embedding model selector. */
 export function ApiKeysSection({ gemini, embedding }: Props) {
   return (
-    <div>
-      <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider mb-3">
-        API Keys
-      </h2>
-      <p className="text-xs text-neutral-600 mb-3">
-        Encrypted storage for API keys. Used for embedding and image generation.
-      </p>
-
-      <div className="p-3 bg-neutral-900 border border-neutral-800 rounded-lg mb-2">
-        <div className="flex items-center justify-between">
-          <div>
-            <div className="text-sm font-medium">Gemini API</div>
-            <div className="text-xs text-neutral-500 mt-0.5">
+    <SectionCard
+      title="API Keys"
+      description="Encrypted storage for API keys. Used for embedding and image generation."
+    >
+      <div className="rounded-[10px] border border-hairline bg-raised p-3">
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="text-[13px] font-medium text-ink">Gemini API</div>
+            <div className="mt-0.5 text-[12px]">
               {gemini.configured ? (
-                <span className="text-emerald-500">Configured</span>
+                <span className="text-lamp-run">Configured</span>
               ) : gemini.hasFallback ? (
-                <span className="text-amber-500">Using fallback</span>
+                <span className="text-lamp-warn">Using fallback</span>
               ) : (
-                <span className="text-neutral-600">Not configured</span>
+                <span className="text-ink-faint">Not configured</span>
               )}
             </div>
           </div>
-          <div className="flex gap-2">
-            <button
-              onClick={gemini.toggleEditing}
-              className="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-xs"
-            >
+          <div className="flex shrink-0 items-center gap-2">
+            <Button onClick={gemini.toggleEditing}>
               {gemini.editing ? "Cancel" : gemini.configured ? "Update" : "Configure"}
-            </button>
+            </Button>
             {gemini.configured && (
               <button
                 onClick={gemini.remove}
-                className="text-neutral-600 hover:text-red-400 text-sm"
+                aria-label="Remove Gemini API key"
+                className="rounded-md px-1.5 text-ink-faint transition-colors hover:text-lamp-err"
               >
                 &times;
               </button>
@@ -50,51 +49,53 @@ export function ApiKeysSection({ gemini, embedding }: Props) {
         </div>
 
         {gemini.editing && (
-          <div className="mt-3 space-y-2 border-t border-neutral-800 pt-3">
-            <input
+          <div className="mt-3 space-y-2 border-t border-hairline pt-3">
+            <Input
+              mono
               type="password"
               value={gemini.input}
               onChange={(e) => gemini.setInput(e.target.value)}
               placeholder="AIza..."
-              className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-xs font-mono focus:outline-none focus:border-neutral-500"
             />
-            <button
+            <Button
+              variant="primary"
               onClick={gemini.save}
               disabled={gemini.saving || !gemini.input.trim()}
-              className="w-full py-2 bg-neutral-700 hover:bg-neutral-600 rounded text-xs font-medium disabled:opacity-40"
+              className="w-full"
             >
               {gemini.saving ? "Saving..." : "Save"}
-            </button>
+            </Button>
           </div>
         )}
 
-        <div className="mt-3 border-t border-neutral-800 pt-3">
-          <div className="text-xs text-neutral-500 mb-1.5">Embedding Model</div>
-          {embedding.loading ? (
-            <div className="text-xs text-neutral-600">Loading models...</div>
-          ) : embedding.available.length > 0 ? (
-            <select
-              value={embedding.model}
-              onChange={(e) => embedding.change(e.target.value)}
-              disabled={embedding.saving}
-              className="w-full px-3 py-1.5 bg-neutral-800 border border-neutral-700 rounded text-xs font-mono focus:outline-none focus:border-neutral-500 disabled:opacity-40"
-            >
-              {!embedding.available.includes(embedding.model) && embedding.model && (
-                <option value={embedding.model}>{embedding.model} (unavailable)</option>
-              )}
-              {embedding.available.map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <div className="text-xs text-neutral-600">
-              {gemini.configured ? "Failed to load models" : "Configure API key to see available models"}
-            </div>
-          )}
+        <div className="mt-3 border-t border-hairline pt-3">
+          <Field label="Embedding Model">
+            {embedding.loading ? (
+              <div className="text-[12px] text-ink-faint">Loading models...</div>
+            ) : embedding.available.length > 0 ? (
+              <Select
+                mono
+                value={embedding.model}
+                onChange={(e) => embedding.change(e.target.value)}
+                disabled={embedding.saving}
+              >
+                {!embedding.available.includes(embedding.model) && embedding.model && (
+                  <option value={embedding.model}>{embedding.model} (unavailable)</option>
+                )}
+                {embedding.available.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </Select>
+            ) : (
+              <div className="text-[12px] text-ink-faint">
+                {gemini.configured ? "Failed to load models" : "Configure API key to see available models"}
+              </div>
+            )}
+          </Field>
         </div>
       </div>
-    </div>
+    </SectionCard>
   );
 }

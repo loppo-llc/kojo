@@ -11,6 +11,8 @@ import { GitPanel } from "./GitPanel";
 import { SpecialKeysBar } from "./SpecialKeysBar";
 import { TerminalTab } from "./TerminalTab";
 import { AttachmentsTab } from "./AttachmentsTab";
+import { Lamp, type LampState } from "./ui/Lamp";
+import { Button } from "./ui/Button";
 
 type SessionTab = "cli" | "terminal" | "files" | "git" | "attachments";
 
@@ -298,42 +300,63 @@ export function SessionPage() {
     fileInput.click();
   };
 
+  const headerLamp: LampState = exited
+    ? session?.exitCode !== undefined && session.exitCode !== 0
+      ? "err"
+      : "off"
+    : "run";
+
   return (
-    <div ref={containerRef} className="h-full flex flex-col bg-neutral-950">
+    <div ref={containerRef} className="flex h-full flex-col bg-app text-ink">
       {/* Header */}
-      <header className="flex items-center gap-2 px-3 py-2 border-b border-neutral-800 shrink-0">
+      <header className="flex h-[52px] shrink-0 items-center gap-2 border-b border-hairline bg-app px-3">
         <button
           onClick={goBackOrHome}
-          className="text-neutral-400 hover:text-neutral-200"
+          aria-label="Back"
+          className="-ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] text-ink-dim transition-colors hover:bg-hover hover:text-ink lg:hidden"
         >
-          &larr;
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
+            <path d="M12.5 15l-5-5 5-5" />
+          </svg>
         </button>
-        <span className="font-mono font-bold">{session?.tool}</span>
-        <span className="text-xs text-neutral-500 truncate flex-1">{session?.workDir}</span>
+        <Lamp state={headerLamp} pulse={!exited} />
+        <div className="flex min-w-0 flex-1 items-baseline gap-2">
+          <span className="shrink-0 font-mono text-[14px] font-semibold text-ink">{session?.tool}</span>
+          {session?.toolSessionId && (
+            <span className="shrink-0 font-mono text-[11px] text-ink-faint">{session.toolSessionId.slice(0, 8)}</span>
+          )}
+          <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-ink-faint">{session?.workDir}</span>
+        </div>
         {exited ? (
           session?.exitCode !== undefined && (
-            <span className="text-xs text-neutral-600">exit {session.exitCode}</span>
+            <span className="shrink-0 font-mono text-[11px] text-ink-faint">exit {session.exitCode}</span>
           )
         ) : (
           <>
             {isClaude && (
               <button
                 onClick={handleYoloToggle}
-                className={`px-2.5 py-1.5 text-xs rounded min-h-[44px] min-w-[44px] flex items-center justify-center ${
-                  session?.yoloMode
-                    ? "bg-yellow-900 text-yellow-300"
-                    : "bg-neutral-800 text-neutral-500"
-                }`}
+                aria-label="Yolo Mode"
+                aria-pressed={session?.yoloMode}
                 title="Yolo Mode"
+                className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px] transition-colors hover:bg-hover ${
+                  session?.yoloMode ? "text-lamp-warn" : "text-ink-faint hover:text-ink"
+                }`}
               >
-                &#x26A1;
+                <svg viewBox="0 0 16 16" fill="currentColor" className="h-4 w-4">
+                  <path d="M9.383 1.11a.5.5 0 01.106.55L7.83 6h2.67a.5.5 0 01.38.825l-5 6a.5.5 0 01-.87-.485L6.17 8H3.5a.5.5 0 01-.38-.825l5-6a.5.5 0 01.263-.065z" />
+                </svg>
               </button>
             )}
             <button
               onClick={handleStop}
-              className="px-2.5 py-1.5 text-xs bg-neutral-800 hover:bg-red-900 text-neutral-400 hover:text-red-300 rounded min-h-[44px] min-w-[44px] flex items-center justify-center"
+              aria-label="Stop session"
+              title="Stop session"
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px] text-ink-faint transition-colors hover:bg-hover hover:text-lamp-err"
             >
-              &#9632;
+              <svg viewBox="0 0 16 16" fill="currentColor" className="h-3.5 w-3.5">
+                <rect x="2" y="2" width="12" height="12" rx="2" />
+              </svg>
             </button>
           </>
         )}
@@ -341,27 +364,29 @@ export function SessionPage() {
 
       {/* Tab bar — hidden when exited */}
       {!exited && (
-        <div className="flex border-b border-neutral-800 shrink-0">
-          {TABS.map((t) => (
-            <button
-              key={t.key}
-              onClick={() => switchTab(t.key)}
-              className={`flex-1 py-2 text-sm text-center ${
-                activeTab === t.key
-                  ? "text-neutral-200 border-b-2 border-neutral-400"
-                  : "text-neutral-500"
-              }`}
-            >
-              {t.label}
-            </button>
-          ))}
+        <div className="flex shrink-0 overflow-x-auto border-b border-hairline">
+          {TABS.map((t) => {
+            const active = activeTab === t.key;
+            return (
+              <button
+                key={t.key}
+                onClick={() => switchTab(t.key)}
+                className={`relative flex h-11 shrink-0 items-center justify-center px-4 font-mono text-[12px] transition-colors ${
+                  active ? "text-ink" : "text-ink-faint hover:text-ink-dim"
+                }`}
+              >
+                {t.label}
+                {active && <span className="absolute inset-x-2 bottom-0 h-0.5 rounded-full bg-copper" />}
+              </button>
+            );
+          })}
         </div>
       )}
 
       {/* Connection indicator */}
       {!exited && !connected && (
-        <div className="px-3 py-1 bg-yellow-950 text-yellow-400 text-xs text-center">
-          Reconnecting...
+        <div className="shrink-0 bg-lamp-warn/10 px-3 py-1 text-center font-mono text-[11px] text-lamp-warn">
+          Reconnecting…
         </div>
       )}
 
@@ -386,11 +411,11 @@ export function SessionPage() {
                   yoloTailRef.current = null;
                   if (yoloOverlayRef.current) yoloOverlayRef.current.style.display = "none";
                 }}
-                className="absolute top-0 left-0 right-0 z-10 px-3 py-2 bg-purple-950/90 text-purple-300 text-xs text-left font-mono active:bg-purple-900"
+                className="absolute inset-x-0 top-0 z-10 border-b border-hairline bg-surface/95 px-3 py-2 text-left font-mono text-[11px] text-copper backdrop-blur active:bg-hover"
               >
-                <span className="text-purple-500">yolo tail</span>{" "}
-                <span data-yolo-text className="truncate block" />
-                <span className="text-purple-600 text-[10px]">tap to copy</span>
+                <span className="text-copper-deep">yolo tail</span>{" "}
+                <span data-yolo-text className="block truncate text-ink-dim" />
+                <span className="text-[10px] text-ink-faint">tap to copy</span>
               </button>
             )}
           </div>
@@ -399,33 +424,42 @@ export function SessionPage() {
           {!exited && (
             <>
               <SpecialKeysBar ctrlMode={ctrlMode} shiftMode={shiftMode} altMode={altMode} onKeyPress={handleKeyPress} />
-              <div className="flex items-end gap-2 px-2 py-2 border-t border-neutral-800 shrink-0">
+              <div className="flex shrink-0 items-end gap-2 border-t border-hairline bg-app px-3 py-2.5">
                 <button
                   onClick={handleFileAttach}
-                  className="px-2 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 rounded"
                   title="Attach file"
+                  aria-label="Attach file"
+                  className="shrink-0 rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink"
                 >
-                  &#x1F4CE;
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5">
+                    <path fillRule="evenodd" d="M15.621 4.379a3 3 0 00-4.242 0l-7 7a3 3 0 004.241 4.243h.001l.497-.5a.75.75 0 011.064 1.057l-.498.501-.002.002a4.5 4.5 0 01-6.364-6.364l7-7a4.5 4.5 0 016.368 6.36l-3.455 3.553A2.625 2.625 0 119.52 9.52l3.45-3.451a.75.75 0 111.061 1.06l-3.45 3.451a1.125 1.125 0 001.587 1.595l3.454-3.553a3 3 0 000-4.242z" clipRule="evenodd" />
+                  </svg>
                 </button>
-                <textarea
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.nativeEvent.isComposing && (enterSends ? !e.shiftKey : e.shiftKey)) {
-                      e.preventDefault();
-                      handleSend();
-                    }
-                  }}
-                  placeholder={enterSends ? "Type here... (Enter to send)" : "Type here... (Shift+Enter to send)"}
-                  rows={Math.min(input.split("\n").length, 5)}
-                  className="flex-1 px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500 resize-none"
-                />
+                <div className="min-w-0 flex-1 rounded-xl border border-hairline bg-raised px-1 focus-within:border-copper/50">
+                  <textarea
+                    value={input}
+                    onChange={(e) => setInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.nativeEvent.isComposing && (enterSends ? !e.shiftKey : e.shiftKey)) {
+                        e.preventDefault();
+                        handleSend();
+                      }
+                    }}
+                    placeholder={enterSends ? "Message… (Enter to send)" : "Message… (Shift+Enter to send)"}
+                    rows={Math.min(input.split("\n").length, 5)}
+                    className="max-h-[150px] w-full resize-none bg-transparent px-3 py-2 text-[14px] text-ink placeholder:text-ink-faint focus:outline-none"
+                  />
+                </div>
                 <button
                   onPointerDown={(e) => e.preventDefault()}
                   onClick={handleSend}
-                  className="px-3 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-sm"
+                  title="Send"
+                  aria-label="Send"
+                  className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-copper text-[#14100b] transition-colors hover:bg-copper-bright"
                 >
-                  Enter
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
+                    <path d="M10 16V4M5 9l5-5 5 5" />
+                  </svg>
                 </button>
               </div>
             </>
@@ -487,27 +521,27 @@ export function SessionPage() {
 
       {/* Exited action buttons */}
       {exited && (
-        <div className="flex flex-col gap-3 px-4 py-4 border-t border-neutral-800 shrink-0">
-          <button
-            onClick={handleResume}
-            className="w-full py-3.5 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-base font-medium"
-          >
-            Resume
-          </button>
-          <button
-            onClick={async () => {
-              if (!session) return;
-              const s = await api.sessions.create({ tool: session.tool, workDir: session.workDir, args: session.args, peerId });
-              const target = peerId ? `/session/${s.id}?peer=${encodeURIComponent(peerId)}` : `/session/${s.id}`;
-              navigate(target, { replace: true });
-            }}
-            className="w-full py-3.5 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-base font-medium"
-          >
-            New Session
-          </button>
+        <div className="flex shrink-0 flex-col gap-2 border-t border-hairline bg-app px-4 py-3">
+          <div className="flex items-center gap-2">
+            <Button variant="primary" onClick={handleResume} className="flex-1 py-2.5">
+              Resume
+            </Button>
+            <Button
+              variant="secondary"
+              onClick={async () => {
+                if (!session) return;
+                const s = await api.sessions.create({ tool: session.tool, workDir: session.workDir, args: session.args, peerId });
+                const target = peerId ? `/session/${s.id}?peer=${encodeURIComponent(peerId)}` : `/session/${s.id}`;
+                navigate(target, { replace: true });
+              }}
+              className="flex-1 py-2.5"
+            >
+              New session
+            </Button>
+          </div>
           <button
             onClick={goBackOrHome}
-            className="w-full py-2.5 text-sm text-neutral-500 hover:text-neutral-400"
+            className="rounded-[10px] py-1.5 text-[13px] text-ink-dim transition-colors hover:text-ink lg:hidden"
           >
             Back
           </button>

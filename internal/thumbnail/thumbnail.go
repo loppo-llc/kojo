@@ -50,6 +50,44 @@ var (
 	ErrSourceTooLarge = errors.New("source image exceeds size budget")
 )
 
+// HTTPError carries an HTTP status and message for a pre-stream failure so
+// that callers can deliver the error in their own format (e.g. the server's
+// JSON envelope) instead of this package writing text/plain itself. It wraps
+// the underlying error so errors.Is against the package sentinels still
+// matches. Once streaming has begun the serving path can no longer change the
+// status code, so late failures are logged rather than returned as HTTPError.
+type HTTPError struct {
+	Status  int
+	Message string
+	err     error
+}
+
+func (e *HTTPError) Error() string { return e.Message }
+func (e *HTTPError) Unwrap() error { return e.err }
+
+// NewHTTPError builds an HTTPError with the given status and message, wrapping
+// err so errors.Is against the package sentinels keeps matching. Pass err=nil
+// when the failure has no underlying error to preserve (e.g. a pre-check).
+func NewHTTPError(status int, message string, err error) *HTTPError {
+	return &HTTPError{Status: status, Message: message, err: err}
+}
+
+// statusForGenerate maps a Generate() error onto the canonical status ladder:
+// unsupported format → 415, over budget → 413, missing source → 404, anything
+// else → 500.
+func statusForGenerate(err error) int {
+	switch {
+	case errors.Is(err, ErrUnsupportedFormat):
+		return http.StatusUnsupportedMediaType
+	case errors.Is(err, ErrSourceTooLarge):
+		return http.StatusRequestEntityTooLarge
+	case os.IsNotExist(err):
+		return http.StatusNotFound
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
 const (
 	// MinSize / MaxSize bound the requested thumbnail edge (the longer
 	// side after preserve-aspect scaling).
@@ -289,9 +327,10 @@ func IsSupportedExt(ext string) bool {
 // content changes (avatars, blob thumbs without a version query).
 //
 // Callers provide the raw HTTP request so http.ServeFile can handle
-// If-None-Match → 304. Returns nil on success; callers should map
-// non-nil errors to the appropriate HTTP status (ErrUnsupportedFormat →
-// 415, ErrSourceTooLarge → 413, os.IsNotExist → 404, else 500).
+// If-None-Match → 304. Returns nil on success; a pre-stream failure is
+// returned as *HTTPError carrying the mapped status (ErrUnsupportedFormat →
+// 415, ErrSourceTooLarge → 413, os.IsNotExist → 404, else 500). The wrapped
+// error keeps errors.Is working against the package sentinels.
 func ServeHTTP(w http.ResponseWriter, r *http.Request, srcPath string, size int) error {
 	return serveHTTP(w, r, srcPath, size, "no-cache")
 }
@@ -299,7 +338,7 @@ func ServeHTTP(w http.ResponseWriter, r *http.Request, srcPath string, size int)
 func serveHTTP(w http.ResponseWriter, r *http.Request, srcPath string, size int, cacheControl string) error {
 	cached, err := Generate(srcPath, size)
 	if err != nil {
-		return err
+		return NewHTTPError(statusForGenerate(err), err.Error(), err)
 	}
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("Cache-Control", cacheControl)

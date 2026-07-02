@@ -90,7 +90,7 @@ func (s *Server) handlePutAgentPersona(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden", "agents may only edit their own persona")
 		return
 	}
-	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest, "If-Match wildcard is not supported for persona")
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, "If-Match wildcard is not supported for persona")
 	if !ok {
 		return
 	}

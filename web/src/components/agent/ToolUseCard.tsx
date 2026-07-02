@@ -29,42 +29,42 @@ export function ToolUseCard({ toolUse, defaultExpanded = false }: ToolUseCardPro
   const preview = extractPreview(toolUse.input);
 
   return (
-    <div className="my-1 border border-neutral-700 rounded-lg overflow-hidden text-xs">
+    <div className="my-1 overflow-hidden rounded-[10px] border border-hairline bg-surface text-xs">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-2 px-3 py-1.5 bg-neutral-800/50 hover:bg-neutral-800 text-neutral-400 min-w-0"
+        className="flex w-full min-w-0 items-center gap-2 px-3 py-1.5 text-ink-dim transition-colors hover:bg-hover"
       >
         <svg
-          className={`w-3 h-3 shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`}
+          className={`h-3 w-3 shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`}
           fill="none"
           viewBox="0 0 24 24"
           stroke="currentColor"
         >
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
         </svg>
-        <span className="font-mono text-neutral-300 shrink-0">
+        <span className="shrink-0 font-mono text-[12px] text-ink">
           {toolUse.name}
         </span>
         {preview && (
-          <span className="text-neutral-500 truncate min-w-0">
+          <span className="min-w-0 truncate font-mono text-[11px] text-ink-faint">
             {preview}
           </span>
         )}
       </button>
       {expanded && (
-        <div className="px-3 py-2 space-y-2 bg-neutral-900/50">
+        <div className="space-y-2 border-t border-hairline bg-app/40 px-3 py-2">
           {toolUse.input && (
             <div>
-              <div className="text-neutral-500 mb-0.5">Input</div>
-              <pre className="text-neutral-300 whitespace-pre-wrap break-all max-h-60 overflow-y-auto">
+              <div className="mb-0.5 font-mono text-[10px] uppercase tracking-wide text-ink-faint">Input</div>
+              <pre className="max-h-60 overflow-x-auto overflow-y-auto whitespace-pre-wrap wrap-anywhere text-ink-dim">
                 {toolUse.input}
               </pre>
             </div>
           )}
           {toolUse.output && (
             <div>
-              <div className="text-neutral-500 mb-0.5">Output</div>
-              <pre className="text-neutral-300 whitespace-pre-wrap break-all max-h-60 overflow-y-auto">
+              <div className="mb-0.5 font-mono text-[10px] uppercase tracking-wide text-ink-faint">Output</div>
+              <pre className="max-h-60 overflow-x-auto overflow-y-auto whitespace-pre-wrap wrap-anywhere text-ink-dim">
                 {toolUse.output}
               </pre>
             </div>

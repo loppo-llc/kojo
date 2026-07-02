@@ -212,7 +212,7 @@ describe("agent route navigation", () => {
 
     // First back: idx === 0, so the button falls back to
     // navigate("/", { replace: true }).
-    fireEvent.click(screen.getByRole("button", { name: "←" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
     expect(await screen.findByText("Open demo")).toBeInTheDocument();
 
     fireEvent.click(screen.getByText("Open demo"));
@@ -221,7 +221,7 @@ describe("agent route navigation", () => {
     // Second back: idx > 0 (after in-app navigate), so the button
     // uses navigate(-1) to pop the real history entry instead of
     // accumulating dead "/" entries.
-    fireEvent.click(screen.getByRole("button", { name: "←" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
     expect(await screen.findByText("Open demo")).toBeInTheDocument();
   });
 });
