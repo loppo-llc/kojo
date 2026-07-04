@@ -116,6 +116,14 @@ func (p Principal) CanSetPrivileged() bool {
 	return p.IsOwner()
 }
 
+// CanRestartServer returns true for principals allowed to trigger a
+// daemon self-restart (POST /api/v1/system/restart): the Owner and
+// privileged agents. Regular agents and peers are refused — a restart
+// quiesces every agent on this host, not just the caller.
+func (p Principal) CanRestartServer() bool {
+	return p.IsOwner() || p.Role == RolePrivAgent
+}
+
 // Resolver maps a Bearer token to a Principal.
 type Resolver struct {
 	tokens       *TokenStore

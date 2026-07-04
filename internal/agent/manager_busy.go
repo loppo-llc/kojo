@@ -170,6 +170,68 @@ func (m *Manager) waitChatIdle(ctx context.Context, agentID string, skipBusy boo
 	}
 }
 
+// SetQuiescing flips the daemon-wide chat gate. When on,
+// acquirePreparing refuses every new Chat / ChatOneShot with
+// ErrAgentBusy ("server restart in progress") for ALL agents.
+// In-flight turns are unaffected — the restart path waits for them
+// via WaitAllChatsIdle. Idempotent; guard-off on a non-quiescing
+// manager is a no-op.
+func (m *Manager) SetQuiescing(on bool) {
+	m.busyMu.Lock()
+	m.quiescing = on
+	m.busyMu.Unlock()
+}
+
+// WaitAllChatsIdle polls until every concurrent write path across
+// ALL agents has drained, or ctx is cancelled. The daemon-wide
+// analogue of WaitChatIdle — same six checks, plus `switching`
+// (a §3.7 device switch must not be cut in half by a re-exec) and
+// the post-turn summarize counter (turnSummarizeAsync runs after
+// busy clears, and killing it mid-write would corrupt recent.md /
+// the cursor file).
+//
+// Callers should SetQuiescing(true) first; otherwise a fresh turn
+// can start between the idle observation and whatever the caller
+// does next (the restart path re-execs the process).
+func (m *Manager) WaitAllChatsIdle(ctx context.Context) error {
+	for {
+		m.busyMu.Lock()
+		idle := len(m.busy) == 0 && len(m.preparing) == 0 &&
+			len(m.editing) == 0 && len(m.resetting) == 0 &&
+			len(m.mutating) == 0 && len(m.switching) == 0 &&
+			m.summarizing == 0
+		m.busyMu.Unlock()
+		if idle {
+			m.oneShotCancelsMu.Lock()
+			for _, set := range m.oneShotCancels {
+				if len(set) > 0 {
+					idle = false
+					break
+				}
+			}
+			m.oneShotCancelsMu.Unlock()
+		}
+		if idle {
+			m.mu.Lock()
+			for _, on := range m.profileGen {
+				if on {
+					idle = false
+					break
+				}
+			}
+			m.mu.Unlock()
+		}
+		if idle {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 // CancelOneShotsForAgent cancels every in-flight one-shot chat
 // (Slack / group-DM responder) for the agent
 // WITHOUT touching the busy entry. The §3.7 device-switch
@@ -187,6 +249,9 @@ func (m *Manager) CancelOneShotsForAgent(agentID string) {
 func (m *Manager) acquirePreparing(agentID string) error {
 	m.busyMu.Lock()
 	defer m.busyMu.Unlock()
+	if m.quiescing {
+		return fmt.Errorf("%w: server restart in progress", ErrAgentBusy)
+	}
 	if m.switching != nil && m.switching[agentID] {
 		return fmt.Errorf("%w: device switch in progress", ErrAgentBusy)
 	}
@@ -268,9 +333,18 @@ func (m *Manager) waitOneShotClear(agentID string) error {
 // the post-complete drain. Idempotent: setting true on an
 // already-switching agent is a no-op; clearing an agent that
 // wasn't switching is also a no-op.
-func (m *Manager) SetSwitching(agentID string, on bool) {
+//
+// Returns ErrAgentBusy when on=true and a restart drain is
+// quiescing the daemon — the quiesce check and the switching set
+// share busyMu, so a switch can never start after WaitAllChatsIdle
+// observed idle. Clearing (on=false) always succeeds so the
+// orchestrator's deferred cleanup can't be refused.
+func (m *Manager) SetSwitching(agentID string, on bool) error {
 	m.busyMu.Lock()
 	defer m.busyMu.Unlock()
+	if on && m.quiescing {
+		return fmt.Errorf("%w: server restart in progress", ErrAgentBusy)
+	}
 	if m.switching == nil {
 		m.switching = make(map[string]bool)
 	}
@@ -279,6 +353,7 @@ func (m *Manager) SetSwitching(agentID string, on bool) {
 	} else {
 		delete(m.switching, agentID)
 	}
+	return nil
 }
 
 // IsSwitching returns true when SetSwitching(agentID, true) is in
@@ -308,6 +383,9 @@ func (m *Manager) AcquireMutation(agentID string) (func(), error) {
 	}
 	m.busyMu.Lock()
 	defer m.busyMu.Unlock()
+	if m.quiescing {
+		return nil, fmt.Errorf("%w: server restart in progress", ErrAgentBusy)
+	}
 	if m.switching != nil && m.switching[agentID] {
 		return nil, fmt.Errorf("%w: device switch in progress", ErrAgentBusy)
 	}
@@ -340,6 +418,10 @@ func (m *Manager) AcquireMutation(agentID string) (func(), error) {
 // Returns ErrAgentBusy if the agent is already being reset.
 func (m *Manager) acquireResetGuard(agentID string) (func(), error) {
 	m.busyMu.Lock()
+	if m.quiescing {
+		m.busyMu.Unlock()
+		return nil, fmt.Errorf("%w: server restart in progress", ErrAgentBusy)
+	}
 	if m.resetting[agentID] {
 		m.busyMu.Unlock()
 		return nil, fmt.Errorf("%w, try again later", ErrAgentBusy)

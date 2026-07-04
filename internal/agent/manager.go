@@ -107,6 +107,21 @@ type Manager struct {
 	// profileGen tracks agents with in-flight publicProfile generation.
 	profileGen map[string]bool
 
+	// quiescing, when true, refuses every new Chat / ChatOneShot at
+	// the acquirePreparing gate — daemon-wide, all agents. Set by the
+	// restart orchestration (POST /api/v1/system/restart) so
+	// WaitAllChatsIdle's drain cannot race a fresh turn starting
+	// between the idle observation and the process re-exec.
+	// Guarded by busyMu.
+	quiescing bool
+
+	// summarizing counts in-flight post-turn summarize goroutines
+	// (turnSummarizeAsync). They run AFTER the busy entry clears, so
+	// without this counter a restart's drain would observe idle while
+	// a summarizer is mid-write on recent.md / the cursor file.
+	// Guarded by busyMu.
+	summarizing int
+
 	// cronPaused globally pauses all cron jobs when true.
 	cronPaused bool
 
@@ -531,6 +546,16 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Admission gate: refuses while a restart drain is quiescing the
+	// daemon, and makes the multi-step provisioning below (dir, auth
+	// token, store row) visible to WaitAllChatsIdle via the mutation
+	// counter so a re-exec can't interrupt it halfway.
+	releaseMut, err := m.AcquireMutation(a.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseMut()
 
 	if err := ensureAgentDir(a); err != nil {
 		return nil, fmt.Errorf("create agent dir: %w", err)
@@ -1017,16 +1042,13 @@ func (m *Manager) Directory() []DirectoryEntry {
 // gate both ends: refuse to start if switching is set on entry,
 // and re-check switching under busyMu before the write.
 func (m *Manager) regeneratePublicProfile(agentID, persona string) {
-	// Refuse to even start if a switch is mid-flight. The target
-	// peer will run its own regen after finalize if needed.
-	m.busyMu.Lock()
-	if m.switching != nil && m.switching[agentID] {
-		m.busyMu.Unlock()
-		return
-	}
-	m.busyMu.Unlock()
-
-	// Dedupe: skip if generation is already in flight for this agent
+	// Dedupe + register FIRST (skip if generation is already in
+	// flight for this agent). Registering before the refusal checks
+	// matters for the restart drain: WaitAllChatsIdle observes
+	// profileGen, so the moment this goroutine is scheduled it is
+	// visible to the drain — checking switching/quiescing first
+	// would leave a window where the drain sees idle while a regen
+	// is about to start.
 	m.mu.Lock()
 	if m.profileGen[agentID] {
 		m.mu.Unlock()
@@ -1040,6 +1062,16 @@ func (m *Manager) regeneratePublicProfile(agentID, persona string) {
 		delete(m.profileGen, agentID)
 		m.mu.Unlock()
 	}()
+
+	// Refuse to even start if a switch is mid-flight (the target
+	// peer will run its own regen after finalize if needed) or a
+	// restart drain is quiescing the daemon.
+	m.busyMu.Lock()
+	refuse := m.quiescing || (m.switching != nil && m.switching[agentID])
+	m.busyMu.Unlock()
+	if refuse {
+		return
+	}
 
 	profile, err := GeneratePublicProfile(persona)
 	if err != nil {
@@ -1901,7 +1933,15 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 // existence check below closes the common case — the agent was already
 // gone before the summary started.
 func (m *Manager) turnSummarizeAsync(agentID string, tool string) {
+	m.busyMu.Lock()
+	m.summarizing++
+	m.busyMu.Unlock()
 	go func() {
+		defer func() {
+			m.busyMu.Lock()
+			m.summarizing--
+			m.busyMu.Unlock()
+		}()
 		m.mu.Lock()
 		_, ok := m.agents[agentID]
 		m.mu.Unlock()
@@ -3153,6 +3193,11 @@ func (m *Manager) acquireTranscriptEdit(agentID string) (func(), error) {
 	// (which changes Tool while holding m.mu). Chat acquires busyMu without
 	// holding m.mu, so this ordering is safe.
 	m.busyMu.Lock()
+	if m.quiescing {
+		m.busyMu.Unlock()
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: server restart in progress", ErrAgentBusy)
+	}
 	if m.resetting[agentID] {
 		m.busyMu.Unlock()
 		m.mu.Unlock()

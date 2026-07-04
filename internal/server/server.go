@@ -17,6 +17,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
@@ -199,6 +200,17 @@ type Server struct {
 	chunkedSyncMu     sync.Mutex
 	// chunkedSyncSweepDone is closed on Shutdown to stop the sweeper.
 	chunkedSyncSweepDone chan struct{}
+
+	// restartTrigger, when set via SetRestartTrigger, is invoked by
+	// POST /api/v1/system/restart after every agent chat has drained.
+	// cmd/kojo wires it to "mark restart intent + cancel the signal
+	// ctx" so the restart reuses the ordered graceful-shutdown path.
+	// nil (tests, windows) → the endpoint returns 501.
+	restartTrigger func()
+	restartMu      sync.Mutex
+	// restartPending dedups concurrent restart requests; cleared only
+	// if the drain times out and the restart aborts.
+	restartPending atomic.Bool
 }
 
 type Config struct {
@@ -494,6 +506,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 
 	// Session routes
 	mux.HandleFunc("GET /api/v1/info", s.handleInfo)
+	mux.HandleFunc("POST /api/v1/system/restart", s.handleSystemRestart)
 	mux.HandleFunc("GET /api/v1/sessions", s.handleListSessions)
 	mux.HandleFunc("POST /api/v1/sessions", s.handleCreateSession)
 	mux.HandleFunc("GET /api/v1/sessions/{id}", s.handleGetSession)

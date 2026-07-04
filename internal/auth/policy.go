@@ -261,6 +261,14 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		return true
 	}
 
+	// Daemon self-restart — privileged agents only (the handler
+	// re-checks via CanRestartServer). Owner is admitted by the
+	// IsOwner short-circuit at the top; RolePeer never reaches
+	// here (peer branch returned above).
+	if method == http.MethodPost && path == "/api/v1/system/restart" {
+		return p.Role == RolePrivAgent
+	}
+
 	// Per-agent {id} routes.
 	if id, sub, ok := SplitAgentIDPath(path); ok {
 		// Avatar and agent-active status are public-readable.

@@ -502,6 +502,12 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	a, err := s.agents.Create(cfg)
 	if err != nil {
+		// ErrAgentBusy here means the restart drain's quiesce refused
+		// the admission gate — a transient state, not a bad request.
+		if errors.Is(err, agent.ErrAgentBusy) {
+			writeError(w, http.StatusConflict, "agent_busy", err.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}

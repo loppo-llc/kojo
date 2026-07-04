@@ -264,6 +264,11 @@ func (m *Manager) acquireMemoryEdit(agentID string) (func(), error) {
 	}
 	archived := a.Archived
 	m.busyMu.Lock()
+	if m.quiescing {
+		m.busyMu.Unlock()
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: server restart in progress", ErrAgentBusy)
+	}
 	if archived {
 		m.busyMu.Unlock()
 		m.mu.Unlock()

@@ -19,6 +19,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
@@ -1200,6 +1202,30 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), session.ShutdownSignals()...)
 	defer stop()
 
+	// Self-restart (POST /api/v1/system/restart): after the server's
+	// drain, this trigger funnels into the same ordered graceful-
+	// shutdown path as SIGINT; the tail of main then re-execs the
+	// (possibly rebuilt) binary in place — same PID, same terminal.
+	// Not wired on platforms without exec (windows) → endpoint 501s.
+	var restartRequested atomic.Bool
+	// tsShutdown, when set (tailscale mode), closes the tsnet server.
+	// Normally deferred; the restart path must run it explicitly
+	// because a successful exec never returns to run defers.
+	var tsShutdown func()
+	if restartSupported {
+		srv.SetRestartTrigger(func() {
+			// If a signal already initiated shutdown, do NOT
+			// convert the operator's stop into a restart — the
+			// drain goroutine can fire this trigger while the
+			// ordered shutdown below is already in flight.
+			if ctx.Err() != nil {
+				return
+			}
+			restartRequested.Store(true)
+			stop()
+		})
+	}
+
 	// Background sweep of expired idempotency_keys rows (3.5). The
 	// dedup window is 24 h; sweeping once an hour keeps the table
 	// from growing unbounded without competing with hot writes. The
@@ -1562,7 +1588,8 @@ func main() {
 			}
 		}()
 
-		defer tsServer.Close()
+		tsShutdown = sync.OnceFunc(func() { _ = tsServer.Close() })
+		defer tsShutdown()
 	}
 
 	<-ctx.Done()
@@ -1616,6 +1643,26 @@ func main() {
 	}
 	if peerRegistrar != nil {
 		peerRegistrar.Stop()
+	}
+
+	if restartRequested.Load() {
+		// exec never returns on success, so deferred cleanups would
+		// be skipped — run them explicitly before swapping the
+		// process image. Both tolerate a second call from the defers
+		// if exec fails. A Close error doesn't cancel the exec:
+		// process exit loses the same buffered state either way, and
+		// coming back up beats staying down.
+		if tsShutdown != nil {
+			tsShutdown()
+		}
+		if err := agentMgr.Close(); err != nil {
+			logger.Warn("restart: agent manager close", "err", err)
+		}
+		execRestart(logger)
+		// exec failed. Exit non-zero so a supervising wrapper (or the
+		// operator's terminal) sees the restart did not happen rather
+		// than a clean stop.
+		os.Exit(1)
 	}
 }
 

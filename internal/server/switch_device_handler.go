@@ -363,7 +363,13 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// under 100ms; a longer hang is a runtime defect worth
 	// surfacing.
 	if s.agents != nil {
-		s.agents.SetSwitching(agentID, true)
+		if err := s.agents.SetSwitching(agentID, true); err != nil {
+			// Restart drain is quiescing the daemon — refuse the
+			// switch so the re-exec can't cut it in half.
+			writeError(w, http.StatusConflict, "agent_busy",
+				"cannot start device switch: "+err.Error())
+			return
+		}
 		defer s.agents.SetSwitching(agentID, false)
 		if selfCall {
 			s.agents.CancelOneShotsForAgent(agentID)
