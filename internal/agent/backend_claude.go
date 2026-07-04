@@ -241,6 +241,19 @@ func (b *ClaudeBackend) buildClaudeInvocation(agent *Agent, systemPrompt string,
 		"--disallowedTools", "AskUserQuestion,EnterPlanMode,ExitPlanMode,CronCreate,CronDelete,CronList,ScheduleWakeup",
 	}
 
+	// Fable-family models emit some mid-turn prose as "narration" blocks
+	// that ride the thinking channel. The API default (display: "omitted")
+	// strips their content server-side — the client receives empty
+	// thinking blocks with a signature only, so the text is unrecoverable.
+	// "summarized" makes the content arrive via thinking_delta, which
+	// parseClaudeStream already captures. Billing is unchanged (display
+	// controls visibility only). Skipped when a custom base URL is set:
+	// Anthropic-compatible endpoints (llama-server etc.) may reject the
+	// thinking.display request field.
+	if b.proxyURL == "" {
+		args = append(args, "--thinking-display", "summarized")
+	}
+
 	if systemPrompt != "" {
 		args = append(args, "--system-prompt", systemPrompt)
 	}
