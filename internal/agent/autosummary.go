@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/loppo-llc/kojo/internal/chathistory"
 	"github.com/loppo-llc/kojo/internal/store"
@@ -35,11 +37,43 @@ func redactSecrets(text string) string {
 }
 
 const (
-	// preCompactMaxMessages limits the number of recent messages to summarize.
+	// preCompactMaxMessages limits the number of recent messages to
+	// summarize on the FALLBACK path (kojo agent_messages transcript).
+	// The primary session-JSONL path is no longer capped by message
+	// count — it summarizes everything since the marker cursor, bounded
+	// by preCompactMaxChunks × preCompactMaxPromptBytes instead.
 	preCompactMaxMessages = 20
 
-	// preCompactMaxPromptBytes caps the summarization prompt size.
+	// preCompactMaxPromptBytes caps a single summarization prompt
+	// (one chunk). Messages that don't fit roll over into the next
+	// chunk; each chunk's LLM call carries the previous chunk's
+	// summary forward so the final output covers the whole span.
 	preCompactMaxPromptBytes = 64 * 1024
+
+	// preCompactMaxChunks bounds how many sequential LLM calls one
+	// summarization fire may issue. 8 × 64KB ≈ 512KB of conversation
+	// text — enough to cover a full 150k-token session's user/assistant
+	// text. When the backlog exceeds this, the OLDEST chunks are
+	// dropped (newest content wins) and the drop is logged.
+	preCompactMaxChunks = 8
+
+	// summaryMsgMaxRunes truncates a single message inside a summary
+	// prompt. Chunking now enforces the total budget, so this only
+	// guards against one pathological message drowning out its
+	// neighbours within a chunk.
+	summaryMsgMaxRunes = 2000
+
+	// summaryCarryMaxBytes caps the carried-forward previous summary
+	// inside a chunk prompt. The carry comes from recent.md (up to
+	// recentSummaryMaxRunes runes ≈ 24KB of UTF-8 Japanese) or from an
+	// unbounded LLM chunk output; without a byte cap the carry alone
+	// could blow the preCompactMaxPromptBytes budget that
+	// splitMessagesForSummary reserved headroom for.
+	summaryCarryMaxBytes = 16 * 1024
+
+	// summaryChunkHeadroomBytes is reserved out of each chunk's budget
+	// for the rules preamble plus the (byte-capped) carry section.
+	summaryChunkHeadroomBytes = summaryCarryMaxBytes + 4*1024
 
 	// autoSummaryMarkerFile is the legacy v0 filename for the per-agent
 	// autosummary marker. In v1 the marker lives in the kv table
@@ -80,7 +114,7 @@ const (
 	// stops a user / agent from hand-editing memory/recent.md. A hard
 	// cap on the read side keeps a hostile or accidentally-large file
 	// from blowing up every turn's input cost.
-	recentSummaryMaxRunes = 4000
+	recentSummaryMaxRunes = 8000
 
 	// transcriptMaxBytes caps how much of a session JSONL we'll read.
 	// Bounds memory + DoS exposure on the (now-validated) transcript
@@ -183,6 +217,24 @@ type autoSummaryMarker struct {
 	LastAt   time.Time `json:"lastAt"`
 	LastHash string    `json:"lastHash"`
 	LastN    int       `json:"lastN"`
+
+	// Cursor / CursorHash / Source implement incremental
+	// summarization over the session JSONL. Cursor is the number of
+	// (stripped) messages already covered by previous summaries;
+	// CursorHash is the CHAIN hash (messagesFingerprint) of ALL
+	// messages up to the cursor, so any rewrite of the already-covered
+	// prefix — a session reset reusing the same deterministic file
+	// path, a compaction rewrite, an insertion — invalidates the
+	// cursor and falls back to summarizing the whole file. A tail-only
+	// hash would miss a rewrite that happens to keep the same message
+	// at the cursor position. Source records which message source the
+	// cursor indexes ("session" or "transcript"); a cursor is only
+	// honoured against the same source. Older markers predate these
+	// fields (zero values) and are treated as "no cursor" — the next
+	// fire summarizes the whole backlog once.
+	Cursor     int    `json:"cursor,omitempty"`
+	CursorHash string `json:"cursorHash,omitempty"`
+	Source     string `json:"source,omitempty"`
 }
 
 // markerKVTimeout bounds each kv read / write. The marker is touched
@@ -674,6 +726,146 @@ func writeMarkerErr(agentID string, m autoSummaryMarker) error {
 	return nil
 }
 
+// diaryFileRe matches daily diary filenames (memory/YYYY-MM-DD.md).
+var diaryFileRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}\.md$`)
+
+// Marker source tags. A cursor stored against one source must not be
+// applied to message indices from the other.
+const (
+	markerSourceSession    = "session"
+	markerSourceTranscript = "transcript"
+)
+
+// generateSummary is the LLM call used for summarization. Package
+// variable so tests can substitute a deterministic fake instead of
+// spawning a real claude/codex process.
+var generateSummary = generateWithPreferred
+
+// lastN returns the trailing n elements of msgs (all of them when
+// len(msgs) <= n).
+func lastN(msgs []*Message, n int) []*Message {
+	if n > 0 && len(msgs) > n {
+		return msgs[len(msgs)-n:]
+	}
+	return msgs
+}
+
+// sessionCursorStart returns the index in stripped from which messages
+// are NEW (not yet covered by a previous summary). Returns 0 — i.e.
+// "summarize everything" — when the marker has no session cursor, the
+// cursor points past the end of the file, or the chain hash of the
+// covered prefix doesn't match (session file was reset / rewritten
+// under the same deterministic path). Fail-soft direction: an invalid
+// cursor causes one over-wide summary, never a silent gap.
+func sessionCursorStart(stripped []*Message, marker autoSummaryMarker) int {
+	if marker.Source != markerSourceSession || marker.Cursor <= 0 || marker.Cursor > len(stripped) {
+		return 0
+	}
+	if messagesFingerprint(stripped[:marker.Cursor]) != marker.CursorHash {
+		return 0
+	}
+	return marker.Cursor
+}
+
+// buildMarker assembles the post-summary marker. cursor is the number
+// of stripped messages actually COVERED by summaries so far (start +
+// processed messages — NOT necessarily the end of the file when the
+// chunk cap truncated this fire's backlog). For the transcript source
+// cursor fields are left zero (that path stays fingerprint-based).
+func buildMarker(now time.Time, fingerprint string, stripped []*Message, source string, cursor int) autoSummaryMarker {
+	m := autoSummaryMarker{
+		LastAt:   now,
+		LastHash: fingerprint,
+		LastN:    len(stripped),
+		Source:   source,
+	}
+	if source == markerSourceSession && cursor > 0 && cursor <= len(stripped) {
+		m.Cursor = cursor
+		m.CursorHash = messagesFingerprint(stripped[:cursor])
+	}
+	return m
+}
+
+// splitMessagesForSummary partitions msgs into consecutive chunks whose
+// rendered prompt size stays under budget bytes. Sizing mirrors
+// buildSummaryPrompt: per-message truncation to summaryMsgMaxRunes plus
+// the small role/format overhead, with headroom reserved for the rules
+// preamble and the carried-forward summary. A single oversized message
+// still gets its own chunk (truncation inside buildSummaryPrompt keeps
+// the actual prompt bounded).
+func splitMessagesForSummary(msgs []*Message, budget int) [][]*Message {
+	// Reserve headroom for the prompt preamble + previous-summary
+	// carry. The carry is byte-capped at summaryCarryMaxBytes inside
+	// buildSummaryPrompt, so this reservation is an actual upper
+	// bound, not an estimate.
+	usable := budget - summaryChunkHeadroomBytes
+	if usable < 4096 {
+		usable = 4096
+	}
+
+	var chunks [][]*Message
+	var cur []*Message
+	curSize := 0
+	for _, m := range msgs {
+		size := len(m.Role) + 8 // "**role**: " + newlines
+		if runes := []rune(m.Content); len(runes) > summaryMsgMaxRunes {
+			size += len(string(runes[:summaryMsgMaxRunes])) + 3
+		} else {
+			size += len(m.Content)
+		}
+		if curSize+size > usable && len(cur) > 0 {
+			chunks = append(chunks, cur)
+			cur = nil
+			curSize = 0
+		}
+		cur = append(cur, m)
+		curSize += size
+	}
+	if len(cur) > 0 {
+		chunks = append(chunks, cur)
+	}
+	return chunks
+}
+
+// readPrevRecentSummary returns the current memory/recent.md content
+// for carry-forward into a rolling summary, capped to
+// recentSummaryMaxRunes (tail). When recent.md is missing (e.g. its
+// last write failed and the stale copy was removed), falls back to
+// today's diary tail — the previous summary was appended there, so the
+// cumulative chain survives a recent.md write failure. Empty string
+// when neither source has content.
+func readPrevRecentSummary(agentID string) string {
+	dir := filepath.Join(agentDir(agentID), "memory")
+	data, err := os.ReadFile(filepath.Join(dir, recentSummaryFile))
+	if err != nil || len(data) == 0 {
+		// Fall back to the NEWEST daily diary — the previous summary
+		// was appended there, and the agent may have been idle across
+		// day boundaries since. Diary filenames are YYYY-MM-DD.md so
+		// lexicographic order is chronological.
+		latest := ""
+		if entries, derr := os.ReadDir(dir); derr == nil {
+			for _, e := range entries {
+				name := e.Name()
+				if !e.IsDir() && diaryFileRe.MatchString(name) && name > latest {
+					latest = name
+				}
+			}
+		}
+		if latest == "" {
+			return ""
+		}
+		data, err = os.ReadFile(filepath.Join(dir, latest))
+		if err != nil || len(data) == 0 {
+			return ""
+		}
+	}
+	content := strings.TrimSpace(string(data))
+	if runes := []rune(content); len(runes) > recentSummaryMaxRunes {
+		content = string(runes[len(runes)-recentSummaryMaxRunes:])
+	}
+	return content
+}
+
 // messagesFingerprint returns a stable hash of the messages' content,
 // used by the rate limiter to detect "nothing new since last fire".
 // Collisions are not security-relevant — at worst a real new turn that
@@ -733,9 +925,16 @@ func PreCompactSummarize(agentID string, tool string, transcriptPath string, log
 		}
 	}
 
-	msgs := loadSessionMessages(agentID, tool, resolvedTranscript, preCompactMaxMessages, logger)
+	// Primary source: the full session JSONL (limit 0 = everything).
+	// The incremental cursor below narrows it to "new since last
+	// summary", so loading the whole file does NOT mean re-summarizing
+	// it every fire.
+	source := markerSourceSession
+	msgs := loadSessionMessages(agentID, tool, resolvedTranscript, 0, logger)
 	if len(msgs) == 0 {
-		// Fallback to kojo transcript
+		// Fallback to kojo transcript (last N only — agent_messages
+		// has no stable cursor across the summarize/reset lifecycle).
+		source = markerSourceTranscript
 		var err error
 		msgs, err = loadMessages(agentID, preCompactMaxMessages)
 		if err != nil {
@@ -746,36 +945,92 @@ func PreCompactSummarize(agentID string, tool string, transcriptPath string, log
 		return nil
 	}
 
-	// Idempotency guard. Strip any volatile-context wrapper we
-	// previously prepended so it doesn't dominate the fingerprint or
-	// the summary prompt — only the actual conversation content should
-	// matter for "is there anything new since last time".
+	// Strip any volatile-context wrapper we previously prepended so it
+	// doesn't dominate the fingerprint / cursor hashes or the summary
+	// prompt — only the actual conversation content should matter for
+	// "is there anything new since last time".
 	stripped := stripVolatileContext(msgs)
-	fingerprint := messagesFingerprint(stripped)
+	fingerprint := messagesFingerprint(lastN(stripped, preCompactMaxMessages))
 
 	marker := readMarker(agentID)
 	now := time.Now()
-	if !marker.LastAt.IsZero() && fingerprint == marker.LastHash {
-		logger.Debug("pre-compaction summary skipped: no new messages since last summary",
-			"agent", agentID, "lastAt", marker.LastAt)
-		return nil
+
+	start := 0
+	var newMsgs []*Message
+	if source == markerSourceSession {
+		start = sessionCursorStart(stripped, marker)
+		newMsgs = stripped[start:]
+		if len(newMsgs) == 0 {
+			logger.Debug("pre-compaction summary skipped: no new session messages since last summary",
+				"agent", agentID, "lastAt", marker.LastAt, "cursor", marker.Cursor)
+			return nil
+		}
+	} else {
+		// Transcript fallback keeps the legacy fingerprint-based
+		// idempotency guard. Only honoured when the marker itself came
+		// from a non-session source ("" = legacy marker) — a session
+		// marker's LastHash may cover messages the transcript view has
+		// never summarized, and a coincidental match must not skip them.
+		if marker.Source != markerSourceSession && !marker.LastAt.IsZero() && fingerprint == marker.LastHash {
+			logger.Debug("pre-compaction summary skipped: no new messages since last summary",
+				"agent", agentID, "lastAt", marker.LastAt)
+			return nil
+		}
+		newMsgs = stripped
 	}
 
-	prompt := buildSummaryPrompt(stripped)
-	if len(prompt) > preCompactMaxPromptBytes {
-		// Trim to fit
-		stripped = stripped[len(stripped)/2:]
-		prompt = buildSummaryPrompt(stripped)
+	// Rolling summary: fold the previous recent.md into the first
+	// chunk's prompt so the rewritten recent.md stays a cumulative
+	// picture, not just the latest delta. Seeded when the session
+	// cursor matched (same session continuing) and on the transcript
+	// fallback (grok/codex backends, or a transiently unreadable
+	// session file — dropping the carry there would overwrite a
+	// cumulative recent.md with a last-20-only summary). NOT seeded
+	// when a session cursor was invalidated: that's a fresh / rewritten
+	// session and a stale summary from the previous one must not leak
+	// in.
+	carry := ""
+	if source == markerSourceTranscript || start > 0 {
+		carry = readPrevRecentSummary(agentID)
 	}
 
-	summary, err := generateWithPreferred(tool, prompt)
-	if err != nil {
-		return fmt.Errorf("generate summary: %w", err)
+	// Chunk the backlog. When it exceeds the per-fire LLM-call budget,
+	// process only the OLDEST chunks and advance the cursor over just
+	// those — the remainder is picked up by the next fire instead of
+	// being silently skipped.
+	chunks := splitMessagesForSummary(newMsgs, preCompactMaxPromptBytes)
+	deferredChunks := 0
+	if len(chunks) > preCompactMaxChunks {
+		deferredChunks = len(chunks) - preCompactMaxChunks
+		logger.Warn("pre-compaction summary: backlog exceeds chunk budget, deferring newest chunks to next fire",
+			"agent", agentID, "chunks", len(chunks), "processing", preCompactMaxChunks)
+		chunks = chunks[:preCompactMaxChunks]
 	}
+	processed := 0
+	for _, chunk := range chunks {
+		processed += len(chunk)
+	}
+	cursor := start + processed
 
-	summary = strings.TrimSpace(summary)
-	if summary == "" {
-		return nil
+	var summary string
+	for i, chunk := range chunks {
+		prompt := buildSummaryPrompt(chunk, carry)
+		out, err := generateSummary(tool, prompt)
+		if err != nil {
+			return fmt.Errorf("generate summary (chunk %d/%d): %w", i+1, len(chunks), err)
+		}
+		out = strings.TrimSpace(out)
+		if out == "" {
+			// An empty chunk output would silently drop this chunk's
+			// content from the carry chain while the cursor still
+			// advances past it. Surface it as an error so the caller
+			// (session reset) aborts instead of deleting unsummarized
+			// context; the marker stays untouched and the next fire
+			// retries.
+			return fmt.Errorf("generate summary (chunk %d/%d): empty output", i+1, len(chunks))
+		}
+		carry = out
+		summary = out
 	}
 
 	// Append to today's diary (audit trail).
@@ -823,19 +1078,26 @@ func PreCompactSummarize(agentID string, tool string, transcriptPath string, log
 	// recent.md is a derived cache: when it's missing,
 	// RecentDiarySummary transparently falls back to today's diary
 	// tail, which we just updated.
-	writeMarker(agentID, autoSummaryMarker{
-		LastAt:   now,
-		LastHash: fingerprint,
-		LastN:    len(stripped),
-	}, logger)
+	writeMarker(agentID, buildMarker(now, fingerprint, stripped, source, cursor), logger)
 
 	logger.Info("pre-compaction summary written",
 		"agent", agentID,
-		"messagesUsed", len(stripped),
+		"source", source,
+		"chunks", len(chunks),
+		"messagesUsed", len(newMsgs),
 		"summaryLen", len(summary),
 		"transcriptHinted", transcriptPath != "",
 		"recentOK", recentOK,
 	)
+
+	if deferredChunks > 0 {
+		// The processed prefix is safely summarized (diary + marker
+		// written above), but messages beyond the chunk cap are not.
+		// Surface that as an error so the session-reset caller keeps
+		// the JSONL — the next fire resumes from the advanced cursor
+		// and works the backlog down until this returns nil.
+		return fmt.Errorf("summary backlog remaining: %d chunks deferred", deferredChunks)
+	}
 	return nil
 }
 
@@ -969,7 +1231,10 @@ func loadSessionMessages(agentID, tool string, transcriptPath string, limit int,
 	// and caps each line at MaxJSONLLineBytes (10 MiB) so a corrupted or
 	// adversarial line cannot OOM the summary path. Stop scanning on
 	// ErrLineTooLarge — any earlier well-formed lines are still summarisable.
-	if err := chathistory.ScanJSONLLines(f, func(line []byte) {
+	// LimitReader backs the stat-based size gate above: a file that
+	// keeps growing WHILE we scan (live claude process appending)
+	// cannot pull the read past the cap.
+	if err := chathistory.ScanJSONLLines(io.LimitReader(f, transcriptMaxBytes), func(line []byte) {
 		var raw struct {
 			Type    string          `json:"type"`
 			Message json.RawMessage `json:"message"`
@@ -1023,9 +1288,13 @@ func loadSessionMessages(agentID, tool string, transcriptPath string, limit int,
 	return msgs
 }
 
-// buildSummaryPrompt creates the LLM prompt for conversation summarization.
-// System messages are excluded to avoid leaking internal markers.
-func buildSummaryPrompt(messages []*Message) string {
+// buildSummaryPrompt creates the LLM prompt for conversation
+// summarization. prevSummary, when non-empty, is the carried-forward
+// summary (previous recent.md or the previous chunk's output) that the
+// model must merge with the new conversation so the result stays
+// cumulative. System messages are excluded to avoid leaking internal
+// markers.
+func buildSummaryPrompt(messages []*Message, prevSummary string) string {
 	var sb strings.Builder
 
 	sb.WriteString("以下はAIエージェントとユーザーの直近の会話です。\n")
@@ -1037,8 +1306,28 @@ func buildSummaryPrompt(messages []*Message) string {
 	sb.WriteString("- 識別子（ID, パス, URL等）は省略せず保持\n")
 	sb.WriteString("- 挨拶や雑談は省略\n")
 	sb.WriteString("- パスワード、トークン、OTPコード、APIキー等の秘密情報は絶対に含めない。「認証情報を使用した」等の事実のみ記録\n")
-	sb.WriteString("- 箇条書き形式。5〜15項目程度（compaction前なので多めに）\n")
-	sb.WriteString("- 要約のみ出力。前置き不要\n\n")
+	sb.WriteString("- 箇条書き形式。5〜20項目程度（compaction前なので多めに）\n")
+	sb.WriteString("- 要約のみ出力。前置き不要\n")
+	if prevSummary != "" {
+		sb.WriteString("- 「これまでの要約」と新しい会話を統合した最新の要約を出力する。まだ有効な既存項目は残し、古くなった項目は削る\n")
+	}
+	sb.WriteString("\n")
+
+	if prevSummary != "" {
+		// Byte-cap the carry (keep the tail on a rune boundary) so an
+		// oversized recent.md or a verbose LLM chunk output can't blow
+		// the chunk budget splitMessagesForSummary reserved for it.
+		if len(prevSummary) > summaryCarryMaxBytes {
+			b := []byte(prevSummary)[len(prevSummary)-summaryCarryMaxBytes:]
+			for len(b) > 0 && !utf8.RuneStart(b[0]) {
+				b = b[1:]
+			}
+			prevSummary = string(b)
+		}
+		sb.WriteString("## これまでの要約\n\n")
+		sb.WriteString(redactSecrets(prevSummary))
+		sb.WriteString("\n\n")
+	}
 
 	sb.WriteString("## 会話\n\n")
 	for _, m := range messages {
@@ -1050,8 +1339,8 @@ func buildSummaryPrompt(messages []*Message) string {
 		// Redact potential secrets from content before summarization
 		content = redactSecrets(content)
 		// Truncate very long messages
-		if runes := []rune(content); len(runes) > 500 {
-			content = string(runes[:500]) + "..."
+		if runes := []rune(content); len(runes) > summaryMsgMaxRunes {
+			content = string(runes[:summaryMsgMaxRunes]) + "..."
 		}
 		sb.WriteString(fmt.Sprintf("**%s**: %s\n\n", m.Role, content))
 	}
