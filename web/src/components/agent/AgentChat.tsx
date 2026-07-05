@@ -130,12 +130,35 @@ export function AgentChat() {
     requestAnimationFrame(handleTextareaInput);
   }, [id, handleTextareaInput]);
 
+  // Monotonic refetch generation shared by every transcript fetch path
+  // (initial load, holder-status refetch, onConnected refetch): each
+  // fetch increments the seq and only the latest one's response is
+  // allowed to commit. Guards against a slow response from one path
+  // arriving after another path has already supplied a fresher
+  // transcript — without this the stale response would re-order or
+  // replace the newer view.
+  const refetchSeqRef = useRef(0);
+
   // Load agent and initial messages
   useEffect(() => {
     if (!id) return;
     abortedIdRef.current = null; // Clear stale abort state on agent change
+    // Clear the previous agent's transcript before fetching the new one.
+    // The WS reconnects for the new id in parallel, and if its
+    // onConnected refetch resolves before this GET, the merge would
+    // otherwise run against the old agent's rows and mix the two
+    // conversations (the late GET is then seq-discarded, so the mixture
+    // would stick).
+    setMessages([]);
+    setHasMore(false);
     agentApi.get(id).then(setAgent).catch(() => navigateRef.current("/"));
+    // Guarded by the shared seq like every other fetch path — the WS may
+    // connect (and onConnected refetch+commit) before this GET returns,
+    // and an unguarded late commit here would wipe that fresher merge.
+    // Replace semantics are kept: this is the initial load.
+    const seq = ++refetchSeqRef.current;
     agentApi.messages(id, PAGE_SIZE).then((r) => {
+      if (seq !== refetchSeqRef.current) return;
       setMessages(r.messages);
       setHasMore(r.hasMore);
     }).catch(console.error);
@@ -157,25 +180,18 @@ export function AgentChat() {
   // "online" also triggers a refetch — the new holder may have
   // accumulated messages while peerA owned the lock.
   const lastHolderRef = useRef<{ peer: string; status?: string } | null>(null);
-  // Monotonic refetch generation: every refetch increments the seq
-  // and only the latest one's response is allowed to commit. Guards
-  // against a slow response from holderA arriving after holderB has
-  // already supplied a fresh transcript — without this the stale
-  // response would re-order or replace the newer view.
-  const refetchSeqRef = useRef(0);
   useEffect(() => {
-    if (!id) {
-      // Agent route gone — invalidate any in-flight refetch so a
-      // late response can't commit to whatever loads next.
-      refetchSeqRef.current++;
-      return;
-    }
+    // The no-fetch early returns must NOT bump the shared seq: on first
+    // render agent is still null, and a bump here would discard the
+    // initial [id] GET's in-flight commit (and any onConnected refetch).
+    // Invalidating an in-flight *holder* refetch when the route goes
+    // away or the holder returns to local is already handled by the
+    // previous run's cleanup below — it's only registered when that run
+    // actually issued a fetch.
+    if (!id) return;
     if (!agent?.holderPeer) {
       // Agent went back to local. Drop the seen state so a future
-      // re-transition to a remote holder starts fresh, and bump
-      // the seq so an in-flight refetch from the previous remote
-      // holder can't land on the now-local transcript.
-      refetchSeqRef.current++;
+      // re-transition to a remote holder starts fresh.
       lastHolderRef.current = null;
       return;
     }
@@ -198,18 +214,32 @@ export function AgentChat() {
     // disruptive. Mirrors loadOlderMessages's restore protocol.
     const container = scrollContainerRef.current;
     suppressAutoScrollRef.current = true;
-    scrollRestoreRef.current = {
+    // Keep the token object's identity so the stale-discard paths below
+    // can tell whether these tokens are still ours: a newer holder
+    // refetch (or the pager) replaces the object, but an onConnected
+    // refetch superseding us never claims it — in that case we must
+    // release the tokens ourselves or a later unrelated commit would
+    // consume an out-of-date scroll anchor.
+    const restoreToken = {
       prevScrollHeight: container?.scrollHeight ?? 0,
       prevScrollTop: container?.scrollTop ?? 0,
     };
+    scrollRestoreRef.current = restoreToken;
     const seq = ++refetchSeqRef.current;
     agentApi.messages(id, PAGE_SIZE).then((r) => {
       // Generation guard: if a newer refetch has fired (e.g. holder
-      // rotated again, or another flip-online landed) we drop this
-      // response — applying it would either reorder the transcript
-      // (older response containing only top-N rows) or overwrite a
-      // fresher view with a stale snapshot.
-      if (seq !== refetchSeqRef.current) return;
+      // rotated again, another flip-online, or an onConnected refetch)
+      // we drop this response — applying it would either reorder the
+      // transcript (older response containing only top-N rows) or
+      // overwrite a fresher view with a stale snapshot. Release the
+      // scroll-restore tokens if nobody re-claimed them since.
+      if (seq !== refetchSeqRef.current) {
+        if (scrollRestoreRef.current === restoreToken) {
+          suppressAutoScrollRef.current = false;
+          scrollRestoreRef.current = null;
+        }
+        return;
+      }
       setMessages((existing) => {
         // Merge: prefer the server's view for the most recent
         // PAGE_SIZE rows, but keep
@@ -229,9 +259,9 @@ export function AgentChat() {
     }).catch(() => {
       // Refetch failed — release the scroll-restore tokens so a
       // subsequent normal update isn't suppressed forever. Skip
-      // when a newer refetch has superseded this one (it owns the
-      // restore tokens now).
-      if (seq !== refetchSeqRef.current) return;
+      // only when someone else has re-claimed the tokens since
+      // (newer holder refetch or the pager own them now).
+      if (scrollRestoreRef.current !== restoreToken) return;
       suppressAutoScrollRef.current = false;
       scrollRestoreRef.current = null;
     });
@@ -394,9 +424,49 @@ export function AgentChat() {
     resetStream();
   }, [resetStream]);
 
+  // Refetch the latest transcript page on every (re)connect. A reply that
+  // completed while we were disconnected is never replayed by the server
+  // (resumeBackgroundChat only replays while the chat is still busy), so
+  // without this a backgrounded tab wakes up to a frozen transcript until
+  // a manual reload. The very first connect also refetches — the mount
+  // [id] effect's GET may race the WS connect and miss a reply that lands
+  // between the two; the merge below is idempotent so the duplicate
+  // request is harmless.
+  //
+  // Shares refetchSeqRef with the holder-status refetch effect above so
+  // the two paths can't overwrite each other with stale out-of-order
+  // responses — only the globally latest refetch's response commits.
+  const onConnected = useCallback(() => {
+    if (!id) return;
+    const seq = ++refetchSeqRef.current;
+    agentApi.messages(id, PAGE_SIZE).then((r) => {
+      if (seq !== refetchSeqRef.current) return;
+      setMessages((prev) => {
+        const newIds = new Set(r.messages.map((m) => m.id));
+        const localSynthetic = prev.filter((m) => !newIds.has(m.id) && /^(pending|error|aborted)_/.test(m.id));
+        const missing = prev.filter((m) => !newIds.has(m.id) && !/^(pending|error|aborted)_/.test(m.id));
+        // Split rows the fetch didn't return by timestamp against the
+        // page's oldest row: paged-in history goes before the page,
+        // while WS messages that arrived after the GET snapshot was
+        // taken go after it — blindly prepending everything would
+        // reorder those fresh rows to the front of the transcript.
+        // (Ties and unparseable timestamps fall to the older side —
+        // matching the previous prepend-everything behavior — since a
+        // fresh WS row is always strictly newer than the page's oldest.)
+        const oldestTs = r.messages.length > 0 ? new Date(r.messages[0].timestamp).getTime() : Infinity;
+        const isNewer = (m: AgentMessage) => new Date(m.timestamp).getTime() > oldestTs;
+        const older = missing.filter((m) => !isNewer(m));
+        const newer = missing.filter(isNewer);
+        return [...older, ...r.messages, ...newer, ...localSynthetic];
+      });
+      if (r.hasMore) setHasMore(true);
+    }).catch(console.error);
+  }, [id]);
+
   const { connected, sendMessage, abort } = useAgentWebSocket({
     agentId: id!,
     onEvent,
+    onConnected,
     onDisconnect,
   });
 

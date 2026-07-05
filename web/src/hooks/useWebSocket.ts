@@ -111,12 +111,74 @@ export function useWebSocket({ sessionId, peerId, onOutput, onScrollback, onExit
   useEffect(() => {
     activeRef.current = true;
     connect();
+
+    // Zombie-socket recovery: after a tab is backgrounded or the machine
+    // sleeps, the underlying TCP connection can die without `onclose`
+    // ever firing — the socket sits in readyState OPEN forever and the
+    // terminal looks frozen until a manual reload. On wake, reconnect
+    // immediately if the socket is already closed/closing/absent, or
+    // force a reconnect on a suspect OPEN socket via the existing
+    // reconnect() helper, which flips connected down and replaces the
+    // socket right away instead of waiting on the dead peer's close
+    // handshake (onclose may never fire, or only after a long timeout).
+    let hiddenAt: number | null = null;
+
+    const wake = (alwaysSuspect: boolean) => {
+      if (!activeRef.current) return;
+      const ws = wsRef.current;
+      if (ws?.readyState === WebSocket.CONNECTING) return; // connect already in flight
+      if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        // Route through reconnect() here too so a CLOSING socket whose
+        // onclose hasn't fired yet gets the same teardown as a zombie
+        // (connected flipped down, buffer cleared, backoff reset) — a
+        // bare connect() would replace wsRef and let the stale-socket
+        // guard swallow that late onclose without ever flipping state.
+        reconnect();
+        return;
+      }
+      if (ws.readyState === WebSocket.OPEN) {
+        if (alwaysSuspect) {
+          // 'online' fired — the network just changed underneath us
+          // (sleep while visible, wifi switch). An OPEN readyState says
+          // nothing about the old route still working; reconnect
+          // unconditionally. 'online' is rare, so the churn is fine.
+          reconnect();
+          return;
+        }
+        const hiddenFor = hiddenAt != null ? Date.now() - hiddenAt : 0;
+        // Only force-reconnect after at least one missed server ping
+        // interval so a quick alt-tab doesn't churn a healthy connection.
+        if (hiddenFor >= 30000) {
+          reconnect();
+        }
+      }
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        hiddenAt = Date.now();
+      } else {
+        wake(false);
+        // Only the visible path clears hiddenAt — an 'online' event that
+        // fires while still hidden must not erase the hide timestamp, or
+        // a long hide would go undetected on the eventual visible flip.
+        hiddenAt = null;
+      }
+    };
+    const onOnline = () => wake(true);
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("online", onOnline);
+
     return () => {
       activeRef.current = false;
       if (reconnectRef.current) clearTimeout(reconnectRef.current);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("online", onOnline);
       bufRef.current?.dispose();
       wsRef.current?.close();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connect]);
 
   const sendInput = useCallback((data: string) => {
@@ -134,6 +196,10 @@ export function useWebSocket({ sessionId, peerId, onOutput, onScrollback, onExit
   const reconnect = useCallback(() => {
     if (reconnectRef.current) clearTimeout(reconnectRef.current);
     bufRef.current?.clear();
+    // Flip connected down immediately — the old socket may be a dead
+    // peer whose close handshake never completes, and its onclose is
+    // ignored anyway once connect() replaces wsRef (stale-socket guard).
+    setConnected(false);
     // Temporarily suppress onclose reconnect while we close the old socket
     activeRef.current = false;
     wsRef.current?.close();
