@@ -36,6 +36,7 @@ export interface AgentSettingsFormState {
     stylePrompt: string;
   };
   disabledInjections: string[];
+  autoEffort: boolean;
 }
 
 /**
@@ -108,5 +109,6 @@ export function buildAgentSavePayload(state: AgentSettingsFormState): AgentUpdat
       stylePrompt: state.tts.stylePrompt.trim() || undefined,
     },
     disabledInjections: state.disabledInjections,
+    autoEffort: state.autoEffort,
   };
 }

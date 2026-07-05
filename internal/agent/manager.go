@@ -1455,6 +1455,9 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		// Validated upstream (validateUpdateConfigPure).
 		a.DisabledInjections = normalizeDisabledInjections(*cfg.DisabledInjections)
 	}
+	if cfg.AutoEffort != nil {
+		a.AutoEffort = cfg.AutoEffort
+	}
 	if cfg.CustomBaseURL != nil {
 		// Validated upstream against the prospective (Tool, CustomBaseURL) combo.
 		a.CustomBaseURL = *cfg.CustomBaseURL
@@ -1812,6 +1815,92 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 	}, nil
 }
 
+// turnEffort is the result of the concurrent per-turn effort resolution.
+type turnEffort struct {
+	effort  string
+	source  string
+	elapsed time.Duration
+}
+
+// resolveTurnEffortAsync kicks off per-turn dynamic effort resolution
+// concurrently with prepareChat so the classifier's latency hides behind
+// the (also LLM/IO-bound) prepare work. Returns nil when the agent is
+// unknown — the subsequent prepareChat will produce the real error. The
+// goroutine writes exactly one result into a buffered channel, so an
+// abandoned channel (prepareChat failed) never leaks the goroutine; ctx
+// is the chat context, so aborting the turn kills the classifier CLI.
+func (m *Manager) resolveTurnEffortAsync(ctx context.Context, agentID, userMessage string, systemTurn bool) <-chan turnEffort {
+	m.mu.Lock()
+	a, ok := m.agents[agentID]
+	var snap Agent
+	if ok {
+		snap = *a
+	}
+	m.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	ch := make(chan turnEffort, 1)
+	go func() {
+		start := time.Now()
+		var diary string
+		// Diary read only matters for the LLM path; skip the disk
+		// read for system turns / disabled agents / other tools.
+		if !systemTurn && snap.IsAutoEffortEnabled() && (snap.Tool == "claude" || snap.Tool == "grok") {
+			diary = RecentDiarySummary(agentID)
+		}
+		eff, src := resolveTurnEffort(ctx, &snap, userMessage, systemTurn, diary, m.logger)
+		ch <- turnEffort{effort: eff, source: src, elapsed: time.Since(start)}
+	}()
+	return ch
+}
+
+// applyTurnEffort joins the concurrent effort resolution and stamps the
+// result onto the per-turn agent copy the backend will be launched with.
+// Never blocks a turn on failure: resolveTurnEffort always returns a
+// usable value (worst case the static Effort).
+func (m *Manager) applyTurnEffort(agentID string, prep *chatPrep, ch <-chan turnEffort) {
+	if ch == nil {
+		return
+	}
+	res := <-ch
+	if res.source == "static" {
+		return // nothing changed; keep logs quiet on the common opt-out path
+	}
+	// Re-check against the FRESH per-turn copy from prepareChat: a PATCH
+	// that landed between the pre-prepare snapshot and now (opt-out,
+	// tool/model/effort change) must win over a classification computed
+	// against the stale settings.
+	if !prep.agentCopy.IsAutoEffortEnabled() ||
+		(prep.agentCopy.Tool != "claude" && prep.agentCopy.Tool != "grok") {
+		return
+	}
+	// Recover the raw verdict: the llm path encodes it as "llm:<tier>"
+	// (its res.effort was mapped against the pre-prepare snapshot); the
+	// rule/heuristic paths emit the tier directly in res.effort.
+	tier := res.effort
+	if t, ok := strings.CutPrefix(res.source, "llm:"); ok {
+		tier = t
+	}
+	switch tier {
+	case "low", "medium", "high":
+	default:
+		// Not a classifier tier — keep the fresh static Effort.
+		return
+	}
+	// Re-map the tier against the FRESH static Effort/Model so a
+	// concurrent effort/model PATCH keeps its ceiling and clamp.
+	final := mapTierToEffort(&prep.agentCopy, tier)
+	m.logger.Info("auto effort",
+		"agent", agentID,
+		"tier", tier,
+		"effort", final,
+		"static", prep.agentCopy.Effort,
+		"source", res.source,
+		"elapsed_ms", res.elapsed.Milliseconds())
+	prep.agentCopy.Effort = final
+}
+
 // Chat sends a message to an agent and returns a channel of streaming events.
 // The role parameter controls how the input message is stored in the transcript
 // ("user" for interactive chat, "system" for cron-triggered messages).
@@ -1833,10 +1922,15 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		}
 	}()
 
+	// Start dynamic-effort resolution before prepareChat so the
+	// classifier runs concurrently with the (slow) prepare work.
+	effortCh := m.resolveTurnEffortAsync(ctx, agentID, userMessage, role == "system")
+
 	prep, err := m.prepareChat(ctx, agentID, userMessage, true, false)
 	if err != nil {
 		return nil, err
 	}
+	m.applyTurnEffort(agentID, prep, effortCh)
 
 	// Check if agent is busy, editing, being reset, or switching
 	m.busyMu.Lock()
@@ -2030,10 +2124,15 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	}
 	defer m.releasePreparing(agentID)
 
+	// Concurrent dynamic-effort resolution, same as Chat. One-shot
+	// callers (Slack/Discord) are always human-driven → systemTurn=false.
+	effortCh := m.resolveTurnEffortAsync(ctx, agentID, userMessage, false)
+
 	prep, err := m.prepareChat(ctx, agentID, userMessage, false, false)
 	if err != nil {
 		return nil, err
 	}
+	m.applyTurnEffort(agentID, prep, effortCh)
 
 	chatCtx, cancel := context.WithCancel(ctx)
 
@@ -3382,6 +3481,10 @@ func copyAgent(a *Agent) *Agent {
 	if a.DeviceSwitchEnabled != nil {
 		v := *a.DeviceSwitchEnabled
 		cp.DeviceSwitchEnabled = &v
+	}
+	if a.AutoEffort != nil {
+		v := *a.AutoEffort
+		cp.AutoEffort = &v
 	}
 	if a.SlackBot != nil {
 		sb := *a.SlackBot

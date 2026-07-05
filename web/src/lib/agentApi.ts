@@ -147,6 +147,10 @@ export interface AgentInfo {
   // injection is enabled — the common case, so the server omits the
   // field entirely rather than sending an empty array on most agents.
   disabledInjections?: string[];
+  // autoEffort gates the per-turn dynamic effort classifier. Absent =
+  // enabled (the feature is opt-out); the configured effort acts as the
+  // ceiling/fallback while enabled. claude / grok tools only.
+  autoEffort?: boolean;
 }
 
 // CONTEXT_INJECTION_KEYS mirrors the server-side allowlist for
@@ -203,6 +207,7 @@ export interface AgentUpdateParams extends Partial<AgentConfig> {
   thinkingMode?: string;
   tts?: TTSConfig | null;
   disabledInjections?: string[];
+  autoEffort?: boolean;
 }
 
 export interface AgentMessageAttachment {

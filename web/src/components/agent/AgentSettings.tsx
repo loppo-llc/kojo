@@ -137,6 +137,9 @@ export function AgentSettings() {
   const [publicProfileOverride, setPublicProfileOverride] = useState(false);
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState<EffortLevel | "">("");
+  // Per-turn dynamic effort classifier. Absent on the server = enabled
+  // (opt-out feature); the Effort selector becomes the ceiling/fallback.
+  const [autoEffort, setAutoEffort] = useState(true);
   const [tool, setTool] = useState("");
   const [customBaseURL, setCustomBaseURL] = useState("http://localhost:8080");
   const [thinkingMode, setThinkingMode] = useState("");
@@ -314,6 +317,7 @@ export function AgentSettings() {
       setPublicProfileOverride(a.publicProfileOverride ?? false);
       setModel(a.model);
       setEffort((a.effort || "") as EffortLevel | "");
+      setAutoEffort(a.autoEffort ?? true);
       setTool(a.tool);
       setCustomBaseURL(a.customBaseURL ?? "http://localhost:8080");
       setThinkingMode(a.thinkingMode ?? "");
@@ -498,6 +502,7 @@ export function AgentSettings() {
           publicProfileOverride,
           model,
           effort,
+          autoEffort,
           tool,
           customBaseURL,
           thinkingMode,
@@ -1125,6 +1130,15 @@ export function AgentSettings() {
             />
 
             <EffortPicker tool={tool} effort={effort} setEffort={setEffort} model={model} />
+
+            {(tool === "claude" || tool === "grok") && (
+              <ToggleRow
+                checked={autoEffort}
+                onChange={setAutoEffort}
+                title="Auto Effort"
+                desc="Pick per-turn effort automatically based on task difficulty; the Effort setting becomes the ceiling/fallback."
+              />
+            )}
 
             {needsCustomURL && (
               <Field label="Custom Base URL" help="Anthropic Messages API compatible endpoint">

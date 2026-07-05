@@ -30,6 +30,53 @@ func runCLIGenerate(toolName string, args []string, workDir string, prompt strin
 	return stripCodeFence(string(output)), nil
 }
 
+// runCLIGenerateTimeout is runCLIGenerate with a caller-chosen timeout and
+// parent context. Used by callers on the interactive-chat critical path
+// (effort classification) that cannot afford the default 120s ceiling and
+// must die with the turn's context.
+func runCLIGenerateTimeout(parent context.Context, toolName string, args []string, workDir string, prompt string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, toolName, args...)
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
+	cmd.Stdin = strings.NewReader(prompt)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", toolName, err)
+	}
+	return stripCodeFence(string(output)), nil
+}
+
+// effortClassifierModel pins the per-turn effort classifier to the
+// cheapest / fastest claude tier the codebase knows about ("haiku",
+// mirrored in web/src/lib/toolModels.ts). Classification is a one-word
+// answer fired on every interactive turn, so latency and cost dominate.
+const effortClassifierModel = "haiku"
+
+// effortClassifierTimeout is a dedicated tight deadline for the effort
+// classifier — it runs concurrently with prepareChat, and anything
+// slower than this would start adding user-visible latency; the caller
+// falls back to a heuristic on expiry.
+const effortClassifierTimeout = 8 * time.Second
+
+// runClaudeEffortClassifier executes the one-shot effort-classification
+// prompt via claude CLI pinned to effortClassifierModel at low effort,
+// no tools. Modeled on runClaudeSummary, minus the pinned-rejection
+// retry: the caller has a cheap heuristic fallback, so a second (slower)
+// CLI invocation on the chat critical path is never worth it.
+func runClaudeEffortClassifier(ctx context.Context, prompt string) (string, error) {
+	return runCLIGenerateTimeout(ctx, "claude", []string{
+		"-p",
+		"--setting-sources", "user",
+		"--system-prompt", effortClassifierSystemPrompt,
+		"--tools", "",
+		"--model", effortClassifierModel,
+		"--effort", "low",
+	}, "", prompt, effortClassifierTimeout)
+}
+
 // runClaude executes a prompt via claude CLI (stdin) and returns the output.
 func runClaude(prompt string) (string, error) {
 	return runCLIGenerate("claude", []string{

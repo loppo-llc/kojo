@@ -403,6 +403,14 @@ type Agent struct {
 	// toggling injections changes the agent's capability surface.
 	DisabledInjections []string `json:"disabledInjections,omitempty"`
 
+	// AutoEffort gates the per-turn dynamic effort classifier (see
+	// resolveTurnEffort). Nil = enabled — the feature is opt-OUT so
+	// existing agents pick it up without a migration. When enabled,
+	// the configured Effort acts as the ceiling/fallback rather than
+	// the fixed per-turn value. Persisted inside agents.settings_json
+	// like every other per-agent setting — no schema migration.
+	AutoEffort *bool `json:"autoEffort,omitempty"`
+
 	// HolderPeerStatus mirrors peer_registry.status for HolderPeer at
 	// list/read time so the UI can grey out chat (and surface an
 	// "offline" banner) without a second round-trip to /api/v1/peers.
@@ -431,6 +439,16 @@ func (a *Agent) IsDeviceSwitchEnabled() bool {
 		return true
 	}
 	return *a.DeviceSwitchEnabled
+}
+
+// IsAutoEffortEnabled reports whether the per-turn dynamic effort
+// classifier is enabled for this agent. Nil pointer = default true
+// (opt-out feature) so agents predating the field participate.
+func (a *Agent) IsAutoEffortEnabled() bool {
+	if a == nil || a.AutoEffort == nil {
+		return true
+	}
+	return *a.AutoEffort
 }
 
 // ResumeIdleDuration returns the configured idle window for keeping an
@@ -537,6 +555,11 @@ type AgentUpdateConfig struct {
 	// empty array to re-enable everything. Owner-only (enforced at the
 	// HTTP handler). Keys validated via ValidateDisabledInjections.
 	DisabledInjections *[]string `json:"disabledInjections"`
+	// AutoEffort toggles the per-turn dynamic effort classifier. nil =
+	// "not provided; leave as-is"; explicit true/false overwrites.
+	// Plain self-PATCHable field (like deviceSwitchEnabled) — not
+	// owner-only.
+	AutoEffort *bool `json:"autoEffort"`
 }
 
 // Context-injection section keys togglable via Agent.DisabledInjections.

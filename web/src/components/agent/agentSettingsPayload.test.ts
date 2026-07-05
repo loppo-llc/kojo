@@ -30,6 +30,7 @@ function baseState(over: Partial<AgentSettingsFormState> = {}): AgentSettingsFor
     allowProtectedPaths: ["/etc"],
     tts: { enabled: false, model: "", voice: "", stylePrompt: "" },
     disabledInjections: [],
+    autoEffort: true,
     ...over,
   };
 }
@@ -71,6 +72,11 @@ describe("buildAgentSavePayload", () => {
   it("omits effort for tools that don't support an effort selector", () => {
     const out = buildAgentSavePayload(baseState({ tool: "llama.cpp" }));
     expect(out.effort).toBeUndefined();
+  });
+
+  it("forwards autoEffort as-is", () => {
+    expect(buildAgentSavePayload(baseState({ autoEffort: true })).autoEffort).toBe(true);
+    expect(buildAgentSavePayload(baseState({ autoEffort: false })).autoEffort).toBe(false);
   });
 
   it("forwards effort for tools that do support it", () => {
