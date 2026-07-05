@@ -188,6 +188,42 @@ func TestParseClaudeStream_FableUsage(t *testing.T) {
 	}
 }
 
+// TestParseClaudeStream_ResultModelUsage verifies that the result event's
+// modelUsage map (invocation-wide totals, including subagent usage) replaces
+// the per-turn usage accumulated from assistant/message_delta events, sums
+// across models, and carries total_cost_usd. A later result event (emitted
+// after a background subagent finishes) must win over an earlier one.
+func TestParseClaudeStream_ResultModelUsage(t *testing.T) {
+	assistant := `{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"Hi"}],"usage":{"input_tokens":10,"output_tokens":5}}}`
+	result1 := `{"type":"result","result":"r1","session_id":"s","total_cost_usd":0.01,"modelUsage":{"claude-fable-5":{"inputTokens":100,"outputTokens":50,"cacheReadInputTokens":1000,"cacheCreationInputTokens":200}}}`
+	result2 := `{"type":"result","result":"r2","session_id":"s","total_cost_usd":0.05,"modelUsage":{"claude-fable-5":{"inputTokens":150,"outputTokens":80,"cacheReadInputTokens":2000,"cacheCreationInputTokens":300},"claude-opus-4-8":{"inputTokens":20,"outputTokens":40,"cacheReadInputTokens":500,"cacheCreationInputTokens":100}}}`
+
+	_, result := collectEvents(t, assistant, result1, result2)
+
+	if result.usage == nil {
+		t.Fatal("expected usage")
+	}
+	u := result.usage
+	if u.InputTokens != 170 || u.OutputTokens != 120 ||
+		u.CacheReadInputTokens != 2500 || u.CacheCreationInputTokens != 400 {
+		t.Errorf("usage = %+v, want summed modelUsage from last result {170 120 2500 400}", u)
+	}
+	if u.CostUSD != 0.05 {
+		t.Errorf("CostUSD = %v, want 0.05", u.CostUSD)
+	}
+}
+
+// TestParseClaudeStream_ResultWithoutModelUsage: a result event lacking
+// modelUsage (older CLI) must not clobber usage accumulated from the stream.
+func TestParseClaudeStream_ResultWithoutModelUsage(t *testing.T) {
+	assistant := `{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"Hi"}],"usage":{"input_tokens":10,"output_tokens":5}}}`
+	_, result := collectEvents(t, assistant, `{"type":"result","result":"done","session_id":"s"}`)
+
+	if result.usage == nil || result.usage.InputTokens != 10 || result.usage.OutputTokens != 5 {
+		t.Errorf("usage = %+v, want {10 5} preserved", result.usage)
+	}
+}
+
 func TestParseClaudeStream_ResultEvent(t *testing.T) {
 	_, result := collectEvents(t,
 		`{"type":"result","result":"final text","session_id":"sess-123"}`,

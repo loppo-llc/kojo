@@ -74,6 +74,9 @@ export interface TurnUsage {
   outputTokens: number;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
+  /** Backend-reported exact cost (Claude CLI total_cost_usd), covering
+   *  subagent usage and per-model rates. Preferred over the estimate. */
+  costUSD?: number;
 }
 
 /**
@@ -90,8 +93,12 @@ export function estimateTurnCost(
   model: string | undefined,
   usage: TurnUsage | undefined,
 ): number | undefined {
+  if (!usage) return undefined;
+  // A backend-reported cost is exact (includes subagent usage billed at
+  // each model's own rate) — always prefer it over the estimate.
+  if (usage.costUSD && usage.costUSD > 0) return usage.costUSD;
   const p = priceModel(model);
-  if (!p || !usage) return undefined;
+  if (!p) return undefined;
   const input = usage.inputTokens || 0;
   const output = usage.outputTokens || 0;
   const cacheRead = usage.cacheReadInputTokens || 0;

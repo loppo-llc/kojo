@@ -28,6 +28,7 @@ export interface GroupMessageUsage {
   outputTokens: number;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
+  costUSD?: number;
 }
 
 /** Server default when maxHops is 0/unset. */

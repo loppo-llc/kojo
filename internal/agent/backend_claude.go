@@ -530,6 +530,26 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 			if event.SessionID != "" {
 				res.streamSessionID = event.SessionID
 			}
+			// The result event's modelUsage map holds the invocation-wide
+			// token totals, including subagent (Task tool) usage that the
+			// main loop's assistant/message_delta events never report.
+			// It is cumulative per CLI process, so when a process emits
+			// several result events (background subagents), the last one
+			// wins — replace wholesale rather than overlay.
+			if len(event.ModelUsage) > 0 {
+				total := &Usage{CostUSD: event.TotalCostUSD}
+				for _, mu := range event.ModelUsage {
+					total.InputTokens += mu.InputTokens
+					total.OutputTokens += mu.OutputTokens
+					total.CacheReadInputTokens += mu.CacheReadInputTokens
+					total.CacheCreationInputTokens += mu.CacheCreationInputTokens
+				}
+				res.usage = total
+			} else if event.TotalCostUSD > 0 && res.usage != nil {
+				// Older CLIs report total_cost_usd without modelUsage;
+				// keep the stream-accumulated tokens and attach the cost.
+				res.usage.CostUSD = event.TotalCostUSD
+			}
 			if event.Result != "" {
 				if fullText.Len() == 0 {
 					fullText.WriteString(event.Result)
@@ -589,8 +609,21 @@ type claudeStreamEvent struct {
 	} `json:"delta,omitempty"`
 
 	// "result" event
-	Result    string `json:"result,omitempty"`
-	SessionID string `json:"session_id,omitempty"`
+	Result       string                      `json:"result,omitempty"`
+	SessionID    string                      `json:"session_id,omitempty"`
+	TotalCostUSD float64                     `json:"total_cost_usd,omitempty"`
+	ModelUsage   map[string]claudeModelUsage `json:"modelUsage,omitempty"`
+}
+
+// claudeModelUsage is one entry of the "result" event's modelUsage map:
+// per-model token totals for the whole CLI invocation, including subagent
+// (Task tool) usage that never surfaces on the main loop's assistant /
+// message_delta events. Note the camelCase keys, unlike claudeUsage.
+type claudeModelUsage struct {
+	InputTokens              int `json:"inputTokens"`
+	OutputTokens             int `json:"outputTokens"`
+	CacheReadInputTokens     int `json:"cacheReadInputTokens"`
+	CacheCreationInputTokens int `json:"cacheCreationInputTokens"`
 }
 
 // claudeUsage holds the token metrics Claude reports on both the

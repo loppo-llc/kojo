@@ -254,6 +254,7 @@ export interface AgentMessage {
     outputTokens: number;
     cacheReadInputTokens?: number;
     cacheCreationInputTokens?: number;
+    costUSD?: number;
   };
   // Strong HTTP entity tag of the row backing this message; passed to
   // PATCH /messages/{msgId} as If-Match for optimistic concurrency.

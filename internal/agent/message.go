@@ -67,6 +67,11 @@ type Usage struct {
 	OutputTokens             int `json:"outputTokens"`
 	CacheReadInputTokens     int `json:"cacheReadInputTokens,omitempty"`
 	CacheCreationInputTokens int `json:"cacheCreationInputTokens,omitempty"`
+	// CostUSD is the backend-reported total cost for the invocation (from
+	// the Claude CLI "result" event's total_cost_usd), covering subagent
+	// usage and per-model rates. Zero when the backend didn't report a
+	// cost; the UI then falls back to a client-side estimate.
+	CostUSD float64 `json:"costUSD,omitempty"`
 }
 
 // ChatEvent is streamed from backend to WebSocket during a chat.
