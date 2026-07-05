@@ -248,6 +248,8 @@ func splitAgentSyncIntoChunks(payload *peerAgentSyncRequest, budgetBytes int) (b
 		SinceMessageSeq:           payload.SinceMessageSeq,
 		SinceMemoryEntrySeq:       payload.SinceMemoryEntrySeq,
 		SinceMemoryEntryUpdatedAt: payload.SinceMemoryEntryUpdatedAt,
+		DegradedFlushes:           payload.DegradedFlushes,
+		TransferSkips:             payload.TransferSkips,
 	}
 	// Begin-size cap: grok session base64 + persona/memory body
 	// can in principle bust the begin cap on their own. Marshal

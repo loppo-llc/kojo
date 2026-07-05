@@ -771,13 +771,16 @@ type arrivalContext struct {
 // here only means the look-up is skipped — the caller still issues the chat
 // with the fallback prompt so the agent at least gets the arrival
 // notification.
-func buildArrivalPrompt(ctx context.Context, m *Manager, agentID, sourcePeerName string) string {
+func buildArrivalPrompt(ctx context.Context, m *Manager, agentID, sourcePeerName string, notes ArrivalNotes) string {
 	head := fmt.Sprintf(arrivalPromptBase, sourcePeerName)
 	ac := collectArrivalContext(ctx, m, agentID)
-	if ac.UserInstruction == "" && ac.TailCommitment == "" {
-		return head + arrivalPromptFallbackTail
-	}
 	var b strings.Builder
+	if ac.UserInstruction == "" && ac.TailCommitment == "" {
+		b.WriteString(head)
+		b.WriteString(arrivalPromptFallbackTail)
+		b.WriteString(arrivalNotesSection(notes))
+		return b.String()
+	}
 	b.WriteString(head)
 	if ac.UserInstruction != "" {
 		b.WriteString("\n\n直前のユーザー指示（自動文脈ブロックは除去済み）:\n")
@@ -788,6 +791,40 @@ func buildArrivalPrompt(ctx context.Context, m *Manager, agentID, sourcePeerName
 		b.WriteString(ac.TailCommitment)
 	}
 	b.WriteString("\n\nまず上記の指示・宣言を確認し、未完了であればこのデバイスで実行してください。すでに完了している場合は通常の待機状態に戻ってください。")
+	b.WriteString(arrivalNotesSection(notes))
+	return b.String()
+}
+
+// arrivalNotesSection renders the per-switch caveat block appended to
+// every arrival prompt. Returns "" for a clean transfer so the prompt
+// stays byte-identical to the pre-notes shape (prompt-cache friendly).
+func arrivalNotesSection(n ArrivalNotes) string {
+	if !n.TokenReissued && len(n.DegradedFlushes) == 0 && len(n.TransferSkips) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n\n転移に関する注意:")
+	if n.TokenReissued {
+		b.WriteString("\n- エージェントトークンはこのデバイスで自動再発行済み。手動での再発行は不要。")
+	}
+	if len(n.DegradedFlushes) > 0 {
+		b.WriteString("\n- degraded モードで転移した。スキップされた flush: ")
+		b.WriteString(strings.Join(n.DegradedFlushes, ", "))
+		b.WriteString("。転移直前のメモリ / persona の編集が反映されていない可能性がある。記憶が古い前提で作業を進めて、必要ならユーザーに確認して。")
+	}
+	if len(n.TransferSkips) > 0 {
+		b.WriteString("\n- 転送されなかったセッションファイル（会話履歴の一部が欠けている可能性がある）:")
+		for _, f := range n.TransferSkips {
+			b.WriteString("\n  - ")
+			b.WriteString(f.Path)
+			b.WriteString(" (")
+			b.WriteString(f.Reason)
+			if f.SizeBytes > 0 {
+				fmt.Fprintf(&b, ", %d bytes", f.SizeBytes)
+			}
+			b.WriteString(")")
+		}
+	}
 	return b.String()
 }
 
@@ -1079,7 +1116,9 @@ func truncatePromptByRune(body string, runeLimit int) string {
 // in which case the dedup keys on agentID alone — accept that the
 // retry-safety degrades to old behavior rather than impose an opID
 // requirement on every caller.
-func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string) {
+// notes carries per-switch caveats (auto token re-issue, degraded
+// flushes, transfer skips) appended to the arrival prompt.
+func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string, notes ArrivalNotes) {
 	if m == nil || agentID == "" {
 		return
 	}
@@ -1120,7 +1159,7 @@ func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string
 		defer arrivalCancels.CompareAndDelete(agentID, myEntry)
 		defer cancel()
 
-		prompt := buildArrivalPrompt(ctx, m, agentID, sourcePeerName)
+		prompt := buildArrivalPrompt(ctx, m, agentID, sourcePeerName, notes)
 		events, err := chatWithArrivalRetry(ctx, m, agentID, prompt, opID)
 		if err != nil {
 			// Clear dedup so a finalize retry for the SAME op can

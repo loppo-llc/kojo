@@ -376,6 +376,13 @@ type Agent struct {
 	// regardless of this flag because there's nothing to switch to.
 	DeviceSwitchEnabled *bool `json:"deviceSwitchEnabled,omitempty"`
 
+	// LastTransferSkips records the session files the most recent
+	// inbound §3.7 device-switch transfer skipped (oversized JSONL,
+	// unreadable codex ref, …). Stamped into settings_json by the
+	// target's applyPeerAgentSync — cleared on a clean transfer —
+	// so the owner UI can show a "skipped during transfer" notice.
+	LastTransferSkips []SkippedSessionFile `json:"lastTransferSkips,omitempty"`
+
 	// HolderPeer is set only for agents that live on a remote peer
 	// (i.e. the agent's agent_locks.holder_peer != local peer). The
 	// Manager.List path populates this for agents whose runtime was

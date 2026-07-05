@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -139,8 +140,11 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			"no pending agent-sync for the given (agent_id, op_id); finalize already committed or sync never landed")
 		return
 	}
+	tokenReissued := false
 	if s.onAgentSyncFinalized != nil {
-		if err := s.onAgentSyncFinalized(r.Context(), req.AgentID, entry.RawToken, req.SourceDeviceID, req.OpID); err != nil {
+		reissued, err := s.onAgentSyncFinalized(r.Context(), req.AgentID, entry.RawToken, req.SourceDeviceID, req.OpID)
+		tokenReissued = reissued
+		if err != nil {
 			// Lock-race surface: cmd/kojo's hook wraps a
 			// post-AddAgent holder-mismatch with
 			// store.ErrFencingMismatch so the source-side retry
@@ -246,7 +250,11 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 				sourceName = rec.Name
 			}
 		}
-		s.agents.NotifyDeviceSwitchArrival(req.AgentID, sourceName, req.OpID)
+		s.agents.NotifyDeviceSwitchArrival(req.AgentID, sourceName, req.OpID, agent.ArrivalNotes{
+			TokenReissued:   tokenReissued,
+			DegradedFlushes: entry.DegradedFlushes,
+			TransferSkips:   entry.TransferSkips,
+		})
 	}
 
 	// Hook + admit gate + tail + arrival all succeeded — NOW remove
@@ -263,6 +271,12 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			"commit kv delete: "+err.Error())
 		return
 	}
+	// Queue-and-forward: the runtime for this agent just activated
+	// on this peer (finalize committed). When this peer is the hub,
+	// messages queued during the switch can deliver locally right
+	// now instead of waiting out the drain's backoff timer; on a
+	// non-hub peer the queue table is empty and this is a no-op.
+	s.kickHandoffQueueDrain()
 	writeJSONResponse(w, http.StatusOK,
 		peerAgentSyncFinalizeResponse{AgentID: req.AgentID})
 }

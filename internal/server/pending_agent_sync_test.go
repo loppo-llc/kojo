@@ -48,7 +48,7 @@ func TestPendingAgentSync_RoundTrip(t *testing.T) {
 		opID    = "op_test"
 		raw     = "sk-test-raw-token"
 	)
-	if err := srv.recordPendingAgentSync(ctx, agentID, opID, raw); err != nil {
+	if err := srv.recordPendingAgentSync(ctx, agentID, opID, pendingSyncEntry{RawToken: raw}); err != nil {
 		t.Fatalf("recordPendingAgentSync: %v", err)
 	}
 	entry, ok, err := srv.consumePendingAgentSync(ctx, agentID, opID)
@@ -85,7 +85,7 @@ func TestPendingAgentSync_SurvivesDaemonRestart(t *testing.T) {
 		opID    = "op_restart"
 		raw     = "sk-restart-raw"
 	)
-	if err := srv.recordPendingAgentSync(ctx, agentID, opID, raw); err != nil {
+	if err := srv.recordPendingAgentSync(ctx, agentID, opID, pendingSyncEntry{RawToken: raw}); err != nil {
 		t.Fatalf("recordPendingAgentSync: %v", err)
 	}
 	// Wipe the in-memory cache to mimic a daemon restart.
@@ -113,7 +113,7 @@ func TestPendingAgentSync_AADBindsKey(t *testing.T) {
 	ctx := context.Background()
 	srv, kv := newPendingSyncTestServer(t)
 
-	if err := srv.recordPendingAgentSync(ctx, "ag_a", "op_a", "tok_a"); err != nil {
+	if err := srv.recordPendingAgentSync(ctx, "ag_a", "op_a", pendingSyncEntry{RawToken: "tok_a"}); err != nil {
 		t.Fatalf("recordPendingAgentSync ag_a: %v", err)
 	}
 	// Read the sealed row directly and rewrite it under a
@@ -152,7 +152,7 @@ func TestPendingAgentSync_NoKEKFallback(t *testing.T) {
 	ctx := context.Background()
 	srv := &Server{logger: slog.Default()}
 
-	if err := srv.recordPendingAgentSync(ctx, "ag_x", "op_x", "tok_x"); err != nil {
+	if err := srv.recordPendingAgentSync(ctx, "ag_x", "op_x", pendingSyncEntry{RawToken: "tok_x"}); err != nil {
 		t.Fatalf("record (no kek): %v", err)
 	}
 	entry, ok, err := srv.consumePendingAgentSync(ctx, "ag_x", "op_x")
@@ -188,7 +188,7 @@ func TestPendingAgentSync_RejectsWrongShape(t *testing.T) {
 		agentID = "ag_shape"
 		opID    = "op_shape"
 	)
-	if err := srv.recordPendingAgentSync(ctx, agentID, opID, "tok_shape"); err != nil {
+	if err := srv.recordPendingAgentSync(ctx, agentID, opID, pendingSyncEntry{RawToken: "tok_shape"}); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	rec, err := kv.GetKV(ctx, pendingAgentSyncNamespace, pendingAgentSyncKey(agentID, opID))
@@ -226,7 +226,7 @@ func TestPendingAgentSync_DropDeletesKV(t *testing.T) {
 	ctx := context.Background()
 	srv, kv := newPendingSyncTestServer(t)
 
-	if err := srv.recordPendingAgentSync(ctx, "ag_drop", "op_drop", "tok_drop"); err != nil {
+	if err := srv.recordPendingAgentSync(ctx, "ag_drop", "op_drop", pendingSyncEntry{RawToken: "tok_drop"}); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if err := srv.dropPendingAgentSync(ctx, "ag_drop", "op_drop"); err != nil {

@@ -133,6 +133,10 @@ type peerAgentSyncChunkedBeginRequest struct {
 	SinceMessageSeq           int64 `json:"since_message_seq,omitempty"`
 	SinceMemoryEntrySeq       int64 `json:"since_memory_entry_seq,omitempty"`
 	SinceMemoryEntryUpdatedAt int64 `json:"since_memory_entry_updated_at,omitempty"`
+
+	// Degraded / skip metadata — singleton-sized, rides begin.
+	DegradedFlushes []string                   `json:"degraded_flushes,omitempty"`
+	TransferSkips   []agent.SkippedSessionFile `json:"transfer_skips,omitempty"`
 }
 
 // peerAgentSyncChunkedChunkRequest appends one batch of rows to a
@@ -200,6 +204,8 @@ func (s *Server) handlePeerAgentSyncChunkedBegin(w http.ResponseWriter, r *http.
 		SinceMessageSeq:           bReq.SinceMessageSeq,
 		SinceMemoryEntrySeq:       bReq.SinceMemoryEntrySeq,
 		SinceMemoryEntryUpdatedAt: bReq.SinceMemoryEntryUpdatedAt,
+		DegradedFlushes:           bReq.DegradedFlushes,
+		TransferSkips:             bReq.TransferSkips,
 	}
 	if !s.validatePeerAgentSyncRequest(w, r, req, p) {
 		return

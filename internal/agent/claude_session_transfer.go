@@ -86,9 +86,11 @@ type ClaudeSessionFile struct {
 //
 // File-content size has a per-file ceiling (claudeSessionMaxBytes)
 // so a runaway log file can't blow up the agent-sync payload.
-// Files larger than the ceiling are skipped with a warning marker
-// (filename appears in the returned skipped slice).
-func ReadClaudeSessionFiles(agentID string) ([]ClaudeSessionFile, []string, error) {
+// Files larger than the ceiling are skipped and recorded in the
+// returned skipped slice (path + reason + size) so the loss can be
+// surfaced to the agent / operator / owner instead of only warn-
+// logged.
+func ReadClaudeSessionFiles(agentID string) ([]ClaudeSessionFile, []SkippedSessionFile, error) {
 	if agentID == "" {
 		return nil, nil, nil
 	}
@@ -105,7 +107,7 @@ func ReadClaudeSessionFiles(agentID string) ([]ClaudeSessionFile, []string, erro
 		return nil, nil, fmt.Errorf("agent.ReadClaudeSessionFiles: readdir: %w", err)
 	}
 	out := make([]ClaudeSessionFile, 0, len(entries))
-	skipped := make([]string, 0)
+	skipped := make([]SkippedSessionFile, 0)
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".jsonl" {
 			continue
@@ -113,10 +115,18 @@ func ReadClaudeSessionFiles(agentID string) ([]ClaudeSessionFile, []string, erro
 		full := filepath.Join(projectDir, e.Name())
 		st, statErr := os.Stat(full)
 		if statErr != nil {
+			// Loss visibility: a stat failure means the file exists
+			// in the dir listing but can't be sized/read — record it
+			// as a skip rather than silently excluding it.
+			skipped = append(skipped, SkippedSessionFile{
+				Path: e.Name(), Reason: "unreadable",
+			})
 			continue
 		}
 		if st.Size() > claudeSessionMaxBytes {
-			skipped = append(skipped, e.Name())
+			skipped = append(skipped, SkippedSessionFile{
+				Path: e.Name(), Reason: "oversized", SizeBytes: st.Size(),
+			})
 			continue
 		}
 		body, readErr := os.ReadFile(full)

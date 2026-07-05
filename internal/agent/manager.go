@@ -1202,9 +1202,23 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	// §3.7 device switch gate. AcquireMutation refuses when
 	// switching is set AND bumps the mutating counter so
 	// WaitChatIdle observes this write in flight.
+	//
+	// Relaxation: a PATCH touching ONLY hub-local-safe fields (see
+	// hub_local_update.go for the classification) is allowed to
+	// proceed mid-switch via acquireMutationAllowSwitching — those
+	// fields never mutate holder disk / live-session state, so the
+	// worst case is a documented last-write-wins divergence with
+	// the in-flight snapshot.
+	usedSwitchingBypass := false
 	releaseMut, err := m.AcquireMutation(id)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, ErrAgentBusy) && cfg.HubLocalOnly() && m.IsSwitching(id) {
+			releaseMut, err = m.acquireMutationAllowSwitching(id)
+			usedSwitchingBypass = err == nil
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer releaseMut()
 	// Pure-input validations that don't depend on existing state run after
@@ -1384,6 +1398,16 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 
 	oldPersona := a.Persona
 	oldOverride := a.PublicProfileOverride
+	// Mid-switch hub-safe write: snapshot the pre-write values (3-way
+	// merge base) BEFORE cfg is applied, so the write can be recorded
+	// as a pending override below. Without this, an edit landing after
+	// the switch payload snapshot would be acknowledged with 200 yet
+	// silently absent on the target — the override kv row lets the
+	// next sync ingest re-apply it (see hub_local_update.go).
+	var switchingBase AgentUpdateConfig
+	if usedSwitchingBypass {
+		switchingBase = captureHubLocalBase(a, cfg)
+	}
 	if cfg.Persona != nil {
 		a.Persona = *cfg.Persona
 	}
@@ -1546,6 +1570,37 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	toolChanged := cfg.Tool != nil && *cfg.Tool != oldTool
 	if cfg.DeviceSwitchEnabled != nil || toolChanged {
 		SyncDeviceSwitchSkillForTool(id, cp.Tool, cp.IsDeviceSwitchEnabled(), m.logger)
+	}
+
+	// Mid-switch write recorded as a pending hub-local override: the
+	// in-flight switch payload may already have been snapshotted, so
+	// the target could arrive without this edit. The next sync ingest
+	// re-applies it via ReapplyHubLocalOverrides (per-field 3-way
+	// merge; see hub_local_update.go). If the write DID make the
+	// snapshot, the merge sees ingested == override value and the
+	// re-apply is a harmless no-op.
+	//
+	// Scope note (review round 3): the kv row is machine-scoped on
+	// THIS device (the switch source), so the TARGET does not see it
+	// while it holds the agent — it runs with the pre-edit value until
+	// the agent syncs back here, where the ingest hook re-applies the
+	// edit. That delayed convergence is the same accepted divergence
+	// class as offline-holder hub edits: this device's row keeps the
+	// edit (all local reads serve it via GetRemote), nothing is lost,
+	// and shipping overrides inside the §3.7 sync wire payload would
+	// change shared sync structs for a window that closes by itself at
+	// switch-home.
+	//
+	// Failure here is Warn-only (unlike the remote-row path, which
+	// surfaces ErrOverrideRecordFailed): the in-memory apply + m.save()
+	// above are already visible side effects, so failing the PATCH now
+	// would misreport a committed write; recordHubLocalOverride's
+	// internal CAS retry makes residual failures rare.
+	if usedSwitchingBypass {
+		if oerr := m.recordHubLocalOverride(id, cfg, switchingBase); oerr != nil && m.logger != nil {
+			m.logger.Warn("mid-switch settings override record failed; edit may be lost after switch",
+				"agent", id, "err", oerr)
+		}
 	}
 
 	return cp, nil
@@ -3037,6 +3092,47 @@ func (m *Manager) UpsertMirrorFromMessages(agentID, holderPeer string, msgs []*M
 	if len(msgs) == 0 {
 		return nil
 	}
+	rows := mirrorRowsFromMessages(msgs)
+	if len(rows) == 0 {
+		return nil
+	}
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+	// レース対策: agent が proxy 中に Hub 側へ戻ってきた (force-reclaim /
+	// finalize で holder==self) ケースを救う。in-flight な proxy 応答が
+	// ActivateAgentRuntime の DeleteMirrorForAgent 直後に到達して stale
+	// 行を再挿入する race を、store 層の単一 BEGIN IMMEDIATE 内 (holder
+	// check + upsert) で閉じる。
+	return st.UpsertRemoteMirrorMessagesIfHolder(ctx, agentID, holderPeer, rows)
+}
+
+// ReplaceMirrorWindowFromMessages は holder の「最新 N 件スナップショット」
+// (cursor なし GET ?limit=N の応答) で mirror の該当 window を置き換える。
+// window 内にあるのに holder が返さなかった行 = holder 側で削除された
+// message を prune する。msgs が空 = holder transcript が空 (呼出側で
+// hasMore=false を確認済み) のとき mirror を全消しする。holder check は
+// UpsertMirrorFromMessages と同じく store 層の単一 tx 内で行われる。
+// 背景 refresher (mirror_refresher.go) 専用 — paginated proxy GET には
+// window 置換の意味論が合わないので UpsertMirrorFromMessages を使うこと。
+func (m *Manager) ReplaceMirrorWindowFromMessages(agentID, holderPeer string, msgs []*Message) error {
+	st := m.Store()
+	if st == nil {
+		return errStoreNotReady
+	}
+	rows := mirrorRowsFromMessages(msgs)
+	if len(rows) == 0 && len(msgs) > 0 {
+		// 全件が変換不能 (id/role/timestamp 欠落) — 消してよい根拠に
+		// ならないので skip。
+		return nil
+	}
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+	return st.ReplaceRemoteMirrorWindowIfHolder(ctx, agentID, holderPeer, rows)
+}
+
+// mirrorRowsFromMessages は wire Message slice を mirror row へ変換する。
+// id/role/timestamp のどれかが欠ける行は捨てる。
+func mirrorRowsFromMessages(msgs []*Message) []store.RemoteMirrorMessage {
 	rows := make([]store.RemoteMirrorMessage, 0, len(msgs))
 	for _, msg := range msgs {
 		if msg == nil || msg.ID == "" || msg.Timestamp == "" {
@@ -3070,17 +3166,7 @@ func (m *Manager) UpsertMirrorFromMessages(agentID, holderPeer string, msgs []*M
 		}
 		rows = append(rows, row)
 	}
-	if len(rows) == 0 {
-		return nil
-	}
-	ctx, cancel := transcriptCtx()
-	defer cancel()
-	// レース対策: agent が proxy 中に Hub 側へ戻ってきた (force-reclaim /
-	// finalize で holder==self) ケースを救う。in-flight な proxy 応答が
-	// ActivateAgentRuntime の DeleteMirrorForAgent 直後に到達して stale
-	// 行を再挿入する race を、store 層の単一 BEGIN IMMEDIATE 内 (holder
-	// check + upsert) で閉じる。
-	return st.UpsertRemoteMirrorMessagesIfHolder(ctx, agentID, holderPeer, rows)
+	return rows
 }
 
 // MirrorMessageExists は (agentID, messageID) が remote_message_mirror に

@@ -17,15 +17,26 @@ export const DEFAULT_GROUPDM_VENUE: GroupDMVenue = "chatroom";
 /** Reserved agentId used for messages posted by the human user (operator). */
 export const USER_SENDER_ID = "user";
 
+/** Room kind: "group" = multi-agent room, "dm" = first-class 1:1 room. */
+export type GroupDMKind = "group" | "dm";
+
+/** Server default when maxHops is 0/unset. */
+export const DEFAULT_MAX_HOPS = 4;
+export const MAX_MAX_HOPS = 20;
+
 export interface GroupDMInfo {
   id: string;
   name: string;
+  /** Server may omit for legacy rooms; treat undefined as "group". */
+  kind?: GroupDMKind;
   members: GroupMember[];
   cooldown: number; // notification cooldown in seconds (0 = default 50s)
   style: GroupDMStyle; // communication style
   /** Physical-setting hint. Server may omit this for legacy groups; UI
    * should fall back to DEFAULT_GROUPDM_VENUE when undefined or empty. */
   venue?: GroupDMVenue;
+  /** Agent-to-agent relay hop limit (0 = server default 4, max 20). */
+  maxHops?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -44,7 +55,46 @@ export interface GroupMessage {
   agentName: string;
   content: string;
   attachments?: AgentMessageAttachment[];
+  /** Relay hop count of this message (0 = origin). */
+  hop?: number;
+  /** Mentioned agent ids; USER_SENDER_ID ("user") = the human operator. */
+  mentions?: string[];
   timestamp: string;
+}
+
+export interface UnreadInfo {
+  count: number;
+  mentionsUser: boolean;
+  hasMore: boolean;
+}
+
+/** localStorage key for the last-read message id of a room. */
+export const lastReadKey = (roomId: string) => `kojo.groupdm.lastRead.${roomId}`;
+
+export function getLastRead(roomId: string): string | null {
+  try {
+    return localStorage.getItem(lastReadKey(roomId));
+  } catch {
+    return null;
+  }
+}
+
+export function setLastRead(roomId: string, messageId: string): void {
+  try {
+    localStorage.setItem(lastReadKey(roomId), messageId);
+  } catch {
+    // storage unavailable (private mode / quota) — badges degrade gracefully
+  }
+}
+
+/** Drop the marker (e.g. after clearing a room's history, when the
+ * referenced message no longer exists). */
+export function clearLastRead(roomId: string): void {
+  try {
+    localStorage.removeItem(lastReadKey(roomId));
+  } catch {
+    // ignore
+  }
 }
 
 export const groupdmApi = {
@@ -76,6 +126,20 @@ export const groupdmApi = {
 
   setVenue: (id: string, venue: GroupDMVenue) =>
     patch<GroupDMInfo>(`/api/v1/groupdms/${id}`, { venue }),
+
+  setMaxHops: (id: string, maxHops: number) =>
+    patch<GroupDMInfo>(`/api/v1/groupdms/${id}`, { maxHops }),
+
+  /** Find-or-create a DM room. Pass {agentId} for a human↔agent DM or
+   * {memberIds} for an agent↔agent pair. Server returns the room either way
+   * (200 = existing, 201 = created). */
+  openDM: (target: { agentId: string } | { memberIds: string[] }) =>
+    post<GroupDMInfo>("/api/v1/dms", target),
+
+  unread: (id: string, after?: string | null) =>
+    get<UnreadInfo>(
+      `/api/v1/groupdms/${id}/unread${after ? `?after=${encodeURIComponent(after)}` : ""}`,
+    ),
 
   addMember: (id: string, agentId: string, callerAgentId: string) =>
     post<GroupDMInfo>(`/api/v1/groupdms/${id}/members`, { agentId, callerAgentId }),

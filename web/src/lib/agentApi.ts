@@ -62,6 +62,14 @@ export const RESUME_IDLE_PRESETS = [
   { label: "1h", value: 60 },
 ] as const;
 
+// TransferSkip is one session file the §3.7 device-switch transfer
+// left behind (see AgentInfo.lastTransferSkips).
+export interface TransferSkip {
+  path: string;
+  reason: string;
+  sizeBytes?: number;
+}
+
 export interface AgentInfo {
   id: string;
   name: string;
@@ -136,6 +144,12 @@ export interface AgentInfo {
   // §3.7 device-switch target has gone offline. Empty when holderPeer
   // is empty.
   holderPeerStatus?: "online" | "offline" | "degraded";
+  // lastTransferSkips records the session files the most recent
+  // inbound §3.7 device-switch transfer skipped (oversized session
+  // JSONL, unreadable codex ref, …). Stamped server-side into the
+  // agent settings by the sync handler; cleared on a clean transfer.
+  // The dashboard shows a "skipped during transfer" notice from it.
+  lastTransferSkips?: TransferSkip[];
   // isSwitching is true while a §3.7 device-switch is mid-flight on
   // this peer (between SetSwitching(true) and (false)). Surfaced by
   // the server so the UI can disable mutating controls (credentials
@@ -326,6 +340,37 @@ export interface SlackBotSetRequest {
   respondDM?: boolean;
   respondMention?: boolean;
   respondThread?: boolean;
+}
+
+// PostAgentMessageResult is the 202 body of POST /agents/{id}/messages.
+// Two shapes share it:
+//   delivered: {accepted:true, queued:false}
+//   queued:    {queued:true, id, agentId, holderPeer, holderPeerName,
+//               createdAt, message} — the holder device is offline and the
+//               message will be forwarded when it reconnects.
+// A full queue (per-agent cap) is a 429 {error:{code:"queue_full"}} and
+// surfaces as a thrown Error("429: ...") from httpClient.
+export interface PostAgentMessageResult {
+  accepted?: boolean;
+  queued: boolean;
+  id?: string;
+  agentId?: string;
+  holderPeer?: string;
+  holderPeerName?: string;
+  // Unix milliseconds (store.NowMillis), not RFC3339.
+  createdAt?: number;
+  message?: string;
+}
+
+// QueuedAgentMessage is one row of GET /agents/{id}/queued-messages.
+export interface QueuedAgentMessage {
+  id: string;
+  agentId: string;
+  holderPeer: string;
+  content: string;
+  // Unix milliseconds (store.NowMillis), not RFC3339.
+  createdAt: number;
+  status: string;
 }
 
 export const agentApi = {
@@ -559,6 +604,23 @@ export const agentApi = {
       `/api/v1/agents/${id}/messages?${params}`,
     ).then((r) => ({ messages: r.messages ?? [], hasMore: r.hasMore ?? false }));
   },
+
+  // Queue-and-forward send path for when the agent's holder device is
+  // offline: the server either delivers immediately (queued:false) or
+  // enqueues for delivery on reconnect (queued:true). 429 queue_full
+  // propagates as a thrown Error.
+  postAgentMessage: (agentId: string, content: string) =>
+    post<PostAgentMessageResult>(`/api/v1/agents/${agentId}/messages`, { content }),
+
+  getQueuedMessages: (agentId: string) =>
+    get<{ messages: QueuedAgentMessage[] }>(
+      `/api/v1/agents/${agentId}/queued-messages`,
+    ).then((r) => r.messages ?? []),
+
+  cancelQueuedMessage: (agentId: string, qid: string) =>
+    del<{ cancelled: boolean; id: string }>(
+      `/api/v1/agents/${agentId}/queued-messages/${qid}`,
+    ),
 
   // PATCH a single message. The `expectedEtag` is the etag the caller
   // believes is current — typically the value embedded in the

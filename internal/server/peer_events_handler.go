@@ -144,6 +144,10 @@ func (s *Server) handlePeerEventsWS(w http.ResponseWriter, r *http.Request) {
 				LastSeen: nowMs,
 				Op:       peer.StatusOpTouch,
 			})
+			// Queue-and-forward: a genuine offline→online
+			// transition is a delivery trigger for any messages
+			// queued while this holder was away.
+			s.kickHandoffQueueDrain()
 		}
 	}
 

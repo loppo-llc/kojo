@@ -272,3 +272,119 @@ func (s *Store) DeleteRemoteMirrorForAgent(ctx context.Context, agentID string) 
 	n, _ := res.RowsAffected()
 	return n, nil
 }
+
+// ReplaceRemoteMirrorWindowIfHolder replaces the mirrored window for
+// one agent with the holder's authoritative latest-N snapshot, inside
+// the same holder-checked BEGIN IMMEDIATE transaction shape as
+// UpsertRemoteMirrorMessagesIfHolder.
+//
+// Semantics: msgs is the holder's newest window (a GET ?limit=N with
+// no `before` cursor). Any mirror row that sorts inside that window —
+// (timestamp, message_id) >= the oldest fetched message — but was NOT
+// returned by the holder has been deleted there, so it is pruned here.
+// Rows older than the window are preserved (they came from deeper
+// paginated proxy reads and the holder said nothing about them).
+// msgs == empty means the holder's transcript is empty: the whole
+// mirror for the agent is cleared. Callers must only pass empty msgs
+// when the holder reported hasMore=false.
+//
+// The holder check (agent_locks.holder_peer == expectedHolder) skips
+// the entire operation — including the prune — when the agent moved
+// or came home, so a stale in-flight response can't clear a mirror it
+// no longer owns.
+func (s *Store) ReplaceRemoteMirrorWindowIfHolder(ctx context.Context, agentID, expectedHolder string, msgs []RemoteMirrorMessage) error {
+	if s == nil || s.db == nil {
+		return errors.New("store.ReplaceRemoteMirrorWindowIfHolder: store not initialised")
+	}
+	if agentID == "" {
+		return errors.New("store.ReplaceRemoteMirrorWindowIfHolder: agent_id required")
+	}
+	if expectedHolder == "" {
+		return errors.New("store.ReplaceRemoteMirrorWindowIfHolder: expectedHolder required")
+	}
+	for i, m := range msgs {
+		if m.ID == "" || m.Role == "" || m.Timestamp == "" {
+			return fmt.Errorf("store.ReplaceRemoteMirrorWindowIfHolder: msg[%d] id/role/timestamp required", i)
+		}
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store.ReplaceRemoteMirrorWindowIfHolder: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Same holder gate as upsertRemoteMirrorMessages: no lock row or a
+	// rotated holder means this response is stale — skip silently.
+	var curHolder string
+	switch err := tx.QueryRowContext(ctx,
+		`SELECT holder_peer FROM agent_locks WHERE agent_id = ?`, agentID).Scan(&curHolder); {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil
+	case err != nil:
+		return fmt.Errorf("store.ReplaceRemoteMirrorWindowIfHolder: holder check: %w", err)
+	}
+	if curHolder != expectedHolder {
+		return nil
+	}
+
+	if len(msgs) == 0 {
+		// Holder transcript is empty and complete — clear the mirror.
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM remote_message_mirror WHERE agent_id = ?`, agentID); err != nil {
+			return fmt.Errorf("store.ReplaceRemoteMirrorWindowIfHolder: clear: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("store.ReplaceRemoteMirrorWindowIfHolder: commit: %w", err)
+		}
+		return nil
+	}
+
+	// Window lower bound = oldest fetched message by the mirror's own
+	// sort order (timestamp, message_id). RFC3339 timestamps compare
+	// correctly as strings, matching the SQL used by list/paginate.
+	minTS, minID := msgs[0].Timestamp, msgs[0].ID
+	for _, m := range msgs[1:] {
+		if m.Timestamp < minTS || (m.Timestamp == minTS && m.ID < minID) {
+			minTS, minID = m.Timestamp, m.ID
+		}
+	}
+
+	// Prune rows inside the window that the holder no longer returned.
+	delQ := `DELETE FROM remote_message_mirror
+	          WHERE agent_id = ?
+	            AND (timestamp > ? OR (timestamp = ? AND message_id >= ?))
+	            AND message_id NOT IN (`
+	delArgs := []any{agentID, minTS, minTS, minID}
+	for i, m := range msgs {
+		if i > 0 {
+			delQ += ","
+		}
+		delQ += "?"
+		delArgs = append(delArgs, m.ID)
+	}
+	delQ += ")"
+	if _, err := tx.ExecContext(ctx, delQ, delArgs...); err != nil {
+		return fmt.Errorf("store.ReplaceRemoteMirrorWindowIfHolder: prune: %w", err)
+	}
+
+	now := NowMillis()
+	stmt, err := tx.PrepareContext(ctx, remoteMirrorUpsertSQL)
+	if err != nil {
+		return fmt.Errorf("store.ReplaceRemoteMirrorWindowIfHolder: prepare: %w", err)
+	}
+	defer stmt.Close()
+	for i, m := range msgs {
+		if _, err := stmt.ExecContext(ctx,
+			agentID, m.ID, m.Role, m.Content, m.Thinking,
+			jsonOrNil(m.ToolUses), jsonOrNil(m.Attachments), jsonOrNil(m.Usage),
+			m.Timestamp, expectedHolder, now,
+		); err != nil {
+			return fmt.Errorf("store.ReplaceRemoteMirrorWindowIfHolder: exec msg[%d] %q: %w", i, m.ID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store.ReplaceRemoteMirrorWindowIfHolder: commit: %w", err)
+	}
+	return nil
+}

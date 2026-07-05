@@ -2,9 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { api, type SessionInfo } from "../lib/api";
 import { agentApi, type AgentInfo } from "../lib/agentApi";
-import { groupdmApi, type GroupDMInfo } from "../lib/groupdmApi";
+import { groupdmApi, getLastRead, type GroupDMInfo, type UnreadInfo } from "../lib/groupdmApi";
 import { peersApi, type PeerInfo } from "../lib/peerApi";
 import { AgentAvatar } from "./agent/AgentAvatar";
+import { TransferSkipsNotice } from "./agent/TransferSkipsNotice";
 import { usePushNotifications } from "../hooks/usePushNotifications";
 import { useCollapsedSet } from "../hooks/useCollapsedSet";
 import { errMsg } from "../lib/utils";
@@ -103,6 +104,8 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [groupDMs, setGroupDMs] = useState<GroupDMInfo[]>([]);
+  const [unreadByRoom, setUnreadByRoom] = useState<Map<string, UnreadInfo>>(new Map());
+  const [dmOpening, setDmOpening] = useState<string | null>(null);
   const [cronPaused, setCronPaused] = useState(false);
   const [showCreateGroupDialog, setShowCreateGroupDialog] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
@@ -291,11 +294,63 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
   }, []);
 
   useEffect(() => {
-    const loadGroups = () => groupdmApi.list().then(setGroupDMs).catch(console.error);
-    loadGroups();
-    const interval = setInterval(loadGroups, 5000);
-    return () => clearInterval(interval);
+    // Unread counts piggyback on the existing 5s room-list poll (no extra
+    // timer). Per-room GET /unread?after=<localStorage lastRead>; failures
+    // for one room keep its previous badge.
+    let cancelled = false;
+    let inflight = false;
+    const loadGroups = async () => {
+      if (inflight) return;
+      inflight = true;
+      try {
+        const groups = await groupdmApi.list();
+        if (cancelled) return;
+        setGroupDMs(groups);
+        const settled = await Promise.allSettled(
+          groups.map((g) =>
+            groupdmApi.unread(g.id, getLastRead(g.id)).then((u) => [g.id, u] as const),
+          ),
+        );
+        if (cancelled) return;
+        setUnreadByRoom((prev) => {
+          const next = new Map(prev);
+          const live = new Set(groups.map((g) => g.id));
+          for (const k of [...next.keys()]) if (!live.has(k)) next.delete(k);
+          for (const r of settled) {
+            if (r.status === "fulfilled") next.set(r.value[0], r.value[1]);
+          }
+          return next;
+        });
+      } catch (err) {
+        if (!cancelled) console.error(err);
+      } finally {
+        inflight = false;
+      }
+    };
+    void loadGroups();
+    const interval = setInterval(() => void loadGroups(), 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, []);
+
+  const openAgentDM = async (agentId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (dmOpening) return;
+    setDmOpening(agentId);
+    try {
+      // Find-or-create: server returns the existing room or a new one.
+      const room = await groupdmApi.openDM({ agentId });
+      setGroupDMs((prev) => [room, ...prev.filter((g) => g.id !== room.id)]);
+      navigate(`/groupdms/${room.id}`);
+    } catch (err) {
+      console.error("Failed to open DM", err);
+      window.alert(`Failed to open DM: ${errMsg(err)}`);
+    } finally {
+      setDmOpening(null);
+    }
+  };
 
   useEffect(() => {
     if (showCreateGroupDialog) createGroupDialogRef.current?.focus();
@@ -309,6 +364,92 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
   }, []);
 
   const groups = groupSessions(sessions);
+  const sortedRooms = [...groupDMs].sort((a, b) => {
+    const diff = new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+    if (diff !== 0 && !Number.isNaN(diff)) return diff;
+    return a.id.localeCompare(b.id);
+  });
+  // First-class 1:1 rooms get their own "DMs" section; everything else
+  // (including legacy rooms without a kind) stays under "Group DMs".
+  const dmRooms = sortedRooms.filter((g) => g.kind === "dm");
+  const groupRooms = sortedRooms.filter((g) => g.kind !== "dm");
+
+  const unreadBadge = (roomId: string) => {
+    const u = unreadByRoom.get(roomId);
+    if (!u || (u.count <= 0 && !u.mentionsUser)) return null;
+    return (
+      <span className="ml-1 flex shrink-0 items-center gap-1">
+        {u.mentionsUser && (
+          <span
+            className="flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-copper px-1 font-mono text-[10px] font-bold text-app"
+            title="Mentions you"
+            aria-label="Mentions you"
+          >
+            @
+          </span>
+        )}
+        {u.count > 0 && (
+          <span
+            className="flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-lamp-run/80 px-1.5 font-mono text-[10px] font-bold text-app"
+            title={`${u.count}${u.hasMore ? "+" : ""} unread`}
+            aria-label={`${u.count}${u.hasMore ? "+" : ""} unread`}
+          >
+            {u.count}
+            {u.hasMore ? "+" : ""}
+          </span>
+        )}
+      </span>
+    );
+  };
+
+  const roomRow = (g: GroupDMInfo) => {
+    const open = !collapsedGroupDMs.has(g.id);
+    return (
+      <div key={g.id} className={`flex items-stretch transition-colors hover:bg-hover${rowEdge(g.id === activeGroupId)}`}>
+        <button
+          onClick={() => navigate(`/groupdms/${g.id}`)}
+          className={`flex min-w-0 flex-1 items-center gap-3 ${open ? "py-3" : "py-2"} pl-3 pr-1 text-left`}
+        >
+          {open && (
+            <div className="flex shrink-0 -space-x-1.5">
+              {g.members.slice(0, 3).map((m) => (
+                <AgentAvatar key={m.agentId} agentId={m.agentId} name={m.agentName} size="xs" />
+              ))}
+            </div>
+          )}
+          <div className="min-w-0 flex-1">
+            <div className="flex items-baseline gap-2">
+              <span className="min-w-0 truncate text-[15px] font-semibold text-ink">{g.name}</span>
+              {unreadBadge(g.id)}
+              {open && <RelTime value={g.updatedAt} className="ml-auto" />}
+            </div>
+            {open && (
+              <div className="mt-0.5 truncate text-[13px] text-ink-dim">
+                {g.members.map((m) => m.agentName).join(", ")}
+              </div>
+            )}
+          </div>
+        </button>
+
+        <button
+          onClick={(e) => toggleCollapseGroupDM(g.id, e)}
+          className="flex w-8 shrink-0 items-center justify-center text-ink-faint transition-colors hover:text-ink-dim"
+          title={open ? "Collapse" : "Expand"}
+          aria-label={open ? "Collapse" : "Expand"}
+        >
+          <svg
+            className={`h-3 w-3 transition-transform ${open ? "rotate-90" : ""}`}
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth={2}
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+          </svg>
+        </button>
+      </div>
+    );
+  };
   const hasAnySessions = sessions.some((s) => !s.internal);
   const visibleSessions = sessions.filter((s) => !s.internal);
   const runningCount = visibleSessions.filter((s) => s.status === "running").length;
@@ -511,6 +652,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                                 <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-ink-faint">{agent.workDir}</span>
                               )}
                             </div>
+                            <TransferSkipsNotice skips={agent.lastTransferSkips} />
                           </>
                         )}
                       </div>
@@ -544,6 +686,22 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                     )}
 
                     <button
+                      onClick={(e) => void openAgentDM(agent.id, e)}
+                      disabled={dmOpening !== null}
+                      className="flex w-8 shrink-0 items-center justify-center text-ink-faint transition-colors hover:text-copper disabled:opacity-40"
+                      title={`DM ${agent.name}`}
+                      aria-label={`DM ${agent.name}`}
+                    >
+                      {dmOpening === agent.id ? (
+                        <span className="font-mono text-[10px]">…</span>
+                      ) : (
+                        <svg viewBox="0 0 20 20" fill="currentColor" className="h-4 w-4">
+                          <path fillRule="evenodd" d="M10 2c-4.418 0-8 3.134-8 7 0 1.941.9 3.698 2.354 4.97-.096.708-.373 1.577-1.005 2.409a.5.5 0 00.438.798c1.618-.09 2.87-.667 3.75-1.284A9.06 9.06 0 0010 16.999c4.418 0 8-3.134 8-7s-3.582-7-8-7z" clipRule="evenodd" />
+                        </svg>
+                      )}
+                    </button>
+
+                    <button
                       onClick={(e) => toggleCollapseAgent(agent.id, e)}
                       className="flex w-8 shrink-0 items-center justify-center text-ink-faint transition-colors hover:text-ink-dim"
                       title={open ? "Collapse" : "Expand"}
@@ -566,11 +724,25 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
           )}
         </section>
 
+        {/* DMs Section — first-class 1:1 rooms (kind === "dm") */}
+        {dmRooms.length > 0 && (
+          <section>
+            <div className="mb-2 flex items-center justify-between px-0.5">
+              <h2 className="font-mono text-[11px] uppercase tracking-wide text-ink-faint">
+                DMs · {dmRooms.length}
+              </h2>
+            </div>
+            <div className="divide-y divide-hairline overflow-hidden rounded-[10px] border border-hairline bg-surface">
+              {dmRooms.map(roomRow)}
+            </div>
+          </section>
+        )}
+
         {/* Group DMs Section */}
         <section>
           <div className="mb-2 flex items-center justify-between px-0.5">
             <h2 className="font-mono text-[11px] uppercase tracking-wide text-ink-faint">
-              Group DMs · {groupDMs.length}
+              Group DMs · {groupRooms.length}
             </h2>
             <button
               onClick={() => {
@@ -584,63 +756,11 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
             </button>
           </div>
 
-          {groupDMs.length === 0 ? (
+          {groupRooms.length === 0 ? (
             <p className="py-8 text-center text-sm text-ink-faint">No group DMs</p>
           ) : (
             <div className="divide-y divide-hairline overflow-hidden rounded-[10px] border border-hairline bg-surface">
-              {[...groupDMs]
-                .sort((a, b) => {
-                  const diff = new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
-                  if (diff !== 0 && !Number.isNaN(diff)) return diff;
-                  return a.id.localeCompare(b.id);
-                })
-                .map((g) => {
-                  const open = !collapsedGroupDMs.has(g.id);
-                  return (
-                    <div key={g.id} className={`flex items-stretch transition-colors hover:bg-hover${rowEdge(g.id === activeGroupId)}`}>
-                      <button
-                        onClick={() => navigate(`/groupdms/${g.id}`)}
-                        className={`flex min-w-0 flex-1 items-center gap-3 ${open ? "py-3" : "py-2"} pl-3 pr-1 text-left`}
-                      >
-                        {open && (
-                          <div className="flex shrink-0 -space-x-1.5">
-                            {g.members.slice(0, 3).map((m) => (
-                              <AgentAvatar key={m.agentId} agentId={m.agentId} name={m.agentName} size="xs" />
-                            ))}
-                          </div>
-                        )}
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-baseline gap-2">
-                            <span className="min-w-0 truncate text-[15px] font-semibold text-ink">{g.name}</span>
-                            {open && <RelTime value={g.updatedAt} className="ml-auto" />}
-                          </div>
-                          {open && (
-                            <div className="mt-0.5 truncate text-[13px] text-ink-dim">
-                              {g.members.map((m) => m.agentName).join(", ")}
-                            </div>
-                          )}
-                        </div>
-                      </button>
-
-                      <button
-                        onClick={(e) => toggleCollapseGroupDM(g.id, e)}
-                        className="flex w-8 shrink-0 items-center justify-center text-ink-faint transition-colors hover:text-ink-dim"
-                        title={open ? "Collapse" : "Expand"}
-                        aria-label={open ? "Collapse" : "Expand"}
-                      >
-                        <svg
-                          className={`h-3 w-3 transition-transform ${open ? "rotate-90" : ""}`}
-                          fill="none"
-                          viewBox="0 0 24 24"
-                          stroke="currentColor"
-                          strokeWidth={2}
-                        >
-                          <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-                        </svg>
-                      </button>
-                    </div>
-                  );
-                })}
+              {groupRooms.map(roomRow)}
             </div>
           )}
         </section>

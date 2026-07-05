@@ -223,6 +223,24 @@ type peerAgentSyncRequest struct {
 	// silently dropping edits across peer clock skew, same rationale
 	// as workspace_files.
 	Credentials *[]*agent.Credential `json:"credentials,omitempty"`
+
+	// COMPAT: both fields below are omitempty, so only degraded /
+	// lossy transfers put them on the wire. An OLD target binary
+	// (DisallowUnknownFields) 400s such a payload and the switch
+	// aborts cleanly pre-complete — acceptable: mixed-version
+	// clusters lose only the new degraded/lossy paths, never data.
+	//
+	// DegradedFlushes lists the source-side flushes that were
+	// skipped because the orchestrator ran in opt-in degraded
+	// mode ("memory_flush", "persona_flush"). Persisted into the
+	// pending entry so finalize can warn the agent via the
+	// arrival prompt that memory / persona may be stale.
+	DegradedFlushes []string `json:"degraded_flushes,omitempty"`
+	// TransferSkips lists the session files source's transfer
+	// readers dropped (oversized JSONL, unreadable codex ref, …).
+	// Stamped into the agent row's settings (lastTransferSkips)
+	// for the owner UI and carried into the arrival prompt.
+	TransferSkips []agent.SkippedSessionFile `json:"transfer_skips,omitempty"`
 }
 
 // agentRecordTool extracts the agent's backend CLI name from an
@@ -488,6 +506,14 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		req.Agent.Settings = map[string]any{}
 	}
 	req.Agent.Settings["workDir"] = targetWorkDir
+	// Loss visibility: persist this transfer's skip list on the
+	// agent row so the owner UI can render a "skipped during
+	// transfer" notice. Always reset first so a clean transfer
+	// clears a stale notice from a previous lossy switch.
+	delete(req.Agent.Settings, "lastTransferSkips")
+	if len(req.TransferSkips) > 0 {
+		req.Agent.Settings["lastTransferSkips"] = req.TransferSkips
+	}
 	// MkdirAll for the portable default workDir runs AFTER the
 	// base64 decode loop below so a 400 on malformed claude_sessions
 	// doesn't leave a stub directory behind on target. The
@@ -735,6 +761,33 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		codexCommit()
 	}
 
+	// Hub-local settings overrides (internal/agent/hub_local_update.go):
+	// settings PATCHed on this peer while the source held the agent
+	// were acknowledged with 200 and must survive the source-wins row
+	// ingest above. Per-field 3-way merge: fields the source never
+	// touched get the local edit re-applied; fields the source changed
+	// later keep the source value (logged, never silent). A re-apply
+	// failure keeps the kv row and returns 500 so the idempotent sync
+	// request is retried rather than completing with a lost edit.
+	// No-op on peers with no pending override row.
+	appliedOv, droppedOv, ovErr := s.agents.ReapplyHubLocalOverrides(r.Context(), req.Agent.ID)
+	if ovErr != nil {
+		releaseMemSync()
+		s.logger.Error("peer agent-sync: hub-local override re-apply failed",
+			"agent", req.Agent.ID, "err", ovErr)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"hub-local override re-apply: "+ovErr.Error())
+		return
+	}
+	if len(appliedOv) > 0 {
+		s.logger.Info("peer agent-sync: re-applied hub-local settings edits made during remote holdership",
+			"agent", req.Agent.ID, "fields", appliedOv)
+	}
+	if len(droppedOv) > 0 {
+		s.logger.Info("peer agent-sync: dropped hub-local settings edits; source changed the same fields later",
+			"agent", req.Agent.ID, "fields", droppedOv)
+	}
+
 	// Credentials sync: re-encrypt and replace target's credentials
 	// for this agent. credentials.db lives in a separate SQLite file
 	// with a peer-local AES key, so this can't ride inside the
@@ -831,7 +884,11 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	// stashed in pendingAgentSyncs keyed by (agent_id, op_id)
 	// so a stale drop from a previous attempt can't erase the
 	// fresh retry's entry.
-	if err := s.recordPendingAgentSync(r.Context(), req.Agent.ID, req.OpID, req.AgentToken); err != nil {
+	if err := s.recordPendingAgentSync(r.Context(), req.Agent.ID, req.OpID, pendingSyncEntry{
+		RawToken:        req.AgentToken,
+		DegradedFlushes: req.DegradedFlushes,
+		TransferSkips:   req.TransferSkips,
+	}); err != nil {
 		s.logger.Error("peer agent-sync: persist pending entry failed",
 			"agent", req.Agent.ID, "op_id", req.OpID, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal",

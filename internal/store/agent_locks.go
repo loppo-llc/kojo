@@ -950,3 +950,39 @@ SELECT agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at, allo
 	}
 	return rec, err
 }
+
+// ListAgentLocksNotHeldBy returns every agent_locks row whose
+// holder_peer differs from selfPeer — i.e. the set of agents that are
+// currently transferred to some other device (§3.7 device-switch).
+// Returns an empty slice when nothing is remote. Lease expiry is not
+// consulted: even an expired remote row means the agent's canonical
+// transcript still lives elsewhere, so the mirror refresher should
+// keep trying while the holder is online.
+//
+// Used by the Hub-side remote_message_mirror refresher to enumerate
+// its work set without scanning the agents table.
+func (s *Store) ListAgentLocksNotHeldBy(ctx context.Context, selfPeer string) ([]AgentLockRecord, error) {
+	if selfPeer == "" {
+		return nil, errors.New("store.ListAgentLocksNotHeldBy: selfPeer required")
+	}
+	const q = `
+SELECT agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at, allowed_proxy_peer
+  FROM agent_locks WHERE holder_peer != ?`
+	rows, err := s.db.QueryContext(ctx, q, selfPeer)
+	if err != nil {
+		return nil, fmt.Errorf("store.ListAgentLocksNotHeldBy: %w", err)
+	}
+	defer rows.Close()
+	out := make([]AgentLockRecord, 0)
+	for rows.Next() {
+		rec, err := scanAgentLockRow(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store.ListAgentLocksNotHeldBy: scan: %w", err)
+		}
+		out = append(out, *rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store.ListAgentLocksNotHeldBy: rows: %w", err)
+	}
+	return out, nil
+}

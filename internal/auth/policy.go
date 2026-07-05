@@ -322,6 +322,12 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		return true
 	}
 
+	// `POST /api/v1/dms` (find-or-create 1:1 DM) — same contract as group
+	// creation: the handler enforces caller-in-memberIds.
+	if path == "/api/v1/dms" && method == http.MethodPost && p.IsAgent() {
+		return true
+	}
+
 	// Group DM API — allow members to read groups, post messages, and
 	// manage their own membership. The handler is responsible for
 	// confirming the principal is actually a member of the named
@@ -341,6 +347,10 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			// finer-grained check there.
 			return method == http.MethodGet
 		case sub == "/messages" && (method == http.MethodGet || method == http.MethodPost):
+			return true
+		case sub == "/unread" && method == http.MethodGet:
+			// Member agents may poll their own unread counters; the
+			// handler enforces membership.
 			return true
 		case strings.HasPrefix(sub, "/members"):
 			return true
@@ -373,7 +383,15 @@ func isSelfScopedRoute(method, sub string) bool {
 	case "/files", "/files/view", "/files/raw", "/files/thumb":
 		return method == http.MethodGet
 	case "/messages":
+		// GET: agent reads its own transcript. POST (HTTP send /
+		// queue-and-forward delivery) is Owner- or RolePeer-driven
+		// — an agent has no reason to HTTP-post to its own chat
+		// loop, so keep it denied here.
 		return method == http.MethodGet
+	case "/queued-messages":
+		// Queue-and-forward inspection is Owner-only (handler
+		// re-checks); explicit deny for Agent principals.
+		return false
 	case "/tasks":
 		return method == http.MethodGet || method == http.MethodPost
 	case "/credentials":

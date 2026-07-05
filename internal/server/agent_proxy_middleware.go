@@ -87,6 +87,14 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// Queue-and-forward inspection / cancel: the queue table
+		// lives hub-side, so these must never be proxied to the
+		// holder.
+		if strings.HasPrefix(sub, "/queued-messages") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Hub-only management ops: the target peer's handler would
 		// 403 anyway (CanForkOrCreate / CanSetPrivileged don't
 		// admit RolePeer). Short-circuit here to avoid a wasted
@@ -96,11 +104,51 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// --- Hub-local fallback for settings PATCH (offline holder) ---
+		//
+		// Classification (full rationale in
+		// internal/agent/hub_local_update.go):
+		//
+		//   HUB-LOCAL-SAFE — pure hub-DB row fields, editable even when
+		//   the holder is offline/unknown: name, publicProfile(+Override),
+		//   effort, autoEffort, disabledInjections,
+		//   silentStart/silentEnd, notifyDuringSilent.
+		//
+		//   HOLDER-ONLY — everything that mutates holder disk or the
+		//   live session and therefore keeps the proxy (and its
+		//   peer_offline failure): persona, model/tool/customBaseURL/
+		//   thinkingMode, workDir, cronExpr, cronMessage (persists via
+		//   agent_workspace_files, not the agents row), timeout/resumeIdle,
+		//   allowedTools/allowProtectedPaths, tts, deviceSwitchEnabled,
+		//   plus the non-PATCH routes (avatar upload, persona/status/
+		//   memory/workspace-file writes, transcript edits, credentials,
+		//   tasks, sessions).
+		//
+		// When the holder is ONLINE the PATCH is still proxied — the
+		// holder's in-memory agent is the write authority and its row
+		// syncs home at the next device switch. Only when that proxy
+		// is guaranteed to fail (holder offline or unknown) does a
+		// hub-safe-only payload get applied to the hub's own row.
+		if r.Method == http.MethodPatch && sub == "" && !s.holderPeerOnline(r.Context(), remote.HolderPeer) {
+			if s.tryPatchRemoteAgentHubLocal(w, r, id) {
+				return
+			}
+		}
+
 		// --- Proxy to holder peer ---
 
 		if remote.HolderPeer == "" || s.peerID == nil {
 			writeError(w, http.StatusServiceUnavailable, "agent_remote",
 				"agent is on a remote peer but holder is unknown; cannot proxy")
+			return
+		}
+
+		// Message send gets queue-and-forward semantics: holder
+		// offline (or unreachable on dial) enqueues into
+		// handoff_queued_messages instead of failing with 502.
+		// Every other mutation keeps the plain proxy behaviour.
+		if r.Method == http.MethodPost && sub == "/messages" {
+			s.proxyOrQueueAgentMessage(w, r, id, remote.HolderPeer)
 			return
 		}
 

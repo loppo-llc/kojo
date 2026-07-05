@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useNavigate, useLocation } from "react-router";
-import { agentApi, type AgentInfo, type AgentMessage, type AgentMessageAttachment, type ChatEvent } from "../../lib/agentApi";
+import { agentApi, type AgentInfo, type AgentMessage, type AgentMessageAttachment, type ChatEvent, type QueuedAgentMessage } from "../../lib/agentApi";
 import { errMsg, localRFC3339 } from "../../lib/utils";
 import { useEnterSends } from "../../lib/preferences";
 import { useAgentWebSocket } from "../../hooks/useAgentWebSocket";
@@ -20,6 +20,7 @@ import {
   enterToSend,
 } from "../chatComposer";
 import { ChatMessage, StreamingMessage } from "./ChatMessage";
+import { QueuedMessages } from "./QueuedMessages";
 import { AgentAvatar } from "./AgentAvatar";
 import { Lamp } from "../ui/Lamp";
 import {
@@ -46,6 +47,12 @@ export function AgentChat() {
   const [agent, setAgent] = useState<AgentInfo | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const { input, setInput } = useDraftInput("agent-draft", id);
+  // Live mirrors for async completions (queued offline send) that must
+  // read the CURRENT route id / draft rather than their closure's.
+  const idRef = useRef(id);
+  idRef.current = id;
+  const inputRef = useRef(input);
+  inputRef.current = input;
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
   const [streamThinking, setStreamThinking] = useState("");
@@ -294,6 +301,97 @@ export function AgentChat() {
     return () => clearInterval(t);
   }, [id, agent?.holderPeer]);
 
+  // Queue-and-forward (holder device offline): queued rows for this
+  // agent, the last queued-send confirmation banner, and the last
+  // queue error (queue_full etc). Fetched on mount / agent change and
+  // whenever the holder flips offline; refreshed after a queued send.
+  const [queuedMsgs, setQueuedMsgs] = useState<QueuedAgentMessage[]>([]);
+  const [queueNotice, setQueueNotice] = useState<string | null>(null);
+  const [queueError, setQueueError] = useState<string | null>(null);
+  // Generation guard for queue GETs (same pattern as refetchSeqRef):
+  // bumped on agent change and after every local mutation (cancel) so
+  // a slow in-flight list response can't resurrect a cancelled row or
+  // leak another agent's queue after navigation.
+  const queueSeqRef = useRef(0);
+  // In-flight guard for the offline HTTP send — blocks double-submits.
+  // Holds the active request's token (0 = idle) so a stale response
+  // from a previous route can only release its OWN guard, never a
+  // newer send's.
+  const queueSendTokenRef = useRef(0);
+  const queueSendSeqRef = useRef(0);
+
+  const refreshQueued = useCallback(() => {
+    if (!id) return;
+    const seq = ++queueSeqRef.current;
+    agentApi.getQueuedMessages(id).then((msgs) => {
+      if (seq !== queueSeqRef.current) return;
+      setQueuedMsgs(msgs);
+    }).catch(() => {
+      // Transient — keep whatever list we have rather than flashing
+      // the panel away on a flaky poll.
+    });
+  }, [id]);
+
+  useEffect(() => {
+    queueSeqRef.current++; // invalidate the previous agent's in-flight GET
+    queueSendTokenRef.current = 0;
+    setQueuedMsgs([]);
+    setQueueNotice(null);
+    setQueueError(null);
+  }, [id]);
+
+  // Refresh on every holderOffline flip: offline picks up rows queued
+  // from another device; back-online clears rows the server just
+  // delivered. Also covers the initial fetch on mount.
+  useEffect(() => {
+    refreshQueued();
+    if (!holderOffline) setQueueNotice(null);
+  }, [holderOffline, refreshQueued]);
+
+  // While rows are queued, poll the list at the same 5 s cadence as the
+  // agent-record poll: the server drains the queue asynchronously when
+  // the holder reconnects, and rows cancelled from another device
+  // should disappear here too.
+  const hasQueued = queuedMsgs.length > 0;
+  useEffect(() => {
+    if (!id || !hasQueued) return;
+    const t = setInterval(refreshQueued, 5000);
+    return () => clearInterval(t);
+  }, [id, hasQueued, refreshQueued]);
+
+  const handleCancelQueued = useCallback(
+    (qid: string) => {
+      if (!id) return;
+      const sentForId = id;
+      agentApi.cancelQueuedMessage(id, qid)
+        .catch((e: unknown) => {
+          if (sentForId !== idRef.current) throw e; // stale route — drop silently
+          // 404 = already delivered or cancelled elsewhere — dropping
+          // the row locally is correct either way. Anything else keeps
+          // the row and surfaces the error.
+          if (e instanceof Error && /^404:/.test(e.message)) return;
+          setQueueError(errMsg(e));
+          throw e;
+        })
+        .then(() => {
+          // Route moved on — don't touch the new agent's queue state.
+          if (sentForId !== idRef.current) return;
+          // Invalidate any in-flight list GET taken before the cancel
+          // so it can't re-add the row we just removed.
+          queueSeqRef.current++;
+          setQueuedMsgs((prev) => {
+            const next = prev.filter((m) => m.id !== qid);
+            // Last row gone → the "queued" notice no longer describes
+            // anything; drop it rather than contradict the empty panel.
+            if (next.length === 0) setQueueNotice(null);
+            return next;
+          });
+        })
+        .catch(() => {});
+    },
+    [id],
+  );
+
   const resetStream = useCallback(() => {
     setStreaming(false);
     setStreamText("");
@@ -501,11 +599,71 @@ export function AgentChat() {
 
   const handleSend = () => {
     const text = input.trim();
-    if ((!text && pendingFiles.length === 0) || streaming || !connected) return;
+    if (streaming) return;
     // Holder peer offline → the WS frame would dead-end at the Hub
-    // proxy and the user's message would be lost. Refuse rather than
-    // silently swallow.
-    if (holderOffline) return;
+    // proxy. Route through the queue-and-forward HTTP endpoint instead:
+    // the server delivers immediately if it can, or queues the message
+    // for delivery when the holder device reconnects. Attachments are
+    // not supported on this path (the composer's AttachButton stays
+    // disabled while the holder is offline), and connectivity of OUR
+    // WebSocket is irrelevant — the POST goes straight to Hub.
+    if (holderOffline) {
+      if (!id) return;
+      if (queueSendTokenRef.current !== 0) return; // one POST at a time
+      if (pendingFiles.length > 0) {
+        // The queue endpoint is text-only. Files can be attached only
+        // while online (AttachButton is disabled offline), so these
+        // predate the outage — refuse rather than silently drop them.
+        setQueueError("Attachments can't be queued — remove them or wait for the device to reconnect.");
+        return;
+      }
+      if (!text) return;
+      setQueueError(null);
+      const token = ++queueSendSeqRef.current;
+      queueSendTokenRef.current = token;
+      // Clear the draft up-front (same optimistic UX as the online
+      // path) so a slow response can't wipe text typed in the interim.
+      setInput("");
+      if (textareaRef.current) textareaRef.current.style.height = "auto";
+      const sentForId = id;
+      agentApi.postAgentMessage(id, text).then((r) => {
+        // Release only our own guard — a newer send owns the slot now.
+        if (queueSendTokenRef.current === token) queueSendTokenRef.current = 0;
+        // Route moved to another agent while the POST was in flight —
+        // don't inject the old agent's notice/message into the new view.
+        if (sentForId !== idRef.current) return;
+        if (r.queued) {
+          const peer = r.holderPeerName || agent?.holderPeerName || (agent?.holderPeer ?? "").slice(0, 8);
+          setQueueNotice(`Queued — will deliver when device ${peer} reconnects.`);
+          refreshQueued();
+        } else {
+          // Delivered after all (holder came back between our last poll
+          // and the POST). Show it optimistically; the status-flip
+          // refetch will reconcile with the holder's transcript.
+          setQueueNotice(null);
+          setMessages((prev) => [...prev, {
+            id: "pending_" + Date.now(),
+            role: "user" as const,
+            content: text,
+            timestamp: localRFC3339(),
+          }]);
+        }
+      }).catch((e: unknown) => {
+        if (queueSendTokenRef.current === token) queueSendTokenRef.current = 0;
+        if (sentForId !== idRef.current) return;
+        const msg = errMsg(e);
+        setQueueError(
+          /queue_full/.test(msg)
+            ? "Queue is full for this agent (100 messages max) — cancel a queued message or wait for the device to reconnect."
+            : msg,
+        );
+        // The draft was cleared optimistically — put the failed text
+        // back so the user can retry, unless they typed something new.
+        if (!inputRef.current.trim()) setInput(text);
+      });
+      return;
+    }
+    if ((!text && pendingFiles.length === 0) || !connected) return;
     abortedIdRef.current = null; // Finalize any pending abort — synthetic message stays as-is
 
     // Add user message immediately
@@ -901,10 +1059,25 @@ export function AgentChat() {
               <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 5a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 5zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
             </svg>
             <span className="flex-1">
-              ホスト端末 <span className="font-mono">{agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)}</span> がオフライン。復帰まで送信不可。
+              ホスト端末 <span className="font-mono">{agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)}</span> がオフライン。送信したメッセージは復帰時に配送する。
             </span>
           </div>
         )}
+        {/* Queue-and-forward panel: queued rows with cancel, shown while
+            the holder is offline or while queued rows remain. */}
+        {(holderOffline || queuedMsgs.length > 0) && (
+          <QueuedMessages
+            messages={queuedMsgs}
+            holderPeerName={agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)}
+            onCancel={handleCancelQueued}
+          />
+        )}
+        {queueNotice && (
+          <div className="mb-2 rounded-[10px] border border-lamp-run/40 bg-lamp-run/10 px-3 py-1.5 text-xs text-ink-dim">
+            {queueNotice}
+          </div>
+        )}
+        {queueError && <DismissibleError message={queueError} onDismiss={() => setQueueError(null)} />}
         {/* Upload error */}
         {uploadError && <DismissibleError message={uploadError} onDismiss={() => setUploadError(null)} />}
         {/* Pending file attachments */}
@@ -940,8 +1113,14 @@ export function AgentChat() {
           ) : (
             <SendButton
               onClick={handleSend}
-              disabled={(!input.trim() && pendingFiles.length === 0) || !connected || holderOffline}
-              title={holderOffline ? `Holder peer is offline — send disabled until @ ${agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)} reconnects` : undefined}
+              disabled={
+                holderOffline
+                  // Attachments-only stays clickable so handleSend can
+                  // explain that attachments can't be queued.
+                  ? !input.trim() && pendingFiles.length === 0
+                  : (!input.trim() && pendingFiles.length === 0) || !connected
+              }
+              title={holderOffline ? `Holder peer is offline — message will be queued and delivered when @ ${agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)} reconnects` : undefined}
             />
           )}
         </div>

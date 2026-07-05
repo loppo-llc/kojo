@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 )
 
 // validGroupDMStyles mirrors v0's GroupDMStyle enum. "efficient" is the
@@ -35,6 +36,14 @@ var validNotifyModes = map[string]bool{
 	"realtime": true,
 	"digest":   true,
 	"muted":    true,
+}
+
+// validGroupDMKinds enumerates the room kinds. "group" is the classic
+// multi-member room; "dm" is a first-class 1:1 room (sugar over the same
+// machinery, listed separately in the UI). Empty is normalized to "group".
+var validGroupDMKinds = map[string]bool{
+	"group": true,
+	"dm":    true,
 }
 
 // UserSenderID is the reserved agent_id for messages posted by the
@@ -68,6 +77,11 @@ type GroupDMRecord struct {
 	Style    string
 	Cooldown int
 	Venue    string
+	// MaxHops caps agent-to-agent notification relay depth for this room.
+	// 0 means "use the built-in default" (agent.defaultMaxHops).
+	MaxHops int
+	// Kind is "group" (default) or "dm" (first-class 1:1 room).
+	Kind string
 
 	Seq       int64
 	Version   int
@@ -108,6 +122,8 @@ type groupDMETagInput struct {
 	Style         string            `json:"style"`
 	Cooldown      int               `json:"cooldown"`
 	Venue         string            `json:"venue"`
+	MaxHops       int               `json:"max_hops,omitempty"`
+	Kind          string            `json:"kind,omitempty"`
 	UpdatedAt     int64             `json:"updated_at"`
 	DeletedAt     *int64            `json:"deleted_at"`
 }
@@ -120,6 +136,8 @@ func computeGroupDMETag(r *GroupDMRecord) (string, error) {
 		Style:         r.Style,
 		Cooldown:      r.Cooldown,
 		Venue:         r.Venue,
+		MaxHops:       r.MaxHops,
+		Kind:          canonicalKind(r.Kind),
 		UpdatedAt:     r.UpdatedAt,
 		DeletedAt:     r.DeletedAt,
 	})
@@ -165,6 +183,15 @@ func (s *Store) InsertGroupDM(ctx context.Context, rec *GroupDMRecord, opts Grou
 	}
 	if rec.Cooldown < 0 {
 		return nil, fmt.Errorf("store.InsertGroupDM: negative cooldown %d", rec.Cooldown)
+	}
+	if rec.MaxHops < 0 {
+		return nil, fmt.Errorf("store.InsertGroupDM: negative max_hops %d", rec.MaxHops)
+	}
+	if rec.Kind == "" {
+		rec.Kind = "group"
+	}
+	if !validGroupDMKinds[rec.Kind] {
+		return nil, fmt.Errorf("store.InsertGroupDM: invalid kind %q", rec.Kind)
 	}
 	if len(rec.Members) == 0 {
 		return nil, errors.New("store.InsertGroupDM: members required")
@@ -225,11 +252,12 @@ func (s *Store) InsertGroupDM(ctx context.Context, rec *GroupDMRecord, opts Grou
 
 	const q = `
 INSERT INTO groupdms (
-  id, name, members_json, style, cooldown, venue,
+  id, name, members_json, style, cooldown, venue, max_hops, kind, dm_member_key,
   seq, version, etag, created_at, updated_at, deleted_at, peer_id
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
 	if _, err := tx.ExecContext(ctx, q,
-		out.ID, out.Name, string(membersJSON), out.Style, out.Cooldown, out.Venue,
+		out.ID, out.Name, string(membersJSON), out.Style, out.Cooldown, out.Venue, out.MaxHops, out.Kind,
+		dmMemberKey(out.Kind, out.Members),
 		out.Seq, out.Version, out.ETag, out.CreatedAt, out.UpdatedAt, nullableText(out.PeerID),
 	); err != nil {
 		return nil, fmt.Errorf("store.InsertGroupDM: %w", err)
@@ -251,7 +279,7 @@ INSERT INTO groupdms (
 // member list to the UI should overlay a live-agents lookup themselves.
 func (s *Store) GetGroupDM(ctx context.Context, id string) (*GroupDMRecord, error) {
 	const q = `
-SELECT id, name, members_json, style, cooldown, venue, seq, version, etag, created_at, updated_at, deleted_at, COALESCE(peer_id,'')
+SELECT id, name, members_json, style, cooldown, venue, max_hops, kind, seq, version, etag, created_at, updated_at, deleted_at, COALESCE(peer_id,'')
   FROM groupdms WHERE id = ? AND deleted_at IS NULL`
 	rec, err := scanGroupDMRow(s.db.QueryRowContext(ctx, q, id))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -263,7 +291,7 @@ SELECT id, name, members_json, style, cooldown, venue, seq, version, etag, creat
 // ListGroupDMs returns all live group DMs ordered by seq.
 func (s *Store) ListGroupDMs(ctx context.Context) ([]*GroupDMRecord, error) {
 	const q = `
-SELECT id, name, members_json, style, cooldown, venue, seq, version, etag, created_at, updated_at, deleted_at, COALESCE(peer_id,'')
+SELECT id, name, members_json, style, cooldown, venue, max_hops, kind, seq, version, etag, created_at, updated_at, deleted_at, COALESCE(peer_id,'')
   FROM groupdms WHERE deleted_at IS NULL ORDER BY seq ASC`
 	rows, err := s.db.QueryContext(ctx, q)
 	if err != nil {
@@ -291,7 +319,7 @@ func (s *Store) UpdateGroupDM(ctx context.Context, id, ifMatchETag string, mutat
 	defer func() { _ = tx.Rollback() }()
 
 	const sel = `
-SELECT id, name, members_json, style, cooldown, venue, seq, version, etag, created_at, updated_at, deleted_at, COALESCE(peer_id,'')
+SELECT id, name, members_json, style, cooldown, venue, max_hops, kind, seq, version, etag, created_at, updated_at, deleted_at, COALESCE(peer_id,'')
   FROM groupdms WHERE id = ? AND deleted_at IS NULL`
 	cur, err := scanGroupDMRow(tx.QueryRowContext(ctx, sel, id))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -336,6 +364,13 @@ SELECT id, name, members_json, style, cooldown, venue, seq, version, etag, creat
 	if next.Cooldown < 0 {
 		return nil, fmt.Errorf("store.UpdateGroupDM: negative cooldown %d", next.Cooldown)
 	}
+	if next.MaxHops < 0 {
+		return nil, fmt.Errorf("store.UpdateGroupDM: negative max_hops %d", next.MaxHops)
+	}
+	// Kind is immutable after creation — a dm can't be promoted to a group
+	// (nor the reverse) because the UI partitions on it and the find-or-
+	// create DM lookup keys on (kind, member set).
+	next.Kind = cur.Kind
 	if len(next.Members) == 0 {
 		return nil, errors.New("store.UpdateGroupDM: members required")
 	}
@@ -367,6 +402,7 @@ SELECT id, name, members_json, style, cooldown, venue, seq, version, etag, creat
 	// digest_window edit *does* bump the version.
 	if next.Name == cur.Name && next.Style == cur.Style &&
 		next.Venue == cur.Venue && next.Cooldown == cur.Cooldown &&
+		next.MaxHops == cur.MaxHops &&
 		sameCanonicalMembers(next.Members, cur.Members) {
 		return cur, nil
 	}
@@ -385,11 +421,13 @@ SELECT id, name, members_json, style, cooldown, venue, seq, version, etag, creat
 
 	const upd = `
 UPDATE groupdms SET
-  name = ?, members_json = ?, style = ?, cooldown = ?, venue = ?,
+  name = ?, members_json = ?, style = ?, cooldown = ?, venue = ?, max_hops = ?,
+  dm_member_key = ?,
   version = ?, etag = ?, updated_at = ?
 WHERE id = ? AND etag = ? AND deleted_at IS NULL`
 	res, err := tx.ExecContext(ctx, upd,
-		next.Name, string(membersJSON), next.Style, next.Cooldown, next.Venue,
+		next.Name, string(membersJSON), next.Style, next.Cooldown, next.Venue, next.MaxHops,
+		dmMemberKey(next.Kind, next.Members),
 		next.Version, next.ETag, next.UpdatedAt,
 		id, cur.ETag,
 	)
@@ -418,7 +456,7 @@ func (s *Store) SoftDeleteGroupDM(ctx context.Context, id string) error {
 	defer func() { _ = tx.Rollback() }()
 
 	const sel = `
-SELECT id, name, members_json, style, cooldown, venue, seq, version, etag, created_at, updated_at, deleted_at, COALESCE(peer_id,'')
+SELECT id, name, members_json, style, cooldown, venue, max_hops, kind, seq, version, etag, created_at, updated_at, deleted_at, COALESCE(peer_id,'')
   FROM groupdms WHERE id = ? AND deleted_at IS NULL`
 	cur, err := scanGroupDMRow(tx.QueryRowContext(ctx, sel, id))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -454,11 +492,12 @@ func scanGroupDMRow(r rowScanner) (*GroupDMRecord, error) {
 		deletedAt sql.NullInt64
 	)
 	if err := r.Scan(
-		&rec.ID, &rec.Name, &members, &rec.Style, &rec.Cooldown, &rec.Venue,
+		&rec.ID, &rec.Name, &members, &rec.Style, &rec.Cooldown, &rec.Venue, &rec.MaxHops, &rec.Kind,
 		&rec.Seq, &rec.Version, &rec.ETag, &rec.CreatedAt, &rec.UpdatedAt, &deletedAt, &rec.PeerID,
 	); err != nil {
 		return nil, err
 	}
+	rec.Kind = canonicalKind(rec.Kind)
 	if deletedAt.Valid {
 		v := deletedAt.Int64
 		rec.DeletedAt = &v
@@ -469,6 +508,31 @@ func scanGroupDMRow(r rowScanner) (*GroupDMRecord, error) {
 		}
 	}
 	return &rec, nil
+}
+
+// dmMemberKey returns the canonical member-set key persisted for
+// kind="dm" rows (sorted agent ids joined with '\n'); "" for other kinds.
+// Backs the partial UNIQUE index that makes DM find-or-create race-safe
+// across daemons.
+func dmMemberKey(kind string, members []GroupDMMember) any {
+	if kind != "dm" {
+		return nil
+	}
+	ids := make([]string, len(members))
+	for i, m := range members {
+		ids[i] = m.AgentID
+	}
+	slices.Sort(ids)
+	return strings.Join(ids, "\n")
+}
+
+// canonicalKind normalizes empty / unknown kinds to "group" on read so
+// legacy rows behave like classic rooms.
+func canonicalKind(k string) string {
+	if !validGroupDMKinds[k] {
+		return "group"
+	}
+	return k
 }
 
 // verifyMembersAlive ensures every id in members exists as a live agent.
@@ -565,6 +629,12 @@ type GroupDMMessageRecord struct {
 	AgentID     string // "" for system messages (NULL in DB)
 	Content     string
 	Attachments json.RawMessage
+	// Hop is the agent-relay depth: 0 for user/system/fresh agent posts,
+	// trigger-hop + 1 for posts made from a notification-triggered turn.
+	Hop int
+	// Mentions is a JSON array of mentioned member ids ("user" for the
+	// human operator). nil when the message mentions nobody.
+	Mentions json.RawMessage
 
 	Version   int
 	ETag      string
@@ -581,6 +651,8 @@ type groupDMMessageETagInput struct {
 	AgentID     string          `json:"agent_id"`
 	Content     string          `json:"content"`
 	Attachments json.RawMessage `json:"attachments,omitempty"`
+	Hop         int             `json:"hop,omitempty"`
+	Mentions    json.RawMessage `json:"mentions,omitempty"`
 	UpdatedAt   int64           `json:"updated_at"`
 	DeletedAt   *int64          `json:"deleted_at"`
 }
@@ -593,6 +665,8 @@ func computeGroupDMMessageETag(r *GroupDMMessageRecord) (string, error) {
 		AgentID:     r.AgentID,
 		Content:     r.Content,
 		Attachments: r.Attachments,
+		Hop:         r.Hop,
+		Mentions:    r.Mentions,
 		UpdatedAt:   r.UpdatedAt,
 		DeletedAt:   r.DeletedAt,
 	})
@@ -622,6 +696,11 @@ type GroupDMMessageInsertOptions struct {
 	// indexed by the UNIQUE(groupdm_id,seq) constraint; the id mapping
 	// is a single SELECT on the way in and stays in the API layer.
 	ExpectedLatestSeq int64
+	// RequireExpectedLatestSeq enforces the head comparison even when
+	// ExpectedLatestSeq is 0, making "I expect the room to be EMPTY"
+	// expressible: two concurrent first posts to an empty room then
+	// collide (the loser gets ErrStaleHead) instead of both passing.
+	RequireExpectedLatestSeq bool
 	// AllowNonMember lets the caller post under an agent_id that is not
 	// in members_json. Reserved for the v0→v1 importer where a member
 	// has since been removed but historical messages must round-trip,
@@ -763,7 +842,8 @@ func (s *Store) AppendGroupDMMessage(ctx context.Context, rec *GroupDMMessageRec
 	if headSeq.Valid {
 		currentHead = headSeq.Int64
 	}
-	if opts.ExpectedLatestSeq != 0 && opts.ExpectedLatestSeq != currentHead {
+	if (opts.ExpectedLatestSeq != 0 || opts.RequireExpectedLatestSeq) &&
+		opts.ExpectedLatestSeq != currentHead {
 		return nil, ErrStaleHead
 	}
 	seq := opts.Seq
@@ -782,6 +862,13 @@ func (s *Store) AppendGroupDMMessage(ctx context.Context, rec *GroupDMMessageRec
 	if err != nil {
 		return nil, fmt.Errorf("store.AppendGroupDMMessage: attachments: %w", err)
 	}
+	out.Mentions, err = nullJSON(out.Mentions)
+	if err != nil {
+		return nil, fmt.Errorf("store.AppendGroupDMMessage: mentions: %w", err)
+	}
+	if out.Hop < 0 {
+		out.Hop = 0
+	}
 	out.ETag, err = computeGroupDMMessageETag(&out)
 	if err != nil {
 		return nil, err
@@ -789,12 +876,13 @@ func (s *Store) AppendGroupDMMessage(ctx context.Context, rec *GroupDMMessageRec
 
 	const q = `
 INSERT INTO groupdm_messages (
-  id, groupdm_id, seq, agent_id, content, attachments,
+  id, groupdm_id, seq, agent_id, content, attachments, hop, mentions,
   version, etag, created_at, updated_at, deleted_at, peer_id
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
 	if _, err := tx.ExecContext(ctx, q,
 		out.ID, out.GroupDMID, out.Seq, nullableText(out.AgentID),
 		nullableText(out.Content), nullableRaw(out.Attachments),
+		out.Hop, nullableRaw(out.Mentions),
 		out.Version, out.ETag, out.CreatedAt, out.UpdatedAt, nullableText(out.PeerID),
 	); err != nil {
 		return nil, fmt.Errorf("store.AppendGroupDMMessage: %w", err)
@@ -822,7 +910,7 @@ func (s *Store) ListGroupDMMessages(ctx context.Context, groupID string, opts Gr
 	args := []any{groupID}
 	q := `
 SELECT m.id, m.groupdm_id, m.seq, COALESCE(m.agent_id,''),
-       COALESCE(m.content,''), m.attachments,
+       COALESCE(m.content,''), m.attachments, m.hop, m.mentions,
        m.version, m.etag, m.created_at, m.updated_at, m.deleted_at, COALESCE(m.peer_id,'')
   FROM groupdm_messages m
   JOIN groupdms         g ON g.id = m.groupdm_id
@@ -907,11 +995,12 @@ func scanGroupDMMessageRow(r rowScanner) (*GroupDMMessageRecord, error) {
 	var (
 		rec         GroupDMMessageRecord
 		attachments sql.NullString
+		mentions    sql.NullString
 		deletedAt   sql.NullInt64
 	)
 	if err := r.Scan(
 		&rec.ID, &rec.GroupDMID, &rec.Seq, &rec.AgentID,
-		&rec.Content, &attachments,
+		&rec.Content, &attachments, &rec.Hop, &mentions,
 		&rec.Version, &rec.ETag, &rec.CreatedAt, &rec.UpdatedAt, &deletedAt, &rec.PeerID,
 	); err != nil {
 		return nil, err
@@ -919,9 +1008,78 @@ func scanGroupDMMessageRow(r rowScanner) (*GroupDMMessageRecord, error) {
 	if attachments.Valid {
 		rec.Attachments = json.RawMessage(attachments.String)
 	}
+	if mentions.Valid {
+		rec.Mentions = json.RawMessage(mentions.String)
+	}
 	if deletedAt.Valid {
 		v := deletedAt.Int64
 		rec.DeletedAt = &v
 	}
 	return &rec, nil
+}
+
+// -- groupdm_dead_letters ----------------------------------------------
+
+// GroupDMDeadLetter is a permanently failed notification delivery. Kept
+// as an audit record instead of silently dropping the batch. Payload is
+// the rendered notification text (may be truncated by the caller).
+type GroupDMDeadLetter struct {
+	ID        int64  `json:"id"`
+	GroupDMID string `json:"groupdmId"`
+	AgentID   string `json:"agentId"`
+	Reason    string `json:"reason"`
+	Payload   string `json:"payload,omitempty"`
+	Attempts  int    `json:"attempts"`
+	CreatedAt int64  `json:"createdAt"`
+}
+
+// InsertGroupDMDeadLetter records a permanently failed delivery.
+func (s *Store) InsertGroupDMDeadLetter(ctx context.Context, dl *GroupDMDeadLetter) error {
+	if dl == nil || dl.GroupDMID == "" || dl.AgentID == "" {
+		return errors.New("store.InsertGroupDMDeadLetter: groupdm_id/agent_id required")
+	}
+	if dl.CreatedAt == 0 {
+		dl.CreatedAt = NowMillis()
+	}
+	res, err := s.db.ExecContext(ctx, `
+INSERT INTO groupdm_dead_letters (groupdm_id, agent_id, reason, payload, attempts, created_at)
+VALUES (?, ?, ?, ?, ?, ?)`,
+		dl.GroupDMID, dl.AgentID, dl.Reason, dl.Payload, dl.Attempts, dl.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("store.InsertGroupDMDeadLetter: %w", err)
+	}
+	if id, err := res.LastInsertId(); err == nil {
+		dl.ID = id
+	}
+	return nil
+}
+
+// ListGroupDMDeadLetters returns dead letters for a group, newest first,
+// capped at limit (0 = 50).
+func (s *Store) ListGroupDMDeadLetters(ctx context.Context, groupID string, limit int) ([]*GroupDMDeadLetter, error) {
+	if groupID == "" {
+		return nil, errors.New("store.ListGroupDMDeadLetters: groupdm_id required")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, groupdm_id, agent_id, reason, COALESCE(payload,''), attempts, created_at
+  FROM groupdm_dead_letters
+ WHERE groupdm_id = ?
+ ORDER BY created_at DESC, id DESC
+ LIMIT ?`, groupID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*GroupDMDeadLetter
+	for rows.Next() {
+		var dl GroupDMDeadLetter
+		if err := rows.Scan(&dl.ID, &dl.GroupDMID, &dl.AgentID, &dl.Reason, &dl.Payload, &dl.Attempts, &dl.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, &dl)
+	}
+	return out, rows.Err()
 }

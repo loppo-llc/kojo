@@ -82,6 +82,9 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 	if s.onAgentForceReclaimed != nil {
 		s.onAgentForceReclaimed(r.Context(), id)
 	}
+	// Queue-and-forward: holdership just moved to the local peer —
+	// deliver anything queued while the previous holder was away.
+	s.kickHandoffQueueDrain()
 	s.logger.Info("force-reclaim: agent runtime reclaimed",
 		"agent", id, "fencing_token", rec.FencingToken,
 		"lease_expires_at", rec.LeaseExpiresAt)

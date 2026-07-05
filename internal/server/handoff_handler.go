@@ -314,6 +314,16 @@ func (s *Server) runHandoffOp(ctx context.Context, agentID, op, targetPeerID str
 				Error:  "row did not converge to target (state mismatch)",
 			})
 		}
+		// Queue-and-forward: holdership just moved (handoff
+		// complete, both HTTP and switch-device orchestrator
+		// paths land here) — trigger a delivery pass for any
+		// messages queued against the previous holder. Safe even
+		// though finalize hasn't run yet: until the target
+		// activates the runtime, its /messages handler 404s (agent
+		// not in its local manager) and its fencing gate refuses
+		// stale holders, so messages stay queued; the drain's
+		// self-scheduled backoff retries after finalize lands.
+		s.kickHandoffQueueDrain()
 		return resp, nil
 	}
 

@@ -103,7 +103,11 @@ type Server struct {
 	// can key on (agentID, opID) instead of agentID alone — without
 	// that, the in-memory dedup map never clears and subsequent
 	// switches back to this peer silently skip their auto-continue.
-	onAgentSyncFinalized func(ctx context.Context, agentID, rawToken, sourceDeviceID, opID string) error
+	// Returns tokenReissued=true when rawToken was empty and the
+	// hook auto-re-issued a fresh agent token on this peer (Task A
+	// auto-repair) — surfaced in the arrival prompt so the agent
+	// knows no manual re-issue is needed.
+	onAgentSyncFinalized func(ctx context.Context, agentID, rawToken, sourceDeviceID, opID string) (tokenReissued bool, err error)
 	// onAgentReleasedAsSource fires after the orchestrator's
 	// successful complete + finalize. Source peer drops the
 	// agent from its local AgentLockGuard so a target lease
@@ -117,6 +121,38 @@ type Server struct {
 	// back up without a daemon restart. Set via
 	// SetOnAgentForceReclaimed.
 	onAgentForceReclaimed func(ctx context.Context, agentID string)
+	// Queue-and-forward drain scheduler state (handoff_queue_handlers.go).
+	// One drain pass in flight at a time; triggers that land mid-pass
+	// set the rerun flag instead of stacking goroutines.
+	handoffDrainMu      sync.Mutex
+	handoffDrainRunning bool
+	handoffDrainAgain   bool
+	// handoffDrainBackoff / handoffDrainTimer implement the
+	// self-scheduled retry: while rows remain queued after a pass,
+	// a timer re-arms the drain with exponential backoff. External
+	// kicks reset the backoff and cancel the pending timer. Both
+	// guarded by handoffDrainMu.
+	handoffDrainBackoff time.Duration
+	handoffDrainTimer   *time.Timer
+	// handoffDrainStopping is set by Shutdown: no new drain passes
+	// start, the retry timer stays cancelled, and if a pass is in
+	// flight handoffDrainStopped (created lazily by Shutdown) is
+	// closed when it exits so Shutdown can wait before the store
+	// closes. Guarded by handoffDrainMu.
+	handoffDrainStopping bool
+	handoffDrainStopped  chan struct{}
+	// handoffDrainCancel aborts the in-flight drain pass's context
+	// (HTTP forwards + store reads) so Shutdown doesn't have to wait
+	// out a 30s holder dial before the store closes. Guarded by
+	// handoffDrainMu.
+	handoffDrainCancel context.CancelFunc
+	// handoffDelivering is the in-process claim set: queue ids
+	// currently being delivered by the drain. The owner cancel
+	// endpoint refuses (409) ids in this set so "cancelled but
+	// delivered anyway" cannot happen — cancel either wins before
+	// the claim (the drain re-checks row existence and skips) or is
+	// told delivery is already in flight. Guarded by handoffDrainMu.
+	handoffDelivering map[string]struct{}
 	// onAgentRuntimePurged fires after the inter-peer state
 	// probe self-heal path (PurgeAgentRuntimeStateForRetry)
 	// deletes the local agent_locks row + handoff markers. The
@@ -200,6 +236,15 @@ type Server struct {
 	chunkedSyncMu     sync.Mutex
 	// chunkedSyncSweepDone is closed on Shutdown to stop the sweeper.
 	chunkedSyncSweepDone chan struct{}
+
+	// mirrorRefreshDone is closed on Shutdown to stop the background
+	// remote_message_mirror push-refresher (mirror_refresher.go).
+	// mirrorRefreshStopped is closed by the refresher goroutine on
+	// exit so Shutdown can wait for in-flight store writes to finish
+	// before agents.Shutdown() closes the DB. nil when the refresher
+	// was never started (peer-only mode / tests).
+	mirrorRefreshDone    chan struct{}
+	mirrorRefreshStopped chan struct{}
 
 	// restartTrigger, when set via SetRestartTrigger, is invoked by
 	// POST /api/v1/system/restart after every agent chat has drained.
@@ -367,6 +412,20 @@ func New(cfg Config) *Server {
 		chunkedSyncSweepDone: make(chan struct{}),
 	}
 	go s.runChunkedSyncSweeper()
+	// Queue-and-forward: drain anything left queued across a
+	// restart. A holder that was already online when the hub came
+	// back would otherwise never trigger delivery (its
+	// offline→online transition happened while we were down).
+	s.kickHandoffQueueDrain()
+	// Push-refresh the remote message mirror while holders are online so
+	// the offline read fallback serves recent data (mirror_refresher.go).
+	// Hub-side concern only: a peer-only daemon never serves the mirror
+	// read fallback, so don't have it crawl other peers.
+	if !cfg.PeerOnly {
+		s.mirrorRefreshDone = make(chan struct{})
+		s.mirrorRefreshStopped = make(chan struct{})
+		go s.runMirrorRefresher()
+	}
 	// Sweep aged thumbnail-cache entries in the background. The cache is
 	// keyed by (path, mtime, size, dimensions) so an edited image
 	// produces a new entry — without periodic purge the cache would grow
@@ -766,6 +825,14 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents/{id}/avatar", s.handleGetAvatar)
 	mux.HandleFunc("POST /api/v1/agents/{id}/avatar", s.handleUploadAvatar)
 	mux.HandleFunc("GET /api/v1/agents/{id}/messages", s.handleGetMessages)
+	// HTTP send path (queue-and-forward, §3.7). Local agents inject
+	// straight into the chat loop; remote agents with an offline /
+	// unreachable holder get queued hub-side (see
+	// remoteAgentProxyMiddleware → proxyOrQueueAgentMessage).
+	mux.HandleFunc("POST /api/v1/agents/{id}/messages", s.handlePostAgentMessage)
+	// Owner-only queued-message inspection / cancel.
+	mux.HandleFunc("GET /api/v1/agents/{id}/queued-messages", s.handleListQueuedAgentMessages)
+	mux.HandleFunc("DELETE /api/v1/agents/{id}/queued-messages/{qid}", s.handleCancelQueuedAgentMessage)
 	mux.HandleFunc("PATCH /api/v1/agents/{id}/messages/{msgId}", s.handleUpdateMessage)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}/messages/{msgId}", s.handleDeleteMessage)
 	mux.HandleFunc("POST /api/v1/agents/{id}/messages/{msgId}/regenerate", s.handleRegenerateMessage)
@@ -878,6 +945,9 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("DELETE /api/v1/groupdms/{id}/messages", s.handleClearGroupMessages)
 		mux.HandleFunc("POST /api/v1/groupdms/{id}/messages", s.handlePostGroupMessage)
 		mux.HandleFunc("POST /api/v1/groupdms/{id}/user-messages", s.handlePostGroupUserMessage)
+		mux.HandleFunc("GET /api/v1/groupdms/{id}/unread", s.handleGetGroupUnread)
+		mux.HandleFunc("GET /api/v1/groupdms/{id}/dead-letters", s.handleGetGroupDeadLetters)
+		mux.HandleFunc("POST /api/v1/dms", s.handleFindOrCreateDM)
 		mux.HandleFunc("GET /api/v1/agents/{id}/groups", s.handleListAgentGroups)
 	}
 }
@@ -1126,6 +1196,11 @@ type pendingSyncKey struct {
 // digests, sync timestamps) without another schema change.
 type pendingSyncEntry struct {
 	RawToken string `json:"raw_token"`
+	// DegradedFlushes / TransferSkips carry the per-switch loss
+	// metadata from the agent-sync payload to the finalize step,
+	// where they feed the arrival prompt's caveat block.
+	DegradedFlushes []string                   `json:"degraded_flushes,omitempty"`
+	TransferSkips   []agent.SkippedSessionFile `json:"transfer_skips,omitempty"`
 }
 
 // pendingAgentSyncNamespace + pendingAgentSyncKey persist
@@ -1203,8 +1278,7 @@ func (s *Server) pendingSyncStore() *store.Store {
 // write fails; the caller surfaces that as 500 so the
 // orchestrator retries. In-memory-only fallback (no KEK or no
 // store) never errors here.
-func (s *Server) recordPendingAgentSync(ctx context.Context, agentID, opID, rawToken string) error {
-	entry := pendingSyncEntry{RawToken: rawToken}
+func (s *Server) recordPendingAgentSync(ctx context.Context, agentID, opID string, entry pendingSyncEntry) error {
 	if st := s.pendingSyncStore(); st != nil && len(s.pendingSyncKEK) > 0 {
 		sealed, err := s.sealPendingSync(agentID, opID, entry)
 		if err != nil {
@@ -1390,7 +1464,7 @@ func (s *Server) currentSelfNodeKey() string {
 // SetOnAgentSyncFinalized installs the post-complete hook that
 // the orchestrator's /api/v1/peers/agent-sync/finalize endpoint
 // invokes. See onAgentSyncFinalized for the contract.
-func (s *Server) SetOnAgentSyncFinalized(fn func(ctx context.Context, agentID, rawToken, sourceDeviceID, opID string) error) {
+func (s *Server) SetOnAgentSyncFinalized(fn func(ctx context.Context, agentID, rawToken, sourceDeviceID, opID string) (bool, error)) {
 	s.onAgentSyncFinalized = fn
 }
 
@@ -1448,6 +1522,51 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	// Now stop background producers / hubs.
+	// Stop the mirror refresher BEFORE agents.Shutdown() so an in-flight
+	// sweep isn't writing to the store while the DB closes. Closing
+	// mirrorRefreshDone also cancels the sweep's fetch context, so this
+	// wait is short (bounded by ctx as a backstop).
+	if s.mirrorRefreshDone != nil {
+		select {
+		case <-s.mirrorRefreshDone:
+		default:
+			close(s.mirrorRefreshDone)
+		}
+		if s.mirrorRefreshStopped != nil {
+			select {
+			case <-s.mirrorRefreshStopped:
+			case <-ctx.Done():
+			}
+		}
+	}
+	// Stop the queue-and-forward drain scheduler BEFORE agents.Shutdown()
+	// for the same reason as the mirror refresher: an in-flight drain
+	// pass writes to the store (and injects local Chat turns).
+	s.handoffDrainMu.Lock()
+	s.handoffDrainStopping = true
+	if s.handoffDrainTimer != nil {
+		s.handoffDrainTimer.Stop()
+		s.handoffDrainTimer = nil
+	}
+	// Abort the in-flight pass promptly (cancels holder dials and
+	// store reads) instead of waiting for it to run to completion.
+	if s.handoffDrainCancel != nil {
+		s.handoffDrainCancel()
+	}
+	var drainStopped chan struct{}
+	if s.handoffDrainRunning {
+		if s.handoffDrainStopped == nil {
+			s.handoffDrainStopped = make(chan struct{})
+		}
+		drainStopped = s.handoffDrainStopped
+	}
+	s.handoffDrainMu.Unlock()
+	if drainStopped != nil {
+		select {
+		case <-drainStopped:
+		case <-ctx.Done():
+		}
+	}
 	if s.slackHub != nil {
 		s.slackHub.Stop()
 	}

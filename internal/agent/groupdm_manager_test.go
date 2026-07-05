@@ -657,7 +657,7 @@ func TestGroupDMManager_MutedMemberDropsNotification(t *testing.T) {
 
 	msg := newGroupMessage("ag_bob", "Bob", "ping", nil)
 	// notifyAgent must return without touching notify state for a muted member.
-	gdm.notifyAgent("ag_alice", g.ID, g.Name, msg, false)
+	gdm.notifyAgent("ag_alice", g.ID, g.Name, msg, false, false)
 
 	gdm.notifyMu.Lock()
 	_, exists := gdm.notify[g.ID+":ag_alice"]
@@ -674,7 +674,7 @@ func TestGroupDMManager_SelfNotificationDropped(t *testing.T) {
 	// Sender == recipient: must be dropped without ever creating a notify
 	// state entry, even if some future caller mis-routes the fan-out.
 	msg := newGroupMessage("ag_alice", "Alice", "self", nil)
-	gdm.notifyAgent("ag_alice", g.ID, g.Name, msg, false)
+	gdm.notifyAgent("ag_alice", g.ID, g.Name, msg, false, false)
 
 	gdm.notifyMu.Lock()
 	_, exists := gdm.notify[g.ID+":ag_alice"]
@@ -688,7 +688,7 @@ func TestGroupDMManager_SelfNotificationDropped(t *testing.T) {
 	// which can never match a real member's ID). The guard must not
 	// block this real-world path.
 	userMsg := newGroupMessage(UserSenderID, UserSenderName, "ping", nil)
-	gdm.notifyAgent("ag_alice", g.ID, g.Name, userMsg, true)
+	gdm.notifyAgent("ag_alice", g.ID, g.Name, userMsg, true, false)
 	gdm.notifyMu.Lock()
 	_, userExists := gdm.notify[g.ID+":ag_alice"]
 	gdm.notifyMu.Unlock()
@@ -970,7 +970,7 @@ func TestGroupDMManager_PendingBufferCap(t *testing.T) {
 	// Push twice the cap; expect the oldest half to be dropped.
 	for i := 0; i < notifyMaxPending*2; i++ {
 		msg := newGroupMessage("ag_bob", "Bob", fmt.Sprintf("msg-%d", i), nil)
-		gdm.notifyAgent("ag_alice", g.ID, g.Name, msg, false)
+		gdm.notifyAgent("ag_alice", g.ID, g.Name, msg, false, false)
 	}
 
 	gdm.notifyMu.Lock()

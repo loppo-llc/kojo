@@ -102,10 +102,23 @@ type GroupDM struct {
 	Style    GroupDMStyle  `json:"style"`    // communication style: "efficient" or "expressive"
 	// Venue is the physical setting hint. "chatroom" (default) for a closed
 	// online chat, "colocated" when members are co-present in real space.
-	Venue     GroupDMVenue `json:"venue,omitempty"`
-	CreatedAt string       `json:"createdAt"`
-	UpdatedAt string       `json:"updatedAt"`
+	Venue GroupDMVenue `json:"venue,omitempty"`
+	// MaxHops caps the agent-to-agent notification relay depth for this
+	// room. 0 means "use defaultMaxHops". See PostMessage hop semantics.
+	MaxHops int `json:"maxHops,omitempty"`
+	// Kind is "group" (default) or "dm" (first-class 1:1 room sugar).
+	Kind      GroupDMKind `json:"kind,omitempty"`
+	CreatedAt string      `json:"createdAt"`
+	UpdatedAt string      `json:"updatedAt"`
 }
+
+// GroupDMKind partitions rooms into classic groups and 1:1 DMs.
+type GroupDMKind string
+
+const (
+	GroupDMKindGroup GroupDMKind = "group"
+	GroupDMKindDM    GroupDMKind = "dm"
+)
 
 // GroupMember is a participant in a group DM.
 //
@@ -131,7 +144,13 @@ type GroupMessage struct {
 	AgentName   string              `json:"agentName"`
 	Content     string              `json:"content"`
 	Attachments []MessageAttachment `json:"attachments,omitempty"`
-	Timestamp   string              `json:"timestamp"`
+	// Hop is the agent-relay depth: 0 for user/system/fresh agent posts,
+	// trigger-hop + 1 for posts made from a notification-triggered turn.
+	Hop int `json:"hop,omitempty"`
+	// Mentions is the list of member ids (agent ids, or "user" for the
+	// human operator) referenced via @name in Content, parsed at post time.
+	Mentions  []string `json:"mentions,omitempty"`
+	Timestamp string   `json:"timestamp"`
 }
 
 func generateGroupID() string {
@@ -143,10 +162,13 @@ func generateGroupMessageID() string {
 }
 
 // appendGroupMessage inserts a message into the group's groupdm_messages
-// table. The store handles seq allocation, member-vs-author validation,
-// and CAS via ExpectedLatestSeq (here we always use 0 — the manager-level
-// CAS check is keyed on the latestMsgID cache).
-func appendGroupMessage(groupID string, msg *GroupMessage) error {
+// table. The store handles seq allocation and member-vs-author validation.
+// expectedLatestSeq re-verifies the per-group head inside the store
+// transaction (store.ErrStaleHead on mismatch) — the DB-level half of the
+// CAS whose fast path is the manager's latestMsgID cache. enforceSeq makes
+// the check run even for expectedLatestSeq == 0 ("room must be empty");
+// with enforceSeq false a zero seq disables the check (legacy callers).
+func appendGroupMessage(groupID string, msg *GroupMessage, expectedLatestSeq int64, enforceSeq bool) error {
 	if msg == nil {
 		return errors.New("appendGroupMessage: nil message")
 	}
@@ -159,6 +181,14 @@ func appendGroupMessage(groupID string, msg *GroupMessage) error {
 		GroupDMID: groupID,
 		AgentID:   msg.AgentID,
 		Content:   msg.Content,
+		Hop:       msg.Hop,
+	}
+	if len(msg.Mentions) > 0 {
+		buf, err := json.Marshal(msg.Mentions)
+		if err != nil {
+			return fmt.Errorf("appendGroupMessage: marshal mentions: %w", err)
+		}
+		rec.Mentions = buf
 	}
 	if len(msg.Attachments) > 0 {
 		buf, err := jsonMarshalAttachments(msg.Attachments)
@@ -174,8 +204,10 @@ func appendGroupMessage(groupID string, msg *GroupMessage) error {
 	ctx, cancel := transcriptCtx()
 	defer cancel()
 	if _, err := db.AppendGroupDMMessage(ctx, rec, store.GroupDMMessageInsertOptions{
-		CreatedAt: ts,
-		UpdatedAt: ts,
+		CreatedAt:                ts,
+		UpdatedAt:                ts,
+		ExpectedLatestSeq:        expectedLatestSeq,
+		RequireExpectedLatestSeq: enforceSeq,
 	}); err != nil {
 		return err
 	}
@@ -183,6 +215,19 @@ func appendGroupMessage(groupID string, msg *GroupMessage) error {
 		msg.Timestamp = millisToRFC3339(ts)
 	}
 	return nil
+}
+
+// resolveGroupMessageSeq maps a message ID to its per-group seq.
+// ok=false means the message is not (or no longer) in this group's live
+// transcript.
+func resolveGroupMessageSeq(groupID, msgID string) (int64, bool, error) {
+	db := getGlobalStore()
+	if db == nil {
+		return 0, false, errStoreNotReady
+	}
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+	return groupMessageSeq(ctx, db, groupID, msgID)
 }
 
 // loadGroupMessages reads messages for groupID with pagination, plus
@@ -387,7 +432,14 @@ func groupRecordToMessage(rec *store.GroupDMMessageRecord) *GroupMessage {
 		ID:        rec.ID,
 		AgentID:   rec.AgentID,
 		Content:   rec.Content,
+		Hop:       rec.Hop,
 		Timestamp: normalizeTimestamp(millisToRFC3339(rec.CreatedAt)),
+	}
+	if len(rec.Mentions) > 0 && string(rec.Mentions) != "null" {
+		var mentions []string
+		if err := json.Unmarshal(rec.Mentions, &mentions); err == nil {
+			out.Mentions = mentions
+		}
 	}
 	if len(rec.Attachments) > 0 && string(rec.Attachments) != "null" {
 		var atts []MessageAttachment

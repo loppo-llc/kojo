@@ -128,6 +128,18 @@ user — the body's ` + "`error.message`" + ` field usually explains the
 failure (bad target name, target unreachable, agent busy with
 another mutation, etc). Do NOT retry automatically.
 
+Exception — degraded retry: when the error code is
+` + "`memory_flush_failed`" + ` or ` + "`persona_flush_failed`" + `, the switch was
+refused because the pre-transfer disk-to-DB memory/persona flush
+failed. A degraded retry is available: tell the user the switch
+can proceed transcript-only (the freshest memory/persona edits may
+not carry over), and if they agree, re-POST the same request with
+` + "`\"degraded\": true`" + ` added to the JSON body, e.g.
+` + "`{\"target_peer_id\":\"<DEVICE_ID>\",\"degraded\":true}`" + `. The skipped
+flushes are recorded in the response (` + "`degraded_flushes`" + `) and in
+the arrival prompt on the target, so the agent there knows memory
+may be stale. Never add the flag without the user's go-ahead.
+
 On 2xx, the response JSON's ` + "`outcome`" + ` field decides the next
 action. When the outcome is anything other than ` + "`completed`" + `,
 relay the explanation to the user verbatim (do NOT paraphrase or
@@ -229,6 +241,18 @@ If the status code is not 2xx, dump the body verbatim to the
 user — the body's ` + "`error.message`" + ` field usually explains the
 failure (bad target name, target unreachable, agent busy with
 another mutation, etc). Do NOT retry automatically.
+
+Exception — degraded retry: when the error code is
+` + "`memory_flush_failed`" + ` or ` + "`persona_flush_failed`" + `, the switch was
+refused because the pre-transfer disk-to-DB memory/persona flush
+failed. A degraded retry is available: tell the user the switch
+can proceed transcript-only (the freshest memory/persona edits may
+not carry over), and if they agree, re-POST the same request with
+` + "`\"degraded\": true`" + ` added to the JSON body, e.g.
+` + "`{\"target_peer_id\":\"<DEVICE_ID>\",\"degraded\":true}`" + `. The skipped
+flushes are recorded in the response (` + "`degraded_flushes`" + `) and in
+the arrival prompt on the target, so the agent there knows memory
+may be stale. Never add the flag without the user's go-ahead.
 
 On 2xx, the response JSON's ` + "`outcome`" + ` field decides the next
 action. When the outcome is anything other than ` + "`completed`" + `,
@@ -341,6 +365,18 @@ user — the body's ` + "`error.message`" + ` field usually explains the
 failure (bad target name, target unreachable, agent busy with
 another mutation, etc). Do NOT retry automatically.
 
+Exception — degraded retry: when the error code is
+` + "`memory_flush_failed`" + ` or ` + "`persona_flush_failed`" + `, the switch was
+refused because the pre-transfer disk-to-DB memory/persona flush
+failed. A degraded retry is available: tell the user the switch
+can proceed transcript-only (the freshest memory/persona edits may
+not carry over), and if they agree, re-POST the same request with
+` + "`\"degraded\": true`" + ` added to the JSON body, e.g.
+` + "`{\"target_peer_id\":\"<DEVICE_ID>\",\"degraded\":true}`" + `. The skipped
+flushes are recorded in the response (` + "`degraded_flushes`" + `) and in
+the arrival prompt on the target, so the agent there knows memory
+may be stale. Never add the flag without the user's go-ahead.
+
 On 2xx, the response JSON's ` + "`outcome`" + ` field decides the next
 action. When the outcome is anything other than ` + "`completed`" + `,
 relay the explanation to the user verbatim (do NOT paraphrase or
@@ -432,6 +468,18 @@ If the status code is not 2xx, dump the body verbatim to the
 user — the body's ` + "`error.message`" + ` field usually explains the
 failure (bad target name, target unreachable, agent busy with
 another mutation, etc). Do NOT retry automatically.
+
+Exception — degraded retry: when the error code is
+` + "`memory_flush_failed`" + ` or ` + "`persona_flush_failed`" + `, the switch was
+refused because the pre-transfer disk-to-DB memory/persona flush
+failed. A degraded retry is available: tell the user the switch
+can proceed transcript-only (the freshest memory/persona edits may
+not carry over), and if they agree, re-POST the same request with
+` + "`\"degraded\": true`" + ` added to the JSON body, e.g.
+` + "`{\"target_peer_id\":\"<DEVICE_ID>\",\"degraded\":true}`" + `. The skipped
+flushes are recorded in the response (` + "`degraded_flushes`" + `) and in
+the arrival prompt on the target, so the agent there knows memory
+may be stale. Never add the flag without the user's go-ahead.
 
 On 2xx, the response JSON's ` + "`outcome`" + ` field decides the next
 action. When the outcome is anything other than ` + "`completed`" + `,

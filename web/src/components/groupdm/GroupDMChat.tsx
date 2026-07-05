@@ -7,6 +7,10 @@ import {
   type GroupDMStyle,
   type GroupDMVenue,
   DEFAULT_GROUPDM_VENUE,
+  DEFAULT_MAX_HOPS,
+  MAX_MAX_HOPS,
+  setLastRead,
+  clearLastRead,
   type GroupMessage,
 } from "../../lib/groupdmApi";
 import { useEnterSends } from "../../lib/preferences";
@@ -59,6 +63,8 @@ export function GroupDMChat() {
   const [showVenueMenu, setShowVenueMenu] = useState(false);
   const [editingCooldown, setEditingCooldown] = useState(false);
   const [cooldownInput, setCooldownInput] = useState("");
+  const [editingMaxHops, setEditingMaxHops] = useState(false);
+  const [maxHopsInput, setMaxHopsInput] = useState("");
   const [editingName, setEditingName] = useState(false);
   const [nameInput, setNameInput] = useState("");
   const nameInputRef = useRef<HTMLInputElement>(null);
@@ -163,6 +169,11 @@ export function GroupDMChat() {
           const older = prev.filter((m) => !newIds.has(m.id));
           return [...older, ...r.messages];
         });
+        // The room is open, so everything fetched counts as read. The
+        // room list uses this marker for its unread badges.
+        if (r.messages.length > 0) {
+          setLastRead(id, r.messages[r.messages.length - 1].id);
+        }
         if (!initialLoadDone.current) {
           setHasMore(r.hasMore);
           initialLoadDone.current = true;
@@ -194,6 +205,9 @@ export function GroupDMChat() {
       if (textareaRef.current) {
         textareaRef.current.style.height = "auto";
       }
+      // Own message counts as read immediately — otherwise navigating away
+      // before the next poll would badge the room for the user's own post.
+      setLastRead(id, sent.id);
       // Optimistically append — the polling loop will reconcile via id dedupe.
       setMessages((prev) => {
         if (prev.some((m) => m.id === sent.id)) return prev;
@@ -434,6 +448,52 @@ export function GroupDMChat() {
             </button>
           )}
         </div>
+        {/* Max hops setting — agent-to-agent relay hop limit (0 = default 4) */}
+        <div className="shrink-0">
+          {editingMaxHops ? (
+            <form
+              className="flex items-center gap-1"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                const raw = maxHopsInput.trim();
+                const val = raw === "" ? 0 : parseInt(raw, 10);
+                if (isNaN(val) || val < 0 || val > MAX_MAX_HOPS) return;
+                try {
+                  const updated = await groupdmApi.setMaxHops(group.id, val);
+                  setGroup(updated);
+                } catch (err) {
+                  console.error("Failed to set max hops", err);
+                }
+                setEditingMaxHops(false);
+              }}
+            >
+              <input
+                type="number"
+                min="0"
+                max={MAX_MAX_HOPS}
+                value={maxHopsInput}
+                onChange={(e) => setMaxHopsInput(e.target.value)}
+                placeholder={String(DEFAULT_MAX_HOPS)}
+                aria-label="Max hops"
+                className="w-16 rounded-[10px] border border-hairline bg-raised px-1.5 py-0.5 text-center text-xs text-ink focus:border-copper focus:outline-none"
+                autoFocus
+                onBlur={() => setEditingMaxHops(false)}
+              />
+              <span className="text-[10px] text-ink-faint">hops</span>
+            </form>
+          ) : (
+            <button
+              onClick={() => {
+                setMaxHopsInput(group.maxHops ? String(group.maxHops) : "");
+                setEditingMaxHops(true);
+              }}
+              className="rounded-[10px] px-1.5 py-0.5 font-mono text-[10px] text-ink-faint transition-colors hover:text-ink"
+              title="Max relay hops (empty = default 4, max 20)"
+            >
+              {group.maxHops || DEFAULT_MAX_HOPS}hops
+            </button>
+          )}
+        </div>
         <button
           onClick={() => {
             setClearError("");
@@ -493,8 +553,13 @@ export function GroupDMChat() {
               </div>
             );
           }
+          // Subtle highlight when the agent @mentions the human operator.
+          const mentionsUser = msg.mentions?.includes(USER_SENDER_ID) ?? false;
           return (
-            <div key={msg.id} className="flex gap-3">
+            <div
+              key={msg.id}
+              className={`flex gap-3${mentionsUser ? " -mx-2 rounded-xl border-l-2 border-copper/60 bg-copper/5 px-2 py-1.5" : ""}`}
+            >
               <AgentAvatar
                 agentId={msg.agentId}
                 name={msg.agentName}
@@ -507,6 +572,14 @@ export function GroupDMChat() {
                     {msg.agentName}
                   </span>
                   <span className="font-mono text-[11px] text-ink-faint">{formatTime(msg.timestamp)}</span>
+                  {mentionsUser && (
+                    <span
+                      className="rounded-full bg-copper/15 px-1.5 font-mono text-[10px] text-copper"
+                      title="Mentions you"
+                    >
+                      @you
+                    </span>
+                  )}
                 </div>
                 {msg.attachments && msg.attachments.length > 0 && (
                   <AttachmentList attachments={msg.attachments} isUser={false} />
@@ -600,6 +673,9 @@ export function GroupDMChat() {
                   setClearError("");
                   try {
                     await groupdmApi.clearMessages(group.id);
+                    // The stored last-read id points at a deleted message;
+                    // drop it so unread counting restarts cleanly.
+                    clearLastRead(group.id);
                     pollGenerationRef.current += 1;
                     setMessages([]);
                     setHasMore(false);

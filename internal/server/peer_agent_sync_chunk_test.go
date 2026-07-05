@@ -40,6 +40,11 @@ func newChunkedSyncTestServer(t *testing.T) *Server {
 		chunkedAgentSyncs:    make(map[string]*chunkedSyncEntry),
 		chunkedSyncSweepDone: make(chan struct{}),
 	}
+	// LIFO: runs BEFORE mgr.Close above, so a fire-and-forget
+	// queue-drain kick from a handler under test (handoff complete,
+	// enqueue, finalize) can't touch the store during TempDir
+	// cleanup (see stopHandoffDrainForTest).
+	t.Cleanup(func() { stopHandoffDrainForTest(t, srv) })
 	return srv
 }
 

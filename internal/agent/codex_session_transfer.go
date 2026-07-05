@@ -139,7 +139,7 @@ func lookupCodexRolloutPath(threadID string) string {
 	return out
 }
 
-func ReadCodexSessionFiles(agentID string) (*CodexSessionTransfer, []string, error) {
+func ReadCodexSessionFiles(agentID string) (*CodexSessionTransfer, []SkippedSessionFile, error) {
 	if agentID == "" {
 		return nil, nil, nil
 	}
@@ -174,7 +174,7 @@ func ReadCodexSessionFiles(agentID string) (*CodexSessionTransfer, []string, err
 	}
 
 	out := &CodexSessionTransfer{}
-	skipped := make([]string, 0)
+	skipped := make([]SkippedSessionFile, 0)
 	var totalBytes int64
 
 	for _, e := range entries {
@@ -183,12 +183,12 @@ func ReadCodexSessionFiles(agentID string) (*CodexSessionTransfer, []string, err
 		}
 		refName := e.Name()
 		if !validCodexThreadRefName(refName) {
-			skipped = append(skipped, refName)
+			skipped = append(skipped, SkippedSessionFile{Path: refName, Reason: "invalid_ref_name"})
 			continue
 		}
 		ref, rerr := readCodexThreadRefFile(filepath.Join(refDir, refName))
 		if rerr != nil || ref == nil || !isCodexThreadID(ref.ThreadID) {
-			skipped = append(skipped, refName)
+			skipped = append(skipped, SkippedSessionFile{Path: refName, Reason: "unreadable_ref"})
 			continue
 		}
 		rolloutPath := ref.RolloutPath
@@ -196,22 +196,24 @@ func ReadCodexSessionFiles(agentID string) (*CodexSessionTransfer, []string, err
 			rolloutPath = lookupCodexRolloutPathFromDB(db, ref.ThreadID)
 		}
 		if rolloutPath == "" {
-			skipped = append(skipped, refName)
+			skipped = append(skipped, SkippedSessionFile{Path: refName, Reason: "rollout_path_unknown"})
 			continue
 		}
 		rel, relErr := codexRolloutRelPath(absRoot, rolloutPath, ref.ThreadID)
 		if relErr != nil {
-			skipped = append(skipped, refName)
+			skipped = append(skipped, SkippedSessionFile{Path: refName, Reason: "rollout_path_invalid"})
 			continue
 		}
 		full := filepath.Join(absRoot, filepath.FromSlash(rel))
 		st, statErr := os.Stat(full)
 		if statErr != nil || !st.Mode().IsRegular() {
-			skipped = append(skipped, rel)
+			skipped = append(skipped, SkippedSessionFile{Path: rel, Reason: "rollout_missing"})
 			continue
 		}
 		if st.Size() > codexSessionFileMaxBytes {
-			skipped = append(skipped, rel)
+			skipped = append(skipped, SkippedSessionFile{
+				Path: rel, Reason: "oversized", SizeBytes: st.Size(),
+			})
 			continue
 		}
 		totalBytes += st.Size()

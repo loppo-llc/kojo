@@ -90,6 +90,18 @@ func AgentFencingMiddleware(st AgentFencingStore, selfPeerID string, logger *slo
 				next.ServeHTTP(w, r)
 				return
 			}
+			// Queue-and-forward cancel (DELETE
+			// /agents/{id}/queued-messages/{qid}) mutates the
+			// hub-side handoff_queued_messages table, not the
+			// agent's own state — the whole point of the queue is
+			// that the holder is elsewhere/offline, so fencing on
+			// the holder would refuse exactly the requests the
+			// feature exists for. (The route is Owner-only at the
+			// handler layer anyway; Owner bypasses the fence.)
+			if sok && strings.HasPrefix(sub, "/queued-messages") {
+				next.ServeHTTP(w, r)
+				return
+			}
 			var fenceID string
 			switch {
 			case p.IsAgent():
@@ -193,6 +205,11 @@ func agentIDForFencing(path, callerAgentID string) (string, bool) {
 		return "", false
 	}
 	if path == "/api/v1/groupdms" || strings.HasPrefix(path, "/api/v1/groupdms/") {
+		return callerAgentID, true
+	}
+	// /api/v1/dms is the find-or-create DM sugar over the same groupdm
+	// machinery — fence it identically to groupdm creation.
+	if path == "/api/v1/dms" {
 		return callerAgentID, true
 	}
 	return "", false

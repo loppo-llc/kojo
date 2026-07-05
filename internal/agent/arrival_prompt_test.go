@@ -266,7 +266,7 @@ func TestBuildArrivalPrompt_NoUserInstructionUsesFallback(t *testing.T) {
 	}, store.MessageInsertOptions{}); err != nil {
 		t.Fatalf("append s1: %v", err)
 	}
-	got := buildArrivalPrompt(ctx, mgr, "ag_f", "SRC-PEER")
+	got := buildArrivalPrompt(ctx, mgr, "ag_f", "SRC-PEER", ArrivalNotes{})
 	if !strings.Contains(got, "SRC-PEER") {
 		t.Errorf("missing source peer in prompt: %q", got)
 	}
@@ -294,7 +294,7 @@ func TestBuildArrivalPrompt_QuotesUnaddressedUserInstruction(t *testing.T) {
 	}, store.MessageInsertOptions{}); err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	got := buildArrivalPrompt(ctx, mgr, "ag_q", "STUDIO-2")
+	got := buildArrivalPrompt(ctx, mgr, "ag_q", "STUDIO-2", ArrivalNotes{})
 	if !strings.Contains(got, instr) {
 		t.Errorf("prompt missing user instruction; got %q", got)
 	}
@@ -335,7 +335,7 @@ func TestBuildArrivalPrompt_AddressedFallsBackToGeneric(t *testing.T) {
 	}, store.MessageInsertOptions{Now: now + 1}); err != nil {
 		t.Fatalf("append a1: %v", err)
 	}
-	got := buildArrivalPrompt(ctx, mgr, "ag_r", "PEER")
+	got := buildArrivalPrompt(ctx, mgr, "ag_r", "PEER", ArrivalNotes{})
 	if strings.Contains(got, "do thing X") {
 		t.Errorf("addressed instruction should not surface; got %q", got)
 	}
@@ -433,7 +433,7 @@ func TestBuildArrivalPrompt_QuotesEvenWhenSwitchSnapshotPresent(t *testing.T) {
 		t.Fatalf("a_snap: %v", err)
 	}
 
-	got := buildArrivalPrompt(ctx, mgr, "ag_s", "STUDIO-2")
+	got := buildArrivalPrompt(ctx, mgr, "ag_s", "STUDIO-2", ArrivalNotes{})
 	if !strings.Contains(got, instr) {
 		t.Errorf("arrival prompt must quote user instruction even when only the kojo-switch snapshot follows; got %q",
 			got)
@@ -492,7 +492,7 @@ func TestBuildArrivalPrompt_QuotesTailWhenPresent(t *testing.T) {
 	mustAppend("a_snap", "assistant", "", switchToolUses, 1)
 	mustAppend("a_tail", "assistant", tailContent, nil, 2)
 
-	got := buildArrivalPrompt(ctx, mgr, "ag_tail", "STUDIO-2")
+	got := buildArrivalPrompt(ctx, mgr, "ag_tail", "STUDIO-2", ArrivalNotes{})
 	if !strings.Contains(got, instr) {
 		t.Errorf("prompt missing user instruction; got %q", got)
 	}
@@ -579,7 +579,7 @@ func TestBuildArrivalPrompt_NoTailWhenSnapshotOnly(t *testing.T) {
 		t.Fatalf("a_snap: %v", err)
 	}
 
-	got := buildArrivalPrompt(ctx, mgr, "ag_no_tail", "STUDIO-2")
+	got := buildArrivalPrompt(ctx, mgr, "ag_no_tail", "STUDIO-2", ArrivalNotes{})
 	if !strings.Contains(got, instr) {
 		t.Errorf("prompt missing user instruction; got %q", got)
 	}

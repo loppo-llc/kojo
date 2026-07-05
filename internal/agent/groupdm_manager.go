@@ -13,7 +13,30 @@ import (
 )
 
 // notifyTimeout is the maximum time allowed for a notification-triggered chat.
-const notifyTimeout = 60 * time.Minute
+const notifyTimeout = 10 * time.Minute
+
+// defaultMaxHops is the default agent-to-agent notification relay depth per
+// room. A message whose hop reaches the room's effective max is still stored
+// (humans see it) but is not fanned out to agents — structural loop
+// prevention that no prompt advice can bypass. Configurable per room via
+// GroupDM.MaxHops.
+const defaultMaxHops = 4
+
+// maxMaxHops is the upper clamp for a room's configured MaxHops.
+const maxMaxHops = 20
+
+// maxNotifyAttempts bounds delivery retries for non-transient failures
+// before the batch is dead-lettered. Transient busy/resetting re-defers
+// don't count against this budget.
+const maxNotifyAttempts = 3
+
+// notifyRetryBase is the initial backoff for non-transient delivery
+// failures; doubled per attempt (30s, 60s, 120s).
+const notifyRetryBase = 30 * time.Second
+
+// deadLetterPayloadCap truncates the persisted notification payload so a
+// pathological batch can't bloat the dead-letter table.
+const deadLetterPayloadCap = 4096
 
 // MaxConflictDiff caps the number of messages returned to a caller whose
 // expectedLatestMessageId is stale. Picked at 50 — same as the default
@@ -50,6 +73,17 @@ func (e *StaleExpectedIDError) Error() string {
 	return "expectedLatestMessageId is stale"
 }
 
+// MissingExpectedIDError is returned by PostMessageStrict when the caller
+// omitted expectedLatestMessageId on a room that already has a head.
+// Latest carries the current head so the caller can recover in one step.
+type MissingExpectedIDError struct {
+	Latest string
+}
+
+func (e *MissingExpectedIDError) Error() string {
+	return "expectedLatestMessageId is required"
+}
+
 // defaultNotifyCooldown is the minimum interval between notifications to the same agent
 // for the same group. This prevents sequential ping-pong loops.
 // Individual groups can override this via GroupDM.Cooldown.
@@ -71,6 +105,9 @@ type pendingMsg struct {
 	timestamp    string // RFC3339
 	senderIsUser bool
 	attachments  []MessageAttachment
+	// hop is the relay depth of the buffered message; the recipient's
+	// notification-triggered turn posts at max(hop)+1.
+	hop int
 }
 
 // notifyState tracks cooldown, pending message buffer, and deferred-timer state
@@ -80,6 +117,7 @@ type notifyState struct {
 	timer    *time.Timer // pending delivery timer (nil if none)
 	gen      uint64      // generation counter; incremented on cancel to invalidate stale timers
 	inFlight bool        // true while a delivery is in progress (prevents concurrent sends)
+	attempts int         // consecutive non-transient delivery failures for the current batch
 
 	// Identity carried between notifyAgent and firePending so the deferred
 	// callback can deliver without re-resolving the (group, agent) pair.
@@ -126,6 +164,23 @@ type GroupDMManager struct {
 	notify   map[string]*notifyState
 	notifyMu sync.Mutex
 
+	// triggerHop records, per agentID, the relay depth of the group-DM
+	// notification batch currently being handled by that agent's turn
+	// (present only while the notification-triggered Chat is in flight).
+	// PostMessage reads it to stamp hop = triggerHop + 1 on posts made
+	// from such a turn. Entries carry an ownership token so a racing
+	// delivery that loses with ErrAgentBusy cannot clobber-then-delete
+	// the winner's live entry on its restore path. Held under notifyMu.
+	triggerHop map[string]triggerHopEntry
+	// triggerHopSeq issues ownership tokens for triggerHop entries.
+	// Held under notifyMu.
+	triggerHopSeq uint64
+
+	// dmMu serializes FindOrCreateDM's find-then-create sequence so two
+	// concurrent calls for the same member set cannot both miss the find
+	// and create duplicate dm rooms.
+	dmMu sync.Mutex
+
 	// patchMus serializes If-Match-gated PATCHes per group. Mirrors
 	// Manager.patchMus for agents. The lock spans the handler's
 	// precondition-check → mutation → ETag-echo trio so two
@@ -145,6 +200,7 @@ func NewGroupDMManager(agentMgr *Manager, logger *slog.Logger) *GroupDMManager {
 		agentMgr:    agentMgr,
 		logger:      logger,
 		notify:      make(map[string]*notifyState),
+		triggerHop:  make(map[string]triggerHopEntry),
 		latestMsgID: make(map[string]string),
 		deleting:    make(map[string]bool),
 		persistGen:  make(map[string]int64),
@@ -187,17 +243,86 @@ func (m *GroupDMManager) APIBase() string {
 // style controls the communication style ("efficient" or "expressive"; empty = "efficient").
 // venue is the physical-setting hint ("chatroom" or "colocated"; empty = defaultGroupDMVenue).
 func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int, style GroupDMStyle, venue GroupDMVenue) (*GroupDM, error) {
-	return m.create(name, memberIDs, cooldown, style, venue, false)
+	return m.create(name, memberIDs, cooldown, style, venue, GroupDMKindGroup, false)
+}
+
+// FindOrCreateDM returns the existing kind="dm" room whose member set
+// equals memberIDs, or creates one. This is pure sugar over the group
+// machinery: a DM is a normal room flagged kind "dm" so the UI can list
+// it separately. One member means a human↔agent DM (the human operator is
+// an implicit participant of every room); two members is an agent↔agent DM.
+func (m *GroupDMManager) FindOrCreateDM(memberIDs []string) (*GroupDM, bool, error) {
+	members, err := m.resolveMembers(memberIDs)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(members) < 1 || len(members) > 2 {
+		return nil, false, fmt.Errorf("a dm requires 1 or 2 members, got %d", len(members))
+	}
+	// Serialize find+create: without this, two racing callers can both
+	// miss the scan below and each create a room for the same pair.
+	m.dmMu.Lock()
+	defer m.dmMu.Unlock()
+
+	want := make(map[string]bool, len(members))
+	for _, mem := range members {
+		want[mem.AgentID] = true
+	}
+
+	m.mu.Lock()
+	for _, g := range m.groups {
+		if g.Kind != GroupDMKindDM || len(g.Members) != len(want) || m.deleting[g.ID] {
+			continue
+		}
+		match := true
+		for _, mem := range g.Members {
+			if !want[mem.AgentID] {
+				match = false
+				break
+			}
+		}
+		if match {
+			cp := m.copyGroup(g)
+			m.mu.Unlock()
+			return cp, false, nil
+		}
+	}
+	m.mu.Unlock()
+
+	ids := make([]string, len(members))
+	for i, mem := range members {
+		ids[i] = mem.AgentID
+	}
+	g, err := m.create("", ids, 0, GroupDMStyleEfficient, defaultGroupDMVenue, GroupDMKindDM, false)
+	if err != nil {
+		// A concurrent daemon on the same database may have created the
+		// room between our scan and this insert — the partial UNIQUE index
+		// on dm_member_key surfaces that as a constraint error. Fetch the
+		// winner's row from the DB, adopt it into memory, and return it.
+		if strings.Contains(err.Error(), "dm_member_key") {
+			if adopted := m.adoptDMFromStore(want); adopted != nil {
+				return adopted, false, nil
+			}
+		}
+		return nil, false, err
+	}
+	return g, true, nil
 }
 
 // CreateWithNotify creates a group and optionally sends a system notification
 // to every member after the row is persisted.
 func (m *GroupDMManager) CreateWithNotify(name string, memberIDs []string, cooldown int, style GroupDMStyle, venue GroupDMVenue, notifyMembers bool) (*GroupDM, error) {
-	return m.create(name, memberIDs, cooldown, style, venue, notifyMembers)
+	return m.create(name, memberIDs, cooldown, style, venue, GroupDMKindGroup, notifyMembers)
 }
 
-func (m *GroupDMManager) create(name string, memberIDs []string, cooldown int, style GroupDMStyle, venue GroupDMVenue, notifyMembers bool) (*GroupDM, error) {
-	if len(memberIDs) < 2 {
+func (m *GroupDMManager) create(name string, memberIDs []string, cooldown int, style GroupDMStyle, venue GroupDMVenue, kind GroupDMKind, notifyMembers bool) (*GroupDM, error) {
+	// DMs (kind "dm") allow a single agent member — the human operator is
+	// an implicit participant. Classic groups keep the 2-member floor.
+	minMembers := 2
+	if kind == GroupDMKindDM {
+		minMembers = 1
+	}
+	if len(memberIDs) < minMembers {
 		return nil, ErrGroupTooFew
 	}
 
@@ -205,7 +330,7 @@ func (m *GroupDMManager) create(name string, memberIDs []string, cooldown int, s
 	if err != nil {
 		return nil, err
 	}
-	if len(members) < 2 {
+	if len(members) < minMembers {
 		return nil, ErrGroupTooFew
 	}
 
@@ -231,6 +356,7 @@ func (m *GroupDMManager) create(name string, memberIDs []string, cooldown int, s
 		Cooldown:  clampCooldown(cooldown),
 		Style:     style,
 		Venue:     venue,
+		Kind:      kind,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -551,6 +677,19 @@ func (m *GroupDMManager) notifyGroupCreated(agentID, groupID, groupName string, 
 // through PostUserMessage; calls with that agentID are rejected so no
 // agent can impersonate a human-user message.
 func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, content, expectedLatestID string, notify bool) (*GroupMessage, error) {
+	return m.postMessage(ctx, groupID, agentID, content, expectedLatestID, notify, false)
+}
+
+// PostMessageStrict is PostMessage with mandatory CAS: an empty
+// expectedLatestID is rejected with *MissingExpectedIDError whenever the
+// room already has a head. Used for agent-token API posts. The check runs
+// under the same lock as the CAS compare so a racing first post cannot
+// slip through the "room is empty" allowance.
+func (m *GroupDMManager) PostMessageStrict(ctx context.Context, groupID, agentID, content, expectedLatestID string, notify bool) (*GroupMessage, error) {
+	return m.postMessage(ctx, groupID, agentID, content, expectedLatestID, notify, true)
+}
+
+func (m *GroupDMManager) postMessage(ctx context.Context, groupID, agentID, content, expectedLatestID string, notify, requireCAS bool) (*GroupMessage, error) {
 	if agentID == UserSenderID {
 		return nil, fmt.Errorf("agent id %q is reserved for the human user", agentID)
 	}
@@ -609,6 +748,16 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 		senderName = a.Name
 	}
 
+	// Mandatory-CAS gate (agent-token posts): an empty cursor is only
+	// acceptable while the room has no head — checked here, under the same
+	// lock as the append, so a concurrent first post can't open a window.
+	if requireCAS && expectedLatestID == "" {
+		if head := m.latestMsgID[groupID]; head != "" {
+			m.mu.Unlock()
+			return nil, &MissingExpectedIDError{Latest: head}
+		}
+	}
+
 	// CAS check. Skipped when expectedLatestID is empty so the older
 	// non-guarded callers (admin tools, user posts, tests) keep working.
 	if expectedLatestID != "" {
@@ -643,18 +792,85 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 	// Collect other members for notification (still under the lock — cheap
 	// loop, no IO).
 	var recipients []GroupMember
+	memberIDs := make([]string, 0, len(g.Members))
 	for _, mem := range g.Members {
+		memberIDs = append(memberIDs, mem.AgentID)
 		if mem.AgentID != agentID {
 			recipients = append(recipients, mem)
 		}
 	}
 	groupName := g.Name
+	maxHops := effectiveMaxHops(g.MaxHops)
+
+	// Hop stamping: a post made from a turn that is itself handling a
+	// group-DM notification carries the triggering batch's hop + 1;
+	// everything else starts a fresh chain at 0. Persisted on the message
+	// so relay depth survives restarts.
+	hop := 0
+	if th, ok := m.currentTriggerHop(agentID); ok {
+		hop = th + 1
+	}
+
+	// Resolve the caller's cursor to its per-group seq so the append can
+	// re-verify the head INSIDE the DB transaction (ExpectedLatestSeq).
+	// The in-memory cache check above is the fast path for this process;
+	// the transactional check closes the gap against any other writer on
+	// the same database.
+	var expectedSeq int64
+	enforceSeq := false
+	if expectedLatestID != "" {
+		seq, ok, err := resolveGroupMessageSeq(groupID, expectedLatestID)
+		if err != nil {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("resolve expected cursor: %w", err)
+		}
+		if !ok {
+			// The cursor passed the cache check but has no live row in the
+			// DB — a foreign process cleared or rewrote the transcript
+			// under us. Silently disabling CAS here would let the post
+			// race past whatever replaced the head; treat the cursor as
+			// stale and return the standard 409 + diff instead.
+			m.mu.Unlock()
+			diff, hasMore, derr := loadGroupMessagesAfter(groupID, expectedLatestID, MaxConflictDiff)
+			if derr != nil {
+				return nil, fmt.Errorf("load conflict diff: %w", derr)
+			}
+			latest := ""
+			if len(diff) > 0 {
+				latest = diff[len(diff)-1].ID
+			}
+			return nil, &StaleExpectedIDError{Latest: latest, NewMessages: diff, HasMore: hasMore}
+		}
+		expectedSeq = seq
+		enforceSeq = true
+	} else if requireCAS {
+		// Mandatory-CAS caller on an (in-cache) empty room: enforce
+		// "room must be empty" at the DB level too, so two concurrent
+		// first posts across processes cannot both pass.
+		enforceSeq = true
+	}
 
 	// Store message under the lock. Failure here aborts the post without
 	// touching the cache, so the next CAS still uses the previous head.
 	msg := newGroupMessage(agentID, senderName, content, nil)
-	if err := appendGroupMessage(groupID, msg); err != nil {
+	msg.Hop = hop
+	msg.Mentions = m.parseMentions(content, memberIDs)
+	if err := appendGroupMessage(groupID, msg, expectedSeq, enforceSeq); err != nil {
 		m.mu.Unlock()
+		if errors.Is(err, store.ErrStaleHead) {
+			// Another writer advanced the head between our cache check and
+			// the transactional append. Same conflict shape as the cache
+			// mismatch above.
+			diff, hasMore, derr := loadGroupMessagesAfter(groupID, expectedLatestID, MaxConflictDiff)
+			if derr != nil {
+				return nil, fmt.Errorf("load conflict diff: %w", derr)
+			}
+			latest := ""
+			if len(diff) > 0 {
+				latest = diff[len(diff)-1].ID
+			}
+			return nil, &StaleExpectedIDError{Latest: latest, NewMessages: diff, HasMore: hasMore}
+		}
 		return nil, fmt.Errorf("store message: %w", err)
 	}
 
@@ -664,14 +880,114 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 	m.mu.Unlock()
 	m.save()
 
-	// Notify other members asynchronously (unless suppressed to prevent loops)
+	// Notify other members asynchronously (unless suppressed to prevent
+	// loops). Hop limit is structural loop prevention: once a message's
+	// relay depth reaches the room's max, agent fan-out is suppressed
+	// entirely — the message stays in the transcript for humans, but no
+	// agent is notified, so the chain terminates. Mentions do NOT pierce
+	// this limit (they only pierce cooldown).
 	if notify {
-		for _, r := range recipients {
-			go m.notifyAgent(r.AgentID, groupID, groupName, msg, false)
+		if msg.Hop >= maxHops {
+			m.logger.Info("groupdm agent fan-out suppressed (hop limit)",
+				"group", groupID, "message", msg.ID, "hop", msg.Hop, "maxHops", maxHops)
+		} else {
+			for _, r := range recipients {
+				go m.notifyAgent(r.AgentID, groupID, groupName, msg, false,
+					containsMention(msg.Mentions, r.AgentID))
+			}
 		}
 	}
 
 	return msg, nil
+}
+
+// adoptDMFromStore looks up the kind="dm" row matching the wanted member
+// set directly in the DB and mirrors it into the in-memory map. Used when
+// FindOrCreateDM loses a cross-process create race. Returns nil when no
+// matching row exists (or no store is configured).
+func (m *GroupDMManager) adoptDMFromStore(want map[string]bool) *GroupDM {
+	db := getGlobalStore()
+	if db == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	recs, err := db.ListGroupDMs(ctx)
+	if err != nil {
+		m.logger.Warn("failed to list groupdms while adopting dm", "err", err)
+		return nil
+	}
+	for _, rec := range recs {
+		if rec.Kind != string(GroupDMKindDM) || len(rec.Members) != len(want) {
+			continue
+		}
+		match := true
+		for _, mem := range rec.Members {
+			if !want[mem.AgentID] {
+				match = false
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		g := groupRecordToGroupDM(rec)
+		m.mu.Lock()
+		if existing, ok := m.groups[g.ID]; ok {
+			g = existing
+		} else {
+			m.groups[g.ID] = g
+		}
+		cp := m.copyGroup(g)
+		m.mu.Unlock()
+		return cp
+	}
+	return nil
+}
+
+// currentTriggerHop returns the hop of the notification batch the agent's
+// in-flight turn is handling, if any.
+func (m *GroupDMManager) currentTriggerHop(agentID string) (int, bool) {
+	m.notifyMu.Lock()
+	defer m.notifyMu.Unlock()
+	e, ok := m.triggerHop[agentID]
+	return e.hop, ok
+}
+
+// parseMentions resolves @name tokens against the room's member set (ids
+// and current display names) plus the reserved "user" sentinel.
+func (m *GroupDMManager) parseMentions(content string, memberIDs []string) []string {
+	names := make(map[string]string, len(memberIDs))
+	for _, id := range memberIDs {
+		if a, ok := m.agentMgr.Get(id); ok {
+			names[id] = a.Name
+		}
+	}
+	return parseGroupMentions(content, memberIDs, names)
+}
+
+// effectiveMaxHops maps a room's configured MaxHops (0 = default) onto the
+// enforced limit.
+func effectiveMaxHops(configured int) int {
+	if configured <= 0 {
+		return defaultMaxHops
+	}
+	if configured > maxMaxHops {
+		return maxMaxHops
+	}
+	return configured
+}
+
+// clampMaxHops validates a caller-supplied MaxHops setting: negative
+// becomes 0 (use default), values above maxMaxHops are clamped.
+func clampMaxHops(v int) int {
+	if v < 0 {
+		return 0
+	}
+	if v > maxMaxHops {
+		return maxMaxHops
+	}
+	return v
 }
 
 // PostUserMessage posts a message from the human user (operator) to a group
@@ -690,9 +1006,14 @@ func (m *GroupDMManager) PostUserMessage(ctx context.Context, groupID, content s
 	recipients := make([]GroupMember, len(g.Members))
 	copy(recipients, g.Members)
 	groupName := g.Name
+	memberIDs := make([]string, len(g.Members))
+	for i, mem := range g.Members {
+		memberIDs[i] = mem.AgentID
+	}
 
 	msg := newGroupMessage(UserSenderID, UserSenderName, content, attachments)
-	if err := appendGroupMessage(groupID, msg); err != nil {
+	msg.Mentions = m.parseMentions(content, memberIDs)
+	if err := appendGroupMessage(groupID, msg, 0, false); err != nil {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("store message: %w", err)
 	}
@@ -707,7 +1028,8 @@ func (m *GroupDMManager) PostUserMessage(ctx context.Context, groupID, content s
 
 	if notify {
 		for _, r := range recipients {
-			go m.notifyAgent(r.AgentID, groupID, groupName, msg, true)
+			go m.notifyAgent(r.AgentID, groupID, groupName, msg, true,
+				containsMention(msg.Mentions, r.AgentID))
 		}
 	}
 
@@ -985,6 +1307,7 @@ type GroupDMSettingsPatch struct {
 	Cooldown      *int
 	Style         *GroupDMStyle
 	Venue         *GroupDMVenue
+	MaxHops       *int
 	CallerAgentID string
 	IfMatchETag   string
 }
@@ -995,8 +1318,8 @@ type GroupDMSettingsPatch struct {
 // holding the group manager lock. Test fixtures without a store still get a
 // single in-memory critical section.
 func (m *GroupDMManager) UpdateSettings(ctx context.Context, id string, patch GroupDMSettingsPatch) (*GroupDM, string, error) {
-	if patch.Name == nil && patch.Cooldown == nil && patch.Style == nil && patch.Venue == nil {
-		return nil, "", errors.New("name, cooldown, style, or venue is required")
+	if patch.Name == nil && patch.Cooldown == nil && patch.Style == nil && patch.Venue == nil && patch.MaxHops == nil {
+		return nil, "", errors.New("name, cooldown, style, venue, or maxHops is required")
 	}
 	if patch.Name != nil && *patch.Name == "" {
 		return nil, "", errors.New("name must not be empty")
@@ -1006,6 +1329,10 @@ func (m *GroupDMManager) UpdateSettings(ctx context.Context, id string, patch Gr
 	var cooldown int
 	if patch.Cooldown != nil {
 		cooldown = clampCooldown(*patch.Cooldown)
+	}
+	var maxHops int
+	if patch.MaxHops != nil {
+		maxHops = clampMaxHops(*patch.MaxHops)
 	}
 	var style GroupDMStyle
 	if patch.Style != nil {
@@ -1083,6 +1410,9 @@ func (m *GroupDMManager) UpdateSettings(ctx context.Context, id string, patch Gr
 		if patch.Venue != nil {
 			dst.Venue = venue
 		}
+		if patch.MaxHops != nil {
+			dst.MaxHops = maxHops
+		}
 		dst.UpdatedAt = time.Now().Format(time.RFC3339)
 	}
 
@@ -1099,6 +1429,9 @@ func (m *GroupDMManager) UpdateSettings(ctx context.Context, id string, patch Gr
 			}
 			if patch.Venue != nil {
 				r.Venue = string(venue)
+			}
+			if patch.MaxHops != nil {
+				r.MaxHops = maxHops
 			}
 			return nil
 		})
@@ -1292,7 +1625,11 @@ func capPending(msgs []pendingMsg) []pendingMsg {
 // not cancelled — the Chat call has no cancelable hook we can reach from
 // here without restructuring. SetMemberNotifyMode drops buffered messages
 // so at most one more batch can land after a mute flip.
-func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName string, msg *GroupMessage, senderIsUser bool) {
+// mentioned marks that this recipient was @-mentioned in msg: mentions
+// pierce the cooldown (the batch fires immediately instead of waiting out
+// the window) but NOT the hop limit (enforced upstream in PostMessage) and
+// NOT mute.
+func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName string, msg *GroupMessage, senderIsUser, mentioned bool) {
 	if msg == nil {
 		return
 	}
@@ -1349,6 +1686,7 @@ func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName string, msg *Gr
 		timestamp:    msg.Timestamp,
 		senderIsUser: senderIsUser,
 		attachments:  msg.Attachments,
+		hop:          msg.Hop,
 	})
 	// Bound the pending buffer: if a recipient stays busy while posts pile
 	// up we drop the oldest entries rather than growing without limit. The
@@ -1356,6 +1694,21 @@ func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName string, msg *Gr
 	ns.pendingMsgs = capPending(ns.pendingMsgs)
 
 	elapsed := time.Since(ns.lastSent)
+	// Mentions pierce the cooldown: fire the buffered batch immediately
+	// (cancelling any deferred timer) unless a delivery is already in
+	// flight — in that case the buffer is drained on that delivery's
+	// completion path anyway.
+	if mentioned && !ns.inFlight {
+		if ns.timer != nil {
+			ns.timer.Stop()
+			ns.timer = nil
+			// Invalidate the stopped timer's callback: Stop() can lose the
+			// race against a callback already blocked on notifyMu, and a
+			// stale firePending must not run a second delivery beside ours.
+			ns.gen++
+		}
+		elapsed = effCooldown
+	}
 	if elapsed < effCooldown || ns.inFlight || ns.timer != nil {
 		if ns.timer == nil && !ns.inFlight {
 			delay := effCooldown - elapsed
@@ -1699,7 +2052,34 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
 	defer cancel()
 
+	// Publish the batch's relay depth (max hop of the messages being
+	// delivered) so a PostMessage issued from the recipient's turn can
+	// stamp hop = triggerHop + 1. Cleared once the turn's event stream is
+	// fully drained (or the Chat call failed).
+	triggerHop := 0
+	for _, p := range pending {
+		if p.hop > triggerHop {
+			triggerHop = p.hop
+		}
+	}
+	// Publish only once Chat has ADMITTED our turn. Manager.Chat runs at
+	// most one turn per agent, so after a successful return the admitted
+	// turn is ours and every post the agent makes until the stream drains
+	// belongs to it — publishing earlier would stamp this hop onto an
+	// unrelated in-flight turn's posts during the (slow) prepare window,
+	// and a busy-losing delivery could linger a hop that isn't tied to
+	// any running turn. Residual window: a post issued in the microseconds
+	// between Chat returning and this publish would stamp hop 0; the
+	// backend cannot realistically emit a tool call that fast, and the
+	// failure mode is only a restarted chain that the limit still caps.
+	// (Binding the hop into the turn itself needs a Manager.Chat API
+	// change, which is out of scope here.) The ownership token inside
+	// setTriggerHop keeps overlapping restore closures safe.
 	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system", nil, BusySourceNotification)
+	var restoreTrigger func()
+	if err == nil {
+		restoreTrigger = m.setTriggerHop(agentID, triggerHop)
+	}
 
 	m.notifyMu.Lock()
 	ns := m.notify[key]
@@ -1707,8 +2087,8 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 		// Key was cleaned up while we were delivering — drop silently.
 		m.notifyMu.Unlock()
 		if err == nil {
-			for range events {
-			}
+			m.auditNotificationStream(ctx, events, groupID, agentID, notification)
+			restoreTrigger()
 		}
 		return
 	}
@@ -1733,25 +2113,56 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 			m.logger.Debug("agent busy, notification re-deferred", "agent", agentID, "group", groupID, "queued", len(merged))
 			return
 		}
-		// Non-transient — drop the batch. Any messages queued during delivery
-		// still need firing.
+		if errors.Is(err, ErrAgentArchived) {
+			// Archived is an expected terminal state, not an error worth
+			// warning (or dead-lettering) about — the agent is intentionally
+			// dormant. Drop the batch; fire anything queued meanwhile.
+			ns.attempts = 0
+			if len(ns.pendingMsgs) > 0 && ns.timer == nil {
+				ns.timer = time.AfterFunc(0, func() {
+					m.firePending(key, gen)
+				})
+			}
+			m.notifyMu.Unlock()
+			m.logger.Debug("skipping group notification for archived agent", "agent", agentID, "group", groupID)
+			return
+		}
+		// Non-transient failure: bounded retry with exponential backoff,
+		// then a persisted dead-letter record instead of a silent drop.
+		ns.attempts++
+		attempts := ns.attempts
+		if attempts < maxNotifyAttempts {
+			merged := append(append([]pendingMsg(nil), pending...), ns.pendingMsgs...)
+			merged = capPending(merged)
+			ns.pendingMsgs = merged
+			if ns.timer == nil {
+				delay := notifyRetryBase << (attempts - 1)
+				ns.timer = time.AfterFunc(delay, func() {
+					m.firePending(key, gen)
+				})
+			}
+			m.notifyMu.Unlock()
+			m.logger.Warn("group notification failed, will retry",
+				"agent", agentID, "group", groupID, "attempt", attempts, "err", err)
+			return
+		}
+		// Retry budget exhausted — dead-letter this batch and drop it.
+		// Messages queued during delivery still get their own attempt.
+		ns.attempts = 0
 		if len(ns.pendingMsgs) > 0 && ns.timer == nil {
 			ns.timer = time.AfterFunc(0, func() {
 				m.firePending(key, gen)
 			})
 		}
 		m.notifyMu.Unlock()
-		// Archived is an expected terminal state, not an error worth warning
-		// about — the agent is intentionally dormant.
-		if errors.Is(err, ErrAgentArchived) {
-			m.logger.Debug("skipping group notification for archived agent", "agent", agentID, "group", groupID)
-		} else {
-			m.logger.Warn("failed to notify agent", "agent", agentID, "group", groupID, "err", err)
-		}
+		m.logger.Warn("group notification permanently failed, dead-lettered",
+			"agent", agentID, "group", groupID, "attempts", attempts, "err", err)
+		m.recordDeadLetter(groupID, agentID, err.Error(), notification, attempts)
 		return
 	}
 
 	ns.lastSent = time.Now()
+	ns.attempts = 0
 	if len(ns.pendingMsgs) > 0 && ns.timer == nil {
 		ns.timer = time.AfterFunc(effCooldown, func() {
 			m.firePending(key, gen)
@@ -1759,8 +2170,99 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 	}
 	m.notifyMu.Unlock()
 
-	// Drain events.
-	for range events {
+	// Drain events — the recipient's turn runs during this window, with
+	// triggerHop published for hop stamping. The stream is audited: an
+	// error event (backend failure, 10-minute notifyTimeout) is recorded
+	// as a dead letter rather than silently counting as success. The turn
+	// is NOT retried — the notification was delivered into the agent's
+	// transcript when Chat accepted it, and re-delivering a delivered
+	// turn would duplicate it.
+	m.auditNotificationStream(ctx, events, groupID, agentID, notification)
+	restoreTrigger()
+}
+
+// auditNotificationStream drains a notification turn's event stream and
+// dead-letters (log + persisted record) any stream-level error. No retry:
+// the turn was already delivered; the record exists so a failed turn is
+// visible instead of silently passing as success.
+func (m *GroupDMManager) auditNotificationStream(ctx context.Context, events <-chan ChatEvent, groupID, agentID, notification string) {
+	var streamErr string
+	for ev := range events {
+		if ev.Type == "error" && streamErr == "" {
+			streamErr = ev.ErrorMessage
+			if streamErr == "" {
+				streamErr = "chat stream reported an error"
+			}
+		}
+	}
+	// A notifyTimeout can end the stream without an error event — the
+	// context cancellation kills the turn and the channel just closes.
+	// Detect it via the deadline so the timeout is dead-lettered too.
+	if streamErr == "" && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		streamErr = fmt.Sprintf("notification turn timed out after %s", notifyTimeout)
+	}
+	if streamErr != "" {
+		m.logger.Warn("group notification turn failed after delivery",
+			"agent", agentID, "group", groupID, "err", streamErr)
+		m.recordDeadLetter(groupID, agentID, "stream error: "+streamErr, notification, 1)
+	}
+}
+
+// triggerHopEntry is a published trigger hop plus the ownership token of
+// the delivery that set it.
+type triggerHopEntry struct {
+	hop   int
+	token uint64
+}
+
+// setTriggerHop publishes agentID's trigger hop and returns a restore
+// function that reinstates the previous state — but only while the entry
+// is still owned by this caller (token match). Two deliveries can race on
+// the same agent (the loser's Chat returns ErrAgentBusy); token ownership
+// guarantees the loser's restore cannot delete or overwrite the winner's
+// still-live entry regardless of set/restore ordering.
+func (m *GroupDMManager) setTriggerHop(agentID string, hop int) (restore func()) {
+	m.notifyMu.Lock()
+	prev, existed := m.triggerHop[agentID]
+	m.triggerHopSeq++
+	token := m.triggerHopSeq
+	m.triggerHop[agentID] = triggerHopEntry{hop: hop, token: token}
+	m.notifyMu.Unlock()
+	return func() {
+		m.notifyMu.Lock()
+		if cur, ok := m.triggerHop[agentID]; ok && cur.token == token {
+			if existed {
+				m.triggerHop[agentID] = prev
+			} else {
+				delete(m.triggerHop, agentID)
+			}
+		}
+		m.notifyMu.Unlock()
+	}
+}
+
+// recordDeadLetter persists a permanently failed delivery for later
+// inspection via GET /api/v1/groupdms/{id}/dead-letters. Best-effort: a
+// missing store (test fixtures) or insert failure only logs.
+func (m *GroupDMManager) recordDeadLetter(groupID, agentID, reason, payload string, attempts int) {
+	db := getGlobalStore()
+	if db == nil {
+		return
+	}
+	if len(payload) > deadLetterPayloadCap {
+		payload = payload[:deadLetterPayloadCap]
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := db.InsertGroupDMDeadLetter(ctx, &store.GroupDMDeadLetter{
+		GroupDMID: groupID,
+		AgentID:   agentID,
+		Reason:    reason,
+		Payload:   payload,
+		Attempts:  attempts,
+	}); err != nil {
+		m.logger.Warn("failed to persist groupdm dead letter",
+			"group", groupID, "agent", agentID, "err", err)
 	}
 }
 
@@ -1885,6 +2387,13 @@ func (m *GroupDMManager) AddMember(id, newAgentID, callerAgentID string) (*Group
 	if err != nil {
 		m.mu.Unlock()
 		return nil, err
+	}
+
+	// DM rooms are fixed 1:1 conversations — growing one into a group
+	// would silently break the find-or-create keying and the UI split.
+	if g.Kind == GroupDMKindDM {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("cannot add members to a dm room %s; create a group instead", id)
 	}
 
 	// Verify caller is a member
@@ -2426,6 +2935,7 @@ func upsertGroupDM(ctx context.Context, db *store.Store, g *GroupDM) error {
 			r.Style = rec.Style
 			r.Cooldown = rec.Cooldown
 			r.Venue = rec.Venue
+			r.MaxHops = rec.MaxHops
 			return nil
 		}); err != nil {
 			return fmt.Errorf("update: %w", err)
@@ -2455,6 +2965,8 @@ func groupDMToRecord(g *GroupDM) *store.GroupDMRecord {
 		Style:    string(g.Style),
 		Cooldown: g.Cooldown,
 		Venue:    string(g.Venue),
+		MaxHops:  g.MaxHops,
+		Kind:     string(g.Kind),
 	}
 }
 
@@ -2477,6 +2989,8 @@ func groupRecordToGroupDM(rec *store.GroupDMRecord) *GroupDM {
 		Cooldown:  rec.Cooldown,
 		Style:     GroupDMStyle(rec.Style),
 		Venue:     GroupDMVenue(rec.Venue),
+		MaxHops:   rec.MaxHops,
+		Kind:      GroupDMKind(rec.Kind),
 		CreatedAt: normalizeTimestamp(millisToRFC3339(rec.CreatedAt)),
 		UpdatedAt: normalizeTimestamp(millisToRFC3339(rec.UpdatedAt)),
 	}
@@ -2499,4 +3013,46 @@ func (m *GroupDMManager) stripReservedMembers(g *GroupDM) bool {
 		g.Members = filtered
 	}
 	return removed
+}
+
+// UnreadInfo returns the number of messages strictly newer than afterID
+// (the UI's per-room read cursor) plus whether any of them @-mentions the
+// human operator. count is capped at limit (0 = 200); hasMore signals the
+// cap bit. afterID=="" counts from the beginning of the transcript window.
+func (m *GroupDMManager) UnreadInfo(groupID, afterID string, limit int) (count int, mentionsUser, hasMore bool, err error) {
+	m.mu.Lock()
+	_, ok := m.groups[groupID]
+	m.mu.Unlock()
+	if !ok {
+		return 0, false, false, fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	msgs, more, err := loadGroupMessagesAfter(groupID, afterID, limit)
+	if err != nil {
+		return 0, false, false, err
+	}
+	for _, msg := range msgs {
+		if containsMention(msg.Mentions, UserSenderID) {
+			mentionsUser = true
+			break
+		}
+	}
+	return len(msgs), mentionsUser, more, nil
+}
+
+// DeadLetters lists permanently failed notification deliveries for a group.
+func (m *GroupDMManager) DeadLetters(ctx context.Context, groupID string, limit int) ([]*store.GroupDMDeadLetter, error) {
+	m.mu.Lock()
+	_, ok := m.groups[groupID]
+	m.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
+	}
+	db := getGlobalStore()
+	if db == nil {
+		return nil, errStoreNotReady
+	}
+	return db.ListGroupDMDeadLetters(ctx, groupID, limit)
 }

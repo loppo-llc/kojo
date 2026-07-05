@@ -352,6 +352,9 @@ func (s *Server) processJoinRequest(w http.ResponseWriter, r *http.Request, req 
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
+		// Queue-and-forward: the peer just came (back) online via
+		// the pairing/join path — trigger a delivery pass.
+		s.kickHandoffQueueDrain()
 		hub := s.buildHubInfoResponse(r.Context())
 		writeJSONResponse(w, http.StatusOK, joinRequestResponse{State: "approved", Hub: hub})
 		return

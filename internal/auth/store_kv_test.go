@@ -529,3 +529,53 @@ func TestParseAuthKVValue_RowShapeGate(t *testing.T) {
 		})
 	}
 }
+
+// TestAutoRepairAgentToken_HashOnlyReissues pins the §3.7 finalize
+// auto-repair (Task A): a target holding only the kv hash (raw lost
+// to a restart, or never held) re-issues automatically — the new raw
+// verifies, the old hash is evicted, and no manual re-issue step
+// remains. A store that still holds the raw reports (false, nil).
+func TestAutoRepairAgentToken_HashOnlyReissues(t *testing.T) {
+	base := t.TempDir()
+	kv := newKVStore(t)
+
+	st1, err := NewTokenStore(base, kv, "owner-x")
+	if err != nil {
+		t.Fatalf("NewTokenStore #1: %v", err)
+	}
+	oldTok, err := st1.AgentToken("ag_repair")
+	if err != nil {
+		t.Fatalf("seed AgentToken: %v", err)
+	}
+
+	// Raw still in memory: nothing to repair.
+	if reissued, err := st1.AutoRepairAgentToken("ag_repair"); err != nil || reissued {
+		t.Fatalf("raw-present repair: got (%v, %v); want (false, nil)", reissued, err)
+	}
+
+	// Reopen — kv has the hash, raw is gone (post-restart target).
+	st2, err := NewTokenStore(base, kv, "owner-x")
+	if err != nil {
+		t.Fatalf("NewTokenStore #2: %v", err)
+	}
+	reissued, err := st2.AutoRepairAgentToken("ag_repair")
+	if err != nil {
+		t.Fatalf("AutoRepairAgentToken: %v", err)
+	}
+	if !reissued {
+		t.Fatalf("hash-only store: reissued = false; want true")
+	}
+	newTok, err := st2.AgentToken("ag_repair")
+	if err != nil || newTok == "" {
+		t.Fatalf("post-repair AgentToken: tok=%q err=%v", newTok, err)
+	}
+	if newTok == oldTok {
+		t.Fatalf("repair did not rotate the token")
+	}
+	if id, ok := st2.LookupAgent(newTok); !ok || id != "ag_repair" {
+		t.Errorf("LookupAgent(new) = (%q, %v); want (ag_repair, true)", id, ok)
+	}
+	if _, ok := st2.LookupAgent(oldTok); ok {
+		t.Errorf("old token still verifies after auto-repair")
+	}
+}

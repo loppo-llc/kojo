@@ -636,6 +636,33 @@ func (s *TokenStore) ReissueAgentToken(agentID string) (string, error) {
 	return tok, nil
 }
 
+// AutoRepairAgentToken is the §3.7 device-switch finalize helper
+// for targets that received NO raw token in the sync payload (the
+// source only held the kv hash after a restart). It ensures this
+// peer ends up with a usable raw $KOJO_AGENT_TOKEN:
+//
+//   - raw already available (or freshly generated for an agent with
+//     no prior hash): nothing to repair, returns (false, nil).
+//   - hash-only (ErrTokenRawUnavailable): re-issues via
+//     ReissueAgentToken — kv hash CAS-swapped, in-memory verifier +
+//     raw updated — and returns (true, nil).
+//   - anything else: (false, err).
+//
+// This replaces the old "manual re-issue required" operator step.
+func (s *TokenStore) AutoRepairAgentToken(agentID string) (bool, error) {
+	_, err := s.AgentToken(agentID)
+	if err == nil {
+		return false, nil
+	}
+	if !errors.Is(err, ErrTokenRawUnavailable) {
+		return false, err
+	}
+	if _, rerr := s.ReissueAgentToken(agentID); rerr != nil {
+		return false, rerr
+	}
+	return true, nil
+}
+
 // AdoptAgentTokenFromPeer installs a raw token sent by another
 // peer during a §3.7 device-switch agent-sync. The hash is
 // computed locally, persisted to kv, and added to the in-memory

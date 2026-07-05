@@ -239,6 +239,7 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 		Cooldown *int   `json:"cooldown"`
 		Style    string `json:"style"`
 		Venue    string `json:"venue"`
+		MaxHops  *int   `json:"maxHops"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
@@ -253,9 +254,9 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 	req.AgentID = bound
 
 	// Validate all fields before applying the atomic settings patch.
-	if req.Name == "" && req.Cooldown == nil && req.Style == "" && req.Venue == "" {
+	if req.Name == "" && req.Cooldown == nil && req.Style == "" && req.Venue == "" && req.MaxHops == nil {
 		writeError(w, http.StatusBadRequest, "bad_request",
-			"name, cooldown, style, or venue is required")
+			"name, cooldown, style, venue, or maxHops is required")
 		return
 	}
 	if req.Style != "" && !agent.ValidGroupDMStyles[agent.GroupDMStyle(req.Style)] {
@@ -301,6 +302,9 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 	if req.Venue != "" {
 		venue := agent.GroupDMVenue(req.Venue)
 		patch.Venue = &venue
+	}
+	if req.MaxHops != nil {
+		patch.MaxHops = req.MaxHops
 	}
 
 	result, etag, err := s.groupdms.UpdateSettings(r.Context(), id, patch)
@@ -471,12 +475,31 @@ func (s *Server) handlePostGroupMessage(w http.ResponseWriter, r *http.Request) 
 			"agentId \"user\" is reserved; use POST /api/v1/groupdms/{id}/user-messages")
 		return
 	}
-
 	// Always notify on API-initiated messages (user or agent-initiated).
 	// Notifications trigger chats that may produce follow-up messages,
 	// but the busy check in Manager.Chat naturally breaks infinite loops.
-	msg, err := s.groupdms.PostMessage(r.Context(), id, req.AgentID, req.Content, req.ExpectedLatestMessageID, true)
+	//
+	// CAS is mandatory for agent-token posts: an empty
+	// expectedLatestMessageId used to skip the check entirely, letting
+	// agents race past concurrent replies. PostMessageStrict enforces the
+	// requirement atomically with the append (a brand-new room with no
+	// head is the one case where "" passes). Owner/human callers keep the
+	// legacy skip-when-empty behavior.
+	post := s.groupdms.PostMessage
+	if p := auth.FromContext(r.Context()); !p.IsOwner() {
+		post = s.groupdms.PostMessageStrict
+	}
+	msg, err := post(r.Context(), id, req.AgentID, req.Content, req.ExpectedLatestMessageID, true)
 	if err != nil {
+		var missingErr *agent.MissingExpectedIDError
+		if errors.As(err, &missingErr) {
+			writeJSONResponse(w, http.StatusConflict, map[string]any{
+				"error":           "expected_latest_message_id_required",
+				"message":         "expectedLatestMessageId is required for agent posts; GET /api/v1/groupdms/" + id + "/messages first and repost with the returned latestMessageId",
+				"latestMessageId": missingErr.Latest,
+			})
+			return
+		}
 		// Stale CAS cursor — return 409 with the new head and the diff so
 		// the caller has everything they need to decide whether to repost.
 		var staleErr *agent.StaleExpectedIDError
@@ -746,4 +769,111 @@ func (s *Server) handleListAgentGroups(w http.ResponseWriter, r *http.Request) {
 		groups = []*agent.GroupDM{}
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]any{"groups": groups})
+}
+
+// handleFindOrCreateDM is the "DM an agent" sugar: finds or creates the
+// kind="dm" room for the given member set. One agentId = human↔agent DM
+// (the human operator participates implicitly); two = agent↔agent DM.
+// Agents may only open DMs they are a member of.
+func (s *Server) handleFindOrCreateDM(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AgentID   string   `json:"agentId"`
+		MemberIDs []string `json:"memberIds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	memberIDs := req.MemberIDs
+	if len(memberIDs) == 0 && req.AgentID != "" {
+		memberIDs = []string{req.AgentID}
+	}
+	if len(memberIDs) < 1 || len(memberIDs) > 2 {
+		writeError(w, http.StatusBadRequest, "bad_request", "agentId or 1-2 memberIds required")
+		return
+	}
+	if p := auth.FromContext(r.Context()); !p.IsOwner() {
+		if !p.IsAgent() {
+			writeError(w, http.StatusForbidden, "forbidden", "agent identity required")
+			return
+		}
+		found := false
+		for _, m := range memberIDs {
+			if m == p.AgentID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			writeError(w, http.StatusForbidden, "forbidden", "caller must be one of the memberIds")
+			return
+		}
+	}
+	g, created, err := s.groupdms.FindOrCreateDM(memberIDs)
+	if err != nil {
+		if p := auth.FromContext(r.Context()); !p.IsOwner() &&
+			(errors.Is(err, agent.ErrAgentNotFound) || errors.Is(err, agent.ErrAgentArchived)) {
+			writeError(w, http.StatusBadRequest, "bad_request", "invalid memberIds")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSONResponse(w, status, g)
+}
+
+// handleGetGroupUnread reports how many messages arrived after the caller's
+// read cursor (?after=<messageId>) and whether any @-mentions the human
+// operator. Drives the room-list unread / mention badges.
+func (s *Server) handleGetGroupUnread(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.requireMemberOrOwner(w, r, id) {
+		return
+	}
+	after := r.URL.Query().Get("after")
+	count, mentionsUser, hasMore, err := s.groupdms.UnreadInfo(id, after, 0)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{
+		"count":        count,
+		"mentionsUser": mentionsUser,
+		"hasMore":      hasMore,
+	})
+}
+
+// handleGetGroupDeadLetters lists permanently failed notification
+// deliveries for a room. Owner-only — dead letters carry rendered
+// notification payloads that may span other members' messages.
+func (s *Server) handleGetGroupDeadLetters(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if p := auth.FromContext(r.Context()); !p.IsOwner() {
+		writeError(w, http.StatusForbidden, "forbidden", "owner access required")
+		return
+	}
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	dls, err := s.groupdms.DeadLetters(r.Context(), id, limit)
+	if err != nil {
+		if errors.Is(err, agent.ErrGroupNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+			return
+		}
+		s.logger.Error("list groupdm dead letters failed", "id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+	if dls == nil {
+		dls = []*store.GroupDMDeadLetter{}
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"deadLetters": dls})
 }

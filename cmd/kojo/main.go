@@ -998,7 +998,8 @@ func main() {
 		// runs after the orchestrator's complete succeeds;
 		// an aborted switch fires drop instead, leaving the
 		// rows present but not actively claimed by this peer.
-		srv.SetOnAgentSyncFinalized(func(hookCtx context.Context, agentID, rawToken, sourceDeviceID, opID string) error {
+		srv.SetOnAgentSyncFinalized(func(hookCtx context.Context, agentID, rawToken, sourceDeviceID, opID string) (bool, error) {
+			tokenReissued := false
 			// Step order is durability-first: write the durable
 			// arrived marker BEFORE touching token / lock-guard
 			// state, THEN best-effort clear any prior released
@@ -1026,7 +1027,7 @@ func main() {
 				// _peer back to self and the Hub→target chat proxy
 				// would 403 in agentHolderAdmitMiddleware.
 				if err := agentMgr.MarkAgentArrivedHere(hookCtx, agentID, sourceDeviceID); err != nil {
-					return fmt.Errorf("mark agent arrived: %w", err)
+					return tokenReissued, fmt.Errorf("mark agent arrived: %w", err)
 				}
 				if err := agentMgr.ClearAgentReleasedHere(hookCtx, agentID); err != nil {
 					// Best-effort: latest-wins picks the
@@ -1037,9 +1038,37 @@ func main() {
 						"agent", agentID, "err", err)
 				}
 			}
-			if rawToken != "" && tokens != nil {
-				if err := tokens.AdoptAgentTokenFromPeer(agentID, rawToken); err != nil {
-					return fmt.Errorf("token adopt: %w", err)
+			if tokens != nil {
+				if rawToken != "" {
+					if err := tokens.AdoptAgentTokenFromPeer(agentID, rawToken); err != nil {
+						return tokenReissued, fmt.Errorf("token adopt: %w", err)
+					}
+				} else {
+					// Task A auto-repair: source only held the kv hash
+					// (post-restart peer) so no raw token rode the sync.
+					// Historically this stranded target in a "manual
+					// re-issue required" state. AutoRepairAgentToken
+					// mints a fresh raw, CAS-swaps the kv hash row, and
+					// updates the in-memory verifier so the next PTY
+					// spawn injects a working $KOJO_AGENT_TOKEN. A
+					// repair failure fails the hook (pending retained;
+					// operator retries finalize) — same contract as an
+					// adopt failure.
+					reissued, terr := tokens.AutoRepairAgentToken(agentID)
+					if terr != nil {
+						// Fail the hook so the finalize handler keeps the
+						// pending entry and the orchestrator retries —
+						// mirrors the AdoptAgentTokenFromPeer failure
+						// contract above. Swallowing the error would
+						// activate the runtime without a usable
+						// $KOJO_AGENT_TOKEN and consume the pending entry.
+						return tokenReissued, fmt.Errorf("token auto-repair: %w", terr)
+					}
+					if reissued {
+						logger.Info("agent-sync finalize: raw agent token unavailable; auto-re-issued on this peer",
+							"agent", agentID)
+						tokenReissued = true
+					}
 				}
 			}
 			if capturedGuard != nil {
@@ -1065,10 +1094,10 @@ func main() {
 					// source-side retry loop picks it up.
 					// Other lookup errors stay as-is (500).
 					if errors.Is(lerr, store.ErrNotFound) {
-						return fmt.Errorf("agent_lock row missing for %q: %w",
+						return tokenReissued, fmt.Errorf("agent_lock row missing for %q: %w",
 							agentID, store.ErrFencingMismatch)
 					}
-					return fmt.Errorf("post-AddAgent lock lookup: %w", lerr)
+					return tokenReissued, fmt.Errorf("post-AddAgent lock lookup: %w", lerr)
 				}
 				if lock == nil || lock.HolderPeer != peerIdentity.DeviceID {
 					holder := ""
@@ -1081,7 +1110,7 @@ func main() {
 					// which the source-side retry loop already
 					// keys on (switch_device_handler.go's
 					// finalizeErr.Error() substring check).
-					return fmt.Errorf("agent_lock did not transfer (holder=%q, self=%q); orchestrator should retry finalize: %w",
+					return tokenReissued, fmt.Errorf("agent_lock did not transfer (holder=%q, self=%q); orchestrator should retry finalize: %w",
 						holder, peerIdentity.DeviceID, store.ErrFencingMismatch)
 				}
 			}
@@ -1104,7 +1133,7 @@ func main() {
 			if agentMgr != nil {
 				agentMgr.ActivateAgentRuntime(agentID)
 			}
-			return nil
+			return tokenReissued, nil
 		})
 		// Source-side hook: after the orchestrator's complete
 		// + finalize succeed, drop the agent from THIS peer's

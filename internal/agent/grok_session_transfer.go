@@ -120,7 +120,7 @@ var grokSessionCoreFiles = map[string]struct{}{
 // BEFORE it ever reaches filepath.Join, so a poisoned
 // `.grok/session_id` (the agent can write its own workspace)
 // cannot escape the session subtree.
-func ReadGrokSessionFiles(agentID string) (*GrokSessionTransfer, []string, error) {
+func ReadGrokSessionFiles(agentID string) (*GrokSessionTransfer, []SkippedSessionFile, error) {
 	if agentID == "" {
 		return nil, nil, nil
 	}
@@ -165,7 +165,7 @@ func ReadGrokSessionFiles(agentID string) (*GrokSessionTransfer, []string, error
 	}
 
 	files := make([]GrokSessionFile, 0)
-	skipped := make([]string, 0)
+	skipped := make([]SkippedSessionFile, 0)
 	var totalBytes int64
 
 	walkErr := filepath.Walk(absSessionRoot, func(path string, fi os.FileInfo, walkErr error) error {
@@ -205,7 +205,9 @@ func ReadGrokSessionFiles(agentID string) (*GrokSessionTransfer, []string, error
 			if _, isCore := grokSessionCoreFiles[rel]; isCore {
 				return fmt.Errorf("core file %q exceeds size cap (%d bytes)", rel, fi.Size())
 			}
-			skipped = append(skipped, rel)
+			skipped = append(skipped, SkippedSessionFile{
+				Path: rel, Reason: "oversized", SizeBytes: fi.Size(),
+			})
 			return nil
 		}
 

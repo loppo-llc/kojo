@@ -90,8 +90,27 @@ import (
 // Tailscale link. Override via context if you need shorter.
 const switchDeviceOpTimeout = 5 * time.Minute
 
+// syncAgentMemoryFromDiskFn / syncAgentPersonaFromDiskFn are the
+// pre-sync flush steps, indirected through package vars so the
+// degraded-mode tests can inject a deterministic failure (the real
+// functions only fail on genuine FS / DB errors that are awkward to
+// stage in a unit test).
+var (
+	syncAgentMemoryFromDiskFn  = agent.SyncAgentMemoryFromDisk
+	syncAgentPersonaFromDiskFn = agent.SyncAgentPersonaFromDisk
+)
+
 type switchDeviceRequest struct {
 	TargetPeerID string `json:"target_peer_id"`
+	// Degraded opts in to transcript-only transfer when the
+	// pre-sync disk→DB memory / persona flush fails. Default
+	// (false) keeps the hard-fail contract: a failed flush
+	// aborts the switch with memory_flush_failed /
+	// persona_flush_failed. With the flag set, the switch
+	// proceeds and the skipped flushes are recorded in the
+	// response (degraded_flushes), the logs, and the target's
+	// arrival prompt so the agent knows memory may be stale.
+	Degraded bool `json:"degraded,omitempty"`
 }
 
 type switchDeviceResponse struct {
@@ -138,6 +157,24 @@ type switchDeviceResponse struct {
 	// claude session JSONLs on target. False means the switch
 	// aborted before sync had a chance to fire.
 	AgentSynced bool `json:"agent_synced,omitempty"`
+	// Degraded / DegradedFlushes report that the switch ran in
+	// opt-in degraded mode AND at least one pre-sync flush was
+	// actually skipped ("memory_flush", "persona_flush"). The
+	// same list rides the sync payload so target's arrival
+	// prompt warns the agent about potentially stale memory.
+	Degraded        bool     `json:"degraded,omitempty"`
+	DegradedFlushes []string `json:"degraded_flushes,omitempty"`
+	// TransferSkips lists every session file the sync payload
+	// left behind (oversized claude JSONL, unreadable codex ref,
+	// …). Also shipped to target for the arrival prompt and the
+	// owner-facing UI notice.
+	TransferSkips []agent.SkippedSessionFile `json:"transfer_skips,omitempty"`
+	// TokenAutoReissue is true when source could not include the
+	// raw $KOJO_AGENT_TOKEN (post-restart peers only hold the kv
+	// hash). Target auto-re-issues at finalize IF it also lacks
+	// the raw (a target that still caches a matching raw needs no
+	// repair) — either way no manual re-issue step remains.
+	TokenAutoReissue bool `json:"token_auto_reissue,omitempty"`
 }
 
 func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request) {
@@ -424,13 +461,35 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// sync takes," which is dominated by FS scan size and SQLite
 	// write throughput. Adding a ctx-aware lock acquire is a
 	// separate refactor.
+	var degradedFlushes []string
 	if s.agents != nil && s.agents.Store() != nil {
-		if err := agent.SyncAgentMemoryFromDisk(ctx, s.agents.Store(), agentID, s.logger); err != nil {
-			s.logger.Error("switch-device: pre-sync disk→DB flush failed; refusing switch to avoid shipping stale memory state",
-				"agent", agentID, "err", err)
-			writeError(w, http.StatusInternalServerError, "memory_flush_failed",
-				"disk→DB memory flush failed; switch aborted to avoid shipping stale state: "+err.Error())
-			return
+		if err := syncAgentMemoryFromDiskFn(ctx, s.agents.Store(), agentID, s.logger); err != nil {
+			if req.Degraded {
+				// Opt-in degraded mode: proceed without the flush.
+				// The sync payload still ships source's DB rows —
+				// deliberately. Those rows hold the LAST SUCCESSFUL
+				// flush, and under the fencing model they are always
+				// ≥ target's copy (only the lock holder mutates
+				// agent state, and the lock is at source; target's
+				// rows froze when the agent last left it). Omitting
+				// memory/persona instead would WIPE target: the
+				// wire treats nil persona/memory as "source has
+				// none → DELETE" and non-incremental memory_entries
+				// as DELETE-then-INSERT. The only loss is the
+				// un-flushed disk edits, which is exactly what
+				// degraded_flushes records on the response, the
+				// sync payload (→ target's arrival prompt), and
+				// the log line here.
+				s.logger.Warn("switch-device: degraded mode: disk→DB memory flush failed; proceeding transcript-only",
+					"agent", agentID, "err", err)
+				degradedFlushes = append(degradedFlushes, "memory_flush")
+			} else {
+				s.logger.Error("switch-device: pre-sync disk→DB flush failed; refusing switch to avoid shipping stale memory state",
+					"agent", agentID, "err", err)
+				writeError(w, http.StatusInternalServerError, "memory_flush_failed",
+					"disk→DB memory flush failed; switch aborted to avoid shipping stale state (retry with \"degraded\":true to proceed transcript-only): "+err.Error())
+				return
+			}
 		}
 		// persona.md rides its own personaSyncMu, NOT the memorySyncMu
 		// path above, so SyncAgentMemoryFromDisk does not flush it.
@@ -438,12 +497,18 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		// set (Step -1). Flush it directly here so a persona edit made
 		// during the closing turn isn't dropped from the sync payload.
 		// Same hard-fail contract as the memory flush.
-		if err := agent.SyncAgentPersonaFromDisk(ctx, s.agents.Store(), agentID, s.logger); err != nil {
-			s.logger.Error("switch-device: pre-sync persona disk→DB flush failed; refusing switch to avoid shipping stale persona state",
-				"agent", agentID, "err", err)
-			writeError(w, http.StatusInternalServerError, "persona_flush_failed",
-				"disk→DB persona flush failed; switch aborted to avoid shipping stale state: "+err.Error())
-			return
+		if err := syncAgentPersonaFromDiskFn(ctx, s.agents.Store(), agentID, s.logger); err != nil {
+			if req.Degraded {
+				s.logger.Warn("switch-device: degraded mode: persona disk→DB flush failed; proceeding transcript-only",
+					"agent", agentID, "err", err)
+				degradedFlushes = append(degradedFlushes, "persona_flush")
+			} else {
+				s.logger.Error("switch-device: pre-sync persona disk→DB flush failed; refusing switch to avoid shipping stale persona state",
+					"agent", agentID, "err", err)
+				writeError(w, http.StatusInternalServerError, "persona_flush_failed",
+					"disk→DB persona flush failed; switch aborted to avoid shipping stale state (retry with \"degraded\":true to proceed transcript-only): "+err.Error())
+				return
+			}
 		}
 	}
 
@@ -497,6 +562,18 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 			"build agent-sync payload: "+serr.Error())
 		return
 	}
+	// Stamp degraded-mode + skip metadata on both the wire payload
+	// (target persists it into the pending entry and the agent row
+	// so the arrival prompt / owner UI can surface it) and the
+	// switch response (operator + skill see it immediately).
+	syncReq.DegradedFlushes = degradedFlushes
+	resp.DegradedFlushes = degradedFlushes
+	resp.Degraded = len(degradedFlushes) > 0
+	resp.TransferSkips = syncReq.TransferSkips
+	// Raw token unavailable on source (hash-only after a restart):
+	// target auto-repairs at finalize if it also lacks the raw.
+	// Surface the fact so the operator knows no raw rode the wire.
+	resp.TokenAutoReissue = syncReq.AgentToken == ""
 
 	// §3.7 self-call: the assistant turn containing the
 	// kojo-switch-device tool_use is still mid-flight — accumulated
@@ -1479,6 +1556,7 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 	if len(skipped) > 0 {
 		s.logger.Warn("agent-sync: skipped oversized claude session files",
 			"agent", agentID, "files", skipped)
+		req.TransferSkips = append(req.TransferSkips, skipped...)
 	}
 	if len(files) > 0 {
 		req.ClaudeSessions = make([]claudeSessionWire, 0, len(files))
@@ -1527,6 +1605,7 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 		if len(grokSkipped) > 0 {
 			s.logger.Warn("agent-sync: skipped oversized grok session files",
 				"agent", agentID, "files", grokSkipped)
+			req.TransferSkips = append(req.TransferSkips, grokSkipped...)
 		}
 		if grokTransfer != nil && len(grokTransfer.Files) > 0 {
 			gw := &grokSessionWire{
@@ -1551,6 +1630,7 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 		if len(codexSkipped) > 0 {
 			s.logger.Warn("agent-sync: skipped codex session files",
 				"agent", agentID, "files", codexSkipped)
+			req.TransferSkips = append(req.TransferSkips, codexSkipped...)
 		}
 		if codexTransfer != nil && len(codexTransfer.Threads) > 0 {
 			cw := &codexSessionWire{
@@ -1571,10 +1651,10 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 	}
 
 	// Raw agent token (best-effort — post-restart peers only
-	// have the kv hash, so the callback may return false; that's
-	// acceptable in v1, the target will require a re-issue
-	// after a stranded sync but the rest of the state still
-	// migrates).
+	// have the kv hash, so the callback may return false). An
+	// empty AgentToken on the wire tells target's finalize hook
+	// to auto-re-issue a fresh token locally, so no manual
+	// re-issue step is needed anymore.
 	if tok, ok := agent.LookupAgentToken(agentID); ok {
 		req.AgentToken = tok
 	}
