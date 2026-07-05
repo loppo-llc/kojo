@@ -134,10 +134,12 @@ describe("Dashboard room list", () => {
     expect(mocks.unread).toHaveBeenCalledWith("d1", null);
   });
 
-  it("starts a new thread from the agent row and navigates to the room", async () => {
+  it("navigates to a draft thread without creating the room (lazy creation)", async () => {
     const router = renderDashboard();
     fireEvent.click(await screen.findByLabelText("New thread with Alice"));
-    await waitFor(() => expect(mocks.createThread).toHaveBeenCalledWith("ag_a"));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/groupdms/t1"));
+    // Lazy: the button must NOT create a room — it only opens the draft route.
+    await waitFor(() => expect(router.state.location.pathname).toBe("/groupdms/new"));
+    expect(router.state.location.search).toBe("?agent=ag_a");
+    expect(mocks.createThread).not.toHaveBeenCalled();
   });
 });

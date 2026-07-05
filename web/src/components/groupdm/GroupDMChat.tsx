@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { useParams, useNavigate } from "react-router";
+import { useParams, useNavigate, useSearchParams } from "react-router";
 import {
   groupdmApi,
   USER_SENDER_ID,
@@ -38,6 +38,12 @@ const PAGE_SIZE = 50;
 export function GroupDMChat() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  // Draft mode: /groupdms/new?agent=<id> renders the chat for a not-yet-created
+  // thread. The room is only created (POST /api/v1/threads) when the first
+  // message is sent, so a mis-click never leaves an empty thread behind.
+  const draftAgentId = searchParams.get("agent");
+  const isDraft = !id;
   const [group, setGroup] = useState<GroupDMInfo | null>(null);
   const [messages, setMessages] = useState<GroupMessage[]>([]);
   const [hasMore, setHasMore] = useState(false);
@@ -88,10 +94,31 @@ export function GroupDMChat() {
   const clearDialogRef = useRef<HTMLDivElement>(null);
 
   // User input
-  const { input, setInput, clearDraft } = useDraftInput("groupdm-draft", id);
+  // Draft rooms have no id yet, so key the composer draft on the target agent
+  // instead — switching between two draft threads must not leak text between
+  // them.
+  const { input, setInput, clearDraft } = useDraftInput("groupdm-draft", id ?? draftAgentId ?? undefined);
+  // Holds the room created for this draft on the first send (tagged with the
+  // agent it belongs to), so a retry after a failed post reuses it instead of
+  // littering a second empty thread — and so a room created for agent A can
+  // never be reused (or adopted mid-flight) after switching to a draft for
+  // agent B.
+  const draftRoomRef = useRef<{ agentId: string; id: string } | null>(null);
+  // Mirrors the CURRENT draft agent so an in-flight createThread started for a
+  // previous draft can detect the switch and discard its result.
+  const currentDraftAgentRef = useRef<string | null>(draftAgentId);
+  useEffect(() => {
+    currentDraftAgentRef.current = draftAgentId;
+    return () => {
+      // Invalidate the draft generation on unmount (or agent switch) so a
+      // slow send that finishes afterwards cannot re-navigate the user to
+      // the old thread from wherever they went next.
+      currentDraftAgentRef.current = null;
+    };
+  }, [draftAgentId]);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
-  const { textareaRef, resize: handleTextareaInput } = useAutoGrowTextarea();
+  const { textareaRef, resize: handleTextareaInput } = useAutoGrowTextarea(input);
   const [enterSends] = useEnterSends();
   const pollGenerationRef = useRef(0);
 
@@ -154,7 +181,8 @@ export function GroupDMChat() {
     setClearError("");
     setPendingFiles([]);
     setUploadError(null);
-  }, [id]);
+    draftRoomRef.current = null;
+  }, [id, draftAgentId]);
 
   // Load group info
   useEffect(() => {
@@ -165,6 +193,40 @@ export function GroupDMChat() {
       }
     });
   }, [id]);
+
+  // Draft mode: synthesize a thread group header from the target agent so the
+  // chat renders (agent name, empty transcript, enabled input) without
+  // creating a room yet.
+  useEffect(() => {
+    if (!isDraft) return;
+    if (!draftAgentId) {
+      setNotFound(true);
+      return;
+    }
+    let cancelled = false;
+    agentApi
+      .get(draftAgentId)
+      .then((a) => {
+        if (cancelled) return;
+        setGroup({
+          id: "",
+          name: a.name,
+          kind: "thread",
+          members: [{ agentId: a.id, agentName: a.name }],
+          cooldown: 0,
+          style: "efficient",
+          createdAt: "",
+          updatedAt: "",
+        });
+        setThreadAgentModel(a.model);
+      })
+      .catch(() => {
+        if (!cancelled) setNotFound(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isDraft, draftAgentId]);
 
   // Resolve the thread agent's model for pricing the usage line. Only threads
   // (single agent member) carry per-reply usage, so skip group rooms.
@@ -189,13 +251,48 @@ export function GroupDMChat() {
   // the server still reports older pages. A fully-covered page replaces the
   // local transcript so remote clears do not keep stale rows on screen.
   const initialLoadDone = useRef(false);
+  const lastHeadRef = useRef<string>("");
+  // Tracks the head we've SUCCESSFULLY persisted as read server-side. Kept
+  // separate from lastHeadRef (which drives the group-info refresh) so a
+  // failed markRead is retried on the next poll instead of being lost — we
+  // only advance this on success.
+  const lastMarkedReadRef = useRef<string>("");
   useEffect(() => {
     if (!id || notFound) return;
     initialLoadDone.current = false;
+    lastHeadRef.current = "";
+    lastMarkedReadRef.current = "";
     const load = () => {
       const generation = pollGenerationRef.current;
       groupdmApi.messages(id, PAGE_SIZE).then((r) => {
         if (generation !== pollGenerationRef.current) return;
+        // Refresh the group (name/settings) whenever the transcript head
+        // advances — the open chat header otherwise never picks up an
+        // auto-title/rename that lands between renders. Piggybacks on the
+        // message poll so it costs one extra GET only when something changed.
+        const head = r.messages.length > 0 ? r.messages[r.messages.length - 1].id : "";
+        if (head && head !== lastHeadRef.current) {
+          groupdmApi.get(id).then((g) => {
+            if (generation !== pollGenerationRef.current) return;
+            // Advance only on success so a failed GET is retried on the
+            // next poll instead of silently pinning a stale header.
+            lastHeadRef.current = head;
+            setGroup(g);
+          }).catch(() => {});
+        }
+        // Persist the read cursor server-side so the unread badge survives a
+        // daemon restart (the localStorage cursor below is lost when the
+        // browser origin/storage changes on restart). Only advance the marker
+        // on success so a transient failure is retried on the next poll rather
+        // than leaving the server cursor stale.
+        if (head && head !== lastMarkedReadRef.current) {
+          groupdmApi
+            .markRead(id, head)
+            .then(() => {
+              lastMarkedReadRef.current = head;
+            })
+            .catch(() => {});
+        }
         setMessages((prev) => {
           if (!r.hasMore) return r.messages;
           const newIds = new Set(r.messages.map((m) => m.id));
@@ -222,12 +319,40 @@ export function GroupDMChat() {
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
-    if ((!text && pendingFiles.length === 0) || sending || !id) return;
+    if ((!text && pendingFiles.length === 0) || sending) return;
+    if (!id && !isDraft) return;
+    if (isDraft && !draftAgentId) return;
     setSending(true);
     setSendError(null);
     try {
+      // Draft mode: create the thread room now (first message = commit), then
+      // post into it and swap the URL to the real room (replace so Back does
+      // not return to the throwaway draft route).
+      let targetId = id;
+      const sendAgentId = draftAgentId;
+      if (isDraft) {
+        // Reuse a room created by a prior (failed-at-post) attempt for the
+        // SAME agent so a retry does not create a second empty thread.
+        let roomId =
+          draftRoomRef.current?.agentId === sendAgentId ? draftRoomRef.current.id : null;
+        if (!roomId) {
+          const room = await groupdmApi.createThread(sendAgentId!);
+          // The draft may have switched to another agent while the create was
+          // in flight — discard the result instead of adopting a room that
+          // belongs to the previous draft (posting there would message the
+          // wrong agent). Archive the just-created room (best-effort) so the
+          // discard doesn't litter an empty thread.
+          if (currentDraftAgentRef.current !== sendAgentId) {
+            groupdmApi.archive(room.id).catch(() => {});
+            return;
+          }
+          draftRoomRef.current = { agentId: sendAgentId!, id: room.id };
+          roomId = room.id;
+        }
+        targetId = roomId;
+      }
       const sent = await groupdmApi.postUserMessage(
-        id,
+        targetId!,
         text,
         pendingFiles.length > 0 ? pendingFiles : undefined,
       );
@@ -240,7 +365,21 @@ export function GroupDMChat() {
       }
       // Own message counts as read immediately — otherwise navigating away
       // before the next poll would badge the room for the user's own post.
-      setLastRead(id, sent.id);
+      // Persist both the local cursor and the server-side one so the read
+      // state holds even on a different device / after a restart.
+      setLastRead(targetId!, sent.id);
+      groupdmApi.markRead(targetId!, sent.id).catch(() => {});
+      if (isDraft) {
+        // Only swap the URL if the user is still on this draft — a slow send
+        // finishing after they navigated to another draft must not yank them
+        // to the old thread. The message itself is already posted.
+        if (currentDraftAgentRef.current === sendAgentId) {
+          // The real room view mounts on the replaced URL and loads the
+          // transcript (including this message) via its own poll.
+          navigate(`/groupdms/${targetId}`, { replace: true });
+        }
+        return;
+      }
       // Optimistically append — the polling loop will reconcile via id dedupe.
       setMessages((prev) => {
         if (prev.some((m) => m.id === sent.id)) return prev;
@@ -251,7 +390,7 @@ export function GroupDMChat() {
     } finally {
       setSending(false);
     }
-  }, [id, input, pendingFiles, sending, clearDraft, setPendingFiles, setUploadError, textareaRef]);
+  }, [id, isDraft, draftAgentId, navigate, input, pendingFiles, sending, clearDraft, setPendingFiles, setUploadError, textareaRef]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => enterToSend(e, enterSends, () => void handleSend()),
@@ -332,7 +471,12 @@ export function GroupDMChat() {
           ))}
         </div>
         <div className="min-w-0 flex-1">
-          {editingName ? (
+          {isDraft ? (
+            // Draft threads have no room yet — nothing to rename.
+            <div className="w-full truncate text-left text-[15px] font-semibold text-ink">
+              {group.name}
+            </div>
+          ) : editingName ? (
             <input
               ref={nameInputRef}
               type="text"
@@ -573,7 +717,7 @@ export function GroupDMChat() {
           </svg>
         </button>
         )}
-        {isThread ? (
+        {isThread && isDraft ? null : isThread ? (
           <button
             onClick={() => {
               setArchiveError("");
@@ -723,7 +867,7 @@ export function GroupDMChat() {
               onChange={(e) => setInput(e.target.value)}
               onInput={handleTextareaInput}
               onKeyDown={handleKeyDown}
-              placeholder={`Message the group… (${enterSends ? "Enter" : "Ctrl+Enter"} to send)`}
+              placeholder={`${isThread ? "Message this thread" : "Message the group"}… (${enterSends ? "Enter" : "Ctrl+Enter"} to send)`}
               rows={1}
               className="max-h-[150px] w-full resize-none bg-transparent px-3 py-2 text-[14px] text-ink placeholder:text-ink-faint focus:outline-none"
             />

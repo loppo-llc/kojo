@@ -105,7 +105,6 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [groupDMs, setGroupDMs] = useState<GroupDMInfo[]>([]);
   const [unreadByRoom, setUnreadByRoom] = useState<Map<string, UnreadInfo>>(new Map());
-  const [dmOpening, setDmOpening] = useState<string | null>(null);
   const [cronPaused, setCronPaused] = useState(false);
   const [showCreateGroupDialog, setShowCreateGroupDialog] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
@@ -335,21 +334,12 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
     };
   }, []);
 
-  const openAgentDM = async (agentId: string, e: React.MouseEvent) => {
+  const openAgentDM = (agentId: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (dmOpening) return;
-    setDmOpening(agentId);
-    try {
-      // Always create a fresh thread room — an agent can hold many in parallel.
-      const room = await groupdmApi.createThread(agentId);
-      setGroupDMs((prev) => [room, ...prev.filter((g) => g.id !== room.id)]);
-      navigate(`/groupdms/${room.id}`);
-    } catch (err) {
-      console.error("Failed to start thread", err);
-      window.alert(`Failed to start thread: ${errMsg(err)}`);
-    } finally {
-      setDmOpening(null);
-    }
+    // Lazy creation: navigate to a draft thread. The room is only created
+    // (POST /api/v1/threads) when the first message is actually sent, so a
+    // mis-click leaves no empty thread behind.
+    navigate(`/groupdms/new?agent=${encodeURIComponent(agentId)}`);
   };
 
   useEffect(() => {
@@ -458,14 +448,22 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
   const busyAgentCount = agents.filter((a) => a.busy).length;
   const runningCount =
     visibleSessions.filter((s) => s.status === "running").length + busyAgentCount;
-  // updatedAt is RFC3339 with seconds resolution, so agents touched in the
-  // same second tie. Manager.List() iterates a map, so input order is random
-  // per request; a 0-return comparator would let that randomness through
-  // (Array.sort is stable, but the tie group still re-shuffles each reload).
-  // Fall back to id for a deterministic order.
+  // Order by most-recent activity: newest last message first. lastMessageAt
+  // is epoch-millis (server-derived from the message row's created_at), so
+  // it survives restarts and doesn't suffer the same-second ties that the
+  // seconds-resolution updatedAt string produced — Manager.List() iterates a
+  // map (random input order per request), so a tie group would otherwise
+  // reshuffle on every reload. Agents with no messages (lastMessageAt 0/
+  // undefined) sort last, ordered by createdAt desc; id is the final
+  // deterministic tiebreak.
   const sortedAgents = [...agents].sort((a, b) => {
-    const diff = new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
-    if (diff !== 0 && !Number.isNaN(diff)) return diff;
+    const aTs = a.lastMessageAt ?? 0;
+    const bTs = b.lastMessageAt ?? 0;
+    if (aTs !== bTs) return bTs - aTs;
+    // Both without messages (or the extraordinarily unlikely exact-millis
+    // tie): fall back to creation time, newest first.
+    const cdiff = new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+    if (cdiff !== 0 && !Number.isNaN(cdiff)) return cdiff;
     return a.id.localeCompare(b.id);
   });
   const selectedNewGroupMembers = sortedAgents.filter((a) => newGroupMemberIds.has(a.id));
@@ -691,17 +689,13 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                     )}
 
                     <button
-                      onClick={(e) => void openAgentDM(agent.id, e)}
-                      disabled={dmOpening !== null}
+                      onClick={(e) => openAgentDM(agent.id, e)}
                       className="flex w-8 shrink-0 items-center justify-center text-ink-faint transition-colors hover:text-copper disabled:opacity-40"
                       title="New thread"
                       aria-label={`New thread with ${agent.name}`}
                     >
-                      {dmOpening === agent.id ? (
-                        <span className="font-mono text-[10px]">…</span>
-                      ) : (
-                        // MessageSquarePlus: a chat bubble with a "+", conveying
-                        // "start a new thread/conversation".
+                      {/* MessageSquarePlus: a chat bubble with a "+", conveying
+                          "start a new thread/conversation". */}
                         <svg
                           viewBox="0 0 24 24"
                           fill="none"
@@ -715,7 +709,6 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                           <line x1="12" y1="8" x2="12" y2="14" />
                           <line x1="9" y1="11" x2="15" y2="11" />
                         </svg>
-                      )}
                     </button>
 
                     <button

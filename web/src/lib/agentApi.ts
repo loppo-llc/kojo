@@ -114,6 +114,11 @@ export interface AgentInfo {
     role: string;
     timestamp: string;
   };
+  // Epoch-millis timestamp of the most recent message. Millisecond
+  // precision (unlike lastMessage.timestamp's seconds-resolution RFC3339
+  // string) so the dashboard can order agents by most-recent activity
+  // without same-second ties reshuffling on reload. Absent/0 = no messages.
+  lastMessageAt?: number;
   // Archived agents are dormant: runtime activity stopped, hidden from
   // the main list, but all data retained on disk for restore.
   archived?: boolean;

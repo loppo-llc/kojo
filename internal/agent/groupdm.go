@@ -125,6 +125,10 @@ const (
 	GroupDMKindThread GroupDMKind = "thread"
 )
 
+// DefaultThreadName is the placeholder title a new thread room carries until
+// its first agent reply auto-titles it (see maybeAutoTitleThread).
+const DefaultThreadName = "無題のスレッド"
+
 // GroupMember is a participant in a group DM.
 //
 // AgentName is a denormalized read-only display field. The DB store
@@ -405,6 +409,41 @@ func loadGroupMessagesAfter(groupID, afterID string, limit int) ([]*GroupMessage
 	listOpts := store.GroupDMMessageListOptions{
 		SinceSeq: afterSeq,
 		Order:    "desc",
+	}
+	if limit > 0 {
+		listOpts.Limit = limit + 1
+	}
+	recs, err := db.ListGroupDMMessages(ctx, groupID, listOpts)
+	if err != nil {
+		return nil, false, err
+	}
+	hasMore := false
+	if limit > 0 && len(recs) > limit {
+		hasMore = true
+		recs = recs[:limit]
+	}
+	out := reverseToOldestFirst(recs)
+	if err := populateAgentNames(ctx, db, out); err != nil {
+		return nil, false, err
+	}
+	return out, hasMore, nil
+}
+
+// loadGroupMessagesAfterSeq returns messages strictly newer than afterSeq
+// (the server-persisted read cursor), capped to the newest `limit` entries.
+// afterSeq<=0 returns the newest `limit` messages (nothing read yet).
+// hasMore is true when older diff entries had to be dropped to fit the cap.
+func loadGroupMessagesAfterSeq(groupID string, afterSeq int64, limit int) ([]*GroupMessage, bool, error) {
+	db := getGlobalStore()
+	if db == nil {
+		return nil, false, errStoreNotReady
+	}
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+
+	listOpts := store.GroupDMMessageListOptions{Order: "desc"}
+	if afterSeq > 0 {
+		listOpts.SinceSeq = afterSeq
 	}
 	if limit > 0 {
 		listOpts.Limit = limit + 1

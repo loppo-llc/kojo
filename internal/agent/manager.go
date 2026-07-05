@@ -377,6 +377,7 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 				Role:      last.Role,
 				Timestamp: last.Timestamp,
 			}
+			a.LastMessageAt = lastMessageMillis(last)
 		}
 		// One-shot migration from the legacy inline Agent.CronMessage
 		// field to the agent_workspace_files (kind=checkin) row. The
@@ -869,6 +870,7 @@ func (m *Manager) GetRemote(id string) *Agent {
 			Role:      last.Role,
 			Timestamp: last.Timestamp,
 		}
+		a.LastMessageAt = lastMessageMillis(last)
 	}
 	has, hash := m.avatarMeta(id)
 	applyAvatarMeta(a, has, hash)
@@ -981,6 +983,7 @@ func (m *Manager) ListRemote() []*Agent {
 				Role:      last.Role,
 				Timestamp: last.Timestamp,
 			}
+			a.LastMessageAt = lastMessageMillis(last)
 		}
 		has, hash := m.avatarMeta(rec.ID)
 		applyAvatarMeta(a, has, hash)
@@ -2638,6 +2641,7 @@ func (m *Manager) persistDoneEvent(agentID string, msg *Message) {
 			Role:      msg.Role,
 			Timestamp: msg.Timestamp,
 		}
+		ag.LastMessageAt = lastMessageMillis(msg)
 		ag.UpdatedAt = time.Now().Format(time.RFC3339)
 	}
 	m.mu.Unlock()
@@ -3473,6 +3477,7 @@ func (m *Manager) refreshLastMessage(agentID string) {
 	}
 	if len(msgs) == 0 {
 		a.LastMessage = nil
+		a.LastMessageAt = 0
 	} else {
 		last := msgs[len(msgs)-1]
 		a.LastMessage = &MessagePreview{
@@ -3480,6 +3485,7 @@ func (m *Manager) refreshLastMessage(agentID string) {
 			Role:      last.Role,
 			Timestamp: last.Timestamp,
 		}
+		a.LastMessageAt = lastMessageMillis(last)
 	}
 	a.UpdatedAt = time.Now().Format(time.RFC3339)
 	m.mu.Unlock()

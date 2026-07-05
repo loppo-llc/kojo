@@ -212,11 +212,11 @@ type GroupDMManager struct {
 // NewGroupDMManager creates a new GroupDMManager.
 func NewGroupDMManager(agentMgr *Manager, logger *slog.Logger) *GroupDMManager {
 	m := &GroupDMManager{
-		groups:      make(map[string]*GroupDM),
-		agentMgr:    agentMgr,
-		logger:      logger,
-		notify:      make(map[string]*notifyState),
-		triggerHop:  make(map[string]triggerHopEntry),
+		groups:        make(map[string]*GroupDM),
+		agentMgr:      agentMgr,
+		logger:        logger,
+		notify:        make(map[string]*notifyState),
+		triggerHop:    make(map[string]triggerHopEntry),
 		latestMsgID:   make(map[string]string),
 		deleting:      make(map[string]bool),
 		persistGen:    make(map[string]int64),
@@ -339,10 +339,10 @@ func isThreadRoom(g *GroupDM) bool {
 
 // CreateThread always creates a NEW thread room (kind "thread") for the given
 // agent — no member-set dedup, so an agent can have many parallel threads.
-// The default name is the agent's display name; the first agent reply may
-// auto-title it (see maybeAutoTitleThread).
+// The default name is DefaultThreadName ("無題のスレッド"); the first agent reply
+// may auto-title it (see maybeAutoTitleThread).
 func (m *GroupDMManager) CreateThread(agentID string) (*GroupDM, error) {
-	return m.create("", []string{agentID}, 0, GroupDMStyleEfficient, defaultGroupDMVenue, GroupDMKindThread, false)
+	return m.create(DefaultThreadName, []string{agentID}, 0, GroupDMStyleEfficient, defaultGroupDMVenue, GroupDMKindThread, false)
 }
 
 // CreateWithNotify creates a group and optionally sends a system notification
@@ -1214,12 +1214,14 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	if text == "" {
 		return // nothing substantive to post
 	}
+	// Auto-title BEFORE posting the reply: the reply advances the transcript
+	// head, and a client that refreshes the room info on head change would
+	// otherwise race the rename and pin the stale default title. No-op after
+	// the first rename; empty replies (above) still skip titling entirely.
+	m.maybeAutoTitleThread(groupID, agentID, msg.Content)
 	if _, err := m.postThreadReply(groupID, agentID, text, usage); err != nil {
 		m.logger.Warn("failed to post thread reply", "group", groupID, "agent", agentID, "err", err)
 	}
-	// Auto-title the thread on its first agent reply while the name is still
-	// the default (the agent's display name). No-op after the first rename.
-	m.maybeAutoTitleThread(groupID, agentID, msg.Content)
 }
 
 // renderThreadPayload builds the one-shot payload for a thread turn from the
@@ -1318,19 +1320,22 @@ func (m *GroupDMManager) maybeAutoTitleThread(groupID, agentID, firstUserMessage
 		m.mu.Unlock()
 		return
 	}
-	// Only rename while the name is still the default: the agent's current
-	// display name. copyGroup overlays the live name onto members, so the
-	// creation-time default equals the agent's present name.
-	defaultName := ""
+	// Only rename while the name is still the default. A "thread" room is
+	// created with DefaultThreadName; a legacy single-agent "dm" room was
+	// created with the agent's display name. Accept either as "still
+	// default" so both shapes auto-title exactly once.
+	agentName := ""
 	if a, ok := m.agentMgr.Get(agentID); ok {
-		defaultName = a.Name
+		agentName = a.Name
 	}
-	if g.Name != defaultName || title == g.Name {
+	isDefault := g.Name == DefaultThreadName || g.Name == agentName
+	if !isDefault || title == g.Name {
 		m.mu.Unlock()
 		return
 	}
-	g.Name = title
-	g.UpdatedAt = time.Now().Format(time.RFC3339)
+	// Persist FIRST, mutate memory only on success: flipping g.Name before
+	// the DB write would break the "still default" gate above on a persist
+	// failure, so the title would never be retried on a later turn.
 	if db := getGlobalStore(); db != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		_, uerr := db.UpdateGroupDM(ctx, groupID, "", func(r *store.GroupDMRecord) error {
@@ -1344,6 +1349,8 @@ func (m *GroupDMManager) maybeAutoTitleThread(groupID, agentID, firstUserMessage
 			return
 		}
 	}
+	g.Name = title
+	g.UpdatedAt = time.Now().Format(time.RFC3339)
 	m.mu.Unlock()
 	if getGlobalStore() == nil {
 		m.save()
@@ -3365,7 +3372,13 @@ func (m *GroupDMManager) stripReservedMembers(g *GroupDM) bool {
 // (the UI's per-room read cursor) plus whether any of them @-mentions the
 // human operator. count is capped at limit (0 = 200); hasMore signals the
 // cap bit. afterID=="" counts from the beginning of the transcript window.
-func (m *GroupDMManager) UnreadInfo(groupID, afterID string, limit int) (count int, mentionsUser, hasMore bool, err error) {
+//
+// useOperatorCursor folds the server-persisted per-room read cursor (the
+// HUMAN operator's, written by MarkGroupRead) into the effective cursor.
+// Pass true only for owner-principal requests — a member agent's unread
+// position is its own client-supplied afterID and must not be advanced to
+// wherever the human happens to have read.
+func (m *GroupDMManager) UnreadInfo(groupID, afterID string, limit int, useOperatorCursor bool) (count int, mentionsUser, hasMore bool, err error) {
 	m.mu.Lock()
 	_, ok := m.groups[groupID]
 	m.mu.Unlock()
@@ -3375,7 +3388,54 @@ func (m *GroupDMManager) UnreadInfo(groupID, afterID string, limit int) (count i
 	if limit <= 0 {
 		limit = 200
 	}
-	msgs, more, err := loadGroupMessagesAfter(groupID, afterID, limit)
+	// Resolve the effective read cursor. For operator requests it is the
+	// FURTHEST (max seq) of the client's afterID (its browser-local
+	// localStorage cursor) and the server-persisted per-room cursor.
+	// Neither side may win unconditionally:
+	//   - client cursor alone: lost on daemon restart / storage eviction,
+	//     and a device with STALE localStorage would resurrect unreads
+	//     already marked read from another device.
+	//   - persisted cursor alone: would ignore a device that just read
+	//     further but whose async markRead POST hasn't landed yet.
+	// Agent requests (useOperatorCursor=false) use only their own afterID.
+	var afterSeq int64
+	var haveSeq bool
+	if afterID != "" {
+		db := getGlobalStore()
+		if db == nil {
+			return 0, false, false, errStoreNotReady
+		}
+		ctx, cancel := transcriptCtx()
+		s, found, serr := groupMessageSeq(ctx, db, groupID, afterID)
+		cancel()
+		if serr != nil {
+			return 0, false, false, serr
+		}
+		if found {
+			afterSeq, haveSeq = s, true
+		}
+		// !found = stale client cursor (message hard-deleted): fall
+		// through to the persisted cursor (operator only); if that's
+		// absent too, the legacy "newest window + hasMore" fallback
+		// below applies.
+	}
+	if useOperatorCursor {
+		if ps, pok, perr := m.readCursorSeq(groupID); perr == nil && pok && ps > afterSeq {
+			afterSeq, haveSeq = ps, true
+		}
+	}
+
+	var msgs []*GroupMessage
+	var more bool
+	if haveSeq {
+		msgs, more, err = loadGroupMessagesAfterSeq(groupID, afterSeq, limit)
+	} else {
+		// No usable cursor on either side. Preserve the legacy contract:
+		// afterID=="" counts from the transcript window's start; a
+		// non-empty-but-unresolvable afterID returns the newest window
+		// with hasMore=true ("couldn't locate your cursor").
+		msgs, more, err = loadGroupMessagesAfter(groupID, afterID, limit)
+	}
 	if err != nil {
 		return 0, false, false, err
 	}
@@ -3386,6 +3446,48 @@ func (m *GroupDMManager) UnreadInfo(groupID, afterID string, limit int) (count i
 		}
 	}
 	return len(msgs), mentionsUser, more, nil
+}
+
+// readCursorSeq returns the persisted read-cursor seq for a room.
+func (m *GroupDMManager) readCursorSeq(groupID string) (int64, bool, error) {
+	db := getGlobalStore()
+	if db == nil {
+		return 0, false, errStoreNotReady
+	}
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+	return db.GetGroupDMReadCursor(ctx, groupID)
+}
+
+// MarkGroupRead persists the operator's read cursor for a room at the seq of
+// messageID. A stale/unknown messageID is ignored (no error) so a cursor
+// pointing at a hard-deleted message doesn't wedge the badge. The store
+// upsert never lowers an existing higher cursor, so out-of-order marks from
+// concurrent devices are safe.
+func (m *GroupDMManager) MarkGroupRead(groupID, messageID string) error {
+	m.mu.Lock()
+	_, ok := m.groups[groupID]
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
+	}
+	if messageID == "" {
+		return nil
+	}
+	db := getGlobalStore()
+	if db == nil {
+		return errStoreNotReady
+	}
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+	seq, found, err := groupMessageSeq(ctx, db, groupID, messageID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	return db.SetGroupDMReadCursor(ctx, groupID, seq)
 }
 
 // DeadLetters lists permanently failed notification deliveries for a group.

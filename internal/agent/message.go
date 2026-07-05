@@ -21,7 +21,13 @@ type Message struct {
 	ToolUses    []ToolUse           `json:"toolUses,omitempty"`
 	Attachments []MessageAttachment `json:"attachments,omitempty"`
 	Timestamp   string              `json:"timestamp"` // RFC3339
-	Usage       *Usage              `json:"usage,omitempty"`
+	// CreatedAtMillis is the row's created_at in epoch-millis. Not
+	// serialized (the wire carries the RFC3339 Timestamp) but retained
+	// in-process so list-ordering can break same-second ties that the
+	// seconds-resolution RFC3339 string cannot. Zero when the message
+	// did not originate from a store record.
+	CreatedAtMillis int64  `json:"-"`
+	Usage           *Usage `json:"usage,omitempty"`
 	// ETag is the inner identifier of the row's strong HTTP entity
 	// tag — UNQUOTED (e.g. "v3-deadbeef") so the JSON looks natural;
 	// the matching HTTP ETag header carries the same identifier

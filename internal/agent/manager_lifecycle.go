@@ -212,6 +212,7 @@ func (m *Manager) ResetData(id string) error {
 	m.mu.Lock()
 	if a, ok := m.agents[id]; ok {
 		a.LastMessage = nil
+		a.LastMessageAt = 0
 		a.UpdatedAt = time.Now().Format(time.RFC3339)
 	}
 	m.mu.Unlock()
@@ -604,6 +605,7 @@ func (m *Manager) ReloadAgentFromStore(agentID string) error {
 			Role:      last.Role,
 			Timestamp: last.Timestamp,
 		}
+		a.LastMessageAt = lastMessageMillis(last)
 	}
 	m.mu.Lock()
 	m.agents[agentID] = a

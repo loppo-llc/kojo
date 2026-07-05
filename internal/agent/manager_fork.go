@@ -79,6 +79,7 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 	fork.CreatedAt = now
 	fork.UpdatedAt = now
 	fork.LastMessage = nil
+	fork.LastMessageAt = 0
 	fork.HasAvatar = false
 	fork.AvatarHash = ""
 	fork.SlackBot = nil
@@ -281,6 +282,7 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 				Role:      last.Role,
 				Timestamp: last.Timestamp,
 			}
+			fork.LastMessageAt = lastMessageMillis(last)
 		}
 	}
 

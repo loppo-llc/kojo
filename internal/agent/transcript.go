@@ -101,9 +101,17 @@ func appendMessage(agentID string, msg *Message) error {
 	if err != nil {
 		return err
 	}
+	// created_at resolution: callers stamp msg.Timestamp with a seconds-
+	// resolution RFC3339 string (time.Now().Format(time.RFC3339)), so
+	// parsing it back always lands on .000 millis — two messages appended
+	// in the same second would tie and defeat millisecond ordering. For a
+	// FRESH message (its second matches the current wall clock) use the
+	// real ms-precision now instead; a backdated Timestamp (imports,
+	// replays — parsed second is in the past) is honored verbatim.
+	now := store.NowMillis()
 	ts := parseAgentRFC3339Millis(msg.Timestamp)
-	if ts == 0 {
-		ts = store.NowMillis()
+	if ts == 0 || (now >= ts && now-ts < 1000) {
+		ts = now
 	}
 
 	ctx, cancel := transcriptCtx()
@@ -118,8 +126,15 @@ func appendMessage(agentID string, msg *Message) error {
 	// Reflect store-allocated timestamp back into the caller's *Message
 	// so subsequent reads (LastMessage preview, broadcaster fan-out)
 	// observe the same RFC3339 string the DB row will produce.
-	if msg.Timestamp == "" && out.CreatedAt != 0 {
-		msg.Timestamp = millisToRFC3339(out.CreatedAt)
+	if out.CreatedAt != 0 {
+		// Carry the store-allocated millis so live list-ordering (the
+		// chat-done LastMessage update path) can break same-second ties
+		// without waiting for a reload to re-read the row. The RFC3339
+		// Timestamp is only seconds-resolution, so it can't.
+		msg.CreatedAtMillis = out.CreatedAt
+		if msg.Timestamp == "" {
+			msg.Timestamp = millisToRFC3339(out.CreatedAt)
+		}
 	}
 	// Reflect the just-allocated etag too — without this, messages
 	// fanned out via the chat broadcaster (WebSocket subscribers) would
@@ -558,12 +573,13 @@ func messageToRecord(agentID string, msg *Message) (*store.MessageRecord, error)
 // caller can rely on len(toolUses)==0 etc. without a separate nil check.
 func recordToMessage(rec *store.MessageRecord) (*Message, error) {
 	m := &Message{
-		ID:        rec.ID,
-		Role:      rec.Role,
-		Content:   rec.Content,
-		Thinking:  rec.Thinking,
-		Timestamp: normalizeTimestamp(millisToRFC3339(rec.CreatedAt)),
-		ETag:      rec.ETag,
+		ID:              rec.ID,
+		Role:            rec.Role,
+		Content:         rec.Content,
+		Thinking:        rec.Thinking,
+		Timestamp:       normalizeTimestamp(millisToRFC3339(rec.CreatedAt)),
+		CreatedAtMillis: rec.CreatedAt,
+		ETag:            rec.ETag,
 	}
 	if len(rec.ToolUses) > 0 && string(rec.ToolUses) != "null" {
 		if err := json.Unmarshal(rec.ToolUses, &m.ToolUses); err != nil {

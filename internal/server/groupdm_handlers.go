@@ -876,7 +876,12 @@ func (s *Server) handleGetGroupUnread(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	after := r.URL.Query().Get("after")
-	count, mentionsUser, hasMore, err := s.groupdms.UnreadInfo(id, after, 0)
+	// The server-persisted read cursor is the HUMAN operator's (written by
+	// MarkGroupRead, owner-only). Fold it in only for owner requests — a
+	// member agent's unread position is its own ?after= cursor and must not
+	// be advanced by where the human happens to have read.
+	isOwner := auth.FromContext(r.Context()).IsOwner()
+	count, mentionsUser, hasMore, err := s.groupdms.UnreadInfo(id, after, 0, isOwner)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "not_found", err.Error())
 		return
@@ -886,6 +891,38 @@ func (s *Server) handleGetGroupUnread(w http.ResponseWriter, r *http.Request) {
 		"mentionsUser": mentionsUser,
 		"hasMore":      hasMore,
 	})
+}
+
+// handleMarkGroupRead persists the operator's read cursor for a room at the
+// given messageId. Drives durable, restart-proof unread badges: the room
+// list's GET /unread (without an ?after=) reads this server-side cursor
+// instead of the browser-local one that was lost on daemon restart.
+func (s *Server) handleMarkGroupRead(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// Owner-only: the read cursor is the human operator's unread state.
+	// Member agents (RoleAgent tokens) can GET /unread but must not be
+	// able to clear the operator's badges.
+	if p := auth.FromContext(r.Context()); !p.IsOwner() {
+		writeError(w, http.StatusForbidden, "forbidden", "owner access required")
+		return
+	}
+	var body struct {
+		MessageID string `json:"messageId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+		return
+	}
+	if err := s.groupdms.MarkGroupRead(id, body.MessageID); err != nil {
+		if errors.Is(err, agent.ErrGroupNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+			return
+		}
+		s.logger.Error("mark groupdm read failed", "id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // handleGetGroupDeadLetters lists permanently failed notification

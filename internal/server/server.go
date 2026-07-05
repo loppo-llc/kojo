@@ -960,6 +960,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("POST /api/v1/groupdms/{id}/messages", s.handlePostGroupMessage)
 		mux.HandleFunc("POST /api/v1/groupdms/{id}/user-messages", s.handlePostGroupUserMessage)
 		mux.HandleFunc("GET /api/v1/groupdms/{id}/unread", s.handleGetGroupUnread)
+		mux.HandleFunc("POST /api/v1/groupdms/{id}/read", s.handleMarkGroupRead)
 		mux.HandleFunc("GET /api/v1/groupdms/{id}/dead-letters", s.handleGetGroupDeadLetters)
 		mux.HandleFunc("POST /api/v1/dms", s.handleFindOrCreateDM)
 		mux.HandleFunc("POST /api/v1/threads", s.handleCreateThread)

@@ -367,3 +367,97 @@ func TestHandleGetGroupUnread(t *testing.T) {
 		t.Fatalf("unread = %+v, want count=1 mentionsUser=true", resp)
 	}
 }
+
+// TestMarkGroupReadPersistsCursor verifies the server-side read cursor makes
+// unread counts survive a daemon restart. The dashboard's unread poll omits
+// ?after= when the browser-local cursor is gone (the exact state after a
+// restart wipes localStorage); the persisted cursor must then drive the
+// count to 0 instead of re-reporting every message as unread.
+func TestMarkGroupReadPersistsCursor(t *testing.T) {
+	srv, gdm, group, _ := newGroupDMHandlerTestServer(t)
+	m1, err := gdm.PostUserMessage(context.Background(), group.ID, "one", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliceID := group.Members[0].AgentID
+	m2, err := gdm.PostMessage(context.Background(), group.ID, aliceID, "reply", m1.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Before marking read, an ?after=-less poll (restarted browser, no local
+	// cursor) counts every message as unread.
+	unread := func(after string) int {
+		url := "/api/v1/groupdms/" + group.ID + "/unread"
+		if after != "" {
+			url += "?after=" + after
+		}
+		req := httptest.NewRequest(http.MethodGet, url, nil)
+		req.SetPathValue("id", group.ID)
+		rr := httptest.NewRecorder()
+		srv.handleGetGroupUnread(rr, authedRequest(req, auth.Principal{Role: auth.RoleOwner}))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("unread status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+		var resp struct {
+			Count int `json:"count"`
+		}
+		readJSONResponse(t, rr, &resp)
+		return resp.Count
+	}
+	if got := unread(""); got != 2 {
+		t.Fatalf("pre-mark unread = %d, want 2", got)
+	}
+
+	// Mark the room read at the head via the API.
+	mreq := httptest.NewRequest(http.MethodPost, "/api/v1/groupdms/"+group.ID+"/read",
+		strings.NewReader(`{"messageId":"`+m2.ID+`"}`))
+	mreq.SetPathValue("id", group.ID)
+	mrr := httptest.NewRecorder()
+	srv.handleMarkGroupRead(mrr, authedRequest(mreq, auth.Principal{Role: auth.RoleOwner}))
+	if mrr.Code != http.StatusOK {
+		t.Fatalf("mark-read status = %d, body = %s", mrr.Code, mrr.Body.String())
+	}
+
+	// A restart-style poll (no ?after=) must now see 0 unread from the
+	// persisted cursor.
+	if got := unread(""); got != 0 {
+		t.Fatalf("post-mark unread (no after) = %d, want 0", got)
+	}
+
+	// A device with a STALE localStorage cursor (?after=m1, one behind the
+	// persisted cursor at m2) must not resurrect the unread badge: the
+	// server takes the max of both cursors.
+	if got := unread(m1.ID); got != 0 {
+		t.Fatalf("post-mark unread (stale after) = %d, want 0", got)
+	}
+
+	// The persisted cursor is the HUMAN operator's. A member agent's unread
+	// view must not be advanced by it: with no ?after= the agent still sees
+	// both messages, and with ?after=m1 it sees one.
+	agentUnread := func(after string) int {
+		url := "/api/v1/groupdms/" + group.ID + "/unread"
+		if after != "" {
+			url += "?after=" + after
+		}
+		req := httptest.NewRequest(http.MethodGet, url, nil)
+		req.SetPathValue("id", group.ID)
+		rr := httptest.NewRecorder()
+		srv.handleGetGroupUnread(rr, authedRequest(req,
+			auth.Principal{Role: auth.RoleAgent, AgentID: aliceID}))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("agent unread status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+		var resp struct {
+			Count int `json:"count"`
+		}
+		readJSONResponse(t, rr, &resp)
+		return resp.Count
+	}
+	if got := agentUnread(""); got != 2 {
+		t.Fatalf("agent unread (no after) = %d, want 2 (operator cursor must not apply)", got)
+	}
+	if got := agentUnread(m1.ID); got != 1 {
+		t.Fatalf("agent unread (after=m1) = %d, want 1", got)
+	}
+}

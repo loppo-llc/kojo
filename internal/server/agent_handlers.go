@@ -1482,6 +1482,15 @@ func (s *Server) enrichRemoteAgentsLatestActivity(ctx context.Context, all []*ag
 					Role:      role,
 					Timestamp: ts,
 				}
+				// Keep the millis sort key in step with the preview —
+				// LastMessageAt drives the dashboard's activity ordering,
+				// so a preview-only update would leave the remote agent
+				// stranded at its pre-transfer position. The remote ts is
+				// seconds-resolution; never move the key backwards past a
+				// (millis-precise) local value within the same second.
+				if ms := parseRFC3339MillisLoose(ts); ms > j.agent.LastMessageAt {
+					j.agent.LastMessageAt = ms
+				}
 			}
 		}(j)
 	}
@@ -1581,6 +1590,20 @@ func isRFC3339After(a, b string) bool {
 		return true
 	}
 	return at.After(bt)
+}
+
+// parseRFC3339MillisLoose converts an RFC3339 string to epoch-millis,
+// returning 0 for empty / unparseable input (caller keeps the existing
+// value). Mirrors the agent package's unexported parseAgentRFC3339Millis.
+func parseRFC3339MillisLoose(s string) int64 {
+	if s == "" {
+		return 0
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return 0
+	}
+	return t.UnixMilli()
 }
 
 // truncateForPreview clips long bodies to a list-preview-friendly size,

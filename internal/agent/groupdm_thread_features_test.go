@@ -29,8 +29,8 @@ func TestCreateThread_AlwaysNewRoom(t *testing.T) {
 		if len(g.Members) != 1 || g.Members[0].AgentID != "ag_alice" {
 			t.Errorf("members = %+v, want single ag_alice", g.Members)
 		}
-		if g.Name != "Alice" {
-			t.Errorf("default name = %q, want agent display name Alice", g.Name)
+		if g.Name != DefaultThreadName {
+			t.Errorf("default name = %q, want %q", g.Name, DefaultThreadName)
 		}
 	}
 }
@@ -125,8 +125,8 @@ func TestThreadAutoTitle_SetOnceNotOverwritten(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if g.Name != "Alice" {
-		t.Fatalf("initial name = %q, want default Alice", g.Name)
+	if g.Name != DefaultThreadName {
+		t.Fatalf("initial name = %q, want default %q", g.Name, DefaultThreadName)
 	}
 
 	if _, err := gdm.PostUserMessage(context.Background(), g.ID, "Fix the flaky build please", nil, true); err != nil {
@@ -137,7 +137,7 @@ func TestThreadAutoTitle_SetOnceNotOverwritten(t *testing.T) {
 	var titled string
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if cur, ok := gdm.Get(g.ID); ok && cur.Name != "Alice" {
+		if cur, ok := gdm.Get(g.ID); ok && cur.Name != DefaultThreadName {
 			titled = cur.Name
 			break
 		}

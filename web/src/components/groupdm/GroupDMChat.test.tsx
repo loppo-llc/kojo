@@ -11,6 +11,8 @@ const mocks = vi.hoisted(() => ({
   setLastRead: vi.fn(),
   archive: vi.fn(),
   agentGet: vi.fn(),
+  createThread: vi.fn(),
+  postUserMessage: vi.fn(),
 }));
 
 vi.mock("../../lib/agentApi", () => ({
@@ -33,7 +35,9 @@ vi.mock("../../lib/groupdmApi", () => ({
     setVenue: vi.fn(),
     setCooldown: vi.fn(),
     setMaxHops: mocks.setMaxHops,
-    postUserMessage: vi.fn(),
+    postUserMessage: mocks.postUserMessage,
+    createThread: mocks.createThread,
+    markRead: vi.fn(() => Promise.resolve({ ok: true })),
     delete: vi.fn(),
     archive: mocks.archive,
   },
@@ -97,7 +101,37 @@ beforeEach(() => {
   });
   mocks.clearMessages.mockResolvedValue({ ok: true, deleted: 1 });
   mocks.agentGet.mockResolvedValue({ id: "ag_alice", name: "Alice", model: "claude-sonnet-4-5" });
+  mocks.createThread.mockResolvedValue({
+    id: "t1",
+    name: "無題のスレッド",
+    kind: "thread",
+    members: [{ agentId: "ag_alice", agentName: "Alice" }],
+    cooldown: 0,
+    style: "efficient",
+    createdAt: "2026-06-15T00:00:00Z",
+    updatedAt: "2026-06-15T00:00:00Z",
+  });
+  mocks.postUserMessage.mockResolvedValue({
+    id: "m_new",
+    agentId: "user",
+    agentName: "User",
+    content: "hi there",
+    timestamp: "2026-06-15T00:00:05Z",
+  });
 });
+
+function renderDraft() {
+  const router = createMemoryRouter(
+    [
+      { path: "/", element: <div>Home</div> },
+      { path: "/groupdms/new", element: <GroupDMChat /> },
+      { path: "/groupdms/:id", element: <GroupDMChat /> },
+    ],
+    { initialEntries: ["/groupdms/new?agent=ag_alice"] },
+  );
+  render(<RouterProvider router={router} />);
+  return router;
+}
 
 afterEach(() => {
   cleanup();
@@ -216,6 +250,51 @@ describe("GroupDMChat thread room", () => {
     expect(await screen.findByText("here you go")).toBeInTheDocument();
     // "1,200→340 tokens" (locale-formatted). Match on the arrow-joined counts.
     expect(await screen.findByText(/1,200.*340 tokens/)).toBeInTheDocument();
+  });
+});
+
+describe("GroupDMChat draft (lazy thread creation)", () => {
+  it("does not create the room on mount and shows the thread placeholder", async () => {
+    renderDraft();
+    // Header renders from the agent, empty transcript, no room created yet.
+    expect(await screen.findByText("No messages yet")).toBeInTheDocument();
+    expect(mocks.createThread).not.toHaveBeenCalled();
+    expect(mocks.groupGet).not.toHaveBeenCalled();
+    expect(
+      screen.getByPlaceholderText(/Message this thread/),
+    ).toBeInTheDocument();
+  });
+
+  it("creates the room and posts on the first send, then swaps to the real url", async () => {
+    const router = renderDraft();
+    const textarea = await screen.findByPlaceholderText(/Message this thread/);
+    fireEvent.change(textarea, { target: { value: "hi there" } });
+    fireEvent.click(screen.getByLabelText("Send"));
+
+    await waitFor(() => expect(mocks.createThread).toHaveBeenCalledWith("ag_alice"));
+    await waitFor(() =>
+      expect(mocks.postUserMessage).toHaveBeenCalledWith("t1", "hi there", undefined),
+    );
+    await waitFor(() => expect(router.state.location.pathname).toBe("/groupdms/t1"));
+  });
+});
+
+describe("GroupDMChat thread placeholder", () => {
+  it("uses thread wording for a thread room", async () => {
+    mocks.groupGet.mockResolvedValue({
+      id: "g1",
+      name: "Alice",
+      kind: "thread",
+      members: [{ agentId: "ag_alice", agentName: "Alice" }],
+      cooldown: 0,
+      style: "efficient",
+      createdAt: "2026-06-15T00:00:00Z",
+      updatedAt: "2026-06-15T00:00:00Z",
+    });
+    renderGroup();
+    expect(
+      await screen.findByPlaceholderText(/Message this thread/),
+    ).toBeInTheDocument();
   });
 });
 

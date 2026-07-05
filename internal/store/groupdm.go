@@ -1153,3 +1153,39 @@ SELECT id, groupdm_id, agent_id, reason, COALESCE(payload,''), attempts, created
 	}
 	return out, rows.Err()
 }
+
+// SetGroupDMReadCursor persists the operator's read cursor (highest read
+// seq) for a room. Idempotent upsert; a lower seq never overwrites a higher
+// one so an out-of-order/stale mark-read can't resurrect unread badges.
+func (s *Store) SetGroupDMReadCursor(ctx context.Context, groupID string, seq int64) error {
+	if groupID == "" {
+		return errors.New("store.SetGroupDMReadCursor: groupdm_id required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO groupdm_read_cursors (groupdm_id, last_read_seq, updated_at)
+VALUES (?, ?, ?)
+ON CONFLICT(groupdm_id) DO UPDATE SET
+  last_read_seq = MAX(last_read_seq, excluded.last_read_seq),
+  updated_at    = excluded.updated_at`,
+		groupID, seq, NowMillis())
+	return err
+}
+
+// GetGroupDMReadCursor returns the persisted read-cursor seq for a room.
+// ok is false when no cursor has been recorded yet (the room has never been
+// marked read on any device).
+func (s *Store) GetGroupDMReadCursor(ctx context.Context, groupID string) (seq int64, ok bool, err error) {
+	if groupID == "" {
+		return 0, false, errors.New("store.GetGroupDMReadCursor: groupdm_id required")
+	}
+	row := s.db.QueryRowContext(ctx,
+		`SELECT last_read_seq FROM groupdm_read_cursors WHERE groupdm_id = ?`, groupID)
+	err = row.Scan(&seq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return seq, true, nil
+}

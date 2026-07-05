@@ -347,6 +347,14 @@ type Agent struct {
 	// LastMessage is a preview of the most recent message (for list display).
 	LastMessage *MessagePreview `json:"lastMessage,omitempty"`
 
+	// LastMessageAt is the epoch-millis timestamp of the most recent
+	// message. Millisecond precision (unlike LastMessage.Timestamp's
+	// seconds-resolution RFC3339 string) so the dashboard can order the
+	// agent list by most-recent activity without same-second ties
+	// reshuffling on every reload. Zero when the agent has no messages;
+	// such agents sort last (by CreatedAt) in the UI.
+	LastMessageAt int64 `json:"lastMessageAt,omitempty"`
+
 	// Archived is true when the agent has been archived via DELETE
 	// /api/v1/agents/{id}?archive=true. Archived agents retain most on-disk
 	// data (agent dir, credentials, notify tokens, messages, memory) but
@@ -484,6 +492,21 @@ type MessagePreview struct {
 	Content   string `json:"content"`
 	Role      string `json:"role"`
 	Timestamp string `json:"timestamp"`
+}
+
+// lastMessageMillis returns the epoch-millis timestamp for a message used
+// as an agent's last-activity marker. Prefers the store-record millis
+// (CreatedAtMillis) and falls back to parsing the seconds-resolution
+// RFC3339 Timestamp for messages that never round-tripped through a store
+// record (e.g. freshly synthesized chat-done previews). Zero for nil.
+func lastMessageMillis(m *Message) int64 {
+	if m == nil {
+		return 0
+	}
+	if m.CreatedAtMillis != 0 {
+		return m.CreatedAtMillis
+	}
+	return parseAgentRFC3339Millis(m.Timestamp)
 }
 
 // DirectoryEntry is the minimal public info shared with other agents.

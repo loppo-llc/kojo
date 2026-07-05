@@ -37,6 +37,7 @@ createRoot(document.getElementById("root")!).render(
           <Route path="/session/:id/git" element={<SessionPage />} />
           <Route path="/session/:id/attachments" element={<SessionPage />} />
           <Route path="/agents/:id" element={<AgentChat />} />
+          <Route path="/groupdms/new" element={<GroupDMChat />} />
           <Route path="/groupdms/:id" element={<GroupDMChat />} />
           {/* Static "new / settings" panes: at lg+ they render in the right
               pane beside the persistent Dashboard sidebar; below lg they drill

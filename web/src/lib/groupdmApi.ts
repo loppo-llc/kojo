@@ -158,6 +158,11 @@ export const groupdmApi = {
       `/api/v1/groupdms/${id}/unread${after ? `?after=${encodeURIComponent(after)}` : ""}`,
     ),
 
+  /** Persist the operator's read cursor server-side (durable across daemon
+   * restarts and shared across devices, unlike the localStorage cursor). */
+  markRead: (id: string, messageId: string) =>
+    post<{ ok: boolean }>(`/api/v1/groupdms/${id}/read`, { messageId }),
+
   addMember: (id: string, agentId: string, callerAgentId: string) =>
     post<GroupDMInfo>(`/api/v1/groupdms/${id}/members`, { agentId, callerAgentId }),
 

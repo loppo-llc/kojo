@@ -397,14 +397,14 @@ func TestGroupDMManager_UnreadInfo(t *testing.T) {
 	if _, err := gdm.PostMessage(context.Background(), g.ID, "ag_bob", "two @user", m1.ID, false); err != nil {
 		t.Fatal(err)
 	}
-	count, mentionsUser, _, err := gdm.UnreadInfo(g.ID, m1.ID, 0)
+	count, mentionsUser, _, err := gdm.UnreadInfo(g.ID, m1.ID, 0, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if count != 1 || !mentionsUser {
 		t.Errorf("unread after m1 = (%d, %v), want (1, true)", count, mentionsUser)
 	}
-	count, mentionsUser, _, err = gdm.UnreadInfo(g.ID, "", 0)
+	count, mentionsUser, _, err = gdm.UnreadInfo(g.ID, "", 0, true)
 	if err != nil {
 		t.Fatal(err)
 	}
