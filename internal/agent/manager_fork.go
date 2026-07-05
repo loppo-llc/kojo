@@ -180,6 +180,9 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 	if err := copyFileIfExists(filepath.Join(srcDir, "user.md"), filepath.Join(dstDir, "user.md")); err != nil {
 		return nil, fmt.Errorf("copy user.md: %w", err)
 	}
+	if err := copyFileIfExists(filepath.Join(srcDir, "status.json"), filepath.Join(dstDir, "status.json")); err != nil {
+		return nil, fmt.Errorf("copy status.json: %w", err)
+	}
 	// memory/recent.md mirrors the last conversation's pre-compaction
 	// summary and is part of the transcript-derived short-term state,
 	// not the agent's long-term memory. When the caller opts out of

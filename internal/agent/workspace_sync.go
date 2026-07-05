@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/atomicfile"
 	"github.com/loppo-llc/kojo/internal/store"
@@ -20,6 +21,7 @@ import (
 var workspaceFileKinds = []store.WorkspaceFileKind{
 	store.WorkspaceFileKindUser,
 	store.WorkspaceFileKindCheckin,
+	store.WorkspaceFileKindStatus,
 }
 
 // workspaceFilePath returns the canonical on-disk mirror path for one
@@ -79,6 +81,23 @@ func ReconcileWorkspaceFilesDiskFromDBHeld(ctx context.Context, st *store.Store,
 		default:
 			// Live DB row. Only rewrite if disk differs (cheap
 			// path: skip on sha match).
+			// restoreMtime pins the row's UpdatedAt as the file mtime.
+			// The status prompt injection surfaces mtime as "Last
+			// updated"; a reconcile (peer sync, device-switch hydrate)
+			// must not make a stale status read as freshly written.
+			// Applied on the sha-match fast path too so an existing
+			// mirror with a wrong mtime gets repaired. Best-effort — a
+			// Chtimes failure only skews the display line.
+			restoreMtime := func() {
+				if rec.UpdatedAt <= 0 {
+					return
+				}
+				ts := time.UnixMilli(rec.UpdatedAt)
+				if err := os.Chtimes(diskPath, ts, ts); err != nil && logger != nil {
+					logger.Debug("workspace reconcile: chtimes failed",
+						"agent", agentID, "kind", string(kind), "err", err)
+				}
+			}
 			needWrite := true
 			if existing, rerr := os.ReadFile(diskPath); rerr == nil {
 				if store.SHA256Hex(existing) == rec.BodySHA256 {
@@ -86,6 +105,7 @@ func ReconcileWorkspaceFilesDiskFromDBHeld(ctx context.Context, st *store.Store,
 				}
 			}
 			if !needWrite {
+				restoreMtime()
 				continue
 			}
 			if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
@@ -102,7 +122,9 @@ func ReconcileWorkspaceFilesDiskFromDBHeld(ctx context.Context, st *store.Store,
 						"agent", agentID, "kind", string(kind), "err", err)
 				}
 				captureErr(err)
+				continue
 			}
+			restoreMtime()
 		}
 	}
 	return firstErr

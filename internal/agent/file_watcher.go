@@ -148,10 +148,10 @@ func (fw *fileWatcher) handle(ev fsnotify.Event) {
 			return
 		}
 	}
-	// Only canonical markdown matters. Skip tmp files (atomicfile
-	// writes <name>.<rand>.tmp then renames), the embedding db, and any
-	// other non-.md churn.
-	if !strings.HasSuffix(ev.Name, ".md") {
+	// Only canonical markdown (plus the status.json workspace mirror)
+	// matters. Skip tmp files (atomicfile writes <name>.<rand>.tmp then
+	// renames), the embedding db, and any other churn.
+	if !strings.HasSuffix(ev.Name, ".md") && filepath.Base(ev.Name) != "status.json" {
 		return
 	}
 	if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) == 0 {

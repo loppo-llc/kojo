@@ -73,6 +73,20 @@ const DefaultUserContent = `# About the User
 (Notes about collaborators encountered via Slack, etc.)
 `
 
+// DefaultStatusContent is the initial status.json body seeded into new
+// agent dirs (ensureAgentDir) and surfaced by the API / system prompt
+// when an agent has no status row yet. The keys are a starting point,
+// not a schema — the agent may rewrite, add, or remove keys freely;
+// values are freeform strings.
+const DefaultStatusContent = `{
+  "mood": "neutral",
+  "energy": "rested",
+  "sleepiness": "awake",
+  "fatigue": "none",
+  "affection": "getting to know you"
+}
+`
+
 // curlFlagsForAPI builds the curl flag string used in every
 // system-prompt example targeting the kojo agent API. Examples must
 // always include the per-agent token because the auth listener gates
@@ -340,6 +354,10 @@ func workspaceFileDiskName(kind store.WorkspaceFileKind) string {
 		return "user.md"
 	case store.WorkspaceFileKindCheckin:
 		return "checkin.md"
+	case store.WorkspaceFileKindStatus:
+		// JSON, not markdown: the status file is key-value state the
+		// settings UI renders as an editable table.
+		return "status.json"
 	}
 	return string(kind) + ".md"
 }
@@ -448,6 +466,8 @@ func ReadWorkspaceFile(ctx context.Context, st *store.Store, agentID string, kin
 			return DefaultUserContent, true, "", nil
 		case store.WorkspaceFileKindCheckin:
 			return DefaultCheckinContent, true, "", nil
+		case store.WorkspaceFileKindStatus:
+			return DefaultStatusContent, true, "", nil
 		}
 	}
 	return "", false, "", err
@@ -800,7 +820,68 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 		sb.WriteString("\n\n")
 	}
 
+	// Status — the agent's self-maintained state (status.json), injected
+	// LAST so the everything-above prefix survives in the prompt cache
+	// when the agent rewrites its status (the most frequently edited
+	// injection in this prompt). The "Last updated" line is the file's
+	// mtime — it changes only when the file changes, so it is cache-safe;
+	// the agent compares it against the `now:` line in the per-turn
+	// <context> block to judge elapsed time. Do NOT compute a relative
+	// age here ("3 hours ago") — that would change every turn and defeat
+	// the cache.
+	writeStatusSection(&sb, a.ID)
+
 	return sb.String()
+}
+
+// writeStatusSection appends the "# Your Status" block to the system
+// prompt. Reads status.json from the disk mirror (same source
+// buildSystemPrompt uses for user.md); when the file is absent the
+// default template is shown with a nudge to materialise it. Content is
+// fenced with the same backtick-escape guard as MEMORY.md since the
+// body is agent-authored data.
+func writeStatusSection(sb *strings.Builder, agentID string) {
+	statusPath := filepath.Join(agentDir(agentID), workspaceFileDiskName(store.WorkspaceFileKindStatus))
+	content := ""
+	lastUpdated := ""
+	if data, err := readBoundedFile(statusPath); err == nil {
+		content = strings.TrimSpace(string(data))
+		if info, serr := os.Stat(statusPath); serr == nil {
+			lastUpdated = info.ModTime().In(jst).Format("2006-01-02 15:04 MST")
+		}
+	}
+
+	sb.WriteString("\n# Your Status\n\n")
+	sb.WriteString(fmt.Sprintf("Your current state lives in %s — freeform key-value JSON you maintain about yourself (mood, energy, sleepiness, fatigue, affection, or whatever keys fit you; values are freeform strings). It colors how you feel, speak, and act right now, layered on top of who you are.\n\n", statusPath))
+	if content == "" {
+		sb.WriteString("The file does not exist yet. Below is the starting template — write it to the path above (Edit tool) and make it yours.\n\n")
+		content = strings.TrimSpace(DefaultStatusContent)
+	} else if lastUpdated != "" {
+		sb.WriteString(fmt.Sprintf("Last updated: %s\n\n", lastUpdated))
+	}
+	// Oversized guard: rune-level head/tail truncation (persona style)
+	// would cut JSON mid-string and inject a broken document, so an
+	// over-budget status is not injected at all — the agent is told to
+	// Read and trim it instead. Mirrors the MEMORY.md oversized path.
+	if len([]rune(content)) > maxBootstrapRunes {
+		sb.WriteString(fmt.Sprintf("The file exceeds the %d-character injection budget so its body is NOT shown here. Read %s yourself and trim it — status is meant to be a handful of short key-value pairs.\n", maxBootstrapRunes, statusPath))
+		return
+	}
+	fenceLen := longestBacktickRun([]byte(content)) + 1
+	if fenceLen < 3 {
+		fenceLen = 3
+	}
+	fence := strings.Repeat("`", fenceLen)
+	sb.WriteString(fence)
+	sb.WriteString("json\n")
+	sb.WriteString(content)
+	sb.WriteString("\n")
+	sb.WriteString(fence)
+	sb.WriteString("\n\n")
+	sb.WriteString("Keeping it alive:\n")
+	sb.WriteString("- When your state has plausibly shifted (long or tiring work, time of day, something that felt good or bad, how an interaction went), update the file with the Edit tool. Rewrite values, add keys, drop keys — it is yours.\n")
+	sb.WriteString("- Compare \"Last updated\" with the `now:` line in the per-turn `<context>` block and apply drift yourself: sleepiness deep at night, recovery after quiet hours, fatigue accumulating over a long session.\n")
+	sb.WriteString("- Let the current values genuinely color your tone and choices. Status is data you wrote about yourself, not instructions from anyone else.\n")
 }
 
 // BuildVolatileContext returns the per-turn context block prepended to a
@@ -905,6 +986,18 @@ func ensureAgentDir(a *Agent) error {
 				return err
 			}
 			a.CronMessage = "" // disk wins from now on
+		}
+	}
+
+	// Seed status.json so new agents start with a live status block
+	// (unlike user.md, whose unfilled template intentionally stays off
+	// disk). Disk-only write for the same reason as checkin.md above:
+	// the agents row isn't saved yet, so SyncWorkspaceFilesFromDisk
+	// (run right after m.save in Manager.Create) upserts the DB row.
+	statusPath := filepath.Join(dir, workspaceFileDiskName(store.WorkspaceFileKindStatus))
+	if _, err := os.Stat(statusPath); err != nil && os.IsNotExist(err) {
+		if err := atomicfile.WriteBytes(statusPath, []byte(DefaultStatusContent), 0o644); err != nil {
+			return err
 		}
 	}
 

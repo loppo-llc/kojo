@@ -394,6 +394,10 @@ func isSelfScopedRoute(method, sub string) bool {
 		// disk persistence until the first PUT). PUT lands at the
 		// per-agent path under agentDir(id).
 		return method == http.MethodGet || method == http.MethodPut
+	case "/status":
+		// Agent reads/writes its own status.json workspace file (the
+		// self-maintained state injected into the system prompt tail).
+		return method == http.MethodGet || method == http.MethodPut
 	case "/checkin-file":
 		// Agent reads/writes its own checkin.md workspace file. GET
 		// surfaces DefaultCheckinContent when checkin.md is absent so

@@ -1,8 +1,12 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"strings"
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/auth"
@@ -120,6 +124,32 @@ func (s *Server) handlePutWorkspaceFile(w http.ResponseWriter, r *http.Request, 
 	if !readCappedJSON(w, r, workspaceFileBodyCap, "request body exceeds 1 MiB cap", "invalid JSON body", &req) {
 		return
 	}
+	// Status is structured: the settings UI renders it as a key-value
+	// table, so a REST write must be a flat JSON object with scalar
+	// values. Whitespace-only passes through — it means "clear" and
+	// tombstones the row like every other kind. Direct disk edits by
+	// the agent bypass this (the prompt injection is tolerant); the
+	// validation only keeps the REST surface — and therefore the UI —
+	// parseable.
+	if kind == store.WorkspaceFileKindStatus && strings.TrimSpace(req.Content) != "" {
+		if verr := validateStatusJSON(req.Content); verr != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", verr.Error())
+			return
+		}
+	}
+	// Admission gate: refuses while a §3.7 device switch or a restart
+	// drain is in flight, and makes this write visible to WaitChatIdle /
+	// WaitAllChatsIdle via the mutation counter — without it a workspace
+	// PUT could land on the source after the switch snapshot (or between
+	// a restart's idle observation and the re-exec). Acquired AFTER the
+	// body read + validation so a slow client can't hold the mutation
+	// slot open and stall those drains.
+	releaseMut, err := s.agents.AcquireMutation(id)
+	if err != nil {
+		writeError(w, http.StatusConflict, "agent_busy", err.Error())
+		return
+	}
+	defer releaseMut()
 	rec, err := agent.WriteWorkspaceFile(r.Context(), s.agents.Store(), id, kind, req.Content, ifMatch)
 	if err != nil {
 		switch {
@@ -182,4 +212,67 @@ func (s *Server) handleGetUserContext(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSetUserContext(w http.ResponseWriter, r *http.Request) {
 	s.handlePutWorkspaceFile(w, r, store.WorkspaceFileKindUser)
+}
+
+func (s *Server) handleGetAgentStatus(w http.ResponseWriter, r *http.Request) {
+	s.handleGetWorkspaceFile(w, r, store.WorkspaceFileKindStatus)
+}
+
+func (s *Server) handlePutAgentStatus(w http.ResponseWriter, r *http.Request) {
+	s.handlePutWorkspaceFile(w, r, store.WorkspaceFileKindStatus)
+}
+
+// validateStatusJSON enforces the shape contract for status.json writes
+// arriving over the REST surface: a single flat JSON object whose values
+// are scalars (string / number / bool). Nested objects and arrays are
+// rejected so the settings UI's key-value table can always round-trip
+// the document; null is rejected because the table has no way to render
+// or re-emit it. Keys are free — the schema belongs to the agent.
+func validateStatusJSON(content string) error {
+	dec := json.NewDecoder(strings.NewReader(content))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return fmt.Errorf("status must be valid JSON: %v", err)
+	}
+	// Trailing garbage after the object (a second document, a stray
+	// closing bracket) would round-trip inconsistently. dec.More()
+	// alone misses non-value trailers like `]`, so assert clean EOF.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("status must be a single JSON document")
+	}
+	obj, ok := v.(map[string]any)
+	if !ok {
+		return errors.New("status must be a JSON object of key-value pairs")
+	}
+	for k, val := range obj {
+		switch val.(type) {
+		case string, json.Number, bool:
+		default:
+			return fmt.Errorf("status value for %q must be a string, number, or boolean (nested objects, arrays, and null are not supported)", k)
+		}
+	}
+	// map decoding silently keeps the last of duplicate keys — count
+	// the keys at token level and reject when the document carried
+	// more than the map retained, so a duplicated key can't silently
+	// drop data on the write path.
+	tok := json.NewDecoder(strings.NewReader(content))
+	if _, err := tok.Token(); err != nil { // consume '{'
+		return fmt.Errorf("status must be valid JSON: %v", err)
+	}
+	keys := 0
+	for tok.More() {
+		if _, err := tok.Token(); err != nil { // key
+			return fmt.Errorf("status must be valid JSON: %v", err)
+		}
+		var skip json.RawMessage
+		if err := tok.Decode(&skip); err != nil { // value
+			return fmt.Errorf("status must be valid JSON: %v", err)
+		}
+		keys++
+	}
+	if keys != len(obj) {
+		return errors.New("status must not contain duplicate keys")
+	}
+	return nil
 }

@@ -28,6 +28,13 @@ const (
 	// stored as settings_json.cronMessage; see the migration header
 	// for the data-migration story.
 	WorkspaceFileKindCheckin WorkspaceFileKind = "checkin"
+
+	// WorkspaceFileKindStatus is the agent's self-maintained state file
+	// (status.json on disk — JSON, not markdown): freeform key-value
+	// pairs (mood, energy, sleepiness, affection, ...) injected into the
+	// system prompt tail and edited by the agent itself as its state
+	// drifts. Added by migration 0021.
+	WorkspaceFileKindStatus WorkspaceFileKind = "status"
 )
 
 // validWorkspaceFileKinds mirrors the SQL CHECK constraint. Map shape
@@ -35,9 +42,10 @@ const (
 var validWorkspaceFileKinds = map[WorkspaceFileKind]bool{
 	WorkspaceFileKindUser:    true,
 	WorkspaceFileKindCheckin: true,
+	WorkspaceFileKindStatus:  true,
 }
 
-// IsValidWorkspaceFileKind reports whether kind is one of the two
+// IsValidWorkspaceFileKind reports whether kind is one of the
 // workspace-file kinds the table accepts. Mirrors validMemoryKinds in
 // memory.go — adding a new kind requires both a schema migration and
 // an update here so the contract stays visible in code review.

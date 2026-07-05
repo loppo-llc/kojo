@@ -13,6 +13,7 @@ import { PersonaField } from "./fields/PersonaField";
 import { ToolPicker } from "./fields/ToolPicker";
 import { ModelPicker } from "./fields/ModelPicker";
 import { EffortPicker } from "./fields/EffortPicker";
+import { StatusField } from "./fields/StatusField";
 import { WorkDirInput } from "./fields/WorkDirInput";
 import { buildAgentSavePayload } from "./agentSettingsPayload";
 import { PageHeader } from "../ui/PageHeader";
@@ -150,6 +151,15 @@ export function AgentSettings() {
   const [loadedUser, setLoadedUser] = useState("");
   // Same etag-threading as checkinEtag above, for the user.md workspace file.
   const [userContextEtag, setUserContextEtag] = useState("");
+  // status.json workspace file — the agent's self-maintained state,
+  // rendered by StatusField as a key-value table. statusLoadGen bumps on
+  // every server hydration so StatusField (which owns its rows after
+  // mount) remounts with fresh content instead of keeping stale rows.
+  const [statusContent, setStatusContent] = useState("");
+  const [statusIsDefault, setStatusIsDefault] = useState(false);
+  const [loadedStatus, setLoadedStatus] = useState("");
+  const [statusEtag, setStatusEtag] = useState("");
+  const [statusLoadGen, setStatusLoadGen] = useState(0);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [archiving, setArchiving] = useState(false);
@@ -260,7 +270,8 @@ export function AgentSettings() {
       agentApi.get(id),
       agentApi.getCheckinFile(id),
       agentApi.getUserContext(id),
-    ]).then(([agentRes, checkinRes, userCtxRes]) => {
+      agentApi.getAgentStatus(id),
+    ]).then(([agentRes, checkinRes, userCtxRes, statusRes]) => {
       if (agentRes.status !== "fulfilled") {
         navigateRef.current("/");
         return;
@@ -326,6 +337,19 @@ export function AgentSettings() {
         setLoadedUser("");
         setUserContextEtag("");
       }
+      if (statusRes.status === "fulfilled") {
+        const v = statusRes.value.value;
+        setStatusContent(v.content);
+        setStatusIsDefault(v.isDefault);
+        setLoadedStatus(v.content);
+        setStatusEtag(statusRes.value.etag ?? v.etag ?? "");
+      } else {
+        setStatusContent("");
+        setStatusIsDefault(true);
+        setLoadedStatus("");
+        setStatusEtag("");
+      }
+      setStatusLoadGen((g) => g + 1);
     });
   }, [id]);
 
@@ -428,6 +452,11 @@ export function AgentSettings() {
       //   - saved + body changed: PUT writes the new body.
       const checkinDirty = cronMessage !== loadedCheckin;
       const userDirty = userContext !== loadedUser;
+      // Status uses the same snapshot comparison, with one extra guard:
+      // an untouched default template must not be persisted, but the
+      // StatusField serializer may reformat identical data (indentation,
+      // key spacing), so also skip when it still parses to the template.
+      const statusDirty = statusContent !== loadedStatus && !statusIsDefault;
 
       const updated = await agentApi.update(
         id!,
@@ -469,6 +498,20 @@ export function AgentSettings() {
         agent?.etag,
       );
 
+      // Commit the PATCH result to local state BEFORE the workspace-file
+      // PUTs. If a PUT below throws (e.g. status validation 400), the
+      // catch skips the tail of this function — without this early
+      // commit the local agent etag would stay stale and the next Save
+      // would 412 even though the PATCH landed.
+      setAgent(updated);
+      setPublicProfile(updated.publicProfile ?? "");
+      setPublicProfileOverride(updated.publicProfileOverride ?? false);
+      // Re-sync cronExpr to whatever the server actually persisted. Without
+      // this, picking a Preset chip ("@preset:30") leaves the local state at
+      // the sentinel even though the saved row is the expanded form
+      // ("7,37 * * * *"); the dirty diff stays true forever.
+      setCronExpr(updated.cronExpr ?? "");
+
       if (checkinDirty) {
         // Thread the etag captured at load time as If-Match. Empty
         // (default-template path) is fine — putWithIfMatch omits the
@@ -501,15 +544,22 @@ export function AgentSettings() {
         setLoadedUser(res.content);
         setUserContextEtag(wrapped.etag ?? res.etag ?? "");
       }
+      if (statusDirty) {
+        const wrapped = await agentApi.putAgentStatus(
+          id!,
+          statusContent,
+          statusEtag || undefined,
+        );
+        const res = wrapped.value;
+        setStatusIsDefault(res.isDefault);
+        setStatusContent(res.content);
+        setLoadedStatus(res.content);
+        setStatusEtag(wrapped.etag ?? res.etag ?? "");
+        // Remount StatusField so the table re-hydrates from the
+        // server-canonical body (the PUT may have normalized types).
+        setStatusLoadGen((g) => g + 1);
+      }
 
-      setAgent(updated);
-      setPublicProfile(updated.publicProfile ?? "");
-      setPublicProfileOverride(updated.publicProfileOverride ?? false);
-      // Re-sync cronExpr to whatever the server actually persisted. Without
-      // this, picking a Preset chip ("@preset:30") leaves the local state at
-      // the sentinel even though the saved row is the expanded form
-      // ("7,37 * * * *"); the dirty diff stays true forever.
-      setCronExpr(updated.cronExpr ?? "");
       setSuccess(true);
       setTimeout(() => setSuccess(false), 2000);
     } catch (err) {
@@ -527,6 +577,22 @@ export function AgentSettings() {
           // can decide what to do; clicking Save again will use the new
           // etag and either succeed or 412 again if a third write
           // landed in between.
+        } catch {
+          /* swallow — primary error is already shown */
+        }
+        // The 412 may equally have come from one of the workspace-file
+        // PUTs (checkin / user / status — e.g. the agent rewrote its own
+        // status mid-edit). Re-pin JUST their etags so the next Save can
+        // succeed; bodies stay as the user typed them.
+        try {
+          const [ck, uc, st] = await Promise.allSettled([
+            agentApi.getCheckinFile(id!),
+            agentApi.getUserContext(id!),
+            agentApi.getAgentStatus(id!),
+          ]);
+          if (ck.status === "fulfilled") setCheckinEtag(ck.value.etag ?? ck.value.value.etag ?? "");
+          if (uc.status === "fulfilled") setUserContextEtag(uc.value.etag ?? uc.value.value.etag ?? "");
+          if (st.status === "fulfilled") setStatusEtag(st.value.etag ?? st.value.value.etag ?? "");
         } catch {
           /* swallow — primary error is already shown */
         }
@@ -915,6 +981,30 @@ export function AgentSettings() {
                   if (userContextIsDefault) setUserContextIsDefault(false);
                 }}
                 rows={6}
+              />
+            </Field>
+
+            {/* Status (status.json) */}
+            <Field
+              label="Status"
+              help={
+                <>
+                  The agent&apos;s self-maintained state (mood, energy, sleepiness,
+                  ...) injected into its system prompt. The agent updates this on
+                  its own as its state drifts; edits here override it.{" "}
+                  {statusIsDefault && "Template — not yet saved."}
+                </>
+              }
+            >
+              <StatusField
+                key={`status-${statusLoadGen}`}
+                initialContent={statusContent}
+                onChange={(content) => {
+                  setStatusContent(content);
+                  // First edit off the default template — clear the flag
+                  // so Save persists the edit (same contract as user.md).
+                  if (statusIsDefault) setStatusIsDefault(false);
+                }}
               />
             </Field>
 

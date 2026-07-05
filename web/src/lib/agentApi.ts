@@ -466,6 +466,23 @@ export const agentApi = {
       expectedEtag,
     ),
 
+  // status.json workspace file — the agent's self-maintained state
+  // (mood, energy, sleepiness, ...) injected into its system prompt.
+  // Content is a flat JSON object of scalar values; the server rejects
+  // nested structures so the settings UI's key-value table always
+  // round-trips. Same default-template / etag contract as user-context.
+  getAgentStatus: (id: string) =>
+    getWithEtag<{ content: string; isDefault: boolean; etag?: string }>(
+      `/api/v1/agents/${id}/status`,
+    ),
+
+  putAgentStatus: (id: string, content: string, expectedEtag?: string) =>
+    putWithIfMatch<{ content: string; isDefault: boolean; etag?: string }>(
+      `/api/v1/agents/${id}/status`,
+      { content },
+      expectedEtag,
+    ),
+
   fork: (id: string, params: { name: string; includeTranscript: boolean }) =>
     post<AgentInfo>(`/api/v1/agents/${id}/fork`, params),
 

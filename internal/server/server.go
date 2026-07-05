@@ -801,6 +801,8 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	// writes atomically and echoes back the persisted content.
 	mux.HandleFunc("GET /api/v1/agents/{id}/user-context", s.handleGetUserContext)
 	mux.HandleFunc("PUT /api/v1/agents/{id}/user-context", s.handleSetUserContext)
+	mux.HandleFunc("GET /api/v1/agents/{id}/status", s.handleGetAgentStatus)
+	mux.HandleFunc("PUT /api/v1/agents/{id}/status", s.handlePutAgentStatus)
 	mux.HandleFunc("GET /api/v1/agents/{id}/checkin-file", s.handleGetCheckinFile)
 	mux.HandleFunc("PUT /api/v1/agents/{id}/checkin-file", s.handlePutCheckinFile)
 	mux.HandleFunc("POST /api/v1/agents/{id}/avatar/generated", s.handleUploadGeneratedAvatar)
