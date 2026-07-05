@@ -1182,6 +1182,7 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	}
 
 	var reply strings.Builder
+	var doneText string
 	var streamErr string
 	var usage *Usage
 	for ev := range events {
@@ -1189,6 +1190,14 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 		case "text":
 			reply.WriteString(ev.Delta)
 		case "done":
+			// The done event's assembled message is the authoritative
+			// reply text: it merges assistant-event text that never
+			// surfaced as "text" deltas (e.g. a turn before a tool-call
+			// retry, or text reported only on the assistant snapshot).
+			// Accumulated deltas alone can be just the tail of the reply.
+			if ev.Message != nil && ev.Message.Content != "" {
+				doneText = ev.Message.Content
+			}
 			// The done event carries the turn's token usage. Prefer the
 			// event's Usage; fall back to the assembled message's Usage.
 			if ev.Usage != nil {
@@ -1210,7 +1219,10 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 		return
 	}
 
-	text := strings.TrimSpace(reply.String())
+	text := strings.TrimSpace(doneText)
+	if text == "" {
+		text = strings.TrimSpace(reply.String())
+	}
 	if text == "" {
 		return // nothing substantive to post
 	}

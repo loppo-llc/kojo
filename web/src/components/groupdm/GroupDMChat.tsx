@@ -35,6 +35,10 @@ import { estimateTurnCost } from "../../lib/pricing";
 
 const PAGE_SIZE = 50;
 
+// Mirrors the server-side thread turn cap (notifyTimeout): after this long
+// without a reply the "replying…" indicator and the send lockout both clear.
+const THREAD_REPLY_TIMEOUT_MS = 10 * 60 * 1000;
+
 export function GroupDMChat() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -317,9 +321,31 @@ export function GroupDMChat() {
     return () => clearInterval(interval);
   }, [id, notFound]);
 
+  // A "thread" room is a human↔agent DM with a single agent member: a
+  // temporary Slack-thread-like side conversation. Group-only affordances
+  // (cooldown / hops settings) are hidden and Delete becomes Archive.
+  const isThread =
+    !!group &&
+    (group.kind === "thread" || (group.kind === "dm" && group.members.length === 1));
+
+  // In a thread, the newest message being the user's own post means the
+  // agent's turn is still running (polling will append the reply and flip
+  // this off). Safety: the server-side thread turn is capped at 10 minutes
+  // (notifyTimeout), so this also clears once the last user message is older
+  // than that — it must not persist forever across reloads or on a rare
+  // empty reply. Recomputed on every 3s poll re-render. Drives both the
+  // "replying…" indicator and the send lockout: posting mid-turn would queue
+  // a second turn that replies without seeing the first answer.
+  const lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
+  const awaitingReply =
+    isThread &&
+    lastMsg !== null &&
+    lastMsg.agentId === USER_SENDER_ID &&
+    Date.now() - new Date(lastMsg.timestamp).getTime() < THREAD_REPLY_TIMEOUT_MS;
+
   const handleSend = useCallback(async () => {
     const text = input.trim();
-    if ((!text && pendingFiles.length === 0) || sending) return;
+    if ((!text && pendingFiles.length === 0) || sending || awaitingReply) return;
     if (!id && !isDraft) return;
     if (isDraft && !draftAgentId) return;
     setSending(true);
@@ -390,7 +416,7 @@ export function GroupDMChat() {
     } finally {
       setSending(false);
     }
-  }, [id, isDraft, draftAgentId, navigate, input, pendingFiles, sending, clearDraft, setPendingFiles, setUploadError, textareaRef]);
+  }, [id, isDraft, draftAgentId, navigate, input, pendingFiles, sending, awaitingReply, clearDraft, setPendingFiles, setUploadError, textareaRef]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => enterToSend(e, enterSends, () => void handleSend()),
@@ -415,27 +441,6 @@ export function GroupDMChat() {
   }
 
   if (!group) return null;
-
-  // A "thread" room is a human↔agent DM with a single agent member: a
-  // temporary Slack-thread-like side conversation. Group-only affordances
-  // (cooldown / hops settings) are hidden and Delete becomes Archive.
-  const isThread =
-    group.kind === "thread" || (group.kind === "dm" && group.members.length === 1);
-
-  // Lightweight "replying…" indicator: in a thread, the newest message being
-  // the user's own post means the agent's turn is still running (polling will
-  // append the reply and flip this off). Safety: the server-side thread turn
-  // is capped at 10 minutes (notifyTimeout), so the indicator also clears
-  // once the last user message is older than that — it must not persist
-  // forever across reloads or on a rare empty reply. Recomputed on every
-  // 3s poll re-render, so the cutoff takes effect without its own timer.
-  const lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
-  const THREAD_REPLY_TIMEOUT_MS = 10 * 60 * 1000;
-  const awaitingReply =
-    isThread &&
-    lastMsg !== null &&
-    lastMsg.agentId === USER_SENDER_ID &&
-    Date.now() - new Date(lastMsg.timestamp).getTime() < THREAD_REPLY_TIMEOUT_MS;
 
   // Build a color map for agents
   const palette = [
@@ -874,7 +879,7 @@ export function GroupDMChat() {
           </div>
           <SendButton
             onClick={() => void handleSend()}
-            disabled={(!input.trim() && pendingFiles.length === 0) || sending}
+            disabled={(!input.trim() && pendingFiles.length === 0) || sending || awaitingReply}
           />
         </div>
         </div>
