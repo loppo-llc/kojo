@@ -162,6 +162,12 @@ type GroupMessage struct {
 	Timestamp string   `json:"timestamp"`
 	// Usage is the token usage of an agent thread reply (nil otherwise).
 	Usage *Usage `json:"usage,omitempty"`
+	// Thinking is the extended-thinking text of an agent thread reply
+	// ("" otherwise).
+	Thinking string `json:"thinking,omitempty"`
+	// ToolUses is the tool-call trace of an agent thread reply (nil
+	// otherwise).
+	ToolUses []ToolUse `json:"toolUses,omitempty"`
 }
 
 func generateGroupID() string {
@@ -214,6 +220,14 @@ func appendGroupMessage(groupID string, msg *GroupMessage, expectedLatestSeq int
 			return fmt.Errorf("appendGroupMessage: marshal usage: %w", err)
 		}
 		rec.Usage = buf
+	}
+	rec.Thinking = msg.Thinking
+	if len(msg.ToolUses) > 0 {
+		buf, err := json.Marshal(msg.ToolUses)
+		if err != nil {
+			return fmt.Errorf("appendGroupMessage: marshal tool_uses: %w", err)
+		}
+		rec.ToolUses = buf
 	}
 	ts := parseAgentRFC3339Millis(msg.Timestamp)
 	if ts == 0 {
@@ -504,6 +518,13 @@ func groupRecordToMessage(rec *store.GroupDMMessageRecord) *GroupMessage {
 		var u Usage
 		if err := json.Unmarshal(rec.Usage, &u); err == nil {
 			out.Usage = &u
+		}
+	}
+	out.Thinking = rec.Thinking
+	if len(rec.ToolUses) > 0 && string(rec.ToolUses) != "null" {
+		var tu []ToolUse
+		if err := json.Unmarshal(rec.ToolUses, &tu); err == nil {
+			out.ToolUses = tu
 		}
 	}
 	return out

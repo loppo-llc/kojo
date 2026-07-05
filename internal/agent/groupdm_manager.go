@@ -1185,6 +1185,8 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	var doneText string
 	var streamErr string
 	var usage *Usage
+	var thinking string
+	var toolUses []ToolUse
 	for ev := range events {
 		switch ev.Type {
 		case "text":
@@ -1204,6 +1206,10 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 				usage = ev.Usage
 			} else if ev.Message != nil && ev.Message.Usage != nil {
 				usage = ev.Message.Usage
+			}
+			if ev.Message != nil {
+				thinking = ev.Message.Thinking
+				toolUses = ev.Message.ToolUses
 			}
 		case "error":
 			if streamErr == "" {
@@ -1231,7 +1237,7 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	// otherwise race the rename and pin the stale default title. No-op after
 	// the first rename; empty replies (above) still skip titling entirely.
 	m.maybeAutoTitleThread(groupID, agentID, msg.Content)
-	if _, err := m.postThreadReply(groupID, agentID, text, usage); err != nil {
+	if _, err := m.postThreadReply(groupID, agentID, text, usage, thinking, toolUses); err != nil {
 		m.logger.Warn("failed to post thread reply", "group", groupID, "agent", agentID, "err", err)
 	}
 }
@@ -1260,7 +1266,7 @@ func (m *GroupDMManager) renderThreadPayload(groupName string, msg *GroupMessage
 // postThreadReply appends an agent-authored message to a thread room on the
 // agent's behalf, bypassing CAS and suppressing notify. Daemon-authored: the
 // agent produced the text via a one-shot turn, not a direct API post.
-func (m *GroupDMManager) postThreadReply(groupID, agentID, content string, usage *Usage) (*GroupMessage, error) {
+func (m *GroupDMManager) postThreadReply(groupID, agentID, content string, usage *Usage, thinking string, toolUses []ToolUse) (*GroupMessage, error) {
 	m.mu.Lock()
 	g, err := m.liveGroupLocked(groupID)
 	if err != nil {
@@ -1277,6 +1283,8 @@ func (m *GroupDMManager) postThreadReply(groupID, agentID, content string, usage
 	}
 	msg := newGroupMessage(agentID, senderName, content, nil)
 	msg.Usage = usage
+	msg.Thinking = thinking
+	msg.ToolUses = toolUses
 	msg.Mentions = m.parseMentions(content, memberIDs)
 	if err := appendGroupMessage(groupID, msg, 0, false); err != nil {
 		m.mu.Unlock()
@@ -1300,7 +1308,7 @@ func (m *GroupDMManager) handleThreadTurnError(groupID, agentID, payload string,
 	}
 	m.logger.Warn("thread turn failed", "group", groupID, "agent", agentID, "err", err)
 	m.recordDeadLetter(groupID, agentID, "thread turn: "+err.Error(), payload, 1)
-	if _, perr := m.postThreadReply(groupID, agentID, "⚠️ Thread reply failed: "+err.Error(), nil); perr != nil {
+	if _, perr := m.postThreadReply(groupID, agentID, "⚠️ Thread reply failed: "+err.Error(), nil, "", nil); perr != nil {
 		m.logger.Warn("failed to post thread failure notice", "group", groupID, "agent", agentID, "err", perr)
 	}
 }

@@ -29,7 +29,8 @@ import {
   enterToSend,
 } from "../chatComposer";
 import { AgentAvatar } from "../agent/AgentAvatar";
-import { AttachmentList, MessageContent } from "../agent/ChatMessage";
+import { AttachmentList, MessageContent, CollapsedToolUses } from "../agent/ChatMessage";
+import { ThinkingBlock } from "../agent/StreamingMessage";
 import { agentApi } from "../../lib/agentApi";
 import { estimateTurnCost } from "../../lib/pricing";
 
@@ -813,6 +814,7 @@ export function GroupDMChat() {
                     </span>
                   )}
                 </div>
+                {msg.thinking && <ThinkingBlock text={msg.thinking} />}
                 {msg.attachments && msg.attachments.length > 0 && (
                   <AttachmentList attachments={msg.attachments} isUser={false} />
                 )}
@@ -825,6 +827,9 @@ export function GroupDMChat() {
                     showTime={false}
                   />
                 </div>
+                {msg.toolUses && msg.toolUses.length > 0 && (
+                  <CollapsedToolUses toolUses={msg.toolUses} />
+                )}
                 {msg.usage && msg.usage.inputTokens != null && (
                   <ThreadUsageLine usage={msg.usage} model={threadAgentModel} />
                 )}

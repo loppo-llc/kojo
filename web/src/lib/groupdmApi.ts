@@ -1,5 +1,5 @@
 import { get, post, del, patch } from "./httpClient";
-import type { AgentMessageAttachment } from "./agentApi";
+import type { AgentMessageAttachment, ToolUse } from "./agentApi";
 
 export type GroupDMStyle = "efficient" | "expressive";
 export type NotifyMode = "realtime" | "digest" | "muted";
@@ -73,6 +73,10 @@ export interface GroupMessage {
   timestamp: string;
   /** Token usage for an agent thread reply (absent otherwise). */
   usage?: GroupMessageUsage;
+  /** Extended-thinking text for an agent thread reply (absent otherwise). */
+  thinking?: string;
+  /** Tool-call trace for an agent thread reply (absent otherwise). */
+  toolUses?: ToolUse[];
 }
 
 export interface UnreadInfo {

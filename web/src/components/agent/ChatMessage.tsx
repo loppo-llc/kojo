@@ -474,7 +474,7 @@ export function MessageContent({
 }
 
 /** Collapsed tool uses summary for completed messages */
-function CollapsedToolUses({ toolUses }: { toolUses: ToolUse[] }) {
+export function CollapsedToolUses({ toolUses }: { toolUses: ToolUse[] }) {
   const [expanded, setExpanded] = useState(false);
 
   // Deduplicate tool names for summary

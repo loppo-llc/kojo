@@ -114,6 +114,77 @@ func TestThreadTurn_PersistsUsage(t *testing.T) {
 	}
 }
 
+// thinkingToolUsesThreadStub emits a text delta plus a done event carrying an
+// assembled message with Thinking and ToolUses set.
+type thinkingToolUsesThreadStub struct {
+	reply    string
+	thinking string
+	toolUses []ToolUse
+}
+
+func (s *thinkingToolUsesThreadStub) fn(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error) {
+	ch := make(chan ChatEvent, 3)
+	if s.reply != "" {
+		ch <- ChatEvent{Type: "text", Delta: s.reply}
+	}
+	ch <- ChatEvent{Type: "done", Message: &Message{
+		Content:  s.reply,
+		Thinking: s.thinking,
+		ToolUses: s.toolUses,
+	}}
+	close(ch)
+	return ch, nil
+}
+
+// TestThreadTurn_PersistsThinkingAndToolUses verifies the done event's
+// assembled message Thinking and ToolUses are attached to the agent's thread
+// reply and survive a reload from the store.
+func TestThreadTurn_PersistsThinkingAndToolUses(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	stub := &thinkingToolUsesThreadStub{
+		reply:    "answer",
+		thinking: "let me consider this carefully",
+		toolUses: []ToolUse{{ID: "tu_1", Name: "shell", Input: "ls -la"}},
+	}
+	gdm.oneShot = stub.fn
+
+	g, err := gdm.CreateThread("ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gdm.PostUserMessage(context.Background(), g.ID, "question", nil, true); err != nil {
+		t.Fatal(err)
+	}
+	reply := waitForMessage(t, gdm, g.ID, "answer")
+	if reply.Thinking != "let me consider this carefully" {
+		t.Errorf("thinking = %q, want %q", reply.Thinking, "let me consider this carefully")
+	}
+	if len(reply.ToolUses) != 1 || reply.ToolUses[0].Name != "shell" || reply.ToolUses[0].Input != "ls -la" {
+		t.Errorf("toolUses = %+v, want [{shell ls -la}]", reply.ToolUses)
+	}
+
+	// Reload from the store (not the in-memory cache) to verify persistence.
+	msgs, _, _, err := gdm.Messages(g.ID, 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reloaded *GroupMessage
+	for _, m := range msgs {
+		if m.ID == reply.ID {
+			reloaded = m
+		}
+	}
+	if reloaded == nil {
+		t.Fatalf("reply %s not found on reload", reply.ID)
+	}
+	if reloaded.Thinking != "let me consider this carefully" {
+		t.Errorf("reloaded thinking = %q, want %q", reloaded.Thinking, "let me consider this carefully")
+	}
+	if len(reloaded.ToolUses) != 1 || reloaded.ToolUses[0].Name != "shell" || reloaded.ToolUses[0].Input != "ls -la" {
+		t.Errorf("reloaded toolUses = %+v, want [{shell ls -la}]", reloaded.ToolUses)
+	}
+}
+
 // TestThreadAutoTitle_SetOnceNotOverwritten verifies the thread is auto-titled
 // from the first user message and later turns do not overwrite the title.
 func TestThreadAutoTitle_SetOnceNotOverwritten(t *testing.T) {

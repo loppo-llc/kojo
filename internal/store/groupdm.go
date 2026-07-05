@@ -695,6 +695,13 @@ type GroupDMMessageRecord struct {
 	// (mirrors agent.Usage). nil for user/system posts and agent posts
 	// made outside a thread turn.
 	Usage json.RawMessage
+	// Thinking is the extended-thinking text for an agent thread reply.
+	// "" for user/system posts and agent posts made outside a thread turn.
+	Thinking string
+	// ToolUses is a JSON array of tool calls (mirrors []agent.ToolUse) for
+	// an agent thread reply. nil for user/system posts and agent posts
+	// made outside a thread turn.
+	ToolUses json.RawMessage
 
 	Version   int
 	ETag      string
@@ -714,6 +721,8 @@ type groupDMMessageETagInput struct {
 	Hop         int             `json:"hop,omitempty"`
 	Mentions    json.RawMessage `json:"mentions,omitempty"`
 	Usage       json.RawMessage `json:"usage,omitempty"`
+	Thinking    string          `json:"thinking,omitempty"`
+	ToolUses    json.RawMessage `json:"tool_uses,omitempty"`
 	UpdatedAt   int64           `json:"updated_at"`
 	DeletedAt   *int64          `json:"deleted_at"`
 }
@@ -729,6 +738,8 @@ func computeGroupDMMessageETag(r *GroupDMMessageRecord) (string, error) {
 		Hop:         r.Hop,
 		Mentions:    r.Mentions,
 		Usage:       r.Usage,
+		Thinking:    r.Thinking,
+		ToolUses:    r.ToolUses,
 		UpdatedAt:   r.UpdatedAt,
 		DeletedAt:   r.DeletedAt,
 	})
@@ -932,6 +943,10 @@ func (s *Store) AppendGroupDMMessage(ctx context.Context, rec *GroupDMMessageRec
 	if err != nil {
 		return nil, fmt.Errorf("store.AppendGroupDMMessage: usage: %w", err)
 	}
+	out.ToolUses, err = nullJSON(out.ToolUses)
+	if err != nil {
+		return nil, fmt.Errorf("store.AppendGroupDMMessage: tool_uses: %w", err)
+	}
 	if out.Hop < 0 {
 		out.Hop = 0
 	}
@@ -943,12 +958,14 @@ func (s *Store) AppendGroupDMMessage(ctx context.Context, rec *GroupDMMessageRec
 	const q = `
 INSERT INTO groupdm_messages (
   id, groupdm_id, seq, agent_id, content, attachments, hop, mentions, usage,
+  thinking, tool_uses,
   version, etag, created_at, updated_at, deleted_at, peer_id
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
 	if _, err := tx.ExecContext(ctx, q,
 		out.ID, out.GroupDMID, out.Seq, nullableText(out.AgentID),
 		nullableText(out.Content), nullableRaw(out.Attachments),
 		out.Hop, nullableRaw(out.Mentions), nullableRaw(out.Usage),
+		nullableText(out.Thinking), nullableRaw(out.ToolUses),
 		out.Version, out.ETag, out.CreatedAt, out.UpdatedAt, nullableText(out.PeerID),
 	); err != nil {
 		return nil, fmt.Errorf("store.AppendGroupDMMessage: %w", err)
@@ -977,6 +994,7 @@ func (s *Store) ListGroupDMMessages(ctx context.Context, groupID string, opts Gr
 	q := `
 SELECT m.id, m.groupdm_id, m.seq, COALESCE(m.agent_id,''),
        COALESCE(m.content,''), m.attachments, m.hop, m.mentions, m.usage,
+       COALESCE(m.thinking,''), m.tool_uses,
        m.version, m.etag, m.created_at, m.updated_at, m.deleted_at, COALESCE(m.peer_id,'')
   FROM groupdm_messages m
   JOIN groupdms         g ON g.id = m.groupdm_id
@@ -1063,11 +1081,13 @@ func scanGroupDMMessageRow(r rowScanner) (*GroupDMMessageRecord, error) {
 		attachments sql.NullString
 		mentions    sql.NullString
 		usage       sql.NullString
+		toolUses    sql.NullString
 		deletedAt   sql.NullInt64
 	)
 	if err := r.Scan(
 		&rec.ID, &rec.GroupDMID, &rec.Seq, &rec.AgentID,
 		&rec.Content, &attachments, &rec.Hop, &mentions, &usage,
+		&rec.Thinking, &toolUses,
 		&rec.Version, &rec.ETag, &rec.CreatedAt, &rec.UpdatedAt, &deletedAt, &rec.PeerID,
 	); err != nil {
 		return nil, err
@@ -1080,6 +1100,9 @@ func scanGroupDMMessageRow(r rowScanner) (*GroupDMMessageRecord, error) {
 	}
 	if usage.Valid {
 		rec.Usage = json.RawMessage(usage.String)
+	}
+	if toolUses.Valid {
+		rec.ToolUses = json.RawMessage(toolUses.String)
 	}
 	if deletedAt.Valid {
 		v := deletedAt.Int64
