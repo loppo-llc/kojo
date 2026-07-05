@@ -316,6 +316,36 @@ type streamParseResult struct {
 	cancelled         bool // true if send returned false (context cancelled)
 }
 
+// applyUsage merges non-zero token metrics into res.usage, allocating it
+// on first use. The overlay (rather than wholesale replace) is deliberate:
+// fable-family streams split a turn's final usage across two events — the
+// top-level "assistant" event carries accurate input/cache counts but a
+// placeholder output_tokens, while the trailing "message_delta" event
+// carries the complete output_tokens. Overlaying keeps whichever event
+// last supplied each field with a non-zero value, so the finalized
+// message_delta corrects the assistant snapshot without clobbering the
+// input/cache fields it may omit.
+func applyUsage(res *streamParseResult, in, out, cacheRead, cacheCreate int) {
+	if in == 0 && out == 0 && cacheRead == 0 && cacheCreate == 0 {
+		return
+	}
+	if res.usage == nil {
+		res.usage = &Usage{}
+	}
+	if in > 0 {
+		res.usage.InputTokens = in
+	}
+	if out > 0 {
+		res.usage.OutputTokens = out
+	}
+	if cacheRead > 0 {
+		res.usage.CacheReadInputTokens = cacheRead
+	}
+	if cacheCreate > 0 {
+		res.usage.CacheCreationInputTokens = cacheCreate
+	}
+}
+
 // mergeStreamTexts combines lastAssistantText and fullText from a stream parse
 // result. When Claude CLI retries a malformed tool call, the first assistant
 // turn's text is captured only in lastAssistantText (via "assistant" events),
@@ -411,24 +441,27 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 				res.lastAssistantText = atext.String()
 			}
 
-			if event.Message.StopReason != "" {
-				// Record usage whenever the assistant turn produced any
-				// metric, not just output_tokens. Cache fields are the
-				// signal we care about for diagnosing prompt-cache
-				// behaviour, and they can be non-zero even on stop
-				// reasons that yield no output text (e.g. tool-only
-				// turns or refusals truncated by max_tokens).
-				u := event.Message.Usage
-				if u.InputTokens > 0 || u.OutputTokens > 0 ||
-					u.CacheReadInputTokens > 0 || u.CacheCreationInputTokens > 0 {
-					res.usage = &Usage{
-						InputTokens:              u.InputTokens,
-						OutputTokens:             u.OutputTokens,
-						CacheReadInputTokens:     u.CacheReadInputTokens,
-						CacheCreationInputTokens: u.CacheCreationInputTokens,
-					}
-				}
-			}
+			// Record usage whenever the assistant turn reports any metric.
+			// The StopReason guard was removed: fable-family models emit
+			// the top-level "assistant" event with usage populated but
+			// stop_reason=null, so gating on stop_reason dropped their
+			// usage entirely (it never persisted). The complete
+			// output_tokens still arrives later in "message_delta"; the
+			// non-zero overlay in applyUsage lets that event correct the
+			// placeholder output_tokens this snapshot carries.
+			u := event.Message.Usage
+			applyUsage(res, u.InputTokens, u.OutputTokens,
+				u.CacheReadInputTokens, u.CacheCreationInputTokens)
+
+		case "message_delta":
+			// Finalized usage for the turn. Anthropic's streaming protocol
+			// puts the complete token counts (notably the full
+			// output_tokens) on message_delta, at the top level of the
+			// event rather than under "message". This is the authoritative
+			// source for the per-turn usage line in the chat UI.
+			d := event.Usage
+			applyUsage(res, d.InputTokens, d.OutputTokens,
+				d.CacheReadInputTokens, d.CacheCreationInputTokens)
 
 		case "content_block_start":
 			if event.ContentBlock.Type == "tool_use" {
@@ -533,13 +566,12 @@ type claudeStreamEvent struct {
 	Message struct {
 		StopReason string               `json:"stop_reason,omitempty"`
 		Content    []claudeContentBlock `json:"content,omitempty"`
-		Usage      struct {
-			InputTokens              int `json:"input_tokens"`
-			OutputTokens             int `json:"output_tokens"`
-			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-		} `json:"usage,omitempty"`
+		Usage      claudeUsage          `json:"usage,omitempty"`
 	} `json:"message,omitempty"`
+
+	// "message_delta" event carries the finalized turn usage at the top
+	// level (a sibling of "delta", not nested under "message").
+	Usage claudeUsage `json:"usage,omitempty"`
 
 	// "content_block_start" event
 	ContentBlock struct {
@@ -559,6 +591,16 @@ type claudeStreamEvent struct {
 	// "result" event
 	Result    string `json:"result,omitempty"`
 	SessionID string `json:"session_id,omitempty"`
+}
+
+// claudeUsage holds the token metrics Claude reports on both the
+// per-turn "assistant" event (nested under message.usage) and the
+// finalized "message_delta" event (top-level usage).
+type claudeUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 }
 
 // claudeContentBlock represents a content block in a Claude message.

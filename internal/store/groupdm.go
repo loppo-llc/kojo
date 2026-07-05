@@ -447,6 +447,58 @@ WHERE id = ? AND etag = ? AND deleted_at IS NULL`
 	return &next, nil
 }
 
+// TouchGroupDM advances a group's updated_at (and version/etag) to reflect
+// new activity — e.g. a freshly posted message — without changing any
+// settings field. It exists because UpdateGroupDM short-circuits on a
+// settings no-op (a message post changes nothing UpdateGroupDM tracks), so
+// it would never bump updated_at; the room-list "last active" time reads
+// updated_at, so without this the row would freeze at creation time across
+// restarts. No-op when the group is missing or tombstoned.
+//
+// ts is the desired updated_at in epoch millis; a value not strictly
+// greater than the current updated_at falls back to now (then to
+// current+1) so the timestamp advances monotonically even under
+// coarse-resolution (RFC3339 seconds) callers.
+func (s *Store) TouchGroupDM(ctx context.Context, id string, ts int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	const sel = `
+SELECT id, name, members_json, style, cooldown, venue, max_hops, kind, seq, version, etag, created_at, updated_at, deleted_at, COALESCE(peer_id,'')
+  FROM groupdms WHERE id = ? AND deleted_at IS NULL`
+	cur, err := scanGroupDMRow(tx.QueryRowContext(ctx, sel, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	if ts <= cur.UpdatedAt {
+		ts = NowMillis()
+		if ts <= cur.UpdatedAt {
+			ts = cur.UpdatedAt + 1
+		}
+	}
+	cur.Version++
+	cur.UpdatedAt = ts
+	cur.ETag, err = computeGroupDMETag(cur)
+	if err != nil {
+		return err
+	}
+
+	const upd = `
+UPDATE groupdms SET version = ?, etag = ?, updated_at = ?
+WHERE id = ? AND deleted_at IS NULL`
+	if _, err := tx.ExecContext(ctx, upd, cur.Version, cur.ETag, cur.UpdatedAt, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // SoftDeleteGroupDM tombstones the group DM. Idempotent. Recomputes etag.
 func (s *Store) SoftDeleteGroupDM(ctx context.Context, id string) error {
 	tx, err := s.db.BeginTx(ctx, nil)

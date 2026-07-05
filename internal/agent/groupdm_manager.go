@@ -427,6 +427,25 @@ func (m *GroupDMManager) create(name string, memberIDs []string, cooldown int, s
 // — paths that must observe the persist before returning success.
 // save() is still the fire-and-forget fan-out for non-critical state
 // changes (cooldown updates, member rename overlays).
+// touchStore persists a bumped updated_at for a single group so the
+// room-list "last active" time tracks the latest message rather than the
+// room's creation time. A message post changes no settings field, so the
+// normal upsert path (store.UpdateGroupDM) treats it as a no-op and never
+// advances updated_at — this dedicated touch is what makes the bump
+// survive a restart. Best-effort: failures are logged, not surfaced, since
+// the message itself has already been durably appended.
+func (m *GroupDMManager) touchStore(groupID, updatedAt string) {
+	db := getGlobalStore()
+	if db == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := db.TouchGroupDM(ctx, groupID, parseAgentRFC3339Millis(updatedAt)); err != nil {
+		m.logger.Warn("failed to touch groupdm updated_at", "group", groupID, "err", err)
+	}
+}
+
 func (m *GroupDMManager) persistOne(snapshot *GroupDM) error {
 	db := getGlobalStore()
 	if db == nil {
@@ -877,8 +896,11 @@ func (m *GroupDMManager) postMessage(ctx context.Context, groupID, agentID, cont
 	// Cache + UpdatedAt update — atomic with the append wrt other writers.
 	m.latestMsgID[groupID] = msg.ID
 	g.UpdatedAt = time.Now().Format(time.RFC3339)
+	updatedAt := g.UpdatedAt
 	m.mu.Unlock()
-	m.save()
+	// touchStore (not save) is what actually persists the bumped
+	// updated_at: save's upsert is a settings no-op for a message post.
+	m.touchStore(groupID, updatedAt)
 
 	// Notify other members asynchronously (unless suppressed to prevent
 	// loops). Hop limit is structural loop prevention: once a message's
@@ -1023,8 +1045,11 @@ func (m *GroupDMManager) PostUserMessage(ctx context.Context, groupID, content s
 	// message and (correctly) get rejected with the user message in the diff.
 	m.latestMsgID[groupID] = msg.ID
 	g.UpdatedAt = time.Now().Format(time.RFC3339)
+	updatedAt := g.UpdatedAt
 	m.mu.Unlock()
-	m.save()
+	// See PostMessage: touchStore persists the updated_at bump that save's
+	// settings-only upsert would drop as a no-op.
+	m.touchStore(groupID, updatedAt)
 
 	if notify {
 		for _, r := range recipients {

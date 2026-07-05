@@ -201,6 +201,54 @@ func TestGroupDMManager_DeleteNotFound(t *testing.T) {
 	}
 }
 
+// TestGroupDMManager_PostMessagePersistsUpdatedAt locks down BUG 2: posting
+// a message must advance the group's persisted updated_at so the room-list
+// "last active" time survives a restart. A message changes no settings
+// field, so the plain settings upsert is a no-op — only the dedicated touch
+// persists the bump. load() reads this exact column on startup, so a
+// store-level advance is the restart guarantee.
+func TestGroupDMManager_PostMessagePersistsUpdatedAt(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, err := gdm.Create("Room", []string{"ag_alice", "ag_bob"}, 0, "", "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	db := getGlobalStore()
+	if db == nil {
+		t.Fatal("expected a global store")
+	}
+	ctx := context.Background()
+	before, err := db.GetGroupDM(ctx, g.ID)
+	if err != nil {
+		t.Fatalf("get before: %v", err)
+	}
+
+	if _, err := gdm.PostMessage(ctx, g.ID, "ag_alice", "hello", "", false); err != nil {
+		t.Fatalf("post agent message: %v", err)
+	}
+	afterAgent, err := db.GetGroupDM(ctx, g.ID)
+	if err != nil {
+		t.Fatalf("get after agent post: %v", err)
+	}
+	if afterAgent.UpdatedAt <= before.UpdatedAt {
+		t.Errorf("agent post did not advance persisted updated_at: before=%d after=%d",
+			before.UpdatedAt, afterAgent.UpdatedAt)
+	}
+
+	if _, err := gdm.PostUserMessage(ctx, g.ID, "hi from human", nil, false); err != nil {
+		t.Fatalf("post user message: %v", err)
+	}
+	afterUser, err := db.GetGroupDM(ctx, g.ID)
+	if err != nil {
+		t.Fatalf("get after user post: %v", err)
+	}
+	if afterUser.UpdatedAt <= afterAgent.UpdatedAt {
+		t.Errorf("user post did not advance persisted updated_at: before=%d after=%d",
+			afterAgent.UpdatedAt, afterUser.UpdatedAt)
+	}
+}
+
 func TestGroupDMManager_SetCooldown(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 

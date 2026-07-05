@@ -80,7 +80,12 @@ export function localRFC3339(d: Date = new Date()): string {
 }
 
 export function timeAgo(dateStr: string): string {
-  const diff = Date.now() - new Date(dateStr).getTime();
+  const t = new Date(dateStr).getTime();
+  // Missing / zero / unparseable timestamps (e.g. a room row with no
+  // updatedAt) yield NaN here; guard so the UI shows "–" instead of
+  // "NaNd ago".
+  if (Number.isNaN(t)) return "–";
+  const diff = Date.now() - t;
   const mins = Math.floor(diff / 60000);
   if (mins < 1) return "just now";
   if (mins < 60) return `${mins}m ago`;

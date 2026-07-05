@@ -162,6 +162,32 @@ func TestParseClaudeStream_AssistantFallback(t *testing.T) {
 	}
 }
 
+// TestParseClaudeStream_FableUsage reproduces the fable-5 shape: the
+// top-level "assistant" event carries usage with stop_reason=null (so the
+// old StopReason guard dropped it), and the finalized output_tokens arrives
+// separately on a message_delta event wrapped in stream_event. The parser
+// must end up with the complete usage — input/cache from the assistant
+// snapshot, output_tokens corrected by message_delta.
+func TestParseClaudeStream_FableUsage(t *testing.T) {
+	assistant := `{"type":"assistant","message":{"stop_reason":null,"content":[{"type":"text","text":"Hi"}],"usage":{"input_tokens":3050,"cache_creation_input_tokens":21439,"cache_read_input_tokens":0,"output_tokens":1}}}`
+	delta := `{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":3050,"cache_creation_input_tokens":21439,"cache_read_input_tokens":0,"output_tokens":13}}}`
+
+	_, result := collectEvents(t, assistant, delta)
+
+	if result.usage == nil {
+		t.Fatal("expected usage to be captured despite null stop_reason")
+	}
+	if result.usage.InputTokens != 3050 {
+		t.Errorf("InputTokens = %d, want 3050", result.usage.InputTokens)
+	}
+	if result.usage.OutputTokens != 13 {
+		t.Errorf("OutputTokens = %d, want 13 (message_delta should correct the placeholder)", result.usage.OutputTokens)
+	}
+	if result.usage.CacheCreationInputTokens != 21439 {
+		t.Errorf("CacheCreationInputTokens = %d, want 21439", result.usage.CacheCreationInputTokens)
+	}
+}
+
 func TestParseClaudeStream_ResultEvent(t *testing.T) {
 	_, result := collectEvents(t,
 		`{"type":"result","result":"final text","session_id":"sess-123"}`,
