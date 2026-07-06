@@ -82,8 +82,8 @@ type ChatOptions struct {
 	SystemPromptExtra string
 
 	// OnSteerReady, if set, is invoked once by a backend that supports
-	// mid-turn steering (currently only claude) as soon as its stdin pipe
-	// is ready to accept a second user-message JSON line. The callback
+	// mid-turn steering (claude: extra user-message line on stdin; codex:
+	// turn/steer JSON-RPC) as soon as the turn can accept input. The callback
 	// receives a SteerFunc the caller can register (e.g. in a busy-turn
 	// handle) and call later to inject text into the running turn.
 	// Backends that don't support steering simply never call this.
@@ -97,7 +97,7 @@ type SteerFunc func(text string) error
 
 // ErrSteerUnsupported is returned by Manager.Steer / Manager.SteerOneShot
 // when the target turn is running on a backend that doesn't support
-// mid-turn steering (only the claude backend does today).
+// mid-turn steering (claude and codex do today).
 var ErrSteerUnsupported = errors.New("steering is not supported for this backend")
 
 // backendSupportsSessionKey reports whether the backend honors

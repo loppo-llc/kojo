@@ -210,33 +210,38 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		// JSON-RPC message sender (mutex-protected since stdin is shared)
 		var reqID atomic.Int64
 		var writeMu sync.Mutex
-		sendRPC := func(method string, params any) int64 {
+		writeLine := func(msg any) error {
+			data, err := json.Marshal(msg)
+			if err != nil {
+				return err
+			}
+			data = append(data, '\n')
+			writeMu.Lock()
+			defer writeMu.Unlock()
+			_, werr := stdin.Write(data)
+			return werr
+		}
+		sendRPCErr := func(method string, params any) (int64, error) {
 			id := reqID.Add(1)
-			msg := rpcRequest{
+			err := writeLine(rpcRequest{
 				JSONRPC: "2.0",
 				Method:  method,
 				ID:      &id,
 				Params:  params,
-			}
-			data, _ := json.Marshal(msg)
-			data = append(data, '\n')
-			writeMu.Lock()
-			stdin.Write(data)
-			writeMu.Unlock()
-			b.logger.Debug("codex rpc send", "method", method, "id", id)
+			})
+			b.logger.Debug("codex rpc send", "method", method, "id", id, "err", err)
+			return id, err
+		}
+		sendRPC := func(method string, params any) int64 {
+			id, _ := sendRPCErr(method, params)
 			return id
 		}
 
 		sendNotify := func(method string) {
-			msg := struct {
+			writeLine(struct {
 				JSONRPC string `json:"jsonrpc"`
 				Method  string `json:"method"`
-			}{"2.0", method}
-			data, _ := json.Marshal(msg)
-			data = append(data, '\n')
-			writeMu.Lock()
-			stdin.Write(data)
-			writeMu.Unlock()
+			}{"2.0", method})
 			b.logger.Debug("codex rpc notify", "method", method)
 		}
 
@@ -419,13 +424,30 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		}
 		turnStartID = sendRPC("turn/start", turnParams)
 
+		// Steering: turn/steer injects extra user input into the running
+		// turn. It needs the active turn id (captured from the turn/start
+		// response by parseCodexStream), so the steerer blocks steer calls
+		// until that id lands.
+		var steerer *codexSteerer
+		if opts.OnSteerReady != nil {
+			steerer = newCodexSteerer(threadID, sendRPCErr)
+			defer steerer.close()
+			opts.OnSteerReady(steerer.steer)
+		}
+
 		if !send(ChatEvent{Type: "status", Status: "thinking"}) {
 			shutdown()
 			return
 		}
 
 		// Step 5: Process streaming events
-		result := parseCodexStream(scanner, turnStartID, b.logger, send)
+		result := parseCodexStream(scanner, turnStartID, steerer, b.logger, send)
+		if steerer != nil {
+			// The turn is over (or the stream broke) — refuse further
+			// steers now rather than at goroutine exit, so a late steer
+			// doesn't get written into a dead turn and silently dropped.
+			steerer.close()
+		}
 		if result.cancelled {
 			shutdown()
 			if ctx.Err() != nil {
@@ -507,7 +529,10 @@ func (r *codexStreamResult) hasOutput() bool {
 // parseCodexStream reads Codex app-server JSON-RPC notifications from a scanner
 // and emits ChatEvents via the send callback. Returns the accumulated result.
 // If send returns false (context cancelled), parsing stops immediately.
-func parseCodexStream(scanner *codexLineScanner, turnStartID int64, logger *slog.Logger, send func(ChatEvent) bool) *codexStreamResult {
+// steer may be nil; when set, the active turn id from the turn/start
+// response (or the turn/started notification) is forwarded to it so
+// mid-turn turn/steer requests can be issued.
+func parseCodexStream(scanner *codexLineScanner, turnStartID int64, steer *codexSteerer, logger *slog.Logger, send func(ChatEvent) bool) *codexStreamResult {
 	res := &codexStreamResult{}
 	itemPhases := make(map[string]string) // itemID -> phase ("commentary" or "final_answer")
 
@@ -523,14 +548,36 @@ func parseCodexStream(scanner *codexLineScanner, turnStartID int64, logger *slog
 			continue
 		}
 
-		// Handle RPC response errors
+		// Handle RPC responses
 		if msg.ID != nil {
-			if *msg.ID == turnStartID && msg.Error != nil {
-				send(ChatEvent{Type: "error", ErrorMessage: msg.Error.Message})
-				res.cancelled = true
-				return res
+			if *msg.ID == turnStartID {
+				if msg.Error != nil {
+					send(ChatEvent{Type: "error", ErrorMessage: msg.Error.Message})
+					res.cancelled = true
+					return res
+				}
+				if steer != nil {
+					steer.setTurnID(decodeCodexTurnID(msg.Result))
+				}
+			} else if steer != nil && steer.resolve(*msg.ID, msg.Error) {
+				// turn/steer response — delivered to the waiting steer
+				// call. Log rejections for the record.
+				if msg.Error != nil {
+					logger.Warn("codex turn/steer rejected", "err", msg.Error.Message)
+				}
 			}
 			continue
+		}
+
+		if steer != nil && msg.Method == "turn/started" && msg.Params != nil {
+			// Fallback capture in case the turn/start response was missed.
+			var params struct {
+				Turn struct {
+					ID string `json:"id"`
+				} `json:"turn"`
+			}
+			json.Unmarshal(*msg.Params, &params)
+			steer.setTurnID(params.Turn.ID)
 		}
 
 		if res.handleNotification(&msg, itemPhases, logger, send) {
@@ -539,6 +586,25 @@ func parseCodexStream(scanner *codexLineScanner, turnStartID int64, logger *slog
 	}
 
 	return res
+}
+
+// decodeCodexTurnID extracts the turn id from a turn/start RPC response,
+// accepting both response shapes ({"turn":{"id":...}} and {"turnId":...}).
+func decodeCodexTurnID(result *json.RawMessage) string {
+	if result == nil {
+		return ""
+	}
+	var r struct {
+		Turn struct {
+			ID string `json:"id"`
+		} `json:"turn"`
+		TurnID string `json:"turnId"`
+	}
+	json.Unmarshal(*result, &r)
+	if r.Turn.ID != "" {
+		return r.Turn.ID
+	}
+	return r.TurnID
 }
 
 // handleNotification processes a single JSON-RPC notification.

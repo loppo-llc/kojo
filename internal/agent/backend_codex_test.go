@@ -49,7 +49,7 @@ func collectCodexEvents(t *testing.T, turnStartID int64, lines ...string) ([]Cha
 		return true
 	}
 
-	result := parseCodexStream(scanner, turnStartID, testLogger(), send)
+	result := parseCodexStream(scanner, turnStartID, nil, testLogger(), send)
 	return events, result
 }
 
@@ -593,7 +593,7 @@ func TestParseCodexStream_Cancelled(t *testing.T) {
 		return callCount < 2
 	}
 
-	result := parseCodexStream(scanner, 1, testLogger(), send)
+	result := parseCodexStream(scanner, 1, nil, testLogger(), send)
 	if !result.cancelled {
 		t.Error("expected cancelled = true")
 	}

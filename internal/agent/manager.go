@@ -2327,8 +2327,8 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		// Register a nil placeholder immediately so SteerOneShot can
 		// distinguish "no turn running" (ErrAgentNotBusy, key absent) from
 		// "turn running but backend doesn't support steering"
-		// (ErrSteerUnsupported, key present but nil) — only claude's
-		// backend.Chat calls OnSteerReady to overwrite it with a real func.
+		// (ErrSteerUnsupported, key present but nil) — only steering-capable
+		// backends (claude, codex) call OnSteerReady to overwrite it.
 		m.oneShotSteersMu.Lock()
 		m.oneShotSteers[sessionKey] = nil
 		m.oneShotSteersMu.Unlock()
