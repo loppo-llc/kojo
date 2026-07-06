@@ -133,6 +133,14 @@ type Manager struct {
 	// Guarded by busyMu.
 	summarizing int
 
+	// notifying counts in-flight unsolicited background-turn goroutines
+	// (handleBackgroundTurn) per agent. An unsolicited turn registers busy
+	// asynchronously, so without this counter a drain could observe idle
+	// between the session opening the turn and the busy entry landing, then
+	// race the background turn's transcript write. Guarded by busyMu; keys are
+	// deleted at zero so len() reflects any agent with an in-flight turn.
+	notifying map[string]int
+
 	// cronPaused globally pauses all cron jobs when true.
 	cronPaused bool
 
@@ -371,6 +379,7 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		busy:           make(map[string]busyEntry),
 		resetting:      make(map[string]bool),
 		switching:      make(map[string]bool),
+		notifying:      make(map[string]int),
 		preparing:      make(map[string]int),
 		mutating:       make(map[string]int),
 		editing:        make(map[string]bool),
@@ -379,6 +388,14 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		chatWatchers:   make(map[string]map[*chatWatcher]struct{}),
 		oneShotCancels: make(map[string]map[int64]context.CancelFunc),
 		oneShotSteers:  make(map[string]SteerFunc),
+	}
+
+	// Register the persistent-session background-turn handler so unsolicited
+	// turns (background subagent notifications arriving on the live claude
+	// process between user turns) get persisted + broadcast as background
+	// chats.
+	if cb, ok := m.backends["claude"].(*ClaudeBackend); ok {
+		cb.SetBackgroundTurnHandler(m.handleBackgroundTurn)
 	}
 
 	m.cron = newCronScheduler(m, logger)
@@ -2407,8 +2424,78 @@ func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, back
 	}
 }
 
-// processChatEvents reads events from the backend channel, persists messages,
-// and forwards events to outCh for the broadcaster.
+// handleBackgroundTurn persists + broadcasts an unsolicited turn produced by
+// a persistent claude session (a background subagent notification that
+// arrives with no user input). It mirrors the busy/broadcaster/processChatEvents
+// plumbing of Chat so the turn shows up live for connected WS clients and in
+// the transcript on next connect, and marks the agent busy for its duration so
+// status displays are truthful.
+func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent) {
+	// The session reports idle at the previous turn's result, but the Manager's
+	// chat goroutine may still be finishing persistence/indexing with the busy
+	// entry set. Briefly retry acquiring the slot before giving up, so a
+	// notification landing in that sub-second window isn't lost.
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var outCh chan ChatEvent
+	acquired := false
+	for attempt := 0; attempt < 40; attempt++ {
+		m.busyMu.Lock()
+		// Honor the same gates Chat checks: a restart drain (quiescing), a
+		// device switch (switching), or a reset (resetting) must not be raced
+		// by a background turn's transcript write. When gated we DISCARD the
+		// notification (drain + log) rather than buffer it — the notification
+		// is a best-effort surfacing of a background subagent result and losing
+		// it is far safer than corrupting a half-drained/half-switched agent.
+		if m.quiescing || (m.switching != nil && m.switching[agentID]) || m.resetting[agentID] {
+			m.busyMu.Unlock()
+			m.logger.Info("background turn discarded: agent gated (quiescing/switching/resetting)", "agent", agentID)
+			for range events {
+			}
+			return
+		}
+		if _, busy := m.busy[agentID]; !busy {
+			ctx, cancel = context.WithCancel(context.Background())
+			outCh = make(chan ChatEvent, 64)
+			bc := newChatBroadcaster(outCh)
+			acc := newChatAccumulator()
+			m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, source: BusySourceNotification, accumulator: acc, outCh: outCh}
+			// Count this in-flight unsolicited turn so drains (waitChatIdle /
+			// WaitAllChatsIdle) don't observe idle while it is writing.
+			m.notifying[agentID]++
+			acquired = true
+			m.busyMu.Unlock()
+			break
+		}
+		m.busyMu.Unlock()
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !acquired {
+		// Still busy after the window (a genuine interactive turn): drain so the
+		// session's sink send doesn't block, but don't double-persist.
+		for range events {
+		}
+		return
+	}
+
+	m.notifyChatStart(agentID)
+
+	defer close(outCh)
+	defer func() {
+		m.busyMu.Lock()
+		if m.notifying[agentID] <= 1 {
+			delete(m.notifying, agentID)
+		} else {
+			m.notifying[agentID]--
+		}
+		m.busyMu.Unlock()
+	}()
+	defer m.clearBusy(agentID)
+	defer cancel()
+	m.processChatEvents(ctx, agentID, events, outCh)
+	m.updatePostChatIndex(agentID)
+}
+
 func (m *Manager) processChatEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent) {
 	// Accumulate streaming data so we can persist a partial message if
 	// the chat is aborted before a "done" event arrives.

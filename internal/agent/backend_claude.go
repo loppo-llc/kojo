@@ -83,10 +83,37 @@ func (s *claudeStdinWriter) close() {
 type ClaudeBackend struct {
 	logger   *slog.Logger
 	proxyURL string // if set, injected as ANTHROPIC_BASE_URL
+	// ephemeral disables the persistent-session pool for throwaway backend
+	// instances (e.g. the custom backend's per-turn delegate) that the
+	// Manager cannot own or close.
+	ephemeral bool
+
+	// Persistent-session pool (Phase 3). Keyed by agent ID. Only the main
+	// agent chat (non-oneShot, empty SessionKey) uses a persistent process;
+	// oneShot/thread turns keep the per-turn spawn model. Guarded by sessMu.
+	sessMu   sync.Mutex
+	sessions map[string]*claudeSession
+	// onBackgroundTurn is invoked by a session when it observes an
+	// unsolicited turn (a background subagent notification) so the Manager
+	// can persist + broadcast it as a background chat. Set by the Manager
+	// at construction; nil disables background-turn surfacing.
+	onBackgroundTurn BackgroundTurnFunc
 }
 
+// BackgroundTurnFunc consumes an unsolicited turn's events (a background
+// subagent notification arriving on the persistent process with no user
+// input) and persists + broadcasts them. The channel is closed by the
+// session when the turn's result arrives.
+type BackgroundTurnFunc func(agentID string, events <-chan ChatEvent)
+
 func NewClaudeBackend(logger *slog.Logger) *ClaudeBackend {
-	return &ClaudeBackend{logger: logger}
+	return &ClaudeBackend{logger: logger, sessions: make(map[string]*claudeSession)}
+}
+
+// SetBackgroundTurnHandler registers the Manager callback used to surface
+// unsolicited (background subagent notification) turns.
+func (b *ClaudeBackend) SetBackgroundTurnHandler(fn BackgroundTurnFunc) {
+	b.onBackgroundTurn = fn
 }
 
 // SetProxyURL configures an ANTHROPIC_BASE_URL to inject into Claude CLI env.
@@ -102,6 +129,14 @@ func (b *ClaudeBackend) Available() bool {
 }
 
 func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error) {
+	// Persistent-session fast path: the agent's main chat (non-oneShot,
+	// no per-conversation SessionKey) reuses one live process across turns
+	// so background subagents and their late notifications survive between
+	// turns. OneShot/thread turns keep the per-turn spawn model below.
+	if persistentSessionsEnabled() && !b.ephemeral && !opts.OneShot && opts.SessionKey == "" {
+		return b.chatViaSession(ctx, agent, userMessage, systemPrompt, opts)
+	}
+
 	claudePath, err := exec.LookPath("claude")
 	if err != nil {
 		return nil, fmt.Errorf("claude not found in PATH")
@@ -289,6 +324,11 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 type claudeInvocation struct {
 	args                   []string
 	bootstrapRecentContext bool
+	// sessionWasReset is true when the session JSONL was deliberately
+	// deleted just now because its context exceeded the reset threshold.
+	// Unlike a merely-missing file, this MUST kill a live persistent
+	// process — its in-memory context is what the reset drops.
+	sessionWasReset bool
 }
 
 // buildClaudeArgs constructs the CLI arguments for a Claude chat invocation.
@@ -381,8 +421,11 @@ func (b *ClaudeBackend) buildClaudeInvocation(agent *Agent, systemPrompt string,
 	// resumes — but against the key-derived UUID, isolating that branch
 	// (Slack thread, etc.) from the agent's main session.
 	bootstrapRecentContext := false
+	sessionWasReset := false
 	if sessionID := expectedClaudeSessionID(agent.ID, sessionKey, oneShot); sessionID != "" {
-		if sessionFileUsable(dir, sessionID, automatedTrigger, agent.ID, agent.ResumeIdleDuration(), b.logger) {
+		usable, reset := sessionFileUsableReset(dir, sessionID, automatedTrigger, agent.ID, agent.ResumeIdleDuration(), b.logger)
+		sessionWasReset = reset
+		if usable {
 			args = append(args, "--resume", sessionID)
 		} else {
 			args = append(args, "--session-id", sessionID)
@@ -390,7 +433,7 @@ func (b *ClaudeBackend) buildClaudeInvocation(agent *Agent, systemPrompt string,
 		}
 	}
 
-	return claudeInvocation{args: args, bootstrapRecentContext: bootstrapRecentContext}
+	return claudeInvocation{args: args, bootstrapRecentContext: bootstrapRecentContext, sessionWasReset: sessionWasReset}
 }
 
 // streamParseResult holds the accumulated state from parsing a Claude stream.
@@ -401,7 +444,9 @@ type streamParseResult struct {
 	streamSessionID   string
 	toolUses          []ToolUse
 	usage             *Usage
-	cancelled         bool // true if send returned false (context cancelled)
+	cancelled         bool   // true if send returned false (context cancelled)
+	origin            string // "result" event origin.kind, e.g. "task-notification"
+	usageCumulative   bool   // usage came from result.modelUsage (cumulative per process)
 }
 
 // applyUsage merges non-zero token metrics into res.usage, allocating it
@@ -464,335 +509,396 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-	res := &streamParseResult{}
-	var fullText strings.Builder
-	var thinking strings.Builder
-	var toolUses []ToolUse
-
-	// Tool use tracking for content_block_start/delta/stop flow
-	var currentToolName string
-	var currentToolID string
-	var currentToolInput strings.Builder
-	toolIDToName := make(map[string]string)
-
-	// Subagent (Task tool) tracking. Every event carrying a non-empty
-	// parent_tool_use_id belongs to a subagent turn and must NOT pollute
-	// fullText/thinking/toolUses above — instead it's accumulated per
-	// parent ID here and attached to the matching Task ToolUse once
-	// parsing finishes.
-	subagents := make(map[string]*subagentState)
-	// subagentOwner maps any tool_use ID seen inside a subagent to the
-	// top-level Task ToolUse ID it should ultimately attach to. This is
-	// how a nested sub-subagent (parent_tool_use_id pointing at a tool
-	// call that itself lives inside a subagent, not in the main
-	// toolUses slice) gets flat-appended onto the original top-level
-	// Task's children instead of requiring a recursive tree.
-	subagentOwner := make(map[string]string)
-	resolveOwner := func(parentID string) string {
-		if o, ok := subagentOwner[parentID]; ok {
-			return o
-		}
-		return parentID
-	}
-	getSubagent := func(owner string) *subagentState {
-		s, ok := subagents[owner]
-		if !ok {
-			s = &subagentState{toolIDToName: make(map[string]string)}
-			subagents[owner] = s
-		}
-		return s
-	}
-
+	acc := newTurnAccumulator(logger, send)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
 			continue
 		}
-
-		var event claudeStreamEvent
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			logger.Debug("failed to parse claude stream event", "err", err)
+		event, rawParentID, ok := decodeClaudeStreamLine(line, logger)
+		if !ok {
 			continue
 		}
-		// Capture parent_tool_use_id BEFORE any stream_event unwrap below
-		// overwrites `event` with the inner payload — the field only ever
-		// appears on the outer wrapper (for streamed deltas) or directly
-		// on a complete top-level assistant/user event, never on the
-		// inner content_block_* payload itself.
-		rawParentID := event.ParentToolUseID
-
-		// Unwrap stream_event wrapper emitted by --include-partial-messages.
-		if event.Type == "stream_event" && len(event.Event) > 0 {
-			var inner claudeStreamEvent
-			if err := json.Unmarshal(event.Event, &inner); err != nil {
-				logger.Debug("failed to parse inner stream event", "err", err)
-				continue
-			}
-			if inner.Type == "" {
-				continue
-			}
-			event = inner
-		}
-
-		parentID := ""
-		if rawParentID != "" {
-			parentID = resolveOwner(rawParentID)
-		}
-
-		switch event.Type {
-		case "system":
-			status := "thinking"
-			if event.Subtype == "compact_boundary" {
-				status = "compacting"
-			}
-			if !send(ChatEvent{Type: "status", Status: status}) {
-				res.cancelled = true
-				return res
-			}
-
-		case "assistant":
-			if parentID != "" {
-				// Subagent turn: complete (non-streamed-delta) assistant
-				// message belonging to a Task-spawned subagent. Route its
-				// text and tool_use blocks into the subagent accumulator
-				// instead of the main fullText/toolUses — this is the fix
-				// for the pre-existing leak where an unwrapped subagent
-				// message content polluted the parent turn.
-				sub := getSubagent(parentID)
-				for _, block := range event.Message.Content {
-					switch block.Type {
-					case "text":
-						if block.Text != "" {
-							sub.appendText(block.Text)
-							if !send(ChatEvent{Type: "text", Delta: block.Text, ParentToolUseID: parentID}) {
-								res.cancelled = true
-								return res
-							}
-						}
-					case "tool_use":
-						input := string(block.Input)
-						sub.children = append(sub.children, ToolUse{ID: block.ID, Name: block.Name, Input: input})
-						sub.toolIDToName[block.ID] = block.Name
-						subagentOwner[block.ID] = parentID
-						if !send(ChatEvent{Type: "tool_use", ToolUseID: block.ID, ToolName: block.Name, ToolInput: input, ParentToolUseID: parentID}) {
-							res.cancelled = true
-							return res
-						}
-					}
-				}
-				break
-			}
-			var atext strings.Builder
-			for _, block := range event.Message.Content {
-				switch block.Type {
-				case "text":
-					if block.Text != "" {
-						atext.WriteString(block.Text)
-					}
-				case "thinking":
-					if block.Thinking != "" && thinking.Len() == 0 {
-						thinking.WriteString(block.Thinking)
-					}
-				}
-			}
-			if atext.Len() > 0 {
-				res.lastAssistantText = atext.String()
-			}
-
-			// Record usage whenever the assistant turn reports any metric.
-			// The StopReason guard was removed: fable-family models emit
-			// the top-level "assistant" event with usage populated but
-			// stop_reason=null, so gating on stop_reason dropped their
-			// usage entirely (it never persisted). The complete
-			// output_tokens still arrives later in "message_delta"; the
-			// non-zero overlay in applyUsage lets that event correct the
-			// placeholder output_tokens this snapshot carries.
-			u := event.Message.Usage
-			applyUsage(res, u.InputTokens, u.OutputTokens,
-				u.CacheReadInputTokens, u.CacheCreationInputTokens)
-
-		case "message_delta":
-			// Finalized usage for the turn. Anthropic's streaming protocol
-			// puts the complete token counts (notably the full
-			// output_tokens) on message_delta, at the top level of the
-			// event rather than under "message". This is the authoritative
-			// source for the per-turn usage line in the chat UI.
-			d := event.Usage
-			applyUsage(res, d.InputTokens, d.OutputTokens,
-				d.CacheReadInputTokens, d.CacheCreationInputTokens)
-
-		case "content_block_start":
-			if event.ContentBlock.Type == "tool_use" {
-				if parentID != "" {
-					sub := getSubagent(parentID)
-					sub.currentToolName = event.ContentBlock.Name
-					sub.currentToolID = event.ContentBlock.ID
-					sub.currentToolInput.Reset()
-					sub.toolIDToName[sub.currentToolID] = sub.currentToolName
-				} else {
-					currentToolName = event.ContentBlock.Name
-					currentToolID = event.ContentBlock.ID
-					currentToolInput.Reset()
-					toolIDToName[currentToolID] = currentToolName
-				}
-			}
-
-		case "content_block_delta":
-			if parentID != "" {
-				sub := getSubagent(parentID)
-				switch event.Delta.Type {
-				case "text_delta":
-					if event.Delta.Text != "" {
-						sub.appendText(event.Delta.Text)
-						if !send(ChatEvent{Type: "text", Delta: event.Delta.Text, ParentToolUseID: parentID}) {
-							res.cancelled = true
-							return res
-						}
-					}
-				case "thinking_delta":
-					// Subagent thinking isn't surfaced today — no UI slot
-					// for nested reasoning text, and it isn't persisted on
-					// the parent ToolUse's Children. Dropped silently.
-				case "input_json_delta":
-					sub.currentToolInput.WriteString(event.Delta.PartialJSON)
-				}
-				break
-			}
-			switch event.Delta.Type {
-			case "text_delta":
-				if event.Delta.Text != "" {
-					fullText.WriteString(event.Delta.Text)
-					if !send(ChatEvent{Type: "text", Delta: event.Delta.Text}) {
-						res.cancelled = true
-						return res
-					}
-				}
-			case "thinking_delta":
-				if event.Delta.Thinking != "" {
-					thinking.WriteString(event.Delta.Thinking)
-					if !send(ChatEvent{Type: "thinking", Delta: event.Delta.Thinking}) {
-						res.cancelled = true
-						return res
-					}
-				}
-			case "input_json_delta":
-				currentToolInput.WriteString(event.Delta.PartialJSON)
-			}
-
-		case "content_block_stop":
-			if parentID != "" {
-				sub := getSubagent(parentID)
-				if sub.currentToolName != "" {
-					input := sub.currentToolInput.String()
-					sub.children = append(sub.children, ToolUse{ID: sub.currentToolID, Name: sub.currentToolName, Input: input})
-					subagentOwner[sub.currentToolID] = parentID
-					if !send(ChatEvent{Type: "tool_use", ToolUseID: sub.currentToolID, ToolName: sub.currentToolName, ToolInput: input, ParentToolUseID: parentID}) {
-						res.cancelled = true
-						return res
-					}
-					sub.currentToolName = ""
-					sub.currentToolID = ""
-					sub.currentToolInput.Reset()
-				}
-				break
-			}
-			if currentToolName != "" {
-				input := currentToolInput.String()
-				tu := ToolUse{
-					ID:    currentToolID,
-					Name:  currentToolName,
-					Input: input,
-				}
-				toolUses = append(toolUses, tu)
-				if !send(ChatEvent{Type: "tool_use", ToolUseID: currentToolID, ToolName: currentToolName, ToolInput: input}) {
-					res.cancelled = true
-					return res
-				}
-				currentToolName = ""
-				currentToolID = ""
-				currentToolInput.Reset()
-			}
-
-		case "user":
-			if parentID != "" {
-				sub := getSubagent(parentID)
-				for _, block := range event.Message.Content {
-					if block.Type == "tool_result" && block.ToolUseID != "" {
-						toolName := sub.toolIDToName[block.ToolUseID]
-						if toolName != "" {
-							output := block.contentText()
-							if !send(ChatEvent{Type: "tool_result", ToolUseID: block.ToolUseID, ToolName: toolName, ToolOutput: output, ParentToolUseID: parentID}) {
-								res.cancelled = true
-								return res
-							}
-							matchToolOutput(sub.children, block.ToolUseID, toolName, output)
-						}
-					}
-				}
-				break
-			}
-			for _, block := range event.Message.Content {
-				if block.Type == "tool_result" && block.ToolUseID != "" {
-					toolName := toolIDToName[block.ToolUseID]
-					if toolName != "" {
-						output := block.contentText()
-						if !send(ChatEvent{Type: "tool_result", ToolUseID: block.ToolUseID, ToolName: toolName, ToolOutput: output}) {
-							res.cancelled = true
-							return res
-						}
-						matchToolOutput(toolUses, block.ToolUseID, toolName, output)
-					}
-				}
-			}
-
-		case "result":
-			if event.SessionID != "" {
-				res.streamSessionID = event.SessionID
-			}
+		isResult := acc.feed(event, rawParentID)
+		if isResult && onResult != nil {
 			// The result event is the turn's terminal event in
 			// --input-format stream-json mode; the process now blocks
 			// waiting for either another stdin line (a steer message
 			// arriving too late to merge into this turn) or EOF. Close
 			// stdin now so it exits promptly instead of idling until
-			// context cancellation/timeout.
-			if onResult != nil {
-				onResult()
-			}
-			// The result event's modelUsage map holds the invocation-wide
-			// token totals, including subagent (Task tool) usage that the
-			// main loop's assistant/message_delta events never report.
-			// It is cumulative per CLI process, so when a process emits
-			// several result events (background subagents), the last one
-			// wins — replace wholesale rather than overlay.
-			if len(event.ModelUsage) > 0 {
-				total := &Usage{CostUSD: event.TotalCostUSD}
-				for _, mu := range event.ModelUsage {
-					total.InputTokens += mu.InputTokens
-					total.OutputTokens += mu.OutputTokens
-					total.CacheReadInputTokens += mu.CacheReadInputTokens
-					total.CacheCreationInputTokens += mu.CacheCreationInputTokens
-				}
-				res.usage = total
-			} else if event.TotalCostUSD > 0 && res.usage != nil {
-				// Older CLIs report total_cost_usd without modelUsage;
-				// keep the stream-accumulated tokens and attach the cost.
-				res.usage.CostUSD = event.TotalCostUSD
-			}
-			if event.Result != "" {
-				if fullText.Len() == 0 {
-					fullText.WriteString(event.Result)
-					if !send(ChatEvent{Type: "text", Delta: event.Result}) {
-						res.cancelled = true
-						return res
+			// context cancellation/timeout. Runs even on a cancelled send
+			// so the process is never left hanging on stdin.
+			onResult()
+		}
+		if acc.res.cancelled {
+			return acc.finalize()
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		logger.Warn("claude stream scanner error", "err", err)
+	}
+	return acc.finalize()
+}
+
+// decodeClaudeStreamLine unmarshals one stream-json line, capturing
+// parent_tool_use_id before unwrapping the --include-partial-messages
+// "stream_event" wrapper. ok is false for lines that should be skipped.
+func decodeClaudeStreamLine(line string, logger *slog.Logger) (event claudeStreamEvent, rawParentID string, ok bool) {
+	if err := json.Unmarshal([]byte(line), &event); err != nil {
+		logger.Debug("failed to parse claude stream event", "err", err)
+		return event, "", false
+	}
+	// Capture parent_tool_use_id BEFORE any stream_event unwrap below
+	// overwrites `event` with the inner payload — the field only ever
+	// appears on the outer wrapper (for streamed deltas) or directly
+	// on a complete top-level assistant/user event, never on the
+	// inner content_block_* payload itself.
+	rawParentID = event.ParentToolUseID
+
+	// Unwrap stream_event wrapper emitted by --include-partial-messages.
+	if event.Type == "stream_event" && len(event.Event) > 0 {
+		var inner claudeStreamEvent
+		if err := json.Unmarshal(event.Event, &inner); err != nil {
+			logger.Debug("failed to parse inner stream event", "err", err)
+			return event, "", false
+		}
+		if inner.Type == "" {
+			return event, "", false
+		}
+		event = inner
+	}
+	return event, rawParentID, true
+}
+
+// turnAccumulator holds the per-turn parse state extracted from
+// parseClaudeStream so both the one-shot spawn path and the persistent
+// session loop share identical stream semantics (subagent nesting, usage
+// overlay, tool_result matching). One accumulator spans exactly one turn:
+// the persistent loop discards it and allocates a fresh one at each
+// "result" boundary.
+type turnAccumulator struct {
+	logger           *slog.Logger
+	send             func(ChatEvent) bool
+	res              *streamParseResult
+	fullText         strings.Builder
+	thinking         strings.Builder
+	toolUses         []ToolUse
+	currentToolName  string
+	currentToolID    string
+	currentToolInput strings.Builder
+	toolIDToName     map[string]string
+	subagents        map[string]*subagentState
+	subagentOwner    map[string]string
+}
+
+func newTurnAccumulator(logger *slog.Logger, send func(ChatEvent) bool) *turnAccumulator {
+	return &turnAccumulator{
+		logger:        logger,
+		send:          send,
+		res:           &streamParseResult{},
+		toolIDToName:  make(map[string]string),
+		subagents:     make(map[string]*subagentState),
+		subagentOwner: make(map[string]string),
+	}
+}
+
+func (a *turnAccumulator) resolveOwner(parentID string) string {
+	if o, ok := a.subagentOwner[parentID]; ok {
+		return o
+	}
+	return parentID
+}
+
+func (a *turnAccumulator) getSubagent(owner string) *subagentState {
+	s, ok := a.subagents[owner]
+	if !ok {
+		s = &subagentState{toolIDToName: make(map[string]string)}
+		a.subagents[owner] = s
+	}
+	return s
+}
+
+// feed processes one already-decoded stream event. It returns true when the
+// event is the turn's terminal "result" event. On a cancelled send it sets
+// a.res.cancelled; callers must check that flag.
+func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isResult bool) {
+	res := a.res
+	send := a.send
+	fullText := &a.fullText
+	thinking := &a.thinking
+	toolUses := a.toolUses
+	defer func() { a.toolUses = toolUses }()
+
+	parentID := ""
+	if rawParentID != "" {
+		parentID = a.resolveOwner(rawParentID)
+	}
+	// currentTool* live on the accumulator; alias for the moved switch body.
+	getSubagent := a.getSubagent
+	subagentOwner := a.subagentOwner
+	toolIDToName := a.toolIDToName
+
+	switch event.Type {
+	case "system":
+		status := "thinking"
+		if event.Subtype == "compact_boundary" {
+			status = "compacting"
+		}
+		if !send(ChatEvent{Type: "status", Status: status}) {
+			res.cancelled = true
+			return false
+		}
+
+	case "assistant":
+		if parentID != "" {
+			// Subagent turn: complete (non-streamed-delta) assistant
+			// message belonging to a Task-spawned subagent. Route its
+			// text and tool_use blocks into the subagent accumulator
+			// instead of the main fullText/toolUses — this is the fix
+			// for the pre-existing leak where an unwrapped subagent
+			// message content polluted the parent turn.
+			sub := getSubagent(parentID)
+			for _, block := range event.Message.Content {
+				switch block.Type {
+				case "text":
+					if block.Text != "" {
+						sub.appendText(block.Text)
+						if !send(ChatEvent{Type: "text", Delta: block.Text, ParentToolUseID: parentID}) {
+							res.cancelled = true
+							return false
+						}
 					}
+				case "tool_use":
+					input := string(block.Input)
+					sub.children = append(sub.children, ToolUse{ID: block.ID, Name: block.Name, Input: input})
+					sub.toolIDToName[block.ID] = block.Name
+					subagentOwner[block.ID] = parentID
+					if !send(ChatEvent{Type: "tool_use", ToolUseID: block.ID, ToolName: block.Name, ToolInput: input, ParentToolUseID: parentID}) {
+						res.cancelled = true
+						return false
+					}
+				}
+			}
+			break
+		}
+		var atext strings.Builder
+		for _, block := range event.Message.Content {
+			switch block.Type {
+			case "text":
+				if block.Text != "" {
+					atext.WriteString(block.Text)
+				}
+			case "thinking":
+				if block.Thinking != "" && thinking.Len() == 0 {
+					thinking.WriteString(block.Thinking)
+				}
+			}
+		}
+		if atext.Len() > 0 {
+			res.lastAssistantText = atext.String()
+		}
+
+		// Record usage whenever the assistant turn reports any metric.
+		// The StopReason guard was removed: fable-family models emit
+		// the top-level "assistant" event with usage populated but
+		// stop_reason=null, so gating on stop_reason dropped their
+		// usage entirely (it never persisted). The complete
+		// output_tokens still arrives later in "message_delta"; the
+		// non-zero overlay in applyUsage lets that event correct the
+		// placeholder output_tokens this snapshot carries.
+		u := event.Message.Usage
+		applyUsage(res, u.InputTokens, u.OutputTokens,
+			u.CacheReadInputTokens, u.CacheCreationInputTokens)
+
+	case "message_delta":
+		// Finalized usage for the turn. Anthropic's streaming protocol
+		// puts the complete token counts (notably the full
+		// output_tokens) on message_delta, at the top level of the
+		// event rather than under "message". This is the authoritative
+		// source for the per-turn usage line in the chat UI.
+		d := event.Usage
+		applyUsage(res, d.InputTokens, d.OutputTokens,
+			d.CacheReadInputTokens, d.CacheCreationInputTokens)
+
+	case "content_block_start":
+		if event.ContentBlock.Type == "tool_use" {
+			if parentID != "" {
+				sub := getSubagent(parentID)
+				sub.currentToolName = event.ContentBlock.Name
+				sub.currentToolID = event.ContentBlock.ID
+				sub.currentToolInput.Reset()
+				sub.toolIDToName[sub.currentToolID] = sub.currentToolName
+			} else {
+				a.currentToolName = event.ContentBlock.Name
+				a.currentToolID = event.ContentBlock.ID
+				a.currentToolInput.Reset()
+				toolIDToName[a.currentToolID] = a.currentToolName
+			}
+		}
+
+	case "content_block_delta":
+		if parentID != "" {
+			sub := getSubagent(parentID)
+			switch event.Delta.Type {
+			case "text_delta":
+				if event.Delta.Text != "" {
+					sub.appendText(event.Delta.Text)
+					if !send(ChatEvent{Type: "text", Delta: event.Delta.Text, ParentToolUseID: parentID}) {
+						res.cancelled = true
+						return false
+					}
+				}
+			case "thinking_delta":
+				// Subagent thinking isn't surfaced today — no UI slot
+				// for nested reasoning text, and it isn't persisted on
+				// the parent ToolUse's Children. Dropped silently.
+			case "input_json_delta":
+				sub.currentToolInput.WriteString(event.Delta.PartialJSON)
+			}
+			break
+		}
+		switch event.Delta.Type {
+		case "text_delta":
+			if event.Delta.Text != "" {
+				fullText.WriteString(event.Delta.Text)
+				if !send(ChatEvent{Type: "text", Delta: event.Delta.Text}) {
+					res.cancelled = true
+					return false
+				}
+			}
+		case "thinking_delta":
+			if event.Delta.Thinking != "" {
+				thinking.WriteString(event.Delta.Thinking)
+				if !send(ChatEvent{Type: "thinking", Delta: event.Delta.Thinking}) {
+					res.cancelled = true
+					return false
+				}
+			}
+		case "input_json_delta":
+			a.currentToolInput.WriteString(event.Delta.PartialJSON)
+		}
+
+	case "content_block_stop":
+		if parentID != "" {
+			sub := getSubagent(parentID)
+			if sub.currentToolName != "" {
+				input := sub.currentToolInput.String()
+				sub.children = append(sub.children, ToolUse{ID: sub.currentToolID, Name: sub.currentToolName, Input: input})
+				subagentOwner[sub.currentToolID] = parentID
+				if !send(ChatEvent{Type: "tool_use", ToolUseID: sub.currentToolID, ToolName: sub.currentToolName, ToolInput: input, ParentToolUseID: parentID}) {
+					res.cancelled = true
+					return false
+				}
+				sub.currentToolName = ""
+				sub.currentToolID = ""
+				sub.currentToolInput.Reset()
+			}
+			break
+		}
+		if a.currentToolName != "" {
+			input := a.currentToolInput.String()
+			tu := ToolUse{
+				ID:    a.currentToolID,
+				Name:  a.currentToolName,
+				Input: input,
+			}
+			toolUses = append(toolUses, tu)
+			if !send(ChatEvent{Type: "tool_use", ToolUseID: a.currentToolID, ToolName: a.currentToolName, ToolInput: input}) {
+				res.cancelled = true
+				return false
+			}
+			a.currentToolName = ""
+			a.currentToolID = ""
+			a.currentToolInput.Reset()
+		}
+
+	case "user":
+		if parentID != "" {
+			sub := getSubagent(parentID)
+			for _, block := range event.Message.Content {
+				if block.Type == "tool_result" && block.ToolUseID != "" {
+					toolName := sub.toolIDToName[block.ToolUseID]
+					if toolName != "" {
+						output := block.contentText()
+						if !send(ChatEvent{Type: "tool_result", ToolUseID: block.ToolUseID, ToolName: toolName, ToolOutput: output, ParentToolUseID: parentID}) {
+							res.cancelled = true
+							return false
+						}
+						matchToolOutput(sub.children, block.ToolUseID, toolName, output)
+					}
+				}
+			}
+			break
+		}
+		for _, block := range event.Message.Content {
+			if block.Type == "tool_result" && block.ToolUseID != "" {
+				toolName := toolIDToName[block.ToolUseID]
+				if toolName != "" {
+					output := block.contentText()
+					if !send(ChatEvent{Type: "tool_result", ToolUseID: block.ToolUseID, ToolName: toolName, ToolOutput: output}) {
+						res.cancelled = true
+						return false
+					}
+					matchToolOutput(toolUses, block.ToolUseID, toolName, output)
+				}
+			}
+		}
+
+	case "result":
+		isResult = true
+		if event.SessionID != "" {
+			res.streamSessionID = event.SessionID
+		}
+		if event.Origin != nil {
+			res.origin = event.Origin.Kind
+		}
+		// The result event's modelUsage map holds the invocation-wide
+		// token totals, including subagent (Task tool) usage that the
+		// main loop's assistant/message_delta events never report.
+		// It is cumulative per CLI process, so when a process emits
+		// several result events (background subagents), the last one
+		// wins — replace wholesale rather than overlay.
+		if len(event.ModelUsage) > 0 {
+			total := &Usage{CostUSD: event.TotalCostUSD}
+			for _, mu := range event.ModelUsage {
+				total.InputTokens += mu.InputTokens
+				total.OutputTokens += mu.OutputTokens
+				total.CacheReadInputTokens += mu.CacheReadInputTokens
+				total.CacheCreationInputTokens += mu.CacheCreationInputTokens
+			}
+			res.usage = total
+			// modelUsage totals are cumulative per CLI process. A persistent
+			// session must delta this against the prior turn; flag the source
+			// so it can (one-shot processes delta from zero, unaffected).
+			res.usageCumulative = true
+		} else if event.TotalCostUSD > 0 && res.usage != nil {
+			// Older CLIs report total_cost_usd without modelUsage;
+			// keep the stream-accumulated tokens and attach the cost.
+			res.usage.CostUSD = event.TotalCostUSD
+		}
+		if event.Result != "" {
+			if fullText.Len() == 0 {
+				fullText.WriteString(event.Result)
+				if !send(ChatEvent{Type: "text", Delta: event.Result}) {
+					// Record the cancelled send but still report the result
+					// boundary: returning early here would leave the caller
+					// (one-shot parseClaudeStream or the persistent session)
+					// thinking the turn never terminated — stdin never gets
+					// closed and the process wedges in cmd.Wait / an
+					// un-completed turn.
+					res.cancelled = true
 				}
 			}
 		}
 	}
+	return isResult
+}
 
-	if err := scanner.Err(); err != nil {
-		logger.Warn("claude stream scanner error", "err", err)
-	}
+// finalize attaches accumulated subagent state onto the matching top-level
+// Task ToolUses and returns the completed per-turn result.
+func (a *turnAccumulator) finalize() *streamParseResult {
+	res := a.res
+	toolUses := a.toolUses
 
 	// Attach accumulated subagent state onto the matching top-level
 	// Task ToolUse. Every key in `subagents` is either a top-level
@@ -802,12 +908,12 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 	// dangling and dropped, matching the "no recursion" flattening
 	// rule: we only ever attach one level deep onto a real top-level
 	// Task call.
-	if len(subagents) > 0 {
+	if len(a.subagents) > 0 {
 		byID := make(map[string]int, len(toolUses))
 		for i, tu := range toolUses {
 			byID[tu.ID] = i
 		}
-		for owner, sub := range subagents {
+		for owner, sub := range a.subagents {
 			idx, ok := byID[owner]
 			if !ok {
 				continue
@@ -816,8 +922,8 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 		}
 	}
 
-	res.fullText = fullText.String()
-	res.thinking = thinking.String()
+	res.fullText = a.fullText.String()
+	res.thinking = a.thinking.String()
 	res.toolUses = toolUses
 	return res
 }
@@ -901,6 +1007,17 @@ type claudeStreamEvent struct {
 	SessionID    string                      `json:"session_id,omitempty"`
 	TotalCostUSD float64                     `json:"total_cost_usd,omitempty"`
 	ModelUsage   map[string]claudeModelUsage `json:"modelUsage,omitempty"`
+
+	// Origin marks the provenance of a "result" event. A background
+	// subagent (Task run_in_background) finishing on a persistent process
+	// emits an unsolicited turn whose result carries origin.kind ==
+	// "task-notification"; a normal user-driven turn has no origin. Used by
+	// the persistent-session loop to decide whether a completed turn was
+	// solicited (deliver to the waiting caller) or unsolicited (persist +
+	// broadcast as a background chat).
+	Origin *struct {
+		Kind string `json:"kind,omitempty"`
+	} `json:"origin,omitempty"`
 }
 
 // claudeModelUsage is one entry of the "result" event's modelUsage map:
@@ -1135,7 +1252,22 @@ const sessionResetMinIdleDuration = defaultResumeIdleDuration
 // agent forgot to update MEMORY.md itself — production experience has shown
 // that persona / system-prompt instructions to "write to MEMORY.md" are not
 // reliable, so the reset path writes a summary regardless.
+// sessionFileUsable reports whether the session JSONL can be resumed.
+// Thin wrapper over sessionFileUsableReset for callers that don't care
+// whether an over-threshold reset just happened.
 func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool, agentID string, idleThreshold time.Duration, logger *slog.Logger) bool {
+	usable, _ := sessionFileUsableReset(agentDir, sessionID, automatedTrigger, agentID, idleThreshold, logger)
+	return usable
+}
+
+// sessionFileUsableReset additionally reports reset=true when the session
+// file existed but was deliberately deleted here because its context grew
+// over the reset threshold. The persistent-session pool uses that signal to
+// kill a live process (whose in-memory context the reset is meant to drop);
+// a merely-missing file (reset=false) must NOT kill a live session — under
+// the persistent model the conversation context lives in the process, and
+// the CLI may not have flushed a JSONL yet.
+func sessionFileUsableReset(agentDir string, sessionID string, automatedTrigger bool, agentID string, idleThreshold time.Duration, logger *slog.Logger) (usable, reset bool) {
 	if logger == nil {
 		// Preserve the pre-DI behavior (logging went to the package
 		// default) for callers — chiefly tests — that pass no logger.
@@ -1143,12 +1275,12 @@ func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool,
 	}
 	absDir, err := filepath.Abs(agentDir)
 	if err != nil {
-		return false
+		return false, false
 	}
 	path := filepath.Join(claudeProjectDir(absDir), sessionID+".jsonl")
 	info, err := os.Stat(path)
 	if err != nil {
-		return false
+		return false, false
 	}
 	if info.Size() == 0 {
 		if err := os.Remove(path); err != nil {
@@ -1157,18 +1289,18 @@ func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool,
 			// alone; next chat will retry.
 			logger.Warn("empty session remove failed, keeping as --resume fallback",
 				"path", path, "err", err)
-			return true
+			return true, false
 		}
-		return false
+		return false, false
 	}
 	ctx, ok := lastSessionContextTokens(path)
 	if !ok {
 		// Couldn't trust the tail read — keep the session for now and
 		// re-evaluate on the next chat.
-		return true
+		return true, false
 	}
 	if ctx <= sessionResetThresholdTokens {
-		return true
+		return true, false
 	}
 	if !automatedTrigger {
 		threshold := idleThreshold
@@ -1179,7 +1311,7 @@ func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool,
 			logger.Debug("claude session over threshold but recently active, keeping",
 				"path", path, "contextTokens", ctx,
 				"idle", idle, "idleThreshold", threshold)
-			return true
+			return true, false
 		}
 	}
 
@@ -1192,7 +1324,7 @@ func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool,
 		if err := preResetSummarize(agentID, "claude", logger); err != nil {
 			logger.Warn("pre-reset summary failed, keeping session to avoid context loss",
 				"path", path, "agent", agentID, "err", err)
-			return true
+			return true, false
 		}
 	}
 
@@ -1208,9 +1340,9 @@ func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool,
 		// --resume; the next run will retry the reset.
 		logger.Warn("session reset: remove failed, keeping session",
 			"path", path, "err", err)
-		return true
+		return true, false
 	}
-	return false
+	return false, true
 }
 
 // lastSessionContextTokens returns (contextTokens, trusted). contextTokens is
@@ -1331,6 +1463,52 @@ func expectedClaudeSessionID(agentID, sessionKey string, oneShot bool) string {
 	return agentIDToUUID(agentID)
 }
 
+// resetClaudeSessionFiles best-effort deletes the deterministic session JSONL
+// AND its ~/.claude/session-env cache for (agentID, sessionKey). claude marks a
+// session "already in use" whenever its JSONL was recently modified but never
+// cleanly closed — which is exactly the state a kill -9'd persistent process
+// leaves behind, blocking a respawn on the same deterministic id until the
+// heuristic's grace window (minutes) elapses. Dropping the JSONL clears that
+// state so a fresh --session-id spawn succeeds immediately; the lost in-flight
+// context is recovered on the next turn via recent-messages bootstrap.
+func resetClaudeSessionFiles(agentID, sessionKey string, logger *slog.Logger) {
+	sessionID := expectedClaudeSessionID(agentID, sessionKey, false)
+	if sessionID == "" {
+		return
+	}
+	// claude encodes its project dir from the process's RESOLVED cwd, so the
+	// path must be symlink-resolved (on macOS the agent dir under /tmp resolves
+	// to /private/tmp; filepath.Abs alone would target a nonexistent
+	// "-tmp-..." project dir and the delete would silently no-op).
+	dir := agentDir(agentID)
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return
+	}
+	_ = os.Remove(filepath.Join(claudeProjectDir(absDir), sessionID+".jsonl"))
+	_ = os.RemoveAll(filepath.Join(claudeConfigDir(), "session-env", sessionID))
+	// Also drop any lingering per-pid session lease that names this session.
+	leaseDir := filepath.Join(claudeConfigDir(), "sessions")
+	if entries, derr := os.ReadDir(leaseDir); derr == nil {
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+				continue
+			}
+			p := filepath.Join(leaseDir, e.Name())
+			if data, rerr := os.ReadFile(p); rerr == nil && strings.Contains(string(data), sessionID) {
+				_ = os.Remove(p)
+			}
+		}
+	}
+	if logger != nil {
+		logger.Warn("reset claude session file to clear stale in-use state",
+			"agent", agentID, "sessionID", sessionID)
+	}
+}
+
 // removeClaudeSession best-effort deletes the Claude session JSONL for the
 // given (agentID, sessionKey) pair. Used when a thread room is archived so the
 // throwaway side-conversation's --resume artifact does not linger. Errors are
@@ -1345,6 +1523,12 @@ func removeClaudeSession(agentID, sessionKey string) {
 		return
 	}
 	_ = os.Remove(filepath.Join(claudeProjectDir(absDir), sessionID+".jsonl"))
+	// The CLI derives its project dir from the RESOLVED cwd (e.g. /tmp →
+	// /private/tmp on macOS); delete that variant too or the file survives
+	// under symlinked config dirs. See resetClaudeSessionFiles.
+	if resolved, rerr := filepath.EvalSymlinks(absDir); rerr == nil && resolved != absDir {
+		_ = os.Remove(filepath.Join(claudeProjectDir(resolved), sessionID+".jsonl"))
+	}
 }
 
 // recoverFromSession reads the Claude session JSONL for the agent and

@@ -267,6 +267,9 @@ func (s *Server) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 				s.restartPending.Store(false)
 				return
 			}
+			// Chats are idle: close any persistent claude processes so the
+			// restart doesn't strand a live CLI holding the session file.
+			s.agents.CloseAllClaudeSessions()
 		}
 		// Arm the wake marker BEFORE the trigger: the trigger cancels
 		// the signal ctx and main's shutdown (store close, exec) starts

@@ -32,5 +32,10 @@ func (b *CustomBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	}
 	cb := NewClaudeBackend(b.logger)
 	cb.SetProxyURL(agent.CustomBaseURL)
+	// This is a throwaway backend created per turn — it is not the Manager's
+	// shared instance, so the Manager can neither reuse nor close a persistent
+	// process it might spawn. Force the per-turn spawn model to avoid orphaned
+	// long-lived processes that pile up until idle-reap.
+	cb.ephemeral = true
 	return cb.Chat(ctx, agent, userMessage, systemPrompt, opts)
 }

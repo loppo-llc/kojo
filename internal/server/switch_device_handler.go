@@ -426,6 +426,9 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 				"source chat did not drain within quiesce window; retry switch-device: "+err.Error())
 			return
 		}
+		// Drained: close the persistent claude process so its session file is
+		// released before the switch transfers session state to the peer.
+		s.agents.CloseClaudeSessionSync(agentID)
 	}
 
 	// Step 0-pre: flush source's disk-side memory writes into the

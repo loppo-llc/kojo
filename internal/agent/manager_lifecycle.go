@@ -85,6 +85,7 @@ func (m *Manager) ResetData(id string) error {
 	// clear touches memory/* nor MEMORY.md, so moving it outside the
 	// memorySyncMu region is safe for the half-reset-visibility
 	// invariant the lock protects.
+	m.closeClaudeSessionSync(id)
 	clearClaudeSession(id, m.logger)
 	clearGrokSession(id)
 	clearCodexSession(id)
@@ -520,6 +521,7 @@ func (m *Manager) Delete(id string) error {
 	// makes a queued summarization harmless: when it eventually runs,
 	// the session source is gone and the transcript is tombstoned, so
 	// it returns without writing.
+	m.closeClaudeSessionSync(id)
 	clearClaudeSession(id, m.logger)
 
 	// Close cached memory index before removing directory
@@ -2160,8 +2162,10 @@ func (m *Manager) ResetSession(agentID string) error {
 
 	switch tool {
 	case "claude":
+		m.closeClaudeSessionSync(agentID)
 		clearClaudeSession(agentID, m.logger)
 	case "custom":
+		m.closeClaudeSessionSync(agentID)
 		clearClaudeSession(agentID, m.logger)
 	case "grok":
 		// Use the counted variant so permission / IO failures

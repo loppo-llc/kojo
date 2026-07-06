@@ -188,6 +188,7 @@ func (m *Manager) waitChatIdle(ctx context.Context, agentID string, skipBusy boo
 		editingOK := m.editing[agentID]
 		resettingOK := m.resetting[agentID]
 		mutating := m.mutating[agentID] > 0
+		notifying := m.notifying[agentID] > 0
 		m.busyMu.Unlock()
 		m.oneShotCancelsMu.Lock()
 		oneShotN := len(m.oneShotCancels[agentID])
@@ -205,7 +206,7 @@ func (m *Manager) waitChatIdle(ctx context.Context, agentID string, skipBusy boo
 		if skipBusy {
 			busyOK = false
 		}
-		if !busyOK && !preparing && !editingOK && !resettingOK && !mutating && oneShotN == 0 && !profileGen {
+		if !busyOK && !preparing && !editingOK && !resettingOK && !mutating && !notifying && oneShotN == 0 && !profileGen {
 			return nil
 		}
 		select {
@@ -245,6 +246,7 @@ func (m *Manager) WaitAllChatsIdle(ctx context.Context) error {
 		idle := len(m.busy) == 0 && len(m.preparing) == 0 &&
 			len(m.editing) == 0 && len(m.resetting) == 0 &&
 			len(m.mutating) == 0 && len(m.switching) == 0 &&
+			len(m.notifying) == 0 &&
 			m.summarizing == 0
 		m.busyMu.Unlock()
 		if idle {
