@@ -640,6 +640,13 @@ export const agentApi = {
   postAgentMessage: (agentId: string, content: string) =>
     post<PostAgentMessageResult>(`/api/v1/agents/${agentId}/messages`, { content }),
 
+  // steerAgent injects an additional user message into the agent's
+  // currently running turn. Rejects with an Error whose message starts
+  // with "409:" when there is no turn in flight, or the backend doesn't
+  // support steering — callers should fall back to a normal send.
+  steerAgent: (agentId: string, content: string) =>
+    post<{ ok: boolean }>(`/api/v1/agents/${agentId}/steer`, { content }),
+
   getQueuedMessages: (agentId: string) =>
     get<{ messages: QueuedAgentMessage[] }>(
       `/api/v1/agents/${agentId}/queued-messages`,

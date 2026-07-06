@@ -82,6 +82,52 @@ func (m *Manager) Abort(agentID string) {
 	m.cancelOneShots(agentID)
 }
 
+// Steer injects an additional user message into the agent's currently
+// running turn (claude backend only — see ChatOptions.OnSteerReady /
+// SteerFunc). Returns ErrAgentNotBusy if no turn is running, and
+// ErrSteerUnsupported if the running turn's backend hasn't registered a
+// steer handle (non-claude backends, or the claude turn's stdin pipe isn't
+// ready yet). On success the steered text is appended to the transcript as
+// a plain user message, mirroring how the turn-start message is persisted.
+func (m *Manager) Steer(agentID, text string) error {
+	// Snapshot the steer handle under busyMu, but do NOT hold the global
+	// lock across the pipe write or the transcript append: a wedged claude
+	// process (stdin buffer full) or a slow disk would otherwise stall
+	// every agent in the daemon behind busyMu. The steer func itself is
+	// safe to call after the turn ends — the stdin writer returns
+	// ErrAgentNotBusy once closed.
+	m.busyMu.Lock()
+	entry, ok := m.busy[agentID]
+	m.busyMu.Unlock()
+	if !ok {
+		return ErrAgentNotBusy
+	}
+	if entry.steer == nil {
+		return ErrSteerUnsupported
+	}
+	if err := entry.steer(text); err != nil {
+		return err
+	}
+	msg := newUserMessage(text, nil)
+	if appendErr := appendMessage(agentID, msg); appendErr != nil {
+		m.logger.Warn("failed to save steer message", "agent", agentID, "err", appendErr)
+	}
+	// Re-acquire busyMu for the live-event push. clearBusy removes the
+	// entry under busyMu BEFORE close(outCh), so an entry re-observed here
+	// is guaranteed to have an open channel while we hold the lock —
+	// re-checking (rather than reusing the earlier snapshot) is what makes
+	// the send panic-safe.
+	m.busyMu.Lock()
+	if cur, ok := m.busy[agentID]; ok && cur.outCh != nil && cur.outCh == entry.outCh {
+		select {
+		case cur.outCh <- ChatEvent{Type: "message", Message: msg}:
+		default:
+		}
+	}
+	m.busyMu.Unlock()
+	return nil
+}
+
 // WaitChatIdle polls busyMu until every concurrent write path
 // has drained for the agent OR ctx is cancelled. Returns nil on
 // idle, ctx.Err() on timeout. Caller is responsible for issuing

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 )
@@ -79,7 +80,25 @@ type ChatOptions struct {
 	// prefix. Mixing channel-context tokens into the middle of the prompt
 	// would invalidate the cache for every Slack message.
 	SystemPromptExtra string
+
+	// OnSteerReady, if set, is invoked once by a backend that supports
+	// mid-turn steering (currently only claude) as soon as its stdin pipe
+	// is ready to accept a second user-message JSON line. The callback
+	// receives a SteerFunc the caller can register (e.g. in a busy-turn
+	// handle) and call later to inject text into the running turn.
+	// Backends that don't support steering simply never call this.
+	OnSteerReady func(SteerFunc)
 }
+
+// SteerFunc injects an additional user message into an in-flight turn.
+// Returns an error if the turn has already finished (process exited /
+// stdin closed).
+type SteerFunc func(text string) error
+
+// ErrSteerUnsupported is returned by Manager.Steer / Manager.SteerOneShot
+// when the target turn is running on a backend that doesn't support
+// mid-turn steering (only the claude backend does today).
+var ErrSteerUnsupported = errors.New("steering is not supported for this backend")
 
 // backendSupportsSessionKey reports whether the backend honors
 // ChatOptions.SessionKey when building its CLI invocation. Backends that

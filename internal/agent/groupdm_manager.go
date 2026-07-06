@@ -244,6 +244,24 @@ type ThreadLiveSnapshot struct {
 // active is false when no turn is currently running for groupID (idle,
 // finished, or the room never had a thread turn) — the snapshot is then
 // the zero value and should not be rendered.
+// Steer injects an operator message into the currently running thread turn
+// for groupID (see runThreadTurn / OneShotOpts.SessionKey), and posts it
+// into the room transcript via PostSteerMessage so it renders inline for
+// every viewer without spawning a second thread turn. Returns
+// ErrAgentNotBusy if no thread turn is currently in flight for this room,
+// or ErrSteerUnsupported if the agent's backend doesn't support steering.
+func (m *GroupDMManager) Steer(ctx context.Context, groupID, content string) (*GroupMessage, error) {
+	active, _ := m.ThreadLive(groupID)
+	if !active {
+		return nil, ErrAgentNotBusy
+	}
+	sessionKey := "groupdm:" + groupID
+	if err := m.agentMgr.SteerOneShot(sessionKey, content); err != nil {
+		return nil, err
+	}
+	return m.PostSteerMessage(ctx, groupID, content, nil)
+}
+
 func (m *GroupDMManager) ThreadLive(groupID string) (active bool, snapshot ThreadLiveSnapshot) {
 	m.threadLiveMu.Lock()
 	defer m.threadLiveMu.Unlock()
@@ -1273,6 +1291,19 @@ func clampMaxHops(v int) int {
 // posts: humans typing in the Web UI should not get 409s from the racing
 // chatter of agents replying around them.
 func (m *GroupDMManager) PostUserMessage(ctx context.Context, groupID, content string, attachments []MessageAttachment, notify bool) (*GroupMessage, error) {
+	return m.postUserMessage(ctx, groupID, content, attachments, notify, false)
+}
+
+// PostSteerMessage posts an operator message into a thread room the same
+// way PostUserMessage does (so it renders in order for every viewer) but
+// never triggers runThreadTurn. Callers are expected to have already
+// injected the text into the in-flight turn via Manager.SteerOneShot — this
+// only handles the transcript/broadcast side.
+func (m *GroupDMManager) PostSteerMessage(ctx context.Context, groupID, content string, attachments []MessageAttachment) (*GroupMessage, error) {
+	return m.postUserMessage(ctx, groupID, content, attachments, true, true)
+}
+
+func (m *GroupDMManager) postUserMessage(ctx context.Context, groupID, content string, attachments []MessageAttachment, notify bool, isSteer bool) (*GroupMessage, error) {
 	m.mu.Lock()
 	g, err := m.liveGroupLocked(groupID)
 	if err != nil {
@@ -1316,8 +1347,14 @@ func (m *GroupDMManager) PostUserMessage(ctx context.Context, groupID, content s
 	if isThread {
 		// Thread room: skip notifyAgent (no cooldown/batch/hops). Run a
 		// temporary parallel conversation with the single agent member,
-		// isolated from the agent's main chat.
-		go m.runThreadTurn(threadAgentID, groupID, groupName, msg)
+		// isolated from the agent's main chat. A steer post is merged into
+		// the ALREADY-running turn (via Manager.SteerOneShot, called by the
+		// HTTP/WS handler before or after this) — starting a second
+		// runThreadTurn for it would race a second --resume of the same
+		// session and duplicate the reply.
+		if !isSteer {
+			go m.runThreadTurn(threadAgentID, groupID, groupName, msg)
+		}
 	} else if notify {
 		for _, r := range recipients {
 			go m.notifyAgent(r.AgentID, groupID, groupName, msg, true,

@@ -41,6 +41,17 @@ type busyEntry struct {
 	// regardless of broadcaster back-pressure. nil for legacy /
 	// hand-rolled busy entries; callers must nil-check.
 	accumulator *chatAccumulator
+	// steer, when set, injects an additional user message into the
+	// running turn (claude backend only — see ChatOptions.OnSteerReady).
+	// nil for backends that don't support mid-turn steering or before the
+	// backend's stdin pipe has become ready.
+	steer SteerFunc
+	// outCh is the raw event channel the broadcaster fans out from. Steer
+	// pushes a "message" event onto it (mirroring how Chat injects the
+	// system-role turn-start message) so already-subscribed clients see
+	// the steered user message appear inline without waiting for a
+	// transcript refetch.
+	outCh chan<- ChatEvent
 }
 
 // Manager manages agent CRUD, chat orchestration, and lifecycle.
@@ -153,6 +164,17 @@ type Manager struct {
 	oneShotSeq       int64
 	oneShotCancels   map[string]map[int64]context.CancelFunc // agentID → id → cancel
 	oneShotCancelsMu sync.Mutex
+
+	// oneShotSteers tracks the steer handle for an in-flight ChatOneShot
+	// turn that opted into session resumption via OneShotOpts.SessionKey
+	// (e.g. Slack/group-DM thread turns — see runThreadTurn). Keyed by
+	// SessionKey rather than agentID since one agent can run several
+	// independent thread turns concurrently, each on its own session.
+	// Only populated for backends that support steering (claude);
+	// registered when the backend's stdin pipe becomes ready and removed
+	// when the turn's goroutine exits.
+	oneShotSteers   map[string]SteerFunc
+	oneShotSteersMu sync.Mutex
 
 	// tokenStore, if set, is kept in sync with agent lifecycle: a per-agent
 	// token is created on Create/Fork and removed on Delete. The store is
@@ -356,6 +378,7 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		memIndexes:     make(map[string]*MemoryIndex),
 		chatWatchers:   make(map[string]map[*chatWatcher]struct{}),
 		oneShotCancels: make(map[string]map[int64]context.CancelFunc),
+		oneShotSteers:  make(map[string]SteerFunc),
 	}
 
 	m.cron = newCronScheduler(m, logger)
@@ -2027,7 +2050,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		src = source[0]
 	}
 	acc := newChatAccumulator()
-	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, source: src, accumulator: acc}
+	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, source: src, accumulator: acc, outCh: outCh}
 	// Hand off the preparing counter to the busy entry under
 	// the same lock so WaitChatIdle never observes a window
 	// where neither preparing nor busy is set for this chat.
@@ -2082,6 +2105,14 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		MCPServers:            prep.mcpServers,
 		AutomatedTrigger:      role == "system",
 		RecentMessagesContext: prep.recentMessagesContext,
+		OnSteerReady: func(fn SteerFunc) {
+			m.busyMu.Lock()
+			if entry, ok := m.busy[agentID]; ok {
+				entry.steer = fn
+				m.busy[agentID] = entry
+			}
+			m.busyMu.Unlock()
+		},
 	})
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
@@ -2270,16 +2301,40 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	// cause a backend to append it a second time. The field stays on
 	// ChatOptions for future backends that want to inject it at a custom
 	// offset rather than the end of the system prompt.
-	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
+	chatOpts := ChatOptions{
 		OneShot:    oneShotMode,
 		MCPServers: prep.mcpServers,
 		SessionKey: sessionKey,
-	})
+	}
+	if sessionKey != "" {
+		// Register a nil placeholder immediately so SteerOneShot can
+		// distinguish "no turn running" (ErrAgentNotBusy, key absent) from
+		// "turn running but backend doesn't support steering"
+		// (ErrSteerUnsupported, key present but nil) — only claude's
+		// backend.Chat calls OnSteerReady to overwrite it with a real func.
+		m.oneShotSteersMu.Lock()
+		m.oneShotSteers[sessionKey] = nil
+		m.oneShotSteersMu.Unlock()
+		chatOpts.OnSteerReady = func(fn SteerFunc) {
+			m.oneShotSteersMu.Lock()
+			m.oneShotSteers[sessionKey] = fn
+			m.oneShotSteersMu.Unlock()
+		}
+	}
+	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, chatOpts)
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
 		cancel()
 		m.untrackOneShot(agentID, osID)
+		if sessionKey != "" {
+			// Remove the nil placeholder registered above — leaving it
+			// would make SteerOneShot report "unsupported" forever for
+			// this key even though no turn is running.
+			m.oneShotSteersMu.Lock()
+			delete(m.oneShotSteers, sessionKey)
+			m.oneShotSteersMu.Unlock()
+		}
 		return nil, err
 	}
 
@@ -2287,10 +2342,35 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		defer close(outCh)
 		defer cancel()
 		defer m.untrackOneShot(agentID, osID)
+		if sessionKey != "" {
+			defer func() {
+				m.oneShotSteersMu.Lock()
+				delete(m.oneShotSteers, sessionKey)
+				m.oneShotSteersMu.Unlock()
+			}()
+		}
 		m.processOneShotEvents(chatCtx, agentID, backendCh, outCh)
 	}()
 
 	return outCh, nil
+}
+
+// SteerOneShot injects an additional user message into an in-flight
+// ChatOneShot turn keyed by OneShotOpts.SessionKey (thread/Slack turns —
+// see runThreadTurn). Returns ErrAgentNotBusy if no matching turn is
+// running, and ErrSteerUnsupported if the turn's backend doesn't support
+// steering.
+func (m *Manager) SteerOneShot(sessionKey, text string) error {
+	m.oneShotSteersMu.Lock()
+	fn, ok := m.oneShotSteers[sessionKey]
+	m.oneShotSteersMu.Unlock()
+	if !ok {
+		return ErrAgentNotBusy
+	}
+	if fn == nil {
+		return ErrSteerUnsupported
+	}
+	return fn(text)
 }
 
 // processOneShotEvents is like processChatEvents but does not persist

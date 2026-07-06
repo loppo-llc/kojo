@@ -19,8 +19,8 @@ import (
 
 // Agent WebSocket message types
 type agentWSClientMsg struct {
-	Type        string                    `json:"type"`                  // "message", "abort"
-	Content     string                    `json:"content"`               // for "message" type
+	Type        string                    `json:"type"`                  // "message", "abort", "steer"
+	Content     string                    `json:"content"`               // for "message"/"steer" types
 	Attachments []agent.MessageAttachment `json:"attachments,omitempty"` // file attachments
 }
 
@@ -252,6 +252,28 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 				// Stream events to client, while also listening for abort
 				s.streamAgentEvents(ctx, conn, events, agentID, clientMsgs)
 
+			case "steer":
+				if msg.Content == "" {
+					continue
+				}
+				// Same §3.7 per-frame fencing as "message": a steer
+				// writes to the running turn's stdin and appends to
+				// the transcript, so a stale holder must be refused
+				// after a handoff.
+				if !s.fencingAllowsAgentWrite(ctx, agentID) {
+					_ = writeJSON(ctx, conn, map[string]string{
+						"type":         "error",
+						"errorMessage": "agent_lock is held by another peer; reload to reconnect to the holder",
+					})
+					continue
+				}
+				if err := s.agents.Steer(agentID, msg.Content); err != nil {
+					_ = writeJSON(ctx, conn, map[string]string{
+						"type":         "error",
+						"errorMessage": err.Error(),
+					})
+				}
+
 			case "abort":
 				s.agents.Abort(agentID)
 				if bgEvents != nil {
@@ -306,7 +328,8 @@ func (s *Server) streamAgentEvents(
 				return
 			}
 		case msg := <-clientMsgs:
-			if msg.Type == "abort" {
+			switch msg.Type {
+			case "abort":
 				s.agents.Abort(agentID)
 				terminal := drainAfterAbort(ctx, events)
 				if terminal != nil {
@@ -318,6 +341,27 @@ func (s *Server) streamAgentEvents(
 					drainEventsAsync(events)
 				}
 				return
+			case "steer":
+				if msg.Content == "" {
+					continue
+				}
+				// Same §3.7 per-frame fencing as "message": a steer
+				// writes to the running turn's stdin and appends to
+				// the transcript, so a stale holder must be refused
+				// after a handoff.
+				if !s.fencingAllowsAgentWrite(ctx, agentID) {
+					_ = writeJSON(ctx, conn, map[string]string{
+						"type":         "error",
+						"errorMessage": "agent_lock is held by another peer; reload to reconnect to the holder",
+					})
+					continue
+				}
+				if err := s.agents.Steer(agentID, msg.Content); err != nil {
+					_ = writeJSON(ctx, conn, map[string]string{
+						"type":         "error",
+						"errorMessage": err.Error(),
+					})
+				}
 			}
 			// Ignore other messages while streaming
 		}

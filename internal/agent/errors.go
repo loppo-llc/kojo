@@ -23,4 +23,8 @@ var (
 	ErrUnsupportedTimeout = errors.New("unsupported timeout")
 
 	ErrInvalidRegenerate = errors.New("invalid regenerate target")
+
+	// ErrAgentNotBusy is returned by Steer / SteerOneShot when there is no
+	// turn currently running to steer.
+	ErrAgentNotBusy = errors.New("agent has no turn in progress")
 )

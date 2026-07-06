@@ -1651,3 +1651,110 @@ func TestGroupDMManager_Messages_AfterDeleteReturnsNotFound(t *testing.T) {
 		t.Errorf("err = %v, want ErrGroupNotFound", err)
 	}
 }
+
+// TestGroupDMManager_Steer_NoActiveTurn verifies that steering a thread
+// room with no in-flight turn is rejected before touching the transcript.
+func TestGroupDMManager_Steer_NoActiveTurn(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _, err := gdm.FindOrCreateDM([]string{"ag_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gdm.Steer(context.Background(), g.ID, "steer text"); !errors.Is(err, ErrAgentNotBusy) {
+		t.Errorf("err = %v, want ErrAgentNotBusy", err)
+	}
+}
+
+// TestGroupDMManager_Steer_InjectsWithoutNewTurn simulates a thread turn
+// already in flight (startThreadLive + a registered claude-style steer
+// handle in Manager.oneShotSteers) and asserts that Steer both (a) delivers
+// the text to the registered SteerFunc and (b) posts it into the room
+// transcript WITHOUT starting a second runThreadTurn — the oneShot stub's
+// call counter must stay at zero throughout.
+func TestGroupDMManager_Steer_InjectsWithoutNewTurn(t *testing.T) {
+	gdm, mgr := setupGroupDMTest(t)
+	g, _, err := gdm.FindOrCreateDM([]string{"ag_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var oneShotCalls int
+	gdm.SetOneShotForTesting(func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error) {
+		oneShotCalls++
+		ch := make(chan ChatEvent)
+		close(ch)
+		return ch, nil
+	})
+
+	sessionKey := "groupdm:" + g.ID
+	var steeredText string
+	mgr.oneShotSteersMu.Lock()
+	if mgr.oneShotSteers == nil {
+		mgr.oneShotSteers = make(map[string]SteerFunc)
+	}
+	mgr.oneShotSteers[sessionKey] = func(text string) error {
+		steeredText = text
+		return nil
+	}
+	mgr.oneShotSteersMu.Unlock()
+
+	gdm.startThreadLive(g.ID)
+	defer gdm.endThreadLive(g.ID)
+
+	msg, err := gdm.Steer(context.Background(), g.ID, "steer this turn")
+	if err != nil {
+		t.Fatalf("Steer: %v", err)
+	}
+	if steeredText != "steer this turn" {
+		t.Errorf("steered text = %q, want %q", steeredText, "steer this turn")
+	}
+	if msg.Content != "steer this turn" {
+		t.Errorf("posted message content = %q, want %q", msg.Content, "steer this turn")
+	}
+	if oneShotCalls != 0 {
+		t.Errorf("oneShotCalls = %d, want 0 (steer must not trigger a new thread turn)", oneShotCalls)
+	}
+
+	// The steered text must land in the room transcript so every viewer
+	// sees it in order.
+	msgs, _, _, err := gdm.Messages(g.ID, 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, m := range msgs {
+		if m.Content == "steer this turn" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("steered message not found in room transcript")
+	}
+}
+
+// TestGroupDMManager_Steer_UnsupportedBackend verifies the nil-placeholder
+// convention: when a turn is running but its backend never called
+// OnSteerReady (i.e. Manager.oneShotSteers[key] is present but nil),
+// Steer must surface ErrSteerUnsupported rather than ErrAgentNotBusy.
+func TestGroupDMManager_Steer_UnsupportedBackend(t *testing.T) {
+	gdm, mgr := setupGroupDMTest(t)
+	g, _, err := gdm.FindOrCreateDM([]string{"ag_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sessionKey := "groupdm:" + g.ID
+	mgr.oneShotSteersMu.Lock()
+	if mgr.oneShotSteers == nil {
+		mgr.oneShotSteers = make(map[string]SteerFunc)
+	}
+	mgr.oneShotSteers[sessionKey] = nil
+	mgr.oneShotSteersMu.Unlock()
+
+	gdm.startThreadLive(g.ID)
+	defer gdm.endThreadLive(g.ID)
+
+	if _, err := gdm.Steer(context.Background(), g.ID, "steer text"); !errors.Is(err, ErrSteerUnsupported) {
+		t.Errorf("err = %v, want ErrSteerUnsupported", err)
+	}
+}

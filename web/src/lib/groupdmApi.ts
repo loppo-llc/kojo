@@ -219,6 +219,13 @@ export const groupdmApi = {
       ...(attachments && attachments.length > 0 ? { attachments } : {}),
     }),
 
+  // steer injects an operator message into a thread room's currently
+  // in-flight reply. Rejects with an Error whose message starts with
+  // "409:" when there is no turn in flight, or the backend doesn't
+  // support steering — callers should fall back to postUserMessage.
+  steer: (groupId: string, content: string) =>
+    post<GroupMessage>(`/api/v1/groupdms/${groupId}/steer`, { content }),
+
   forAgent: (agentId: string) =>
     get<{ groups: GroupDMInfo[] }>(`/api/v1/agents/${agentId}/groups`).then(
       (r) => r.groups ?? [],

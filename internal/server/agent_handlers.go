@@ -1700,6 +1700,39 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// handleSteerAgent — POST /api/v1/agents/{id}/steer. Injects an additional
+// user message into the agent's currently running turn. Mirrors the auth
+// posture of the other transcript-mutating handlers above (relies on the
+// server-wide auth listener; no extra per-handler check needed).
+func (s *Server) handleSteerAgent(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	var body struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	if strings.TrimSpace(body.Content) == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "content is required")
+		return
+	}
+
+	if err := s.agents.Steer(id, body.Content); err != nil {
+		switch {
+		case errors.Is(err, agent.ErrAgentNotBusy):
+			writeError(w, http.StatusConflict, "not_busy", "agent has no turn in progress")
+		case errors.Is(err, agent.ErrSteerUnsupported):
+			writeError(w, http.StatusConflict, "unsupported", err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (s *Server) handleRegenerateMessage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	msgID := r.PathValue("msgId")

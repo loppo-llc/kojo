@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
@@ -552,6 +553,39 @@ func (s *Server) handlePostGroupUserMessage(w http.ResponseWriter, r *http.Reque
 	msg, err := s.groupdms.PostUserMessage(r.Context(), id, req.Content, cleanAtts, true)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, msg)
+}
+
+// handleSteerGroupDM — POST /api/v1/groupdms/{id}/steer. Injects an operator
+// message into the room's currently in-flight thread turn (see
+// GroupDMManager.Steer / runThreadTurn). Mirrors the auth posture of
+// handlePostGroupUserMessage above — no extra per-handler check beyond the
+// server-wide auth listener.
+func (s *Server) handleSteerGroupDM(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.Content) == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "content is required")
+		return
+	}
+	msg, err := s.groupdms.Steer(r.Context(), id, req.Content)
+	if err != nil {
+		switch {
+		case errors.Is(err, agent.ErrAgentNotBusy):
+			writeError(w, http.StatusConflict, "not_busy", "no thread turn in progress")
+		case errors.Is(err, agent.ErrSteerUnsupported):
+			writeError(w, http.StatusConflict, "unsupported", err.Error())
+		default:
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		}
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, msg)

@@ -152,6 +152,67 @@ func TestBuildClaudeArgs_SessionKey(t *testing.T) {
 	})
 }
 
+func TestBuildClaudeArgs_InputFormatStreamJSON(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := &ClaudeBackend{logger: logger}
+	tmp := t.TempDir()
+	a := &Agent{ID: "ag_test"}
+
+	args := b.buildClaudeArgs(a, "", tmp, false, nil, false, "")
+	found := false
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--input-format" && args[i+1] == "stream-json" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected --input-format stream-json in args, got %v", args)
+	}
+}
+
+func TestClaudeStdinWriter_WriteAndClose(t *testing.T) {
+	r, w := io.Pipe()
+	sw := &claudeStdinWriter{w: w}
+
+	done := make(chan string, 1)
+	go func() {
+		buf, _ := io.ReadAll(r)
+		done <- string(buf)
+	}()
+
+	if err := sw.writeUserLine("steer this turn"); err != nil {
+		t.Fatalf("writeUserLine: %v", err)
+	}
+	sw.close()
+	// A second close must be a no-op, not a panic/double-close error.
+	sw.close()
+
+	if err := sw.writeUserLine("too late"); err == nil {
+		t.Error("expected error writing to a closed stdin pipe")
+	}
+
+	got := <-done
+	var parsed struct {
+		Type    string `json:"type"`
+		Message struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(got)), &parsed); err != nil {
+		t.Fatalf("output not valid JSON line: %v (%q)", err, got)
+	}
+	if parsed.Type != "user" || parsed.Message.Role != "user" {
+		t.Errorf("unexpected envelope: %+v", parsed)
+	}
+	if len(parsed.Message.Content) != 1 || parsed.Message.Content[0].Type != "text" || parsed.Message.Content[0].Text != "steer this turn" {
+		t.Errorf("unexpected content: %+v", parsed.Message.Content)
+	}
+}
+
 func TestBuildClaudeInvocation_BootstrapRecentContext(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

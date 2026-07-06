@@ -385,12 +385,41 @@ export function GroupDMChat() {
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
-    if ((!text && pendingFiles.length === 0) || sending || awaitingReply) return;
+    if ((!text && pendingFiles.length === 0) || sending) return;
     if (!id && !isDraft) return;
     if (isDraft && !draftAgentId) return;
     setSending(true);
     setSendError(null);
     try {
+      // Steer path: a thread reply is currently in flight. Inject the
+      // text into that turn instead of posting a normal user message
+      // (which would queue a second, independent turn). Falls back to a
+      // normal post if the turn finished (409) while this was in flight.
+      // Attachments can't ride a steer (the API is text-only), so a send
+      // with pending files takes the normal post path instead of silently
+      // dropping them.
+      if (awaitingReply && !isDraft && id && pendingFiles.length === 0) {
+        try {
+          const sent = await groupdmApi.steer(id, text);
+          clearDraft();
+          setPendingFiles([]);
+          setUploadError(null);
+          if (textareaRef.current) textareaRef.current.style.height = "auto";
+          setLastRead(id, sent.id);
+          groupdmApi.markRead(id, sent.id).catch(() => {});
+          setMessages((prev) => {
+            if (prev.some((m) => m.id === sent.id)) return prev;
+            return [...prev, sent];
+          });
+          return;
+        } catch (e) {
+          if (!/^409:/.test(e instanceof Error ? e.message : String(e))) {
+            setSendError(e instanceof Error ? e.message : "Failed to steer");
+            return;
+          }
+          // 409: the turn already finished — fall through to a normal post.
+        }
+      }
       // Draft mode: create the thread room now (first message = commit), then
       // post into it and swap the URL to the real room (replace so Back does
       // not return to the throwaway draft route).
@@ -956,14 +985,18 @@ export function GroupDMChat() {
               onChange={(e) => setInput(e.target.value)}
               onInput={handleTextareaInput}
               onKeyDown={handleKeyDown}
-              placeholder={`${isThread ? "Message this thread" : "Message the group"}… (${enterSends ? "Enter" : "Ctrl+Enter"} to send)`}
+              placeholder={
+                awaitingReply
+                  ? `Steer the running reply… (${enterSends ? "Enter" : "Ctrl+Enter"} to send)`
+                  : `${isThread ? "Message this thread" : "Message the group"}… (${enterSends ? "Enter" : "Ctrl+Enter"} to send)`
+              }
               rows={1}
               className="max-h-[150px] w-full resize-none bg-transparent px-3 py-2 text-[14px] text-ink placeholder:text-ink-faint focus:outline-none"
             />
           </div>
           <SendButton
             onClick={() => void handleSend()}
-            disabled={(!input.trim() && pendingFiles.length === 0) || sending || awaitingReply}
+            disabled={(!input.trim() && pendingFiles.length === 0) || sending}
           />
         </div>
         </div>

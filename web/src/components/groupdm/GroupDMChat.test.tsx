@@ -13,6 +13,8 @@ const mocks = vi.hoisted(() => ({
   agentGet: vi.fn(),
   createThread: vi.fn(),
   postUserMessage: vi.fn(),
+  steer: vi.fn(),
+  threadLive: vi.fn(),
 }));
 
 vi.mock("../../lib/agentApi", () => ({
@@ -40,6 +42,8 @@ vi.mock("../../lib/groupdmApi", () => ({
     markRead: vi.fn(() => Promise.resolve({ ok: true })),
     delete: vi.fn(),
     archive: mocks.archive,
+    steer: mocks.steer,
+    threadLive: mocks.threadLive,
   },
 }));
 
@@ -118,6 +122,7 @@ beforeEach(() => {
     content: "hi there",
     timestamp: "2026-06-15T00:00:05Z",
   });
+  mocks.threadLive.mockResolvedValue({ active: false });
 });
 
 function renderDraft() {
@@ -250,6 +255,82 @@ describe("GroupDMChat thread room", () => {
     expect(await screen.findByText("here you go")).toBeInTheDocument();
     // "1,200→340 tokens" (locale-formatted). Match on the arrow-joined counts.
     expect(await screen.findByText(/1,200.*340 tokens/)).toBeInTheDocument();
+  });
+});
+
+describe("GroupDMChat steering", () => {
+  const threadGroup = {
+    id: "g1",
+    name: "Alice",
+    kind: "dm" as const,
+    members: [{ agentId: "ag_alice", agentName: "Alice", status: "online" as const }],
+    cooldown: 0,
+    style: "efficient" as const,
+    venue: "chatroom" as const,
+    createdAt: "2026-06-15T00:00:00Z",
+    updatedAt: "2026-06-15T00:00:00Z",
+  };
+
+  function withAwaitingReply() {
+    mocks.groupGet.mockResolvedValue(threadGroup);
+    mocks.groupMessages.mockResolvedValue({
+      messages: [
+        {
+          id: "m1",
+          agentId: "user",
+          agentName: "User",
+          content: "hi there",
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      hasMore: false,
+    });
+  }
+
+  it("sends via steer (not postUserMessage) while a reply is in flight, and does not disable the send button", async () => {
+    withAwaitingReply();
+    mocks.steer.mockResolvedValue({
+      id: "m_steer",
+      agentId: "user",
+      agentName: "User",
+      content: "wait, actually",
+      timestamp: "2026-06-15T00:00:06Z",
+    });
+    renderGroup();
+
+    const input = await screen.findByPlaceholderText(/Steer the running reply/);
+    fireEvent.change(input, { target: { value: "wait, actually" } });
+
+    const sendBtn = screen.getByRole("button", { name: /send/i });
+    expect(sendBtn).not.toBeDisabled();
+
+    fireEvent.click(sendBtn);
+
+    await waitFor(() => expect(mocks.steer).toHaveBeenCalledWith("g1", "wait, actually"));
+    expect(mocks.postUserMessage).not.toHaveBeenCalled();
+    expect(await screen.findByText("wait, actually")).toBeInTheDocument();
+  });
+
+  it("falls back to postUserMessage when steer rejects with 409", async () => {
+    withAwaitingReply();
+    mocks.steer.mockRejectedValue(new Error("409: no turn in flight"));
+    mocks.postUserMessage.mockResolvedValue({
+      id: "m_fallback",
+      agentId: "user",
+      agentName: "User",
+      content: "fallback text",
+      timestamp: "2026-06-15T00:00:07Z",
+    });
+    renderGroup();
+
+    const input = await screen.findByPlaceholderText(/Steer the running reply/);
+    fireEvent.change(input, { target: { value: "fallback text" } });
+    fireEvent.click(screen.getByRole("button", { name: /send/i }));
+
+    await waitFor(() => expect(mocks.steer).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(mocks.postUserMessage).toHaveBeenCalledWith("g1", "fallback text", undefined),
+    );
   });
 });
 

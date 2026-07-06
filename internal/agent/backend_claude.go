@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,9 +15,69 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
+
+// claudeStdinWriter guards writes to a running Claude CLI process's stdin
+// pipe, which is kept open for the duration of the turn (--input-format
+// stream-json) so a mid-turn steer message can be injected as a second
+// "user" JSON line. Closed exactly once, either after the stream's "result"
+// event is observed or on context cancellation/process exit.
+type claudeStdinWriter struct {
+	mu     sync.Mutex
+	w      io.WriteCloser
+	closed bool
+}
+
+// writeUserLine marshals text as a stream-json user-message line and writes
+// it to the pipe. Returns an error if the pipe has already been closed
+// (i.e. the turn already finished or the process exited).
+func (s *claudeStdinWriter) writeUserLine(text string) error {
+	line, err := json.Marshal(map[string]any{
+		"type": "user",
+		"message": map[string]any{
+			"role": "user",
+			"content": []map[string]any{
+				{"type": "text", "text": text},
+			},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		// The turn already produced its result (or the process exited) —
+		// surface this as "not busy" so the HTTP layer maps it to 409 and
+		// the frontend falls back to a normal send.
+		return ErrAgentNotBusy
+	}
+	if _, err = s.w.Write(append(line, '\n')); err != nil {
+		// A broken/closed pipe means the process died mid-turn — same
+		// caller-facing meaning as the closed flag above.
+		if errors.Is(err, syscall.EPIPE) || errors.Is(err, os.ErrClosed) {
+			return ErrAgentNotBusy
+		}
+		return err
+	}
+	return nil
+}
+
+// close closes the underlying pipe exactly once. Safe to call multiple
+// times (e.g. once from the "result" observer and once from a deferred
+// cleanup on an early-return path).
+func (s *claudeStdinWriter) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+	_ = s.w.Close()
+}
 
 // ClaudeBackend implements ChatBackend using the Claude CLI with stream-json output.
 type ClaudeBackend struct {
@@ -94,10 +155,6 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	}
 	cmd.WaitDelay = 10 * time.Second
 
-	// Pass user message via stdin to avoid option injection when the message
-	// starts with "-" (which would be misinterpreted as a CLI flag).
-	cmd.Stdin = strings.NewReader(userMessage)
-
 	// Capture stderr for error diagnostics (limit to 4KB to prevent memory issues)
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &limitedWriter{w: &stderrBuf, limit: 4096}
@@ -107,19 +164,44 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
 
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stdin pipe: %w", err)
+	}
+	stdinW := &claudeStdinWriter{w: stdinPipe}
+
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start claude: %w", err)
+	}
+
+	// Write the initial user message as the first stream-json line. This
+	// mirrors what plain stdin text delivery used to do implicitly, just
+	// framed as JSON so a later Steer call can append a second line onto
+	// the same open pipe.
+	if err := stdinW.writeUserLine(userMessage); err != nil {
+		stdinW.close()
+		_ = cmd.Process.Kill()
+		cmd.Wait()
+		return nil, fmt.Errorf("write initial stdin message: %w", err)
+	}
+
+	if opts.OnSteerReady != nil {
+		opts.OnSteerReady(stdinW.writeUserLine)
 	}
 
 	ch := make(chan ChatEvent, 64)
 
 	go func() {
 		defer close(ch)
+		// Ensure the pipe is always closed so the process can exit even on
+		// an early-return path (cancelled stream, process error, etc.)
+		// that never reaches the "result" event below.
+		defer stdinW.close()
 
 		// send is a helper that respects context cancellation to avoid goroutine leaks.
 		send := func(e ChatEvent) bool { return ctxSend(ctx, ch, e) }
 
-		result := parseClaudeStream(stdout, b.logger, send)
+		result := parseClaudeStream(stdout, b.logger, send, stdinW.close)
 
 		// If stream was cancelled (send returned false), clean up process
 		// and emit a partial done event so the transcript is persisted.
@@ -222,6 +304,12 @@ func (b *ClaudeBackend) buildClaudeInvocation(agent *Agent, systemPrompt string,
 	args := []string{
 		"-p",
 		"--output-format", "stream-json",
+		// Read the prompt (and any mid-turn steer messages) as stream-json
+		// lines on stdin instead of a single plain-text blob. The pipe is
+		// kept open for the duration of the turn so Manager.Steer /
+		// SteerOneShot can inject a second user message that the running
+		// process merges into the same turn (see claudeStdinWriter).
+		"--input-format", "stream-json",
 		"--verbose",
 		"--include-partial-messages",
 		"--dangerously-skip-permissions",
@@ -372,7 +460,7 @@ func mergeStreamTexts(r *streamParseResult) string {
 // parseClaudeStream reads Claude's stream-json output from r and emits ChatEvents
 // via the send callback. Returns the accumulated parse result.
 // If send returns false (channel full / context cancelled), parsing stops immediately.
-func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool) *streamParseResult {
+func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool, onResult func()) *streamParseResult {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
@@ -660,6 +748,15 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 		case "result":
 			if event.SessionID != "" {
 				res.streamSessionID = event.SessionID
+			}
+			// The result event is the turn's terminal event in
+			// --input-format stream-json mode; the process now blocks
+			// waiting for either another stdin line (a steer message
+			// arriving too late to merge into this turn) or EOF. Close
+			// stdin now so it exits promptly instead of idling until
+			// context cancellation/timeout.
+			if onResult != nil {
+				onResult()
 			}
 			// The result event's modelUsage map holds the invocation-wide
 			// token totals, including subagent (Task tool) usage that the

@@ -172,14 +172,18 @@ export function useAgentWebSocket({
     };
   }, [connect]);
 
-  const sendMessage = useCallback((content: string, attachments?: AgentMessageAttachment[]) => {
+  // Returns true when the frame was actually handed to an OPEN socket —
+  // callers that MUST NOT silently drop text (steer fallbacks) check this.
+  const sendMessage = useCallback((content: string, attachments?: AgentMessageAttachment[]): boolean => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       const msg: Record<string, unknown> = { type: "message", content };
       if (attachments && attachments.length > 0) {
         msg.attachments = attachments;
       }
       wsRef.current.send(JSON.stringify(msg));
+      return true;
     }
+    return false;
   }, []);
 
   const abort = useCallback(() => {
@@ -188,5 +192,18 @@ export function useAgentWebSocket({
     }
   }, []);
 
-  return { connected, sendMessage, abort };
+  // steer injects an additional user message into a running turn (claude
+  // backend only server-side; unsupported backends surface an "error"
+  // ChatEvent over the same socket, handled by the caller's onEvent).
+  // Returns false if the socket isn't open so callers can fall back to a
+  // plain POST.
+  const steer = useCallback((content: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "steer", content }));
+      return true;
+    }
+    return false;
+  }, []);
+
+  return { connected, sendMessage, abort, steer };
 }
