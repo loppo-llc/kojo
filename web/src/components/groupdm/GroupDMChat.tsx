@@ -12,6 +12,7 @@ import {
   setLastRead,
   clearLastRead,
   type GroupMessage,
+  type ThreadLive,
 } from "../../lib/groupdmApi";
 import { useEnterSends } from "../../lib/preferences";
 import { formatTime } from "../../lib/utils";
@@ -31,6 +32,7 @@ import {
 import { AgentAvatar } from "../agent/AgentAvatar";
 import { AttachmentList, MessageContent, CollapsedToolUses } from "../agent/ChatMessage";
 import { ThinkingBlock } from "../agent/StreamingMessage";
+import { Lamp } from "../ui/Lamp";
 import { agentApi } from "../../lib/agentApi";
 import { estimateTurnCost } from "../../lib/pricing";
 
@@ -343,6 +345,43 @@ export function GroupDMChat() {
     lastMsg !== null &&
     lastMsg.agentId === USER_SENDER_ID &&
     Date.now() - new Date(lastMsg.timestamp).getTime() < THREAD_REPLY_TIMEOUT_MS;
+
+  // Live progress for the in-flight turn: polled while awaitingReply so
+  // thinking / tool calls / partial text render in place of a static
+  // "replying…" placeholder. Cleared whenever awaitingReply flips false (the
+  // reply landed, or the timeout window closed) so a stale snapshot never
+  // lingers into the next turn.
+  const [threadLive, setThreadLive] = useState<ThreadLive | null>(null);
+  useEffect(() => {
+    // Reset unconditionally on every id/awaitingReply change — otherwise a
+    // room switch between two threads that are both mid-turn would keep
+    // showing the previous room's stale snapshot until the next poll.
+    setThreadLive(null);
+    if (!id || !awaitingReply) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    // Serialize polls — schedule the next one only after the current request
+    // settles, rather than a fixed setInterval. A fixed interval would keep
+    // firing on schedule even while a request is still in flight (e.g. a
+    // slow or hung request), piling up overlapping requests and responses
+    // that can resolve out of order. Serializing means only one request is
+    // ever in flight, so responses always apply in issue order.
+    const poll = () => {
+      groupdmApi.threadLive(id).then(
+        (live) => {
+          if (!cancelled) setThreadLive(live);
+        },
+        () => {/* transient poll failure — keep showing the last snapshot */},
+      ).finally(() => {
+        if (!cancelled) timer = setTimeout(poll, 1000);
+      });
+    };
+    poll();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [id, awaitingReply]);
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
@@ -837,16 +876,56 @@ export function GroupDMChat() {
             </div>
           );
         })}
-        {awaitingReply && (
-          <div className="flex items-center gap-3" aria-live="polite">
-            <div className="flex gap-3">
-              {group.members.slice(0, 1).map((m) => (
-                <AgentAvatar key={m.agentId} agentId={m.agentId} name={m.agentName} size="xs" className="mt-0.5 shrink-0" />
-              ))}
+        {awaitingReply && (() => {
+          const live = threadLive?.active ? threadLive : null;
+          const hasProgress =
+            !!live &&
+            (!!live.status || !!live.thinking || !!live.text || (live.toolUses?.length ?? 0) > 0);
+          const replier = group.members[0];
+          if (!hasProgress) {
+            return (
+              <div className="flex items-center gap-3" aria-live="polite">
+                <div className="flex gap-3">
+                  {replier && (
+                    <AgentAvatar agentId={replier.agentId} name={replier.agentName} size="xs" className="mt-0.5 shrink-0" />
+                  )}
+                </div>
+                <span className="text-[13px] italic text-ink-faint">replying…</span>
+              </div>
+            );
+          }
+          return (
+            <div className="flex gap-3" aria-live="polite">
+              {replier && (
+                <AgentAvatar agentId={replier.agentId} name={replier.agentName} size="xs" className="mt-0.5 shrink-0" />
+              )}
+              <div className="min-w-0 flex-1">
+                <div className="mb-1 flex items-center gap-2">
+                  <span className="text-[13px] font-semibold text-ink">{replier?.agentName}</span>
+                  <span className="flex items-center gap-1.5 font-mono text-[11px] text-ink-faint">
+                    <Lamp state="warn" pulse size={6} />
+                    {live!.status === "compacting" ? "compacting…" : "replying…"}
+                  </span>
+                </div>
+                {live!.thinking && <ThinkingBlock text={live!.thinking} streaming={!live!.text} />}
+                {live!.text && (
+                  <div className="text-[14px] text-ink">
+                    <MessageContent
+                      messageId="live"
+                      content={live!.text}
+                      isUser={false}
+                      timestamp=""
+                      showTime={false}
+                    />
+                  </div>
+                )}
+                {live!.toolUses && live!.toolUses.length > 0 && (
+                  <CollapsedToolUses toolUses={live!.toolUses} />
+                )}
+              </div>
             </div>
-            <span className="text-[13px] italic text-ink-faint">replying…</span>
-          </div>
-        )}
+          );
+        })()}
         <div ref={messagesEndRef} />
         </div>
       </div>

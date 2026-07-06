@@ -956,6 +956,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("PATCH /api/v1/groupdms/{id}/members/{agentId}", s.handleSetGroupMemberSettings)
 		mux.HandleFunc("DELETE /api/v1/groupdms/{id}/members/{agentId}", s.handleLeaveGroup)
 		mux.HandleFunc("GET /api/v1/groupdms/{id}/messages", s.handleGetGroupMessages)
+		mux.HandleFunc("GET /api/v1/groupdms/{id}/live", s.handleGetGroupDMLive)
 		mux.HandleFunc("DELETE /api/v1/groupdms/{id}/messages", s.handleClearGroupMessages)
 		mux.HandleFunc("POST /api/v1/groupdms/{id}/messages", s.handlePostGroupMessage)
 		mux.HandleFunc("POST /api/v1/groupdms/{id}/user-messages", s.handlePostGroupUserMessage)

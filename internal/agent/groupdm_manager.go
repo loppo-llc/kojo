@@ -207,6 +207,137 @@ type GroupDMManager struct {
 	// oneShot runs a one-shot agent turn for thread rooms. Defaults to
 	// agentMgr.ChatOneShot; overridable in tests to stub the agent turn.
 	oneShot func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error)
+
+	// threadLiveMu guards threadLive. A dedicated mutex (not m.mu) so the
+	// per-event UI-snapshot update on the hot streaming path never
+	// contends with the group's main state lock.
+	threadLiveMu sync.Mutex
+	// threadLive holds the in-progress live snapshot for a thread room's
+	// currently-running turn, keyed by groupID. Entries exist only while a
+	// turn is in flight; absence means "not active" (idle or never run).
+	threadLive map[string]*threadLiveState
+}
+
+// threadLiveState is the in-memory live snapshot of an in-flight thread
+// turn, updated as ChatEvents arrive so the Web UI can poll for
+// thinking/tool-call/partial-text progress instead of only seeing a static
+// "replying…" placeholder. Guarded by GroupDMManager.threadLiveMu.
+type threadLiveState struct {
+	Status    string
+	Thinking  string
+	Text      string
+	ToolUses  []ToolUse
+	UpdatedAt time.Time
+}
+
+// ThreadLiveSnapshot is a defensive copy of a thread room's live turn state,
+// safe to hand to callers outside the manager (no shared slices/pointers
+// with the internal registry).
+type ThreadLiveSnapshot struct {
+	Status   string    `json:"status,omitempty"`
+	Thinking string    `json:"thinking,omitempty"`
+	Text     string    `json:"text,omitempty"`
+	ToolUses []ToolUse `json:"toolUses,omitempty"`
+}
+
+// ThreadLive returns the live snapshot for a thread room's in-flight turn.
+// active is false when no turn is currently running for groupID (idle,
+// finished, or the room never had a thread turn) — the snapshot is then
+// the zero value and should not be rendered.
+func (m *GroupDMManager) ThreadLive(groupID string) (active bool, snapshot ThreadLiveSnapshot) {
+	m.threadLiveMu.Lock()
+	defer m.threadLiveMu.Unlock()
+	st, ok := m.threadLive[groupID]
+	if !ok {
+		return false, ThreadLiveSnapshot{}
+	}
+	toolUses := make([]ToolUse, len(st.ToolUses))
+	copy(toolUses, st.ToolUses)
+	return true, ThreadLiveSnapshot{
+		Status:   st.Status,
+		Thinking: st.Thinking,
+		Text:     st.Text,
+		ToolUses: toolUses,
+	}
+}
+
+// SetOneShotForTesting overrides the one-shot chat function used for thread
+// turns. Exposed (exported) so tests outside this package — notably the
+// HTTP handler tests in internal/server — can stub thread-turn behavior
+// (including a blocking, event-emitting stub) without a real backend. Not
+// used in production code paths.
+func (m *GroupDMManager) SetOneShotForTesting(fn func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error)) {
+	m.oneShot = fn
+}
+
+// startThreadLive creates (or replaces) the live-state entry for groupID at
+// the start of a thread turn.
+func (m *GroupDMManager) startThreadLive(groupID string) {
+	m.threadLiveMu.Lock()
+	m.threadLive[groupID] = &threadLiveState{UpdatedAt: time.Now()}
+	m.threadLiveMu.Unlock()
+}
+
+// endThreadLive removes the live-state entry for groupID, e.g. after the
+// turn's reply has been posted or the turn failed/timed out/was cancelled.
+func (m *GroupDMManager) endThreadLive(groupID string) {
+	m.threadLiveMu.Lock()
+	delete(m.threadLive, groupID)
+	m.threadLiveMu.Unlock()
+}
+
+// updateThreadLiveStatus records a "status" event's Status on the live
+// snapshot (e.g. "thinking", "compacting").
+func (m *GroupDMManager) updateThreadLiveStatus(groupID, status string) {
+	m.threadLiveMu.Lock()
+	if st, ok := m.threadLive[groupID]; ok {
+		st.Status = status
+		st.UpdatedAt = time.Now()
+	}
+	m.threadLiveMu.Unlock()
+}
+
+// appendThreadLiveThinking appends a "thinking" event's Delta.
+func (m *GroupDMManager) appendThreadLiveThinking(groupID, delta string) {
+	m.threadLiveMu.Lock()
+	if st, ok := m.threadLive[groupID]; ok {
+		st.Thinking += delta
+		st.UpdatedAt = time.Now()
+	}
+	m.threadLiveMu.Unlock()
+}
+
+// appendThreadLiveText appends a "text" event's Delta.
+func (m *GroupDMManager) appendThreadLiveText(groupID, delta string) {
+	m.threadLiveMu.Lock()
+	if st, ok := m.threadLive[groupID]; ok {
+		st.Text += delta
+		st.UpdatedAt = time.Now()
+	}
+	m.threadLiveMu.Unlock()
+}
+
+// appendThreadLiveToolUse records a "tool_use" event as a new ToolUse entry.
+func (m *GroupDMManager) appendThreadLiveToolUse(groupID string, tu ToolUse) {
+	m.threadLiveMu.Lock()
+	if st, ok := m.threadLive[groupID]; ok {
+		st.ToolUses = append(st.ToolUses, tu)
+		st.UpdatedAt = time.Now()
+	}
+	m.threadLiveMu.Unlock()
+}
+
+// setThreadLiveToolOutput fills in the Output of the matching ToolUse entry
+// from a "tool_result" event, mirroring the main-chat matchToolOutput
+// semantics (match by ID when provided, else by name against the most
+// recent output-less entry).
+func (m *GroupDMManager) setThreadLiveToolOutput(groupID, id, name, output string) {
+	m.threadLiveMu.Lock()
+	if st, ok := m.threadLive[groupID]; ok {
+		matchToolOutput(st.ToolUses, id, name, output)
+		st.UpdatedAt = time.Now()
+	}
+	m.threadLiveMu.Unlock()
 }
 
 // NewGroupDMManager creates a new GroupDMManager.
@@ -221,6 +352,7 @@ func NewGroupDMManager(agentMgr *Manager, logger *slog.Logger) *GroupDMManager {
 		deleting:      make(map[string]bool),
 		persistGen:    make(map[string]int64),
 		threadCancels: make(map[string]context.CancelFunc),
+		threadLive:    make(map[string]*threadLiveState),
 	}
 	m.load()
 	return m
@@ -1171,6 +1303,13 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 		oneShot = m.agentMgr.ChatOneShot
 	}
 
+	// The live snapshot is visible to GET /groupdms/{id}/live from the
+	// moment the turn is about to stream events until the reply is posted
+	// (or the turn errors/times out/is cancelled) — deferred cleanup covers
+	// every one of those exits uniformly.
+	m.startThreadLive(groupID)
+	defer m.endThreadLive(groupID)
+
 	payload := m.renderThreadPayload(groupName, msg)
 	events, err := oneShot(ctx, agentID, payload, OneShotOpts{
 		SessionKey:        "groupdm:" + groupID,
@@ -1189,8 +1328,17 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	var toolUses []ToolUse
 	for ev := range events {
 		switch ev.Type {
+		case "status":
+			m.updateThreadLiveStatus(groupID, ev.Status)
+		case "thinking":
+			m.appendThreadLiveThinking(groupID, ev.Delta)
+		case "tool_use":
+			m.appendThreadLiveToolUse(groupID, ToolUse{ID: ev.ToolUseID, Name: ev.ToolName, Input: ev.ToolInput})
+		case "tool_result":
+			m.setThreadLiveToolOutput(groupID, ev.ToolUseID, ev.ToolName, ev.ToolOutput)
 		case "text":
 			reply.WriteString(ev.Delta)
+			m.appendThreadLiveText(groupID, ev.Delta)
 		case "done":
 			// The done event's assembled message is the authoritative
 			// reply text: it merges assistant-event text that never

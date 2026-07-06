@@ -925,6 +925,33 @@ func (s *Server) handleMarkGroupRead(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// handleGetGroupDMLive reports the live in-progress snapshot of a thread
+// room's currently-running turn (status/thinking/partial text/tool calls),
+// so the Web UI can poll it while runThreadTurn (internal/agent) is
+// streaming instead of only showing a static "replying…" placeholder.
+// Auth mirrors GET .../messages exactly: member-or-owner, then a 404 if the
+// group itself doesn't exist. {"active":false} (with no other fields) is
+// returned when no turn is currently in flight for the room.
+func (s *Server) handleGetGroupDMLive(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.requireMemberOrOwner(w, r, id) {
+		return
+	}
+	if _, ok := s.groupdms.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "group not found: "+id)
+		return
+	}
+	active, snap := s.groupdms.ThreadLive(id)
+	if !active {
+		writeJSONResponse(w, http.StatusOK, map[string]any{"active": false})
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, struct {
+		Active bool `json:"active"`
+		agent.ThreadLiveSnapshot
+	}{Active: true, ThreadLiveSnapshot: snap})
+}
+
 // handleGetGroupDeadLetters lists permanently failed notification
 // deliveries for a room. Owner-only — dead letters carry rendered
 // notification payloads that may span other members' messages.

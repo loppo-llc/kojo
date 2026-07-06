@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/auth"
@@ -460,4 +461,150 @@ func TestMarkGroupReadPersistsCursor(t *testing.T) {
 	if got := agentUnread(m1.ID); got != 1 {
 		t.Fatalf("agent unread (after=m1) = %d, want 1", got)
 	}
+}
+
+func getGroupDMLiveRequest(groupID string, p auth.Principal) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/groupdms/"+groupID+"/live", nil)
+	req.SetPathValue("id", groupID)
+	return authedRequest(req, p)
+}
+
+// TestHandleGetGroupDMLive_InactiveWhenNoTurnRunning verifies the endpoint
+// reports {"active":false} (and nothing else) when no thread turn is
+// currently in flight for the room.
+func TestHandleGetGroupDMLive_InactiveWhenNoTurnRunning(t *testing.T) {
+	srv, _, group, _ := newGroupDMHandlerTestServer(t)
+	rr := httptest.NewRecorder()
+	srv.handleGetGroupDMLive(rr, getGroupDMLiveRequest(group.ID, auth.Principal{Role: auth.RoleOwner}))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]any
+	readJSONResponse(t, rr, &resp)
+	if active, _ := resp["active"].(bool); active {
+		t.Fatalf("active = %v, want false", active)
+	}
+	if _, hasOther := resp["status"]; hasOther || len(resp) != 1 {
+		t.Errorf("inactive response should contain only active:false, got %+v", resp)
+	}
+}
+
+// TestHandleGetGroupDMLive_RejectsNonMemberAgent mirrors
+// TestHandleClearGroupMessages_RejectsNonMemberAgent's auth check: an agent
+// token that isn't a member of the room gets 403, matching requireMemberOrOwner.
+func TestHandleGetGroupDMLive_RejectsNonMemberAgent(t *testing.T) {
+	srv, _, group, outsider := newGroupDMHandlerTestServer(t)
+	rr := httptest.NewRecorder()
+	srv.handleGetGroupDMLive(rr, getGroupDMLiveRequest(group.ID, auth.Principal{
+		Role:    auth.RoleAgent,
+		AgentID: outsider.ID,
+	}))
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestHandleGetGroupDMLive_NotFound mirrors GET .../messages' 404 for an
+// unknown group id (requireMemberOrOwner passes an Owner caller through
+// regardless of existence; the handler's own existence check 404s).
+func TestHandleGetGroupDMLive_NotFound(t *testing.T) {
+	srv, _, _, _ := newGroupDMHandlerTestServer(t)
+	rr := httptest.NewRecorder()
+	srv.handleGetGroupDMLive(rr, getGroupDMLiveRequest("does-not-exist", auth.Principal{Role: auth.RoleOwner}))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+// liveThreadStub blocks a thread turn after emitting a
+// thinking/tool_use/tool_result/text sequence, so the test can poll GET
+// /live for the accumulated mid-turn snapshot before releasing it to finish.
+type liveThreadStub struct {
+	release chan struct{}
+}
+
+func (s *liveThreadStub) fn(ctx context.Context, agentID, userMessage string, opts agent.OneShotOpts) (<-chan agent.ChatEvent, error) {
+	ch := make(chan agent.ChatEvent)
+	go func() {
+		defer close(ch)
+		ch <- agent.ChatEvent{Type: "status", Status: "thinking"}
+		ch <- agent.ChatEvent{Type: "thinking", Delta: "considering"}
+		ch <- agent.ChatEvent{Type: "tool_use", ToolUseID: "tu_1", ToolName: "shell", ToolInput: `{"cmd":"ls"}`}
+		ch <- agent.ChatEvent{Type: "tool_result", ToolUseID: "tu_1", ToolName: "shell", ToolOutput: "ok"}
+		ch <- agent.ChatEvent{Type: "text", Delta: "partial reply"}
+		<-s.release
+		ch <- agent.ChatEvent{Type: "done", Message: &agent.Message{Content: "partial reply"}}
+	}()
+	return ch, nil
+}
+
+// TestHandleGetGroupDMLive_ActiveSnapshotThenClears drives a real (stubbed)
+// thread turn and verifies GET /live surfaces the accumulated
+// status/thinking/tool-use/text snapshot while the turn is in flight, then
+// reports inactive again once the turn completes.
+func TestHandleGetGroupDMLive_ActiveSnapshotThenClears(t *testing.T) {
+	srv, gdm, group, _ := newGroupDMHandlerTestServer(t)
+	aliceID := group.Members[0].AgentID
+
+	stub := &liveThreadStub{release: make(chan struct{})}
+	gdm.SetOneShotForTesting(stub.fn)
+
+	thread, err := gdm.CreateThread(aliceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gdm.PostUserMessage(context.Background(), thread.ID, "ping", nil, true); err != nil {
+		t.Fatal(err)
+	}
+
+	var resp struct {
+		Active   bool            `json:"active"`
+		Status   string          `json:"status"`
+		Thinking string          `json:"thinking"`
+		Text     string          `json:"text"`
+		ToolUses []agent.ToolUse `json:"toolUses"`
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		rr := httptest.NewRecorder()
+		srv.handleGetGroupDMLive(rr, getGroupDMLiveRequest(thread.ID, auth.Principal{Role: auth.RoleOwner}))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+		readJSONResponse(t, rr, &resp)
+		if resp.Active && resp.Text == "partial reply" &&
+			len(resp.ToolUses) == 1 && resp.ToolUses[0].Output != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !resp.Active {
+		t.Fatalf("live snapshot never became active, last = %+v", resp)
+	}
+	if resp.Status != "thinking" {
+		t.Errorf("status = %q, want %q", resp.Status, "thinking")
+	}
+	if resp.Thinking != "considering" {
+		t.Errorf("thinking = %q, want %q", resp.Thinking, "considering")
+	}
+	if len(resp.ToolUses) != 1 || resp.ToolUses[0].Name != "shell" || resp.ToolUses[0].Output != "ok" {
+		t.Errorf("toolUses = %+v, want one shell call with output %q", resp.ToolUses, "ok")
+	}
+
+	close(stub.release)
+
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		rr := httptest.NewRecorder()
+		srv.handleGetGroupDMLive(rr, getGroupDMLiveRequest(thread.ID, auth.Principal{Role: auth.RoleOwner}))
+		var r2 struct {
+			Active bool `json:"active"`
+		}
+		readJSONResponse(t, rr, &r2)
+		if !r2.Active {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("live snapshot still active after turn completed")
 }

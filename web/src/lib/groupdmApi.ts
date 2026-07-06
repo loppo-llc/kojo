@@ -85,6 +85,18 @@ export interface UnreadInfo {
   hasMore: boolean;
 }
 
+/** Live snapshot of a thread room's in-flight turn (GET .../live), polled
+ * while the "replying…" indicator is up so thinking / tool calls / partial
+ * text can render instead of only a static placeholder. `active: false` means
+ * no turn is currently running for the room — the other fields are absent. */
+export interface ThreadLive {
+  active: boolean;
+  status?: string;
+  thinking?: string;
+  text?: string;
+  toolUses?: ToolUse[];
+}
+
 /** localStorage key for the last-read message id of a room. */
 export const lastReadKey = (roomId: string) => `kojo.groupdm.lastRead.${roomId}`;
 
@@ -157,6 +169,8 @@ export const groupdmApi = {
    * fresh room (201) — no dedup, unlike openDM. */
   createThread: (agentId: string) =>
     post<GroupDMInfo>("/api/v1/threads", { agentId }),
+
+  threadLive: (id: string) => get<ThreadLive>(`/api/v1/groupdms/${id}/live`),
 
   unread: (id: string, after?: string | null) =>
     get<UnreadInfo>(

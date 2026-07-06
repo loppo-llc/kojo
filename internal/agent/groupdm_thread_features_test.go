@@ -232,6 +232,92 @@ func TestThreadAutoTitle_SetOnceNotOverwritten(t *testing.T) {
 	}
 }
 
+// liveThreadStub emits a thinking/tool_use/tool_result/text sequence
+// asynchronously, then blocks on release before sending the terminal "done"
+// event — so a test can observe GroupDMManager.ThreadLive's accumulated
+// mid-turn snapshot before letting the turn finish.
+type liveThreadStub struct {
+	release chan struct{}
+}
+
+func (s *liveThreadStub) fn(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error) {
+	ch := make(chan ChatEvent)
+	go func() {
+		defer close(ch)
+		ch <- ChatEvent{Type: "status", Status: "thinking"}
+		ch <- ChatEvent{Type: "thinking", Delta: "pondering "}
+		ch <- ChatEvent{Type: "thinking", Delta: "deeply"}
+		ch <- ChatEvent{Type: "tool_use", ToolUseID: "tu_1", ToolName: "shell", ToolInput: `{"cmd":"ls"}`}
+		ch <- ChatEvent{Type: "tool_result", ToolUseID: "tu_1", ToolName: "shell", ToolOutput: "file1\nfile2"}
+		ch <- ChatEvent{Type: "text", Delta: "here "}
+		ch <- ChatEvent{Type: "text", Delta: "is the answer"}
+		<-s.release
+		ch <- ChatEvent{Type: "done", Message: &Message{Content: "here is the answer"}}
+	}()
+	return ch, nil
+}
+
+// TestThreadLive_ShowsAccumulatedSnapshotMidTurnThenClears verifies that
+// ThreadLive reflects the status/thinking/tool-use/text accumulated so far
+// while a thread turn is in flight, and that the entry is gone once the
+// turn completes and the reply is posted.
+func TestThreadLive_ShowsAccumulatedSnapshotMidTurnThenClears(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	stub := &liveThreadStub{release: make(chan struct{})}
+	gdm.oneShot = stub.fn
+
+	g, err := gdm.CreateThread("ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gdm.PostUserMessage(context.Background(), g.ID, "ping", nil, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Poll until the live snapshot shows the fully-accumulated mid-turn
+	// state (the stub is blocked before "done", so this state is stable).
+	var active bool
+	var snap ThreadLiveSnapshot
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		active, snap = gdm.ThreadLive(g.ID)
+		if active && snap.Text == "here is the answer" &&
+			len(snap.ToolUses) == 1 && snap.ToolUses[0].Output != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !active {
+		t.Fatalf("ThreadLive not active mid-turn")
+	}
+	if snap.Status != "thinking" {
+		t.Errorf("status = %q, want %q", snap.Status, "thinking")
+	}
+	if snap.Thinking != "pondering deeply" {
+		t.Errorf("thinking = %q, want %q", snap.Thinking, "pondering deeply")
+	}
+	if snap.Text != "here is the answer" {
+		t.Errorf("text = %q, want %q", snap.Text, "here is the answer")
+	}
+	if len(snap.ToolUses) != 1 || snap.ToolUses[0].Name != "shell" ||
+		snap.ToolUses[0].Input != `{"cmd":"ls"}` || snap.ToolUses[0].Output != "file1\nfile2" {
+		t.Errorf("toolUses = %+v, want one shell call with matched output", snap.ToolUses)
+	}
+
+	// Release the stub so the turn completes and the reply is posted.
+	close(stub.release)
+	waitForMessage(t, gdm, g.ID, "here is the answer")
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if a, _ := gdm.ThreadLive(g.ID); !a {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("ThreadLive entry still active after turn completed")
+}
+
 func TestDeriveThreadTitle(t *testing.T) {
 	cases := map[string]string{
 		"":                    "",
