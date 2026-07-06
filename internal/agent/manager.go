@@ -3541,7 +3541,7 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 	m.busyMu.Lock()
 	delete(m.editing, agentID)
 	editingReleased = true
-	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, accumulator: newChatAccumulator()}
+	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, accumulator: newChatAccumulator(), outCh: outCh}
 	m.busyMu.Unlock()
 	m.notifyChatStart(agentID)
 
@@ -3550,7 +3550,19 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 		defer m.clearBusy(agentID)
 		defer cancel()
 
-		backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{})
+		backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
+			// Register the steer handle so a steer sent during a
+			// regenerate turn injects into it instead of stalling in
+			// awaitSteerHandle until the deadline.
+			OnSteerReady: func(fn SteerFunc) {
+				m.busyMu.Lock()
+				if entry, ok := m.busy[agentID]; ok {
+					entry.steer = fn
+					m.busy[agentID] = entry
+				}
+				m.busyMu.Unlock()
+			},
+		})
 		if err != nil {
 			// Abort before the stream started is not a failure —
 			// exit silently so no error surfaces in the transcript.

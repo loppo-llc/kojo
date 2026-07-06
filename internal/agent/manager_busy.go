@@ -83,27 +83,29 @@ func (m *Manager) Abort(agentID string) {
 }
 
 // Steer injects an additional user message into the agent's currently
-// running turn (claude backend only — see ChatOptions.OnSteerReady /
+// running turn (claude/codex backends only — see ChatOptions.OnSteerReady /
 // SteerFunc). Returns ErrAgentNotBusy if no turn is running, and
-// ErrSteerUnsupported if the running turn's backend hasn't registered a
-// steer handle (non-claude backends, or the claude turn's stdin pipe isn't
-// ready yet). On success the steered text is appended to the transcript as
-// a plain user message, mirroring how the turn-start message is persisted.
-func (m *Manager) Steer(agentID, text string) error {
-	// Snapshot the steer handle under busyMu, but do NOT hold the global
-	// lock across the pipe write or the transcript append: a wedged claude
+// ErrSteerUnsupported if the running turn's backend cannot register a
+// steer handle (non-steerable backends). On success the steered text is
+// appended to the transcript as a plain user message, mirroring how the
+// turn-start message is persisted.
+//
+// A steer that arrives while the turn is still starting — prepareChat
+// (memory search, context assembly) runs BEFORE the busy entry exists,
+// and OnSteerReady fires slightly after it — waits for the handle
+// instead of bouncing 409 not_busy. Without the wait, a message sent in
+// that window falls back to a queued normal send and gets reordered
+// behind steers sent later in the same turn.
+func (m *Manager) Steer(ctx context.Context, agentID, text string) error {
+	// Wait for the steer handle, but do NOT hold the global lock across
+	// the wait, the pipe write, or the transcript append: a wedged claude
 	// process (stdin buffer full) or a slow disk would otherwise stall
 	// every agent in the daemon behind busyMu. The steer func itself is
 	// safe to call after the turn ends — the stdin writer returns
 	// ErrAgentNotBusy once closed.
-	m.busyMu.Lock()
-	entry, ok := m.busy[agentID]
-	m.busyMu.Unlock()
-	if !ok {
-		return ErrAgentNotBusy
-	}
-	if entry.steer == nil {
-		return ErrSteerUnsupported
+	entry, err := m.awaitSteerHandle(ctx, agentID)
+	if err != nil {
+		return err
 	}
 	if err := entry.steer(text); err != nil {
 		return err
@@ -126,6 +128,83 @@ func (m *Manager) Steer(agentID, text string) error {
 	}
 	m.busyMu.Unlock()
 	return nil
+}
+
+// steerHandleWait bounds how long Steer waits for a starting turn to
+// register its steer handle. prepareChat (memory search, volatile
+// context) normally finishes well inside this; the bound only guards
+// against a prepare that wedges or a backend that never registers.
+const steerHandleWait = 30 * time.Second
+
+// backendSupportsSteer reports whether the tool's backend ever registers
+// a steer handle (ChatOptions.OnSteerReady).
+func backendSupportsSteer(tool string) bool {
+	return tool == "claude" || tool == "codex"
+}
+
+// awaitSteerHandle returns the current turn's busy entry once its steer
+// handle is registered. If no turn is running or preparing, it returns
+// ErrAgentNotBusy immediately. If a turn is running or starting on a
+// backend that can never steer, it returns ErrSteerUnsupported
+// immediately. Otherwise (turn preparing, or busy entry present but
+// OnSteerReady not yet fired) it polls until the handle appears, the
+// turn disappears, ctx is cancelled, or steerHandleWait elapses.
+//
+// The wait is pinned to the FIRST busy entry it observes (by outCh
+// identity): if that turn ends and a different one appears while we
+// poll, the steer was aimed at a turn that no longer exists and the
+// caller gets ErrAgentNotBusy (→ normal-send fallback) instead of the
+// text silently landing in the wrong turn. A prepare that aborts and is
+// replaced by another prepare inside one poll interval is not
+// distinguishable (prepares carry no identity); steering the successor
+// turn there matches the pre-wait fallback ordering anyway.
+func (m *Manager) awaitSteerHandle(ctx context.Context, agentID string) (busyEntry, error) {
+	var supportChecked, supported bool
+	var pinnedCh chan<- ChatEvent
+	deadline := time.Now().Add(steerHandleWait)
+	for {
+		m.busyMu.Lock()
+		entry, busyOK := m.busy[agentID]
+		preparing := m.preparing[agentID] > 0
+		m.busyMu.Unlock()
+		if busyOK {
+			if pinnedCh == nil {
+				pinnedCh = entry.outCh
+			} else if entry.outCh != pinnedCh {
+				return busyEntry{}, ErrAgentNotBusy
+			}
+			if entry.steer != nil {
+				return entry, nil
+			}
+		} else if pinnedCh != nil {
+			// The turn we were waiting on ended without ever
+			// registering a handle.
+			return busyEntry{}, ErrAgentNotBusy
+		}
+		if !busyOK && !preparing {
+			return busyEntry{}, ErrAgentNotBusy
+		}
+		// A turn is starting (preparing) or running without a handle
+		// yet. Waiting is only useful when the backend will eventually
+		// register one; look the tool up once, lazily.
+		if !supportChecked {
+			supportChecked = true
+			if ag, ok := m.Get(agentID); ok {
+				supported = backendSupportsSteer(ag.Tool)
+			}
+		}
+		if !supported {
+			return busyEntry{}, ErrSteerUnsupported
+		}
+		if time.Now().After(deadline) {
+			return busyEntry{}, ErrSteerUnsupported
+		}
+		select {
+		case <-ctx.Done():
+			return busyEntry{}, ctx.Err()
+		case <-time.After(75 * time.Millisecond):
+		}
+	}
 }
 
 // WaitChatIdle polls busyMu until every concurrent write path

@@ -1719,7 +1719,7 @@ func (s *Server) handleSteerAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.agents.Steer(id, body.Content); err != nil {
+	if err := s.agents.Steer(r.Context(), id, body.Content); err != nil {
 		switch {
 		case errors.Is(err, agent.ErrAgentNotBusy):
 			writeError(w, http.StatusConflict, "not_busy", "agent has no turn in progress")

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -10,7 +11,7 @@ import (
 // running turn.
 func TestManager_Steer_NotBusy(t *testing.T) {
 	m := newTestManager(t)
-	if err := m.Steer("ag_nobody", "hello"); !errors.Is(err, ErrAgentNotBusy) {
+	if err := m.Steer(context.Background(), "ag_nobody", "hello"); !errors.Is(err, ErrAgentNotBusy) {
 		t.Errorf("err = %v, want ErrAgentNotBusy", err)
 	}
 }
@@ -24,7 +25,7 @@ func TestManager_Steer_UnsupportedBackend(t *testing.T) {
 	m.busy["ag_test"] = busyEntry{startedAt: time.Now(), cancel: func() {}}
 	m.busyMu.Unlock()
 
-	if err := m.Steer("ag_test", "hello"); !errors.Is(err, ErrSteerUnsupported) {
+	if err := m.Steer(context.Background(), "ag_test", "hello"); !errors.Is(err, ErrSteerUnsupported) {
 		t.Errorf("err = %v, want ErrSteerUnsupported", err)
 	}
 }
@@ -54,7 +55,7 @@ func TestManager_Steer_InjectsAndPersists(t *testing.T) {
 	}
 	m.busyMu.Unlock()
 
-	if err := m.Steer("ag_test", "steer this turn"); err != nil {
+	if err := m.Steer(context.Background(), "ag_test", "steer this turn"); err != nil {
 		t.Fatalf("Steer: %v", err)
 	}
 	if got != "steer this turn" {
@@ -99,7 +100,7 @@ func TestManager_Steer_SteerFuncError(t *testing.T) {
 	}
 	m.busyMu.Unlock()
 
-	if err := m.Steer("ag_test", "too late"); err == nil {
+	if err := m.Steer(context.Background(), "ag_test", "too late"); err == nil {
 		t.Error("expected error from steer func to propagate")
 	}
 }
