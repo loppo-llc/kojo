@@ -80,6 +80,7 @@ type claudeSession struct {
 	turnCtx       context.Context // solicited turn's context (Background for unsolicited)
 	unsolicited   bool            // true when the active turn is a background notification
 	turnCanAnswer bool            // true when a user can answer AskUserQuestion this turn
+	turnAutomated bool            // true when the active turn is automated (question held with a timeout)
 	turnDone    chan struct{}   // closed when the active turn's result is delivered
 }
 
@@ -247,10 +248,11 @@ func (b *ClaudeBackend) chatViaSession(ctx context.Context, agent *Agent, userMe
 		userMessage = injectRecentMessagesContext(userMessage, opts.RecentMessagesContext)
 	}
 
-	// A question can only be surfaced when the caller wired an answer channel
-	// and the turn is watched by a user; otherwise readLoop auto-denies.
-	canAnswer := opts.OnQuestionReady != nil && !opts.AutomatedTrigger
-	ch, err := sess.startTurn(ctx, agent, userMessage, canAnswer)
+	// A question can be surfaced whenever the caller wired an answer channel.
+	// Automated turns surface it too (held with a timeout by handleControlRequest)
+	// instead of auto-denying; only turns with no answer channel deny inline.
+	canAnswer := opts.OnQuestionReady != nil
+	ch, err := sess.startTurn(ctx, agent, userMessage, canAnswer, opts.AutomatedTrigger)
 	if err == nil {
 		if opts.OnSteerReady != nil {
 			opts.OnSteerReady(sess.stdinW.writeUserLine)
@@ -433,7 +435,7 @@ func (s *claudeSession) healthy(fp string) bool {
 // startTurn registers a solicited turn, writes the user message onto the live
 // stdin, and returns the turn's event channel. The returned channel receives
 // streaming events and a terminal done/error, then closes.
-func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage string, canAnswer bool) (<-chan ChatEvent, error) {
+func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage string, canAnswer, automated bool) (<-chan ChatEvent, error) {
 	s.mu.Lock()
 	if s.state == sessDead {
 		s.mu.Unlock()
@@ -452,6 +454,7 @@ func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage
 	s.state = sessInTurn
 	s.unsolicited = false
 	s.turnCanAnswer = canAnswer
+	s.turnAutomated = automated
 	s.turnSink = sink
 	s.turnCtx = ctx
 	s.turnDone = done
@@ -547,13 +550,26 @@ func (s *claudeSession) interrupt() {
 func (s *claudeSession) handleControlRequest(cr *controlRequestMsg) {
 	s.mu.Lock()
 	acc := s.acc
-	automated := !s.turnCanAnswer || s.unsolicited || s.state != sessInTurn || acc == nil
+	// A question can only be surfaced/answered on a live turn that wired an
+	// answer channel. Otherwise force the immediate-deny path (qstate nil).
+	noChannel := !s.turnCanAnswer || s.state != sessInTurn || acc == nil
+	// Unsolicited (background notification) and system-triggered turns are
+	// automated: hold the question with a timeout rather than until turn end.
+	automated := s.turnAutomated || s.unsolicited
 	s.mu.Unlock()
 	send := func(ChatEvent) bool { return true }
 	if acc != nil {
 		send = acc.send
 	}
-	handleControlRequest(cr, s.stdinW, s.qstate, automated, s.logger, send)
+	qstate := s.qstate
+	if noChannel {
+		qstate = nil
+	}
+	var questionTimeout time.Duration
+	if automated {
+		questionTimeout = automatedQuestionTimeout
+	}
+	handleControlRequest(cr, s.stdinW, qstate, questionTimeout, s.logger, send)
 }
 
 // readLoop parses the process stdout for its whole lifetime, demuxing turns.
@@ -664,13 +680,18 @@ func (s *claudeSession) openUnsolicitedLocked() {
 	sink := make(chan ChatEvent, 64)
 	s.state = sessInTurn
 	s.unsolicited = true
+	// An unsolicited turn is automated, but a watching human can still answer an
+	// AskUserQuestion it raises — the answer func is handed to the background
+	// turn handler below, and turnCanAnswer lets handleControlRequest surface the
+	// card (held with a timeout since unsolicited turns count as automated).
+	s.turnCanAnswer = true
 	s.turnSink = sink
 	s.turnCtx = context.Background()
 	s.turnDone = make(chan struct{})
 	s.acc = newTurnAccumulator(s.logger, func(e ChatEvent) bool {
 		return sessionSend(context.Background(), sink, e)
 	})
-	go s.b.onBackgroundTurn(s.agentID, sink)
+	go s.b.onBackgroundTurn(s.agentID, sink, s.qstate.answer)
 }
 
 // absorbNotification handles a task-notification result that raced into an
@@ -686,7 +707,7 @@ func (s *claudeSession) absorbNotification(event claudeStreamEvent, rawParent st
 	acc := newTurnAccumulator(s.logger, func(e ChatEvent) bool {
 		return sessionSend(context.Background(), sink, e)
 	})
-	go s.b.onBackgroundTurn(s.agentID, sink)
+	go s.b.onBackgroundTurn(s.agentID, sink, s.qstate.answer)
 	acc.feed(event, rawParent)
 	res := acc.finalize()
 	turnUsage := s.turnUsageDelta(res)

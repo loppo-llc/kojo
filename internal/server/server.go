@@ -825,6 +825,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents", s.handleListAgents)
 	mux.HandleFunc("POST /api/v1/agents", s.handleCreateAgent)
 	mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGetAgent)
+	mux.HandleFunc("GET /api/v1/agents/{id}/ratelimit", s.handleGetAgentRateLimit)
 	mux.HandleFunc("GET /api/v1/agents/{id}/files", s.handleListAgentFiles)
 	mux.HandleFunc("GET /api/v1/agents/{id}/files/view", s.handleViewAgentFile)
 	mux.HandleFunc("GET /api/v1/agents/{id}/files/raw", s.handleRawAgentFile)

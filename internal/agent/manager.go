@@ -171,6 +171,13 @@ type Manager struct {
 	memIndexes   map[string]*MemoryIndex
 	memIndexesMu sync.Mutex
 
+	// rateLimits caches the latest per-agent rate-limit snapshot parsed
+	// from the Claude backend's stream (persisted to the kv table so it
+	// survives a restart). Lives outside busyEntry because it must outlive
+	// the busy window — see ratelimit.go.
+	rateLimits   map[string]RateLimitSnapshot
+	rateLimitsMu sync.Mutex
+
 	// OnChatDone is called when an agent finishes its response.
 	OnChatDone func(agent *Agent, message *Message)
 
@@ -2458,7 +2465,7 @@ func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, back
 // plumbing of Chat so the turn shows up live for connected WS clients and in
 // the transcript on next connect, and marks the agent busy for its duration so
 // status displays are truthful.
-func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent) {
+func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent, answer AnswerFunc) {
 	// The session reports idle at the previous turn's result, but the Manager's
 	// chat goroutine may still be finishing persistence/indexing with the busy
 	// entry set. Briefly retry acquiring the slot before giving up, so a
@@ -2487,7 +2494,9 @@ func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent) 
 			outCh = make(chan ChatEvent, 64)
 			bc := newChatBroadcaster(outCh)
 			acc := newChatAccumulator()
-			m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, source: BusySourceNotification, accumulator: acc, outCh: outCh, unsolicited: true}
+			// answer lets a watching human resolve an AskUserQuestion raised on
+			// this automated turn (surfaced as a card, held with a timeout).
+			m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, source: BusySourceNotification, accumulator: acc, outCh: outCh, unsolicited: true, answer: answer}
 			// Count this in-flight unsolicited turn so drains (waitChatIdle /
 			// WaitAllChatsIdle) don't observe idle while it is writing.
 			m.notifying[agentID]++
@@ -2778,6 +2787,14 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 
 			accumulate(&event)
 			handleTerminal(&event)
+
+			// Rate-limit telemetry: record the latest snapshot (in-memory
+			// + kv) so the API and volatile-context reads see it, then let
+			// it fall through to the non-blocking forward below so the UI
+			// badge updates live over the WS.
+			if event.Type == "rate_limit" && event.RateLimit != nil {
+				m.recordRateLimit(agentID, *event.RateLimit)
+			}
 
 			// Terminal events (done/error) use blocking send so the
 			// client always receives them. A user_question also blocks:

@@ -22,7 +22,7 @@ func collectEvents(t *testing.T, lines ...string) ([]ChatEvent, *streamParseResu
 		return true
 	}
 
-	result := parseClaudeStream(r, logger, send, nil, nil, nil, false)
+	result := parseClaudeStream(r, logger, send, nil, nil, nil, 0)
 	return events, result
 }
 
@@ -297,7 +297,7 @@ func TestParseClaudeStream_Cancelled(t *testing.T) {
 		return callCount < 2 // cancel after first event
 	}
 
-	result := parseClaudeStream(r, testLogger(), send, nil, nil, nil, false)
+	result := parseClaudeStream(r, testLogger(), send, nil, nil, nil, 0)
 	if !result.cancelled {
 		t.Error("expected cancelled = true")
 	}

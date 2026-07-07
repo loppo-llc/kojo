@@ -52,7 +52,7 @@ func collect(t *testing.T, ch <-chan ChatEvent, timeout time.Duration) []ChatEve
 
 func TestSessionSolicitedTurn(t *testing.T) {
 	s, pw := newTestSession(t, nil)
-	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false)
+	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false, false)
 	if err != nil {
 		t.Fatalf("startTurn: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestSessionSolicitedTurn(t *testing.T) {
 
 func TestSessionUnsolicitedTurn(t *testing.T) {
 	bgCh := make(chan (<-chan ChatEvent), 1)
-	_, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent) {
+	_, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc) {
 		bgCh <- events
 	})
 	// No solicited turn: feed an unsolicited notification segment.
@@ -120,10 +120,10 @@ func TestSessionUnsolicitedTurn(t *testing.T) {
 // the user turn's content.
 func TestSessionNotifResultDuringSolicitedTurn(t *testing.T) {
 	bgCh := make(chan (<-chan ChatEvent), 1)
-	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent) {
+	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc) {
 		bgCh <- events
 	})
-	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false)
+	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false, false)
 	if err != nil {
 		t.Fatalf("startTurn: %v", err)
 	}
@@ -168,7 +168,7 @@ func TestSessionNotifResultDuringSolicitedTurn(t *testing.T) {
 
 func TestSessionEmptyUnsolicitedDropped(t *testing.T) {
 	bgCh := make(chan (<-chan ChatEvent), 1)
-	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent) {
+	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc) {
 		bgCh <- events
 	})
 	// Stray content-less segment: should open+close the bg turn with no done.
@@ -192,7 +192,7 @@ func TestSessionEmptyUnsolicitedDropped(t *testing.T) {
 
 func TestSessionEOFMidTurnErrors(t *testing.T) {
 	s, pw := newTestSession(t, nil)
-	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false)
+	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false, false)
 	if err != nil {
 		t.Fatalf("startTurn: %v", err)
 	}
@@ -221,23 +221,23 @@ func TestSessionEOFMidTurnErrors(t *testing.T) {
 func TestSessionBusyRejectsSecondTurn(t *testing.T) {
 	s, pw := newTestSession(t, nil)
 	defer pw.Close()
-	if _, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false); err != nil {
+	if _, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false, false); err != nil {
 		t.Fatalf("startTurn 1: %v", err)
 	}
-	if _, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "again", false); err != ErrAgentBusy {
+	if _, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "again", false, false); err != ErrAgentBusy {
 		t.Fatalf("startTurn 2 err = %v, want ErrAgentBusy", err)
 	}
 }
 
 func TestSessionStrayIdleEventsDoNotOpenTurn(t *testing.T) {
 	called := make(chan struct{}, 1)
-	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent) {
+	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc) {
 		called <- struct{}{}
 		for range events {
 		}
 	})
 	// Complete a solicited turn.
-	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false)
+	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false, false)
 	if err != nil {
 		t.Fatalf("startTurn: %v", err)
 	}

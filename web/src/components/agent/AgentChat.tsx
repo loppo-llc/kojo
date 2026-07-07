@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useNavigate, useLocation } from "react-router";
-import { agentApi, type AgentInfo, type AgentMessage, type AgentMessageAttachment, type ChatEvent, type QueuedAgentMessage, type UserQuestion } from "../../lib/agentApi";
+import { agentApi, type AgentInfo, type AgentMessage, type AgentMessageAttachment, type ChatEvent, type QueuedAgentMessage, type RateLimitInfo, type UserQuestion } from "../../lib/agentApi";
+import { RateLimitBadge } from "./RateLimitBadge";
 import { UserQuestionCard, type PendingQuestion } from "./UserQuestionCard";
 import { errMsg, localRFC3339 } from "../../lib/utils";
 import { useEnterSends } from "../../lib/preferences";
@@ -85,6 +86,9 @@ export function AgentChat() {
   // Rendered as cards below the live stream; cleared when the turn ends.
   const [pendingQuestions, setPendingQuestions] = useState<PendingQuestion[]>([]);
   const [hasMore, setHasMore] = useState(false);
+  // Latest rate-limit snapshot for the header badge. Hydrated on mount from
+  // the ratelimit endpoint, then updated live off "rate_limit" ChatEvents.
+  const [rateLimit, setRateLimit] = useState<RateLimitInfo | null>(null);
   const {
     pendingFiles,
     setPendingFiles,
@@ -182,6 +186,10 @@ export function AgentChat() {
     setMessages([]);
     setHasMore(false);
     agentApi.get(id).then(setAgent).catch(() => navigateRef.current("/"));
+    // Hydrate the rate-limit badge from the persisted snapshot; live updates
+    // then arrive over the WS as "rate_limit" events.
+    setRateLimit(null);
+    agentApi.rateLimit(id).then((s) => setRateLimit(s)).catch(() => {});
     // Guarded by the shared seq like every other fetch path — the WS may
     // connect (and onConnected refetch+commit) before this GET returns,
     // and an unguarded late commit here would wipe that fresher merge.
@@ -460,6 +468,9 @@ export function AgentChat() {
         return;
       }
       switch (event.type) {
+        case "rate_limit":
+          if (event.rateLimit) setRateLimit(event.rateLimit);
+          break;
         case "status":
           setStreamStatus(event.status ?? "");
           if (event.status === "thinking") {
@@ -930,6 +941,7 @@ export function AgentChat() {
             </span>
           </div>
         </div>
+        <RateLimitBadge info={rateLimit} />
         {ttsAgentEnabled && (
           <button
             onClick={() => setTTSAuto((v) => !v)}

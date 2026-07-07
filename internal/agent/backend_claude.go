@@ -146,8 +146,21 @@ func maybeControlRequest(line string) (*controlRequestMsg, bool) {
 }
 
 // automatedDenyMessage is written back when the model calls AskUserQuestion on
-// a turn no human is watching (cron, background notification, one-shot).
+// a turn that can never surface a question to a user (no answer channel wired,
+// e.g. a Slack one-shot). Automated turns that CAN surface a card use the
+// timeout path (see automatedQuestionTimeout) instead of denying immediately.
 const automatedDenyMessage = "No user is watching this automated turn; continue without asking and use your best judgment."
+
+// automatedQuestionTimeout bounds how long an automated turn (cron, background
+// notification, restart-wake) holds an AskUserQuestion open waiting for a human
+// who may not be watching. On expiry the question is auto-denied so a blocked
+// CLI eventually proceeds. User turns pass timeout 0 (held until turn end/abort,
+// unchanged).
+const automatedQuestionTimeout = 10 * time.Minute
+
+// automatedQuestionTimeoutMessage is the deny wording used when an automated
+// turn's question goes unanswered past automatedQuestionTimeout.
+const automatedQuestionTimeoutMessage = "No answer arrived within the time limit for this automated turn; continue without asking and use your best judgment."
 
 // claudeQuestionState tracks the interactive AskUserQuestion prompts pending on
 // a live CLI process and answers them by writing control_response lines. One
@@ -162,18 +175,44 @@ type claudeQuestionState struct {
 	// {"questions":[...]} object) so the allow control_response can echo the
 	// questions array back verbatim alongside the answers.
 	pending map[string]json.RawMessage
+	// timers holds the auto-deny timer for questions registered with a
+	// timeout (automated turns). Stopped and cleared when the question is
+	// answered or the turn ends, so a resolved question never fires a late deny.
+	timers map[string]*time.Timer
 }
 
 func newClaudeQuestionState(stdinW *claudeStdinWriter) *claudeQuestionState {
-	return &claudeQuestionState{stdinW: stdinW, pending: make(map[string]json.RawMessage)}
+	return &claudeQuestionState{
+		stdinW:  stdinW,
+		pending: make(map[string]json.RawMessage),
+		timers:  make(map[string]*time.Timer),
+	}
 }
 
 // register records a pending question so a later answer can rebuild its
-// control_response.
-func (q *claudeQuestionState) register(requestID string, input json.RawMessage) {
+// control_response. When timeout > 0 it also arms a timer that auto-denies the
+// question with timeoutMsg if no answer arrives — used for automated turns
+// nobody may be watching so a blocked CLI eventually proceeds.
+func (q *claudeQuestionState) register(requestID string, input json.RawMessage, timeout time.Duration, timeoutMsg string) {
 	q.mu.Lock()
 	q.pending[requestID] = append(json.RawMessage(nil), input...)
+	if timeout > 0 {
+		q.timers[requestID] = time.AfterFunc(timeout, func() {
+			// answer() is a no-op (ErrQuestionNotFound) if the question was
+			// already resolved, so a race with a real answer is harmless.
+			_ = q.answer(requestID, nil, true, timeoutMsg)
+		})
+	}
 	q.mu.Unlock()
+}
+
+// stopTimerLocked stops and clears any auto-deny timer for requestID. Caller
+// holds q.mu.
+func (q *claudeQuestionState) stopTimerLocked(requestID string) {
+	if t := q.timers[requestID]; t != nil {
+		t.Stop()
+		delete(q.timers, requestID)
+	}
 }
 
 // answer implements AnswerFunc: it builds and writes the control_response for a
@@ -183,6 +222,7 @@ func (q *claudeQuestionState) answer(requestID string, answers map[string]any, d
 	input, ok := q.pending[requestID]
 	if ok {
 		delete(q.pending, requestID)
+		q.stopTimerLocked(requestID)
 	}
 	q.mu.Unlock()
 	if !ok {
@@ -224,6 +264,7 @@ func (q *claudeQuestionState) denyAllPending(reason string) {
 	ids := make([]string, 0, len(q.pending))
 	for id := range q.pending {
 		ids = append(ids, id)
+		q.stopTimerLocked(id)
 	}
 	q.pending = make(map[string]json.RawMessage)
 	q.mu.Unlock()
@@ -234,10 +275,16 @@ func (q *claudeQuestionState) denyAllPending(reason string) {
 
 // handleControlRequest resolves a decoded can_use_tool control_request. It
 // never blocks: non-AskUserQuestion tools are auto-allowed (preserving
-// bypassPermissions semantics); AskUserQuestion is auto-denied on automated
-// turns or when no answer channel exists (qstate nil), and otherwise registered
-// as pending with a user_question event emitted via send for the UI to render.
-func handleControlRequest(cr *controlRequestMsg, stdinW *claudeStdinWriter, qstate *claudeQuestionState, automated bool, logger *slog.Logger, send func(ChatEvent) bool) {
+// bypassPermissions semantics); AskUserQuestion is auto-denied only when no
+// answer channel exists (qstate nil), and otherwise registered as pending with
+// a user_question event emitted via send for the UI to render.
+//
+// questionTimeout controls how long the question is held: 0 means hold until
+// the turn ends/aborts (watched user turns), and a positive value arms an
+// auto-deny timer (automated turns nobody may be watching) so the CLI is not
+// blocked indefinitely. Either way the card is surfaced so a watching human can
+// answer, and an answer that arrives in time works identically to a user turn.
+func handleControlRequest(cr *controlRequestMsg, stdinW *claudeStdinWriter, qstate *claudeQuestionState, questionTimeout time.Duration, logger *slog.Logger, send func(ChatEvent) bool) {
 	if cr.Request.Subtype != "can_use_tool" {
 		// Other control_request subtypes (e.g. our own interrupt's response
 		// path) are not permission prompts; nothing to answer here.
@@ -254,7 +301,10 @@ func handleControlRequest(cr *controlRequestMsg, stdinW *claudeStdinWriter, qsta
 		}
 		return
 	}
-	if automated || qstate == nil {
+	if qstate == nil {
+		// No answer channel exists for this turn (e.g. a one-shot with no
+		// OnQuestionReady): the question can never be surfaced or answered, so
+		// deny immediately rather than leave the CLI blocked.
 		if err := stdinW.writeControlResponse(cr.RequestID, map[string]any{
 			"behavior": "deny",
 			"message":  automatedDenyMessage,
@@ -263,8 +313,9 @@ func handleControlRequest(cr *controlRequestMsg, stdinW *claudeStdinWriter, qsta
 		}
 		return
 	}
-	// Interactive turn: register the pending question and surface it to the UI.
-	qstate.register(cr.RequestID, cr.Request.Input)
+	// Register the pending question (arming an auto-deny timer for automated
+	// turns) and surface it to the UI.
+	qstate.register(cr.RequestID, cr.Request.Input, questionTimeout, automatedQuestionTimeoutMessage)
 	var inp struct {
 		Questions json.RawMessage `json:"questions"`
 	}
@@ -278,8 +329,7 @@ func handleControlRequest(cr *controlRequestMsg, stdinW *claudeStdinWriter, qsta
 		// The turn was cancelled / the consumer went away before the question
 		// reached any UI: nobody can answer it, so deny now instead of leaving
 		// the CLI blocked on a control_response.
-		q, deny, denyMsg := cr.RequestID, true, automatedDenyMessage
-		_ = qstate.answer(q, nil, deny, denyMsg)
+		_ = qstate.answer(cr.RequestID, nil, true, automatedDenyMessage)
 	}
 }
 
@@ -314,8 +364,10 @@ type ClaudeBackend struct {
 // BackgroundTurnFunc consumes an unsolicited turn's events (a background
 // subagent notification arriving on the persistent process with no user
 // input) and persists + broadcasts them. The channel is closed by the
-// session when the turn's result arrives.
-type BackgroundTurnFunc func(agentID string, events <-chan ChatEvent)
+// session when the turn's result arrives. answer resolves an AskUserQuestion
+// raised during the turn (nil if the session has no answer channel), letting a
+// watching human respond to a question on an otherwise-automated turn.
+type BackgroundTurnFunc func(agentID string, events <-chan ChatEvent, answer AnswerFunc)
 
 func NewClaudeBackend(logger *slog.Logger) *ClaudeBackend {
 	return &ClaudeBackend{logger: logger, sessions: make(map[string]*claudeSession)}
@@ -441,13 +493,21 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		opts.OnSteerReady(stdinW.writeUserLine)
 	}
 
-	// qstate is only allocated for interactive turns that can surface an
-	// AskUserQuestion prompt to a user (OnQuestionReady set). Automated /
-	// unwatched one-shot turns leave it nil so questions are auto-denied.
+	// qstate is allocated whenever the caller wired an answer channel
+	// (OnQuestionReady). Automated turns get it too (unlike before) so an
+	// AskUserQuestion surfaces a card and is held with a timeout rather than
+	// auto-denied. Turns with no answer channel (e.g. one-shots) leave it nil
+	// so questions are denied inline.
 	var qstate *claudeQuestionState
-	if opts.OnQuestionReady != nil && !opts.AutomatedTrigger {
+	if opts.OnQuestionReady != nil {
 		qstate = newClaudeQuestionState(stdinW)
 		opts.OnQuestionReady(qstate.answer)
+	}
+	// Watched user turns hold a question until the turn ends; automated turns
+	// hold it only for a bounded window so an unwatched turn eventually proceeds.
+	questionTimeout := time.Duration(0)
+	if opts.AutomatedTrigger {
+		questionTimeout = automatedQuestionTimeout
 	}
 
 	ch := make(chan ChatEvent, 64)
@@ -465,7 +525,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		// send is a helper that respects context cancellation to avoid goroutine leaks.
 		send := func(e ChatEvent) bool { return ctxSend(ctx, ch, e) }
 
-		result := parseClaudeStream(stdout, b.logger, send, stdinW.close, stdinW, qstate, opts.AutomatedTrigger)
+		result := parseClaudeStream(stdout, b.logger, send, stdinW.close, stdinW, qstate, questionTimeout)
 
 		// If stream was cancelled (send returned false), clean up process
 		// and emit a partial done event so the transcript is persisted.
@@ -741,11 +801,11 @@ func mergeStreamTexts(r *streamParseResult) string {
 // parseClaudeStream reads Claude's stream-json output from r and emits ChatEvents
 // via the send callback. Returns the accumulated parse result.
 // If send returns false (channel full / context cancelled), parsing stops immediately.
-// qstate/automated drive interactive AskUserQuestion handling: qstate is nil
-// (or automated true) for turns with no watching user, in which case any
-// control_request is answered inline (auto-allow / auto-deny) rather than
-// surfaced.
-func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool, onResult func(), stdinW *claudeStdinWriter, qstate *claudeQuestionState, automated bool) *streamParseResult {
+// qstate/questionTimeout drive interactive AskUserQuestion handling: qstate is
+// nil for turns with no answer channel (question auto-denied inline);
+// questionTimeout is 0 for watched user turns (held until turn end) and positive
+// for automated turns (held with an auto-deny timeout).
+func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool, onResult func(), stdinW *claudeStdinWriter, qstate *claudeQuestionState, questionTimeout time.Duration) *streamParseResult {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
@@ -760,7 +820,7 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 			// always has one so a control_request never goes unanswered (an
 			// unanswered can_use_tool would block the CLI forever).
 			if stdinW != nil {
-				handleControlRequest(cr, stdinW, qstate, automated, logger, send)
+				handleControlRequest(cr, stdinW, qstate, questionTimeout, logger, send)
 			}
 			continue
 		}
@@ -888,6 +948,20 @@ func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isR
 	toolIDToName := a.toolIDToName
 
 	switch event.Type {
+	case "rate_limit_event":
+		// Usage-window telemetry emitted mid-turn. It belongs to the
+		// whole session, not any subagent, so it's forwarded regardless
+		// of parentID and never accumulated into the turn's text. The
+		// Manager taps this event to persist the snapshot; the UI badge
+		// updates live off the same event.
+		if event.RateLimitInfo != nil {
+			info := *event.RateLimitInfo
+			if !send(ChatEvent{Type: "rate_limit", RateLimit: &info}) {
+				res.cancelled = true
+				return false
+			}
+		}
+
 	case "system":
 		status := "thinking"
 		if event.Subtype == "compact_boundary" {
@@ -1256,6 +1330,10 @@ type claudeStreamEvent struct {
 	SessionID    string                      `json:"session_id,omitempty"`
 	TotalCostUSD float64                     `json:"total_cost_usd,omitempty"`
 	ModelUsage   map[string]claudeModelUsage `json:"modelUsage,omitempty"`
+
+	// "rate_limit_event" carries the CLI's usage-window telemetry,
+	// emitted mid-turn when a reporting threshold is crossed.
+	RateLimitInfo *RateLimitInfo `json:"rate_limit_info,omitempty"`
 
 	// Origin marks the provenance of a "result" event. A background
 	// subagent (Task run_in_background) finishing on a persistent process

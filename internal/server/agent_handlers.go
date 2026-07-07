@@ -580,6 +580,27 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, toDirectoryView(a))
 }
 
+// handleGetAgentRateLimit returns the latest rate-limit snapshot the claude
+// backend reported for this agent (in-memory, lazily hydrated from the kv
+// table so it survives a restart). Returns 204 when nothing has ever been
+// recorded so the UI can simply hide the badge. Read-only, no ETag — the
+// live badge updates over the chat WebSocket; this endpoint is the initial
+// hydrate on mount.
+func (s *Server) handleGetAgentRateLimit(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	p := auth.FromContext(r.Context())
+	if !p.CanReadFull(id) {
+		writeError(w, http.StatusForbidden, "forbidden", "not permitted")
+		return
+	}
+	snap, ok := s.agents.RateLimit(id)
+	if !ok {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, snap)
+}
+
 func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	p := auth.FromContext(r.Context())

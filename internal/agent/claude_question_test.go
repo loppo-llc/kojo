@@ -57,7 +57,7 @@ func TestHandleControlRequest_AutoAllowNonQuestion(t *testing.T) {
 	cr.Request.Input = json.RawMessage(`{"command":"ls"}`)
 
 	emitted := false
-	handleControlRequest(cr, sw, qs, false, testLogger(), func(ChatEvent) bool { emitted = true; return true })
+	handleControlRequest(cr, sw, qs, 0, testLogger(), func(ChatEvent) bool { emitted = true; return true })
 
 	if emitted {
 		t.Error("non-question control_request must not emit an event")
@@ -68,23 +68,97 @@ func TestHandleControlRequest_AutoAllowNonQuestion(t *testing.T) {
 	}
 }
 
-// TestHandleControlRequest_AutoDenyAutomated verifies AskUserQuestion on an
-// automated turn is denied inline with no event.
-func TestHandleControlRequest_AutoDenyAutomated(t *testing.T) {
+// TestHandleControlRequest_NoChannelDenies verifies AskUserQuestion is denied
+// inline with no event when there is no answer channel (qstate nil) — a turn
+// that can never surface or answer a question.
+func TestHandleControlRequest_NoChannelDenies(t *testing.T) {
 	sw, buf := newTestStdinWriter()
-	qs := newClaudeQuestionState(sw)
 
 	emitted := false
-	handleControlRequest(askUserQuestionCR(), sw, qs, true, testLogger(), func(ChatEvent) bool { emitted = true; return true })
+	handleControlRequest(askUserQuestionCR(), sw, nil, 0, testLogger(), func(ChatEvent) bool { emitted = true; return true })
 
 	if emitted {
-		t.Error("automated AskUserQuestion must not emit an event")
+		t.Error("AskUserQuestion with no answer channel must not emit an event")
 	}
 	if out := buf.String(); !strings.Contains(out, `"behavior":"deny"`) {
 		t.Errorf("expected deny control_response, got %q", out)
 	}
-	if _, ok := qs.pending["req-1"]; ok {
-		t.Error("automated question must not be registered as pending")
+}
+
+// TestHandleControlRequest_AutomatedSurfacesAndTimesOut verifies an automated
+// turn (positive timeout) surfaces the question as a card, holds it, and then
+// auto-denies once the timeout elapses.
+func TestHandleControlRequest_AutomatedSurfacesAndTimesOut(t *testing.T) {
+	sw, buf := newTestStdinWriter()
+	qs := newClaudeQuestionState(sw)
+
+	var got ChatEvent
+	handleControlRequest(askUserQuestionCR(), sw, qs, 30*time.Millisecond, testLogger(),
+		func(e ChatEvent) bool { got = e; return true })
+
+	if got.Type != "user_question" || got.RequestID != "req-1" {
+		t.Fatalf("automated turn must surface a user_question card, got %+v", got)
+	}
+	qs.mu.Lock()
+	_, registered := qs.pending["req-1"]
+	qs.mu.Unlock()
+	if !registered {
+		t.Fatal("automated question must be registered as pending")
+	}
+	// Wait for the auto-deny timer to fire and write the deny control_response.
+	deadline := time.Now().Add(2 * time.Second)
+	var out string
+	for time.Now().Before(deadline) {
+		out = buf.String()
+		if strings.Contains(out, `"behavior":"deny"`) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !strings.Contains(out, `"behavior":"deny"`) || !strings.Contains(out, "time limit") {
+		t.Errorf("expected timeout deny control_response, got %q", out)
+	}
+	qs.mu.Lock()
+	_, stillPending := qs.pending["req-1"]
+	qs.mu.Unlock()
+	if stillPending {
+		t.Error("timeout should have cleared the pending question")
+	}
+}
+
+// TestHandleControlRequest_AutomatedAnsweredInTime verifies an answer that
+// arrives before the timeout works like a user turn: an allow control_response
+// is written, the timer is stopped, and no deny is emitted.
+func TestHandleControlRequest_AutomatedAnsweredInTime(t *testing.T) {
+	sw, buf := newTestStdinWriter()
+	qs := newClaudeQuestionState(sw)
+
+	handleControlRequest(askUserQuestionCR(), sw, qs, time.Minute, testLogger(),
+		func(ChatEvent) bool { return true })
+
+	if err := qs.answer("req-1", map[string]any{"色は?": "青"}, false, ""); err != nil {
+		t.Fatalf("answer: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `"behavior":"allow"`) || !strings.Contains(out, "青") {
+		t.Errorf("expected allow control_response, got %q", out)
+	}
+	if strings.Contains(out, `"behavior":"deny"`) {
+		t.Error("answered-in-time question must not be denied")
+	}
+	// The auto-deny timer must have been stopped/cleared.
+	qs.mu.Lock()
+	_, hasTimer := qs.timers["req-1"]
+	_, stillPending := qs.pending["req-1"]
+	qs.mu.Unlock()
+	if hasTimer || stillPending {
+		t.Error("answer must clear the pending entry and stop the timer")
+	}
+	// Give any (incorrectly-not-stopped) timer a chance to fire; nothing new
+	// should be written.
+	time.Sleep(20 * time.Millisecond)
+	if buf.String() != out {
+		t.Errorf("no further control_response expected after answer, got %q", buf.String())
 	}
 }
 
@@ -95,7 +169,7 @@ func TestHandleControlRequest_UserTurnRegistersAndEmits(t *testing.T) {
 	qs := newClaudeQuestionState(sw)
 
 	var got ChatEvent
-	handleControlRequest(askUserQuestionCR(), sw, qs, false, testLogger(), func(e ChatEvent) bool { got = e; return true })
+	handleControlRequest(askUserQuestionCR(), sw, qs, 0, testLogger(), func(e ChatEvent) bool { got = e; return true })
 
 	if got.Type != "user_question" || got.RequestID != "req-1" || got.ToolUseID != "tu-1" {
 		t.Errorf("unexpected event: %+v", got)
@@ -117,7 +191,7 @@ func TestHandleControlRequest_UserTurnRegistersAndEmits(t *testing.T) {
 func TestQuestionState_AnswerAllow(t *testing.T) {
 	sw, buf := newTestStdinWriter()
 	qs := newClaudeQuestionState(sw)
-	qs.register("req-1", json.RawMessage(askQuestionInput))
+	qs.register("req-1", json.RawMessage(askQuestionInput), 0, "")
 
 	if err := qs.answer("req-1", map[string]any{"色は?": "青"}, false, ""); err != nil {
 		t.Fatalf("answer: %v", err)
@@ -146,7 +220,7 @@ func TestQuestionState_AnswerUnknown(t *testing.T) {
 func TestQuestionState_DenyAllPending(t *testing.T) {
 	sw, buf := newTestStdinWriter()
 	qs := newClaudeQuestionState(sw)
-	qs.register("req-1", json.RawMessage(askQuestionInput))
+	qs.register("req-1", json.RawMessage(askQuestionInput), 0, "")
 	qs.denyAllPending("turn ended")
 	if len(qs.pending) != 0 {
 		t.Error("denyAllPending must clear pending map")

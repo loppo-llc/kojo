@@ -314,8 +314,25 @@ export interface UserQuestion {
   multiSelect?: boolean;
 }
 
+// RateLimitInfo mirrors the Go agent.RateLimitInfo (the claude CLI's
+// rate_limit_event payload).
+export interface RateLimitInfo {
+  status: string; // "allowed" | "allowed_warning" | "rejected"
+  rateLimitType?: string; // "seven_day" | "five_hour"
+  resetsAt?: number; // unix seconds
+  utilization: number; // 0..1
+  isUsingOverage?: boolean;
+  surpassedThreshold?: number;
+}
+
+// RateLimitSnapshot is a RateLimitInfo plus the unix-seconds time it was
+// observed. Returned by GET /api/v1/agents/{id}/ratelimit.
+export interface RateLimitSnapshot extends RateLimitInfo {
+  observedAt: number;
+}
+
 export interface ChatEvent {
-  type: "status" | "text" | "thinking" | "tool_use" | "tool_result" | "done" | "error" | "message" | "attachment" | "user_question";
+  type: "status" | "text" | "thinking" | "tool_use" | "tool_result" | "done" | "error" | "message" | "attachment" | "user_question" | "rate_limit";
   status?: string;
   delta?: string;
   toolUseId?: string;
@@ -329,6 +346,8 @@ export interface ChatEvent {
   // answer endpoint, and the raw AskUserQuestion questions payload.
   requestId?: string;
   questions?: UserQuestion[];
+  // Set on "rate_limit" events: the latest usage-window telemetry.
+  rateLimit?: RateLimitInfo;
   startedAt?: string; // RFC3339 timestamp of when processing started
   // Set when this event belongs to a subagent (Task tool) turn rather
   // than the main assistant turn. Value is the tool_use ID of the
@@ -459,6 +478,15 @@ export const agentApi = {
     if (!value.etag && etag) value.etag = etag;
     return value;
   },
+
+  // GET /api/v1/agents/{id}/ratelimit — latest rate-limit snapshot, or null
+  // when the backend has never reported one (204). Used to hydrate the badge
+  // on mount; live updates arrive over the chat WebSocket as "rate_limit"
+  // ChatEvents.
+  rateLimit: (id: string): Promise<RateLimitSnapshot | null> =>
+    get<RateLimitSnapshot | undefined>(`/api/v1/agents/${id}/ratelimit`).then(
+      (v) => v ?? null,
+    ),
 
   files: {
     list: (agentId: string, relPath: string, hidden?: boolean) => {

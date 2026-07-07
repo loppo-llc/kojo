@@ -120,6 +120,10 @@ type ChatEvent struct {
 	// (the CLI's tool input) so the UI can render the question card. Only
 	// populated on "user_question" events.
 	Questions json.RawMessage `json:"questions,omitempty"`
+	// RateLimit carries the latest rate-limit snapshot parsed from the
+	// backend stream. Populated only on "rate_limit" events, which arrive
+	// mid-turn whenever the Claude CLI reports a usage threshold crossing.
+	RateLimit *RateLimitInfo `json:"rateLimit,omitempty"`
 }
 
 func generateMessageID() string {
