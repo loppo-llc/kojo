@@ -86,14 +86,14 @@ export function UserQuestionCard({
 
   if (done) {
     return (
-      <div className="mx-auto max-w-[760px] rounded-[10px] border border-hairline bg-app/60 px-3 py-2 text-xs text-muted">
+      <div className="mx-auto max-w-[760px] rounded-[10px] border border-hairline bg-app/60 px-3 py-2 text-xs text-ink-dim">
         回答済み: {done}
       </div>
     );
   }
   if (expired) {
     return (
-      <div className="mx-auto max-w-[760px] rounded-[10px] border border-hairline bg-app/60 px-3 py-2 text-xs text-muted">
+      <div className="mx-auto max-w-[760px] rounded-[10px] border border-hairline bg-app/60 px-3 py-2 text-xs text-ink-dim">
         この質問は期限切れ (ターンが終了した)。
       </div>
     );
@@ -104,8 +104,8 @@ export function UserQuestionCard({
       <div className="mb-2 text-xs font-medium text-lamp-warn">質問</div>
       {questions.map((q, qi) => (
         <div key={qi} className="mb-3 last:mb-0">
-          {q.header && <div className="mb-1 text-xs text-muted">{q.header}</div>}
-          <div className="mb-2 text-sm text-fg">{q.question}</div>
+          {q.header && <div className="mb-1 text-xs text-ink-dim">{q.header}</div>}
+          <div className="mb-2 text-sm text-ink">{q.question}</div>
           <div className="flex flex-wrap gap-2">
             {(q.options ?? []).map((opt) => {
               const on = (selected[qi] ?? []).includes(opt.label);
@@ -118,8 +118,8 @@ export function UserQuestionCard({
                   className={
                     "rounded-[8px] border px-3 py-1.5 text-sm transition " +
                     (on
-                      ? "border-accent bg-accent/15 text-accent"
-                      : "border-hairline bg-app text-fg hover:border-accent/60")
+                      ? "border-copper bg-copper/15 text-copper-bright"
+                      : "border-hairline bg-app text-ink hover:border-copper/60")
                   }
                 >
                   {q.multiSelect && (
@@ -135,16 +135,16 @@ export function UserQuestionCard({
             value={custom[qi] ?? ""}
             onChange={(e) => setCustom((prev) => ({ ...prev, [qi]: e.target.value }))}
             placeholder="その他 (自由入力)"
-            className="mt-2 w-full rounded-[8px] border border-hairline bg-app px-3 py-1.5 text-sm text-fg outline-none focus:border-accent"
+            className="mt-2 w-full rounded-[8px] border border-hairline bg-app px-3 py-1.5 text-sm text-ink outline-none focus:border-copper"
           />
         </div>
       ))}
-      {error && <div className="mb-2 text-xs text-lamp-error">{error}</div>}
+      {error && <div className="mb-2 text-xs text-lamp-err">{error}</div>}
       <button
         type="button"
         disabled={!canSubmit || submitting}
         onClick={submit}
-        className="rounded-[8px] bg-accent px-4 py-1.5 text-sm font-medium text-app disabled:opacity-40"
+        className="rounded-[8px] bg-copper px-4 py-1.5 text-sm font-semibold text-[#14100b] transition-colors hover:bg-copper-bright disabled:opacity-40"
       >
         {submitting ? "送信中…" : "回答する"}
       </button>
