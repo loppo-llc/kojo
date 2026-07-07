@@ -7,6 +7,7 @@ import { PeersSection } from "./globalsettings/PeersSection";
 import { SystemSection } from "./globalsettings/SystemSection";
 import { useEmbeddingModel } from "./globalsettings/useEmbeddingModel";
 import { useGeminiApiKey } from "./globalsettings/useGeminiApiKey";
+import { useXAIApiKey } from "./globalsettings/useXAIApiKey";
 import { useEnterSends } from "../lib/preferences";
 import { PageHeader } from "./ui/PageHeader";
 import { Banner } from "./ui/Banner";
@@ -36,13 +37,14 @@ export function GlobalSettings() {
     setError,
     flashSuccess,
   );
+  const xai = useXAIApiKey(setError, flashSuccess);
 
   return (
     <div className="h-full overflow-y-auto bg-app text-ink">
       <PageHeader title="Settings" onBack={() => navigate("/")} hideBackAtLg />
 
       <main className="mx-auto max-w-[560px] space-y-6 px-4 py-6">
-        <ApiKeysSection gemini={gemini} embedding={embedding} />
+        <ApiKeysSection gemini={gemini} embedding={embedding} xai={xai} />
         <ChatPreferencesSection enterSends={enterSends} setEnterSends={setEnterSends} />
         <PeersSection setError={setError} flashSuccess={flashSuccess} />
         <ArchivedAgentsSection setError={setError} flashSuccess={flashSuccess} />

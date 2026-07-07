@@ -892,6 +892,13 @@ export const agentApi = {
       del<unknown>(`/api/v1/api-keys/${provider}`),
   },
 
+  stt: {
+    // Mint a short-lived ephemeral token for the browser to open the xAI
+    // streaming Speech-to-Text WebSocket directly.
+    token: () =>
+      post<{ token: string; expiresAt: number; wsBaseUrl: string }>(`/api/v1/stt/token`, {}),
+  },
+
   embeddingModel: {
     set: (model: string) =>
       put<{ ok: boolean; model: string; embeddingsCleared: boolean }>(`/api/v1/embedding-model`, { model }),

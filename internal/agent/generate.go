@@ -413,6 +413,40 @@ func loadGeminiAPIKey(creds *CredentialStore) (string, error) {
 	return key, nil
 }
 
+// LoadXAIAPIKey loads the xAI (Grok) API key for callers outside the
+// agent package (internal/server's STT ephemeral-token handler).
+// Priority: 1) encrypted credential store (provider "xai"),
+// 2) XAI_API_KEY env var, 3) the grok-research credentials file.
+func LoadXAIAPIKey(creds *CredentialStore) (string, error) {
+	// 1. Credential store (encrypted, set via Settings UI).
+	if creds != nil {
+		if key, err := creds.GetToken("xai", "", "", "api_key"); err == nil && key != "" {
+			return key, nil
+		}
+	}
+
+	// 2. Environment variable.
+	if key := strings.TrimSpace(os.Getenv("XAI_API_KEY")); key != "" {
+		return key, nil
+	}
+
+	// 3. Fallback: grok-research credentials file (raw key, one line).
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot get home dir: %w", err)
+	}
+	credPath := filepath.Join(home, ".config", "grok-research", "credentials")
+	data, err := os.ReadFile(credPath)
+	if err != nil {
+		return "", fmt.Errorf("xAI API key not configured (check Settings) and fallback failed: %w", err)
+	}
+	key := strings.TrimSpace(string(data))
+	if key == "" {
+		return "", fmt.Errorf("xAI API key not configured (check Settings)")
+	}
+	return key, nil
+}
+
 // loadEmbeddingModel returns the configured embedding model name.
 // Falls back to defaultEmbeddingModel if not set.
 func loadEmbeddingModel(creds *CredentialStore) string {

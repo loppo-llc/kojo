@@ -40,6 +40,16 @@ func (s *Server) handleGetAPIKey(w http.ResponseWriter, r *http.Request) {
 			hasFallback = err == nil && strings.TrimSpace(string(data)) != ""
 		}
 	}
+	// xAI falls back to the XAI_API_KEY env var or the grok-research
+	// credentials file, mirroring agent.LoadXAIAPIKey's priority.
+	if provider == "xai" {
+		if strings.TrimSpace(os.Getenv("XAI_API_KEY")) != "" {
+			hasFallback = true
+		} else if home, err := os.UserHomeDir(); err == nil {
+			data, err := os.ReadFile(filepath.Join(home, ".config", "grok-research", "credentials"))
+			hasFallback = err == nil && strings.TrimSpace(string(data)) != ""
+		}
+	}
 
 	resp := map[string]any{
 		"provider":    provider,

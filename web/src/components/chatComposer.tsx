@@ -174,6 +174,52 @@ export function AttachButton({
   );
 }
 
+/**
+ * Mic toggle for push-to-talk voice input. Idle: quiet mic glyph. Listening:
+ * pulsing copper. Connecting: spinner. Click toggles start/stop.
+ */
+export function MicButton({
+  listening,
+  connecting,
+  disabled,
+  onClick,
+  title,
+}: {
+  listening: boolean;
+  connecting: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+  title?: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title={title ?? (listening ? "Stop voice input" : "Voice input")}
+      aria-label={listening ? "Stop voice input" : "Voice input"}
+      aria-pressed={listening}
+      className={
+        "shrink-0 rounded-[10px] p-2 transition-colors disabled:opacity-40 " +
+        (listening
+          ? "animate-pulse text-copper hover:text-copper-bright"
+          : "text-ink-faint hover:text-ink")
+      }
+    >
+      {connecting ? (
+        <svg className="h-5 w-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+        </svg>
+      ) : (
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5">
+          <path d="M10 2a3 3 0 00-3 3v5a3 3 0 006 0V5a3 3 0 00-3-3z" />
+          <path d="M4 9a.75.75 0 011.5 0 4.5 4.5 0 009 0A.75.75 0 0116 9a6 6 0 01-5.25 5.954V17.5a.75.75 0 01-1.5 0v-2.546A6 6 0 014 9z" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
 /** 36px copper circular send button (arrow-up). Quiet/faint when disabled. */
 export function SendButton({
   onClick,

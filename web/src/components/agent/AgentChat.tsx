@@ -12,11 +12,13 @@ import { useDraftInput } from "../../hooks/useDraftInput";
 import { useAutoGrowTextarea } from "../../hooks/useAutoGrowTextarea";
 import { useChatScroll } from "../../hooks/useChatScroll";
 import { useChatPagination } from "../../hooks/useChatPagination";
+import { useSpeechInput } from "../../hooks/useSpeechInput";
 import {
   DismissibleError,
   PendingAttachments,
   LoadMoreButton,
   AttachButton,
+  MicButton,
   SendButton,
   StopButton,
   enterToSend,
@@ -819,7 +821,34 @@ export function AgentChat() {
 
   const [enterSends] = useEnterSends();
 
-  const handleKeyDown = (e: React.KeyboardEvent) => enterToSend(e, enterSends, handleSend);
+  // Voice input (push-to-talk STT). Finalized utterances are appended to the
+  // draft; the user edits/sends via the normal path.
+  const appendTranscript = useCallback(
+    (text: string) => {
+      if (!text) return;
+      const prev = inputRef.current;
+      const next = (prev && !/\s$/.test(prev) ? prev + " " : prev) + text;
+      // Advance the mirror synchronously so a second final arriving before
+      // the next render chains onto this value instead of overwriting it.
+      inputRef.current = next;
+      setInput(next);
+    },
+    [setInput],
+  );
+  const speech = useSpeechInput({ onFinal: appendTranscript });
+  const toggleVoice = useCallback(() => {
+    if (speech.state === "listening" || speech.state === "connecting") speech.stop();
+    else void speech.start();
+  }, [speech]);
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Escape" && (speech.state === "listening" || speech.state === "connecting")) {
+      e.preventDefault();
+      speech.stop();
+      return;
+    }
+    enterToSend(e, enterSends, handleSend);
+  };
 
   if (!agent) return null;
 
@@ -1218,6 +1247,17 @@ export function AgentChat() {
         {queueError && <DismissibleError message={queueError} onDismiss={() => setQueueError(null)} />}
         {/* Upload error */}
         {uploadError && <DismissibleError message={uploadError} onDismiss={() => setUploadError(null)} />}
+        {/* Voice input error (e.g. missing xAI key → hint to Settings) */}
+        {speech.state === "error" && speech.error && (
+          <DismissibleError
+            message={
+              /api key|not configured/i.test(speech.error)
+                ? "xAI API キーが未設定。設定画面で登録して。"
+                : speech.error
+            }
+            onDismiss={() => speech.stop()}
+          />
+        )}
         {/* Pending file attachments */}
         <PendingAttachments files={pendingFiles} onRemove={removePendingFile} thumb />
         <div className="flex items-end gap-2">
@@ -1234,6 +1274,13 @@ export function AgentChat() {
             disabled={uploading || streaming || holderOffline}
             title={holderOffline ? "Holder peer offline" : "Attach files"}
           />
+          {speech.supported && (
+            <MicButton
+              listening={speech.state === "listening"}
+              connecting={speech.state === "connecting"}
+              onClick={toggleVoice}
+            />
+          )}
           <div className="min-w-0 flex-1 rounded-xl border border-hairline bg-raised px-1 focus-within:border-copper/50">
             <textarea
               ref={textareaRef}
@@ -1249,6 +1296,11 @@ export function AgentChat() {
               rows={1}
               className="max-h-[150px] w-full resize-none bg-transparent px-3 py-2 text-[14px] text-ink placeholder:text-ink-faint focus:outline-none"
             />
+            {(speech.state === "listening" || speech.interimText) && (
+              <div className="px-3 pb-2 text-[13px] italic text-ink-faint">
+                {speech.interimText || "聞き取り中…"}
+              </div>
+            )}
           </div>
           {streaming ? (
             <>
