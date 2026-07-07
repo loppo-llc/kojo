@@ -18,8 +18,11 @@ func TestCronPromptAt_Default(t *testing.T) {
 	if !strings.Contains(got, "2026年4月25日 15:04") {
 		t.Errorf("missing localized timestamp: %q", got)
 	}
-	if !strings.Contains(got, "今回のタイムアウトは10分") {
-		t.Errorf("missing timeout: %q", got)
+	if strings.Contains(got, "タイムアウト") {
+		t.Errorf("timeout must not be shown to the model (fable5 guide): %q", got)
+	}
+	if !strings.Contains(got, "次回のチェックインは最短30分後 (15:34)") {
+		t.Errorf("missing next-checkin schedule: %q", got)
 	}
 	if !strings.Contains(got, "memory/2026-04-25.md") {
 		t.Errorf("missing default memory instruction with today's date: %q", got)

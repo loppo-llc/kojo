@@ -218,7 +218,7 @@ func TestBuildSystemPrompt_MemoryWriteDirective(t *testing.T) {
 
 	mustContain := []string{
 		"Memory Write — MANDATORY",
-		"kojo will reset it automatically",
+		"only durable record across sessions",
 		todayDiary, // absolute path, not relative — prevents cwd-dependent writes
 		"Short exchanges count",
 		// Lean-index rules live in the guide file now; the prompt keeps

@@ -609,9 +609,8 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	sb.WriteString(fmt.Sprintf("4. Use Grep to search %s for relevant past notes.\n", memoryRoot))
 
 	sb.WriteString("\n### Memory Write — MANDATORY\n\n")
-	sb.WriteString("Your conversation history is volatile. kojo will reset it automatically\n")
-	sb.WriteString("when context grows too large. Your memory files are what survives —\n")
-	sb.WriteString("if you don't write to them, that turn is lost forever.\n\n")
+	sb.WriteString("Your memory files are your only durable record across sessions —\n")
+	sb.WriteString("anything worth remembering must be written to them.\n\n")
 	sb.WriteString(fmt.Sprintf("At the end of EVERY response involving a user request/decision, new information about the user, work you did or started, or errors/blockers, append to `%s` using the Edit tool.\n", todayDiary))
 	sb.WriteString(fmt.Sprintf("Format: `- HH:MM — <one-line summary>` appended under a `## %s` date header (create the header on the first write of the day; do not rewrite earlier entries).\n", today))
 	sb.WriteString("Short exchanges count. \"It felt too small to record\" is the failure mode —\n")

@@ -63,7 +63,6 @@ func cronPromptAt(now, nextRun time.Time, timeoutMinutes int, customMessage stri
 	today := now.Format("2006-01-02")
 	msg := "[system message] " + now.Format("2006年1月2日 15:04") + "の定期チェックインです。"
 
-	msg += fmt.Sprintf("（今回のタイムアウトは%d分", timeoutMinutes)
 	if !nextRun.IsZero() {
 		var nextFmt string
 		if nextRun.YearDay() == now.YearDay() && nextRun.Year() == now.Year() {
@@ -71,9 +70,8 @@ func cronPromptAt(now, nextRun time.Time, timeoutMinutes int, customMessage stri
 		} else {
 			nextFmt = nextRun.Format("1月2日 15:04")
 		}
-		msg += "。完了後の次回のチェックインは最短" + formatUntil(nextRun, now) + "後 (" + nextFmt + ")"
+		msg += "（完了後の次回のチェックインは最短" + formatUntil(nextRun, now) + "後 (" + nextFmt + ")）"
 	}
-	msg += "）"
 	body := strings.TrimSpace(customMessage)
 	if body == "" {
 		body = DefaultCheckinContent
@@ -92,7 +90,6 @@ func cronPromptAt(now, nextRun time.Time, timeoutMinutes int, customMessage stri
 func checkinPrompt(now time.Time, timeoutMinutes int, customMessage string) string {
 	today := now.Format("2006-01-02")
 	msg := "[system message] " + now.Format("2006年1月2日 15:04") + "のチェックインです。"
-	msg += fmt.Sprintf("（今回のタイムアウトは%d分）", timeoutMinutes)
 	body := strings.TrimSpace(customMessage)
 	if body == "" {
 		body = DefaultCheckinContent
