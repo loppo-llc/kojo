@@ -29,6 +29,18 @@ export function ToolUseCard({ toolUse, defaultExpanded = false }: ToolUseCardPro
   const preview = extractPreview(toolUse.input);
   const children = toolUse.children ?? [];
 
+  // A Task launched with run_in_background prints "Async agent launched" as its
+  // immediate tool_result; its real output streams in later via the subagent
+  // tailer (attached to children). Flag it so the card shows a background badge.
+  const isBackground =
+    toolUse.name === "Task" && /Async agent launched/i.test(toolUse.output ?? "");
+  // Weak done heuristic: every observed tool child has an output (nothing left
+  // pending). No children yet ⇒ still spinning up ⇒ running.
+  const backgroundDone =
+    isBackground &&
+    children.length > 0 &&
+    children.every((c) => c.name === "" || (c.output ?? "") !== "");
+
   return (
     <div className="my-1 overflow-hidden rounded-[10px] border border-hairline bg-surface text-xs">
       <button
@@ -54,6 +66,15 @@ export function ToolUseCard({ toolUse, defaultExpanded = false }: ToolUseCardPro
         {children.length > 0 && (
           <span className="shrink-0 rounded-full bg-app/60 px-1.5 py-0.5 font-mono text-[10px] text-ink-faint">
             {children.length} sub
+          </span>
+        )}
+        {isBackground && (
+          <span
+            className={`shrink-0 rounded-full px-1.5 py-0.5 font-mono text-[10px] ${
+              backgroundDone ? "bg-emerald-500/10 text-emerald-400" : "bg-amber-500/10 text-amber-400"
+            }`}
+          >
+            {backgroundDone ? "background done" : "background running"}
           </span>
         )}
       </button>

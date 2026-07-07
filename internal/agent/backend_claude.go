@@ -302,6 +302,13 @@ type ClaudeBackend struct {
 	// can persist + broadcast it as a background chat. Set by the Manager
 	// at construction; nil disables background-turn surfacing.
 	onBackgroundTurn BackgroundTurnFunc
+
+	// onSubagentActivity is invoked by a session's subagent tailer when a
+	// background subagent (Task run_in_background) emits output after the
+	// spawning turn already finalized. The Manager durably attaches it to the
+	// owning message's ToolUse.Children and pushes it live. nil disables
+	// background-subagent surfacing.
+	onSubagentActivity subagentActivityFunc
 }
 
 // BackgroundTurnFunc consumes an unsolicited turn's events (a background
@@ -318,6 +325,12 @@ func NewClaudeBackend(logger *slog.Logger) *ClaudeBackend {
 // unsolicited (background subagent notification) turns.
 func (b *ClaudeBackend) SetBackgroundTurnHandler(fn BackgroundTurnFunc) {
 	b.onBackgroundTurn = fn
+}
+
+// SetSubagentActivityHandler registers the Manager callback used to surface
+// live/backfilled background-subagent output (Option A + C).
+func (b *ClaudeBackend) SetSubagentActivityHandler(fn subagentActivityFunc) {
+	b.onSubagentActivity = fn
 }
 
 // SetProxyURL configures an ANTHROPIC_BASE_URL to inject into Claude CLI env.

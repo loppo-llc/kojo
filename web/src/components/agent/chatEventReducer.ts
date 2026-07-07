@@ -138,6 +138,77 @@ export function applySubagentEvent(prev: readonly StreamingTool[], event: ChatEv
 }
 
 /**
+ * Apply a subagent (Task tool) event to a persisted ToolUse's children list.
+ * Mirrors applySubagentEvent but operates on the persisted ToolUse shape
+ * (output is "" rather than null) and de-dupes tool_use children by id so a
+ * live push that overlaps a transcript reload can't double-insert.
+ *
+ * Returns the SAME array reference when nothing changed so callers can rely on
+ * React's referential fast-path.
+ */
+function applyEventToToolChildren(children: readonly ToolUse[], event: ChatEvent): ToolUse[] {
+  if (event.type === "tool_use" && event.toolName) {
+    const id = event.toolUseId ?? "";
+    if (id && children.some((c) => c.id === id)) return [...children];
+    return [...children, { id, name: event.toolName, input: event.toolInput ?? "", output: "" }];
+  }
+  if (event.type === "tool_result") {
+    const id = event.toolUseId ?? "";
+    const out = children.slice();
+    for (let i = out.length - 1; i >= 0; i--) {
+      if (id && out[i].id === id) {
+        out[i] = { ...out[i], output: event.toolOutput ?? "" };
+        return out;
+      }
+    }
+    return out;
+  }
+  if (event.type === "text") {
+    const out = children.slice();
+    const last = out[out.length - 1];
+    if (last && last.name === "") {
+      out[out.length - 1] = { ...last, text: (last.text ?? "") + (event.delta ?? "") };
+    } else {
+      out.push({ id: "", name: "", input: "", output: "", text: event.delta ?? "" });
+    }
+    return out;
+  }
+  return [...children];
+}
+
+/**
+ * Route a subagent event into the timeline's already-persisted messages when
+ * its parentToolUseId targets a Task ToolUse living inside a persisted message
+ * (rather than the live streamTools of the current turn). This is what makes a
+ * BACKGROUND subagent — whose output arrives after the spawning turn finished —
+ * nest under its Task chip live, instead of being dropped.
+ *
+ * Returns the SAME array reference when no persisted message owns the tool_use
+ * (the common case: the parent is in the live stream, or nothing matches), so
+ * setMessages elides the re-render.
+ */
+export function applySubagentEventToMessages(
+  msgs: AgentMessage[],
+  event: ChatEvent,
+): AgentMessage[] {
+  const parentId = event.parentToolUseId;
+  if (!parentId) return msgs;
+  let hit = false;
+  const next = msgs.map((msg) => {
+    if (!msg.toolUses) return msg;
+    const idx = msg.toolUses.findIndex((t) => t.id === parentId);
+    if (idx === -1) return msg;
+    hit = true;
+    const parent = msg.toolUses[idx];
+    const children = applyEventToToolChildren(parent.children ?? [], event);
+    const toolUses = msg.toolUses.slice();
+    toolUses[idx] = { ...parent, children };
+    return { ...msg, toolUses };
+  });
+  return hit ? next : msgs;
+}
+
+/**
  * Append a message unless an entry with the same id is already
  * present. Used by `message` and the no-abort `done` path.
  *

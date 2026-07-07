@@ -301,6 +301,52 @@ func updateMessageContent(agentID, msgID, content, ifMatchETag string) (*Message
 	return msg, rec.ETag, nil
 }
 
+// updateMessageToolUses replaces the persisted toolUses payload of the message
+// with the given ID. Used by the background-subagent tailer to durably attach
+// late-arriving Children onto the Task ToolUse of an already-persisted message,
+// so a reload keeps them. No If-Match: this is a daemon-internal, append-only
+// merge (the caller re-reads + merges before every write), and a concurrent
+// human edit only ever touches Content, never toolUses. Returns the post-update
+// etag for the live-push path to carry.
+func updateMessageToolUses(agentID, msgID string, toolUses []ToolUse) (string, error) {
+	db := getGlobalStore()
+	if db == nil {
+		return "", errStoreNotReady
+	}
+	var payload json.RawMessage
+	if len(toolUses) > 0 {
+		buf, err := json.Marshal(toolUses)
+		if err != nil {
+			return "", fmt.Errorf("marshal toolUses: %w", err)
+		}
+		payload = buf
+	} else {
+		payload = json.RawMessage("null")
+	}
+
+	ctx, cancel := transcriptCtx()
+	defer cancel()
+
+	cur, err := db.GetMessage(ctx, msgID)
+	if errors.Is(err, store.ErrNotFound) {
+		return "", ErrMessageNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	if cur.AgentID != agentID {
+		return "", ErrMessageNotFound
+	}
+	rec, err := db.UpdateMessage(ctx, msgID, "", store.MessagePatch{ToolUses: payload})
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return "", ErrMessageNotFound
+	case err != nil:
+		return "", err
+	}
+	return rec.ETag, nil
+}
+
 // deleteMessage removes the message with the given ID from the transcript.
 // Returns ErrMessageNotFound if no matching message exists or if it does
 // not belong to agentID.

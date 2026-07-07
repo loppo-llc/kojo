@@ -412,6 +412,10 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 	// chats.
 	if cb, ok := m.backends["claude"].(*ClaudeBackend); ok {
 		cb.SetBackgroundTurnHandler(m.handleBackgroundTurn)
+		// Surface background-subagent (Task run_in_background) output that
+		// outlives the spawning turn: durably attach to the owning message and
+		// live-push to watchers (Option A live tail + Option C backfill).
+		cb.SetSubagentActivityHandler(m.handleSubagentActivity)
 	}
 
 	m.cron = newCronScheduler(m, logger)

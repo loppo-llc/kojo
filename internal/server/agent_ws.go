@@ -17,6 +17,23 @@ import (
 	"github.com/loppo-llc/kojo/internal/uploadpath"
 )
 
+// agentHeartbeatInterval is the cadence of the application-level
+// heartbeat frame. The client watchdog (useAgentWebSocket.ts) declares
+// the socket dead after ~45s of silence, so 20s keeps two heartbeats
+// (plus slack) inside that window even if one frame is lost. var (not
+// const) only so tests can shrink it.
+var agentHeartbeatInterval = 20 * time.Second
+
+// agentHeartbeatMsg is the application-level liveness frame. Unlike the
+// protocol-level Ping (which a TLS-terminating proxy such as
+// `tailscale serve` can absorb without the browser ever observing it),
+// this JSON event flows end-to-end to the browser, giving the client a
+// positive signal it can time out on. Unknown to old clients, whose
+// event switch has no default case and ignores it.
+func agentHeartbeatMsg() map[string]any {
+	return map[string]any{"type": "ping", "t": time.Now().UnixMilli()}
+}
+
 // Agent WebSocket message types
 type agentWSClientMsg struct {
 	Type        string                    `json:"type"`                  // "message", "abort", "steer"
@@ -66,6 +83,15 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Channel for client messages (read goroutine → main loop)
 	clientMsgs := make(chan agentWSClientMsg, 8)
+
+	// Application-level heartbeat. Emitted only from the main loop and
+	// streamAgentEvents — both run on THIS goroutine — so it serializes
+	// with every other writeJSON. coder/websocket forbids concurrent
+	// data writes, which is also why this is a ticker consumed in the
+	// select rather than its own goroutine (unlike the protocol Ping
+	// above, whose control frame IS safe to write concurrently).
+	heartbeat := time.NewTicker(agentHeartbeatInterval)
+	defer heartbeat.Stop()
 
 	// Keepalive ping
 	go func() {
@@ -169,6 +195,8 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-heartbeat.C:
+			_ = writeJSON(ctx, conn, agentHeartbeatMsg())
 		case event, ok := <-bgEvents:
 			if !ok {
 				bgEvents = nil
@@ -250,7 +278,7 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 
 				// Stream events to client, while also listening for abort
-				s.streamAgentEvents(ctx, conn, events, agentID, clientMsgs)
+				s.streamAgentEvents(ctx, conn, events, agentID, clientMsgs, heartbeat)
 
 			case "steer":
 				if msg.Content == "" {
@@ -302,6 +330,7 @@ func (s *Server) streamAgentEvents(
 	events <-chan agent.ChatEvent,
 	agentID string,
 	clientMsgs <-chan agentWSClientMsg,
+	heartbeat *time.Ticker,
 ) {
 	for {
 		select {
@@ -312,6 +341,14 @@ func (s *Server) streamAgentEvents(
 			// goroutine doesn't block on the unread channel.
 			drainEventsAsync(events)
 			return
+		case <-heartbeat.C:
+			// Keep the heartbeat flowing during a turn that produces no
+			// events for a while (e.g. a long silent tool call), so the
+			// client watchdog doesn't force-reconnect mid-turn.
+			if err := writeJSON(ctx, conn, agentHeartbeatMsg()); err != nil {
+				drainEventsAsync(events)
+				return
+			}
 		case event, ok := <-events:
 			if !ok {
 				_ = writeJSON(ctx, conn, s.synthesizeTerminal(agentID))

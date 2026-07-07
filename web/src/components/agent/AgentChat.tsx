@@ -29,6 +29,7 @@ import {
   appendUniqueMessage,
   applyDoneMessage,
   applySubagentEvent,
+  applySubagentEventToMessages,
   applyToolResult,
   newToolFromEvent,
   toToolUse,
@@ -451,6 +452,11 @@ export function AgentChat() {
       if (event.parentToolUseId) {
         liveStreamToolsRef.current = applySubagentEvent(liveStreamToolsRef.current, event);
         setStreamTools((prev) => applySubagentEvent(prev, event));
+        // A BACKGROUND subagent's output can arrive after the spawning turn
+        // finished, so its Task chip no longer lives in streamTools but in an
+        // already-persisted message. Route it there too (no-op fast path when
+        // the parent is the live stream, so only one target actually updates).
+        setMessages((prev) => applySubagentEventToMessages(prev, event));
         return;
       }
       switch (event.type) {

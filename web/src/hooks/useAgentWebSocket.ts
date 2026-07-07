@@ -19,6 +19,11 @@ export function useAgentWebSocket({
   const [connected, setConnected] = useState(false);
   const reconnectRef = useRef<ReturnType<typeof setTimeout>>(null);
   const backoffRef = useRef(1000);
+  // Timestamp of the last frame received on the current socket. ANY frame
+  // counts (chat events AND the server's ~20s heartbeat), so a healthy but
+  // idle connection still refreshes this. The watchdog below reads it to
+  // detect a zombie socket the browser never reported closed.
+  const lastMsgRef = useRef(Date.now());
   const activeRef = useRef(true);
   const onEventRef = useRef(onEvent);
   onEventRef.current = onEvent;
@@ -34,6 +39,7 @@ export function useAgentWebSocket({
 
     ws.onopen = () => {
       if (wsRef.current !== ws) return;
+      lastMsgRef.current = Date.now();
       setConnected(true);
       backoffRef.current = 1000;
       onConnectedRef.current?.();
@@ -41,8 +47,16 @@ export function useAgentWebSocket({
 
     ws.onmessage = (evt) => {
       if (wsRef.current !== ws) return;
+      // Any inbound frame proves the socket is alive — refresh the
+      // watchdog timestamp before anything else (cheap: one ref write).
+      lastMsgRef.current = Date.now();
       try {
         const event: ChatEvent = JSON.parse(evt.data);
+        // Server heartbeat: liveness only, nothing to render. Swallow it
+        // here so the reducer never sees a synthetic event. (Old clients
+        // lacking this branch fall through to onEvent, whose switch has no
+        // default case and ignores the unknown "ping" type harmlessly.)
+        if ((event.type as string) === "ping") return;
         onEventRef.current(event);
       } catch {
         // ignore
@@ -127,9 +141,10 @@ export function useAgentWebSocket({
           return;
         }
         const hiddenFor = hiddenAt != null ? Date.now() - hiddenAt : 0;
-        // Server pings every 30s (internal/server/agent_ws.go) — only
-        // force-reconnect after at least one missed ping interval so a
-        // quick alt-tab doesn't churn a perfectly healthy connection.
+        // Server heartbeats every ~20s (internal/server/agent_ws.go) and
+        // the watchdog above catches silent zombies within ~45s — only
+        // force-reconnect on wake after a hide long enough to have missed
+        // a heartbeat, so a quick alt-tab doesn't churn a healthy socket.
         if (hiddenFor >= 30000) {
           forceReconnect();
         }
@@ -149,12 +164,33 @@ export function useAgentWebSocket({
     };
     const onOnline = () => wake(true);
 
+    // Watchdog for the zombie socket the reported scenario produces: a
+    // TLS-terminating proxy (tailscale serve) keeps the browser-side TCP
+    // open across a daemon re-exec, so onclose never fires and the
+    // OPEN-but-dead socket goes unnoticed by the visibility/online paths
+    // (the tab stays foregrounded, the network never changes). The server
+    // now emits an application heartbeat every ~20s, so >45s of total
+    // silence (2 missed heartbeats + slack) on an OPEN socket means the
+    // frames are being black-holed. Force-reconnect and let the existing
+    // backoff + onConnected refetch path recover. 10s poll is cheap and
+    // reads only a ref timestamp, so idle tabs cost nothing.
+    const DEAD_AFTER_MS = 45000;
+    const watchdog = setInterval(() => {
+      if (!activeRef.current) return;
+      const ws = wsRef.current;
+      if (ws?.readyState !== WebSocket.OPEN) return; // only OPEN can be a zombie
+      if (Date.now() - lastMsgRef.current > DEAD_AFTER_MS) {
+        forceReconnect();
+      }
+    }, 10000);
+
     document.addEventListener("visibilitychange", onVisibilityChange);
     window.addEventListener("online", onOnline);
 
     return () => {
       activeRef.current = false;
       if (reconnectRef.current) clearTimeout(reconnectRef.current);
+      clearInterval(watchdog);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       window.removeEventListener("online", onOnline);
       const ws = wsRef.current;

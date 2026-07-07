@@ -61,6 +61,12 @@ type claudeSession struct {
 	// across turns on this process (requestIDs are unique per prompt).
 	qstate *claudeQuestionState
 
+	// tailer surfaces background-subagent (Task run_in_background) output that
+	// outlives the spawning turn. Owned by this session; its poll loop is tied
+	// to procCtx so it stops when the process exits (no goroutine leak). nil
+	// when no subagent-activity handler is registered.
+	tailer *subagentTailer
+
 	mu           sync.Mutex
 	state        sessionState
 	sessionID    string // authoritative, from result events
@@ -357,9 +363,29 @@ func (b *ClaudeBackend) spawnSession(agentID, dir, fp string, args []string) (*c
 		lastActivity: time.Now(),
 	}
 	s.qstate = newClaudeQuestionState(s.stdinW)
+	// Background-subagent tailer: surfaces Task(run_in_background) output that
+	// outlives the spawning turn. Tied to procCtx so the poll loop dies with
+	// the process. Only started when a handler is registered.
+	if b.onSubagentActivity != nil {
+		s.tailer = newSubagentTailer(agentID, dir, b.logger, s.currentSessionID, b.onSubagentActivity)
+		go s.tailer.run(procCtx)
+	}
 	go s.readLoop(stdout)
 	b.logger.Info("claude persistent session spawned", "agent", agentID)
 	return s, nil
+}
+
+// currentSessionID returns the authoritative session id (from a result event)
+// when known, else the deterministic id for this agent's main chat — the only
+// chat kind that uses a persistent session, so sessionKey is always empty here.
+func (s *claudeSession) currentSessionID() string {
+	s.mu.Lock()
+	sid := s.sessionID
+	s.mu.Unlock()
+	if sid != "" {
+		return sid
+	}
+	return agentIDToUUID(s.agentID)
 }
 
 // awaitDead polls (bounded by timeout) until the session process has fully
@@ -694,6 +720,13 @@ func (s *claudeSession) completeTurn() {
 	s.turnDone = nil
 	s.armReapLocked()
 	s.mu.Unlock()
+
+	// Backfill (Option C): a turn just ended, so any background subagent it
+	// spawned may have flushed transcript lines the poll loop hasn't picked up
+	// yet. Kick an immediate scan off the readLoop goroutine to cut latency.
+	if s.tailer != nil {
+		go s.tailer.scanOnce()
+	}
 
 	// Release any question left unanswered at the turn boundary (abort path).
 	s.qstate.denyAllPending("turn ended before the question was answered")
