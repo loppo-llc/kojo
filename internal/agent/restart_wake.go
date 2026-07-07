@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/store"
@@ -23,10 +25,53 @@ const (
 	restartWakeKey       = "restart_wake"
 )
 
-// ArmRestartWake persists the restart-wake marker for agentID. Called by
-// the restart drain goroutine right before the shutdown trigger fires —
-// never earlier, so an aborted drain leaves no marker behind.
-func (m *Manager) ArmRestartWake(agentID string) error {
+// restartWakeMarker is the JSON payload stored when the wake targets a
+// specific thread. A marker with only an agent ID (the original format,
+// and the common main-conversation case) is stored as the bare agent ID
+// string instead — see encode/decodeRestartWake for the backward-compat
+// contract.
+type restartWakeMarker struct {
+	AgentID    string `json:"agentId"`
+	SessionKey string `json:"sessionKey,omitempty"`
+}
+
+// encodeRestartWake serialises the marker value. With no sessionKey it
+// returns the bare agentID (identical to the pre-thread format, so old
+// readers and existing tests keep working). With a sessionKey it returns
+// a JSON object.
+func encodeRestartWake(agentID, sessionKey string) string {
+	if sessionKey == "" {
+		return agentID
+	}
+	b, err := json.Marshal(restartWakeMarker{AgentID: agentID, SessionKey: sessionKey})
+	if err != nil {
+		// Marshalling two strings cannot realistically fail; degrade to
+		// the main-conversation wake rather than dropping it entirely.
+		return agentID
+	}
+	return string(b)
+}
+
+// decodeRestartWake parses a marker value written by encodeRestartWake OR
+// by any older kojo that stored a bare agent ID. A leading '{' selects
+// the JSON form; anything else is treated as a bare agent ID targeting
+// the main conversation.
+func decodeRestartWake(value string) (agentID, sessionKey string) {
+	if strings.HasPrefix(strings.TrimSpace(value), "{") {
+		var mrk restartWakeMarker
+		if err := json.Unmarshal([]byte(value), &mrk); err == nil && mrk.AgentID != "" {
+			return mrk.AgentID, mrk.SessionKey
+		}
+	}
+	return value, ""
+}
+
+// ArmRestartWake persists the restart-wake marker for agentID. When
+// sessionKey is non-empty the wake is routed back to that thread on boot
+// (falling back to the main conversation if the thread is gone). Called
+// by the restart drain goroutine right before the shutdown trigger fires
+// — never earlier, so an aborted drain leaves no marker behind.
+func (m *Manager) ArmRestartWake(agentID, sessionKey string) error {
 	st := m.Store()
 	if st == nil {
 		return errors.New("restart wake: store unavailable")
@@ -34,7 +79,7 @@ func (m *Manager) ArmRestartWake(agentID string) error {
 	rec := &store.KVRecord{
 		Namespace: restartWakeNamespace,
 		Key:       restartWakeKey,
-		Value:     agentID,
+		Value:     encodeRestartWake(agentID, sessionKey),
 		Type:      store.KVTypeString,
 		Scope:     store.KVScopeMachine,
 	}
@@ -86,7 +131,7 @@ func (m *Manager) ConsumeRestartWake(version string, bootTime time.Time) {
 		m.logger.Info("restart wake: marker newer than this boot; leaving for the next process")
 		return
 	}
-	agentID := rec.Value
+	agentID, sessionKey := decodeRestartWake(rec.Value)
 	// Delete FIRST — at-most-once semantics. If the delete fails we do
 	// NOT fire: a marker we cannot clear would re-trigger a turn on
 	// every subsequent boot. Conditional on the etag we just read so a
@@ -107,18 +152,74 @@ func (m *Manager) ConsumeRestartWake(version string, bootTime time.Time) {
 	// other error (agent gone, archived, backend) aborts immediately.
 	deadline := time.Now().Add(2 * time.Minute)
 	for {
-		err := m.WakeChat(agentID, msg)
+		err := m.fireWake(agentID, sessionKey, msg)
 		if err == nil {
-			m.logger.Info("restart wake: turn triggered", "agent", agentID, "version", version)
+			m.logger.Info("restart wake: turn triggered", "agent", agentID, "thread", sessionKey, "version", version)
 			return
 		}
 		if !errors.Is(err, ErrAgentBusy) || time.Now().After(deadline) {
-			m.logger.Warn("restart wake: chat failed", "agent", agentID, "err", err)
+			m.logger.Warn("restart wake: chat failed", "agent", agentID, "thread", sessionKey, "err", err)
 			return
 		}
 		m.logger.Info("restart wake: agent busy; retrying", "agent", agentID)
 		time.Sleep(5 * time.Second)
 	}
+}
+
+// errWakeThreadGone signals that a thread-targeted wake could not be
+// delivered because the thread no longer exists (or the marker names a
+// thread flavour this build cannot re-drive at boot). The caller falls
+// back to the agent's main conversation.
+var errWakeThreadGone = errors.New("restart wake: thread unavailable")
+
+// fireWake delivers the wake turn to the thread named by sessionKey, or
+// to the agent's main conversation when sessionKey is empty. A thread
+// that has gone away falls back to the main conversation so the wake is
+// never silently dropped.
+func (m *Manager) fireWake(agentID, sessionKey, msg string) error {
+	if sessionKey != "" {
+		err := m.WakeThread(agentID, sessionKey, msg)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, errWakeThreadGone) {
+			return err
+		}
+		m.logger.Info("restart wake: thread gone; waking main conversation", "agent", agentID, "thread", sessionKey)
+	}
+	return m.WakeChat(agentID, msg)
+}
+
+// WakeThread delivers the wake turn into a group-DM thread room. Only the
+// "groupdm:<id>" session-key flavour has a boot-time registry that can be
+// resolved and re-driven; anything else (e.g. a Slack thread key, which
+// needs the slackbot to redeliver) returns errWakeThreadGone so fireWake
+// falls back to the main conversation. Delivery reuses the normal thread
+// post path (PostUserMessage) so the wake lands in the thread transcript
+// and triggers the agent turn exactly like a human message would.
+func (m *Manager) WakeThread(agentID, sessionKey, msg string) error {
+	groupID, ok := strings.CutPrefix(sessionKey, "groupdm:")
+	if !ok || m.groupdms == nil {
+		return errWakeThreadGone
+	}
+	// CheckMembership fails (ErrGroupNotFound) when the thread is gone, and
+	// also guards against a reused group ID whose single agent member
+	// changed across the exec.
+	if err := m.groupdms.CheckMembership(groupID, agentID); err != nil {
+		return errWakeThreadGone
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// PostUserMessage appends synchronously and spawns runThreadTurn in its
+	// own goroutine, so the short ctx here bounds only the transcript write.
+	_, err := m.groupdms.PostUserMessage(ctx, groupID, msg, nil, false)
+	// The thread can be deleted in the window between CheckMembership and
+	// here — surface that as errWakeThreadGone so fireWake still falls back
+	// to the main conversation rather than dropping the wake.
+	if errors.Is(err, ErrGroupNotFound) || errors.Is(err, ErrGroupNotMember) {
+		return errWakeThreadGone
+	}
+	return err
 }
 
 // WakeChat fires an asynchronous system-role chat turn with a

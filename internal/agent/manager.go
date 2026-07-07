@@ -175,6 +175,7 @@ type Manager struct {
 	// Keyed by a unique int64 ID since context.CancelFunc is not comparable.
 	oneShotSeq       int64
 	oneShotCancels   map[string]map[int64]context.CancelFunc // agentID → id → cancel
+	oneShotSessions  map[string]map[int64]string             // agentID → id → SessionKey (restart-wake thread routing)
 	oneShotCancelsMu sync.Mutex
 
 	// oneShotSteers tracks the steer handle for an in-flight ChatOneShot
@@ -377,21 +378,22 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 			"custom":    NewCustomBackend(logger),
 			"llama.cpp": NewLlamaCppBackend(logger),
 		},
-		store:          st,
-		creds:          creds,
-		logger:         logger,
-		busy:           make(map[string]busyEntry),
-		resetting:      make(map[string]bool),
-		switching:      make(map[string]bool),
-		notifying:      make(map[string]int),
-		preparing:      make(map[string]int),
-		mutating:       make(map[string]int),
-		editing:        make(map[string]bool),
-		profileGen:     make(map[string]bool),
-		memIndexes:     make(map[string]*MemoryIndex),
-		chatWatchers:   make(map[string]map[*chatWatcher]struct{}),
-		oneShotCancels: make(map[string]map[int64]context.CancelFunc),
-		oneShotSteers:  make(map[string]SteerFunc),
+		store:           st,
+		creds:           creds,
+		logger:          logger,
+		busy:            make(map[string]busyEntry),
+		resetting:       make(map[string]bool),
+		switching:       make(map[string]bool),
+		notifying:       make(map[string]int),
+		preparing:       make(map[string]int),
+		mutating:        make(map[string]int),
+		editing:         make(map[string]bool),
+		profileGen:      make(map[string]bool),
+		memIndexes:      make(map[string]*MemoryIndex),
+		chatWatchers:    make(map[string]map[*chatWatcher]struct{}),
+		oneShotCancels:  make(map[string]map[int64]context.CancelFunc),
+		oneShotSessions: make(map[string]map[int64]string),
+		oneShotSteers:   make(map[string]SteerFunc),
 	}
 
 	// Register the persistent-session background-turn handler so unsolicited
@@ -2279,7 +2281,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	// after a reset/delete has already drained and started wiping.
 	// Lock nesting (busyMu → oneShotCancelsMu) is safe: no code path
 	// acquires them in the opposite order.
-	osID := m.trackOneShot(agentID, cancel)
+	osID := m.trackOneShot(agentID, cancel, opts.SessionKey)
 	m.busyMu.Unlock()
 
 	outCh := make(chan ChatEvent, 64)
@@ -3134,7 +3136,7 @@ func (m *Manager) IsAgentDMAvailable(agentID string) (bool, bool) {
 
 // trackOneShot registers a one-shot chat's cancel func so it can be
 // cleaned up on Shutdown or agent Delete. Returns an ID for untracking.
-func (m *Manager) trackOneShot(agentID string, cancel context.CancelFunc) int64 {
+func (m *Manager) trackOneShot(agentID string, cancel context.CancelFunc, sessionKey string) int64 {
 	m.oneShotCancelsMu.Lock()
 	defer m.oneShotCancelsMu.Unlock()
 	m.oneShotSeq++
@@ -3143,7 +3145,37 @@ func (m *Manager) trackOneShot(agentID string, cancel context.CancelFunc) int64 
 		m.oneShotCancels[agentID] = make(map[int64]context.CancelFunc)
 	}
 	m.oneShotCancels[agentID][id] = cancel
+	// Record the thread SessionKey (empty for legacy ephemeral one-shots)
+	// so a restart-wake request made mid-turn can be routed back to the
+	// thread the calling turn is running on. See InFlightOneShotSessionKey.
+	if m.oneShotSessions[agentID] == nil {
+		m.oneShotSessions[agentID] = make(map[int64]string)
+	}
+	m.oneShotSessions[agentID][id] = sessionKey
 	return id
+}
+
+// InFlightOneShotSessionKey returns the SessionKey of the agent's
+// currently running one-shot (thread) turn, when exactly one non-empty
+// key is in flight. Returns "" when the agent has no thread turn running,
+// the running turns carry no SessionKey, or the choice is ambiguous
+// (several distinct keys) — the caller then falls back to the agent's
+// main conversation.
+func (m *Manager) InFlightOneShotSessionKey(agentID string) string {
+	m.oneShotCancelsMu.Lock()
+	defer m.oneShotCancelsMu.Unlock()
+	var found string
+	for _, key := range m.oneShotSessions[agentID] {
+		if key == "" {
+			continue
+		}
+		if found == "" {
+			found = key
+		} else if found != key {
+			return ""
+		}
+	}
+	return found
 }
 
 // untrackOneShot removes a one-shot chat's cancel func after it completes.
@@ -3154,6 +3186,12 @@ func (m *Manager) untrackOneShot(agentID string, id int64) {
 		delete(set, id)
 		if len(set) == 0 {
 			delete(m.oneShotCancels, agentID)
+		}
+	}
+	if set, ok := m.oneShotSessions[agentID]; ok {
+		delete(set, id)
+		if len(set) == 0 {
+			delete(m.oneShotSessions, agentID)
 		}
 	}
 }
@@ -3179,6 +3217,7 @@ func (m *Manager) cancelAllOneShots() {
 	m.oneShotCancelsMu.Lock()
 	all := m.oneShotCancels
 	m.oneShotCancels = make(map[string]map[int64]context.CancelFunc)
+	m.oneShotSessions = make(map[string]map[int64]string)
 	m.oneShotCancelsMu.Unlock()
 	for _, cancels := range all {
 		for _, cancel := range cancels {

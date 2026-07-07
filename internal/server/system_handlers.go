@@ -244,6 +244,14 @@ func (s *Server) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Capture the thread the calling turn is running on NOW, while that
+	// turn is still in flight. By the time the drain goroutine arms the
+	// marker every chat has gone idle, so the reverse lookup would be
+	// empty. Empty string = main conversation (the common case).
+	wakeSessionKey := ""
+	if wakeID != "" {
+		wakeSessionKey = s.agents.InFlightOneShotSessionKey(wakeID)
+	}
 	s.restartMu.Lock()
 	trigger := s.restartTrigger
 	s.restartMu.Unlock()
@@ -282,7 +290,7 @@ func (s *Server) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 			// archived while the drain waited.
 			if a, ok := s.agents.Get(wakeID); !ok || a.Archived {
 				s.logger.Warn("restart: wake target gone or archived; wake skipped", "agent", wakeID)
-			} else if err := s.agents.ArmRestartWake(wakeID); err != nil {
+			} else if err := s.agents.ArmRestartWake(wakeID, wakeSessionKey); err != nil {
 				s.logger.Warn("restart: wake marker write failed; restarting without wake",
 					"agent", wakeID, "err", err)
 			} else {
