@@ -13,6 +13,7 @@ import { AgentCredentials } from "./components/agent/AgentCredentials";
 import { AgentDataBrowser } from "./components/agent/AgentDataBrowser";
 import { GroupDMChat } from "./components/groupdm/GroupDMChat";
 import { GlobalSettings } from "./components/GlobalSettings";
+import { ReloadPrompt } from "./components/ui/ReloadPrompt";
 import "@fontsource/ibm-plex-mono/400.css";
 import "@fontsource/ibm-plex-mono/500.css";
 import "@fontsource/ibm-plex-mono/600.css";
@@ -54,6 +55,7 @@ createRoot(document.getElementById("root")!).render(
         <Route path="/agents/:id/credentials" element={<AgentCredentials />} />
         <Route path="/agents/:id/data" element={<AgentDataBrowser />} />
       </Routes>
+      <ReloadPrompt />
     </BrowserRouter>
   </StrictMode>,
 );

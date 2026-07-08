@@ -1,6 +1,7 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import type { AgentMessageAttachment, ChatEvent } from "../lib/agentApi";
 import { wsUrl } from "../lib/utils";
+import { checkServerVersion } from "../lib/versionCheck";
 
 interface UseAgentWebSocketOptions {
   agentId: string;
@@ -52,6 +53,15 @@ export function useAgentWebSocket({
       lastMsgRef.current = Date.now();
       try {
         const event: ChatEvent = JSON.parse(evt.data);
+        // Connection handshake: the server's running version. Emitted
+        // once per connection (including every reconnect after a deploy).
+        // Feed it to the stale-frontend check and swallow it — nothing to
+        // render. Old clients lacking this branch fall through to onEvent,
+        // whose switch ignores the unknown "connected" type harmlessly.
+        if ((event.type as string) === "connected") {
+          checkServerVersion((event as { version?: string }).version);
+          return;
+        }
         // Server heartbeat: liveness only, nothing to render. Swallow it
         // here so the reducer never sees a synthetic event. (Old clients
         // lacking this branch fall through to onEvent, whose switch has no

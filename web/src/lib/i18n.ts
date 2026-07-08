@@ -85,6 +85,13 @@ const messages = {
   "common.saved": { ja: "保存した", en: "Saved" },
   "common.removeName": { ja: "{name} を削除", en: "Remove {name}" },
 
+  // ── Stale-frontend reload prompt ──
+  "reload.available": {
+    ja: "新しいバージョンがあります。リロードしてください",
+    en: "A new version is available. Reload.",
+  },
+  "reload.action": { ja: "リロード", en: "Reload" },
+
   // ── Composer (shared by AgentChat + GroupDMChat) ──
   "composer.olderMessages": { ja: "過去のメッセージ", en: "older messages" },
   "composer.attachFiles": { ja: "ファイルを添付", en: "Attach files" },

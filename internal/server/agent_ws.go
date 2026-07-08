@@ -34,6 +34,17 @@ func agentHeartbeatMsg() map[string]any {
 	return map[string]any{"type": "ping", "t": time.Now().UnixMilli()}
 }
 
+// agentConnectedMsg is the handshake frame sent once at the top of every
+// agent WS connection. It carries the running server version so the
+// client can detect a stale frontend after a deploy: the WS reconnects
+// on every server restart, so a version that no longer matches the
+// loaded bundle means a new build is live (see web lib/versionCheck.ts).
+// Unknown to old clients, whose event switch has no default case and
+// ignores it.
+func agentConnectedMsg(version string) map[string]any {
+	return map[string]any{"type": "connected", "version": version}
+}
+
 // Agent WebSocket message types
 type agentWSClientMsg struct {
 	Type        string                    `json:"type"`                  // "message", "abort", "steer"
@@ -67,6 +78,13 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	s.logger.Debug("agent websocket connected", "agent", agentID)
+
+	// Handshake: announce the running server version as the very first
+	// frame — before any resume replay, chat, or heartbeat — so the client
+	// can prompt a reload when a deploy has made its loaded bundle stale.
+	// A write failure just means the client vanished; the loop below
+	// notices via ctx.
+	_ = writeJSON(ctx, conn, agentConnectedMsg(s.version))
 
 	bgEvents, bgUnsub := s.resumeBackgroundChat(ctx, conn, agentID)
 	defer func() {
