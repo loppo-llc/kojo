@@ -995,14 +995,18 @@ export function AgentChat() {
             {agent.thinkingMode === "on" ? "think:on" : agent.thinkingMode === "off" ? "think:off" : "think:auto"}
           </button>
         )}
-        <button
-          onClick={() => navigate(`/agents/${agent.id}/credentials`, { replace: true })}
-          className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink"
-          title={t("chat.credentials")}
-          aria-label={t("chat.credentials")}
-        >
-          <span className="text-base leading-none">🔐</span>
-        </button>
+        {!(agent.disabledInjections ?? []).includes("credentials") && (
+          <button
+            onClick={() => navigate(`/agents/${agent.id}/credentials`, { replace: true })}
+            className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink"
+            title={t("chat.credentials")}
+            aria-label={t("chat.credentials")}
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
+              <path fillRule="evenodd" d="M8 7a5 5 0 113.61 4.804l-1.903 1.903A1 1 0 019 14H8v1a1 1 0 01-1 1H6v1a1 1 0 01-1 1H3a1 1 0 01-1-1v-2a1 1 0 01.293-.707L8.196 8.39A5.002 5.002 0 018 7zm5-3a.75.75 0 000 1.5A1.5 1.5 0 0114.5 7 .75.75 0 0016 7a3 3 0 00-3-3z" clipRule="evenodd" />
+            </svg>
+          </button>
+        )}
         <button
           onClick={() => navigate(`/agents/${agent.id}/data`, {
             replace: true,
@@ -1016,8 +1020,11 @@ export function AgentChat() {
             <path d="M3.75 3A1.75 1.75 0 002 4.75v1.5c0 .199.034.39.096.568A1.75 1.75 0 002 8.25v7A1.75 1.75 0 003.75 17h12.5A1.75 1.75 0 0018 15.25v-7a1.75 1.75 0 00-.096-.932c.062-.179.096-.37.096-.568v-1.5A1.75 1.75 0 0016.25 3h-4.086a1.75 1.75 0 01-1.237-.513l-.707-.707A1.75 1.75 0 009.086 1.28L8.914 1.28H3.75z" />
           </svg>
         </button>
+        {/* Settings is pushed (not replaced) so browser back from settings
+            returns to this chat — settings is only reachable through chat,
+            and back should retrace the app flow, not skip over it. */}
         <button
-          onClick={() => navigate(`/agents/${agent.id}/settings`, { replace: true })}
+          onClick={() => navigate(`/agents/${agent.id}/settings`, { state: { fromChat: true } })}
           className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink"
           title={t("chat.settings")}
           aria-label={t("chat.settings")}

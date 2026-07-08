@@ -398,7 +398,6 @@ const messages = {
     ja: "ffmpeg が見つからない — WAV 出力のみ。ffmpeg を入れると Opus/MP3 (はるかに小さい) が使える。",
     en: "ffmpeg not detected — only WAV output is available. Install ffmpeg to enable Opus/MP3 (much smaller).",
   },
-  "settings.saveTts": { ja: "TTS 設定を保存", en: "Save TTS Settings" },
   "settings.saving": { ja: "保存中...", en: "Saving..." },
   "settings.enableTts": { ja: "TTS を有効化", en: "Enable TTS" },
 
@@ -428,6 +427,8 @@ const messages = {
     en: "Someone else updated this agent. Reloading…",
   },
   "settings.saveChanges": { ja: "変更を保存", en: "Save Changes" },
+  "settings.unsavedChanges": { ja: "未保存の変更がある", en: "Unsaved changes" },
+  "settings.discard": { ja: "破棄", en: "Discard" },
 
   // ── AgentSettings: Danger Zone ──
   "settings.resetCliSession": { ja: "CLI セッションをリセット", en: "Reset CLI Session" },

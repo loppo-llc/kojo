@@ -137,7 +137,7 @@ describe("agent route navigation", () => {
     render(<RouterProvider router={router} />);
 
     const credentialsButton = await screen.findByLabelText("Credentials");
-    expect(credentialsButton).toHaveTextContent("🔐");
+    expect(credentialsButton.querySelector("svg")).not.toBeNull();
 
     fireEvent.click(credentialsButton);
     await waitFor(() => expect(router.state.location.pathname).toBe("/agents/demo/credentials"));
@@ -146,7 +146,26 @@ describe("agent route navigation", () => {
     expect(router.state.location.pathname).toBe("/");
   });
 
-  it("replaces chat when opening settings so returning to chat still backs home", async () => {
+  it("hides the credentials icon when the credentials injection is disabled", async () => {
+    mocks.agentGet.mockResolvedValue({
+      ...demoAgent(),
+      disabledInjections: ["credentials"],
+    });
+    const router = createMemoryRouter(
+      [
+        { path: "/", element: homeRoute() },
+        { path: "/agents/:id", element: <AgentChat /> },
+      ],
+      { initialEntries: ["/", "/agents/demo"], initialIndex: 1 },
+    );
+
+    render(<RouterProvider router={router} />);
+
+    await screen.findByTitle("Settings");
+    expect(screen.queryByLabelText("Credentials")).not.toBeInTheDocument();
+  });
+
+  it("pushes settings so browser back returns directly to chat", async () => {
     const router = createMemoryRouter(
       [
         { path: "/", element: homeRoute() },
@@ -165,9 +184,39 @@ describe("agent route navigation", () => {
     expect(await screen.findByText("Settings")).toBeInTheDocument();
     expect(screen.queryByText("Manage Credentials")).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "←" }));
+    // (a) Browser back directly from settings lands on chat — settings was
+    // pushed onto the stack (not replaced), so the prior chat entry is intact.
+    await router.navigate(-1);
+    expect(router.state.location.pathname).toBe("/agents/demo");
+
+    // ...and chat still has home behind it (no dead entries were inserted).
+    await router.navigate(-1);
+    expect(router.state.location.pathname).toBe("/");
+  });
+
+  it("UI back then browser back does not land on a duplicate chat", async () => {
+    const router = createMemoryRouter(
+      [
+        { path: "/", element: homeRoute() },
+        { path: "/agents/:id", element: <AgentChat /> },
+        { path: "/agents/:id/settings", element: <AgentSettings /> },
+      ],
+      { initialEntries: ["/", "/agents/demo"], initialIndex: 1 },
+    );
+
+    render(<RouterProvider router={router} />);
+
+    const settingsButton = await screen.findByTitle("Settings");
+    fireEvent.click(settingsButton);
+    await waitFor(() => expect(router.state.location.pathname).toBe("/agents/demo/settings"));
+
+    // (b) In-UI back pops the pushed settings entry (navigate(-1)) rather
+    // than pushing/replacing a new chat route.
+    fireEvent.click(await screen.findByRole("button", { name: "←" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/agents/demo"));
 
+    // Browser back from there goes straight to home — there is no duplicate
+    // chat entry left behind by the UI back button.
     await router.navigate(-1);
     expect(router.state.location.pathname).toBe("/");
   });

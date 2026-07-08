@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useParams, useNavigate } from "react-router";
+import { useParams, useNavigate, useLocation } from "react-router";
 import {
   agentApi,
   CONTEXT_INJECTION_KEYS,
@@ -14,7 +14,7 @@ import { useT } from "../../lib/i18n";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
 import { SlackBotSettings } from "./SlackBotSettings";
-import { modelsForTool, type EffortLevel } from "../../lib/toolModels";
+import { modelsForTool, supportsEffort, type EffortLevel } from "../../lib/toolModels";
 import { useCustomModels } from "./fields/useCustomModels";
 import { PersonaField } from "./fields/PersonaField";
 import { ToolPicker } from "./fields/ToolPicker";
@@ -22,7 +22,7 @@ import { ModelPicker } from "./fields/ModelPicker";
 import { EffortPicker } from "./fields/EffortPicker";
 import { StatusField } from "./fields/StatusField";
 import { WorkDirInput } from "./fields/WorkDirInput";
-import { buildAgentSavePayload } from "./agentSettingsPayload";
+import { buildAgentSavePayload, needsCustomURLFor } from "./agentSettingsPayload";
 import { PageHeader } from "../ui/PageHeader";
 import { SectionCard } from "../ui/SectionCard";
 import { Field } from "../ui/Field";
@@ -111,6 +111,7 @@ export function AgentSettings() {
   const t = useT();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const navigateRef = useRef(navigate);
   navigateRef.current = navigate;
   const [agent, setAgent] = useState<AgentInfo | null>(null);
@@ -302,6 +303,44 @@ export function AgentSettings() {
   const [forkError, setForkError] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
 
+  // Sets every agent-row-backed form field from a server row, applying the
+  // same normalizations everywhere (initial load, post-save re-sync,
+  // discard) so the dirty computation always compares like with like — the
+  // server trims name/persona/workDir/etc. on save, and re-hydrating from
+  // its response is what lets the sticky bar settle after a save.
+  const hydrateFromAgent = (a: AgentInfo) => {
+    setName(a.name);
+    setPersona(a.persona);
+    setPublicProfile(a.publicProfile ?? "");
+    setPublicProfileOverride(a.publicProfileOverride ?? false);
+    setModel(a.model);
+    setEffort((a.effort || "") as EffortLevel | "");
+    setAutoEffort(a.autoEffort ?? true);
+    setTool(a.tool);
+    setCustomBaseURL(a.customBaseURL ?? "http://localhost:8080");
+    setThinkingMode(a.thinkingMode ?? "");
+    setWorkDir(a.workDir ?? "");
+    setCronExpr(a.cronExpr ?? "");
+    setTimeoutMinutes(a.timeoutMinutes || 10);
+    setResumeIdleMinutes(a.resumeIdleMinutes ?? 0);
+    setSilentStart(a.silentStart ?? "");
+    setSilentEnd(a.silentEnd ?? "");
+    setNotifyDuringSilent(a.notifyDuringSilent ?? true);
+    setAllowedTools(a.allowedTools ?? []);
+    setDisabledInjections(a.disabledInjections ?? []);
+    setAllowProtectedPaths(a.allowProtectedPaths ?? []);
+    setPrivileged(a.privileged ?? false);
+    setTTSEnabled(a.tts?.enabled ?? false);
+    setTTSProvider(a.tts?.provider === "grok" ? "grok" : "gemini");
+    setTTSModel(a.tts?.model ?? "");
+    setTTSVoice(a.tts?.voice ?? "");
+    setTTSStylePrompt(a.tts?.stylePrompt ?? "");
+  };
+  // Ref so the load effect (deps: [id]) can call the latest hydrate
+  // without listing it as a dependency.
+  const hydrateRef = useRef(hydrateFromAgent);
+  hydrateRef.current = hydrateFromAgent;
+
   useEffect(() => {
     if (!id) return;
     // Run agent + workspace-file fetches in parallel via allSettled so a
@@ -323,32 +362,7 @@ export function AgentSettings() {
       }
       const a = agentRes.value;
       setAgent(a);
-      setName(a.name);
-      setPersona(a.persona);
-      setPublicProfile(a.publicProfile ?? "");
-      setPublicProfileOverride(a.publicProfileOverride ?? false);
-      setModel(a.model);
-      setEffort((a.effort || "") as EffortLevel | "");
-      setAutoEffort(a.autoEffort ?? true);
-      setTool(a.tool);
-      setCustomBaseURL(a.customBaseURL ?? "http://localhost:8080");
-      setThinkingMode(a.thinkingMode ?? "");
-      setWorkDir(a.workDir ?? "");
-      setCronExpr(a.cronExpr ?? "");
-      setTimeoutMinutes(a.timeoutMinutes || 10);
-      setResumeIdleMinutes(a.resumeIdleMinutes ?? 0);
-      setSilentStart(a.silentStart ?? "");
-      setSilentEnd(a.silentEnd ?? "");
-      setNotifyDuringSilent(a.notifyDuringSilent ?? true);
-      setAllowedTools(a.allowedTools ?? []);
-      setDisabledInjections(a.disabledInjections ?? []);
-      setAllowProtectedPaths(a.allowProtectedPaths ?? []);
-      setPrivileged(a.privileged ?? false);
-      setTTSEnabled(a.tts?.enabled ?? false);
-      setTTSProvider(a.tts?.provider === "grok" ? "grok" : "gemini");
-      setTTSModel(a.tts?.model ?? "");
-      setTTSVoice(a.tts?.voice ?? "");
-      setTTSStylePrompt(a.tts?.stylePrompt ?? "");
+      hydrateRef.current(a);
       // checkin.md: prefer the workspace file. The legacy inline
       // agent.cronMessage is migrated into checkin.md on agent load
       // (see Manager init), so on a current server the endpoint
@@ -568,13 +582,12 @@ export function AgentSettings() {
       // commit the local agent etag would stay stale and the next Save
       // would 412 even though the PATCH landed.
       setAgent(updated);
-      setPublicProfile(updated.publicProfile ?? "");
-      setPublicProfileOverride(updated.publicProfileOverride ?? false);
-      // Re-sync cronExpr to whatever the server actually persisted. Without
-      // this, picking a Preset chip ("@preset:30") leaves the local state at
-      // the sentinel even though the saved row is the expanded form
-      // ("7,37 * * * *"); the dirty diff stays true forever.
-      setCronExpr(updated.cronExpr ?? "");
+      // Re-sync every field to whatever the server actually persisted.
+      // The server normalizes on save (trims name/persona/workDir, expands
+      // cron preset chips like "@preset:30" to "7,37 * * * *", clears grok
+      // TTS model/stylePrompt); without this the dirty diff would compare
+      // raw local state against the normalized row and stay true forever.
+      hydrateFromAgent(updated);
 
       if (checkinDirty) {
         // Thread the etag captured at load time as If-Match. Empty
@@ -658,8 +671,11 @@ export function AgentSettings() {
         }
         // The 412 may equally have come from one of the workspace-file
         // PUTs (checkin / user / status — e.g. the agent rewrote its own
-        // status mid-edit). Re-pin JUST their etags so the next Save can
-        // succeed; bodies stay as the user typed them.
+        // status mid-edit). Re-pin their etags AND loaded snapshots so the
+        // next Save can succeed and Discard reverts to the server's current
+        // bodies (not the stale ones this form loaded with); the textarea
+        // contents — and the isDefault flags guarding untouched templates —
+        // stay as the user left them.
         try {
           const [ck, uc, st, an] = await Promise.allSettled([
             agentApi.getCheckinFile(id!),
@@ -667,10 +683,39 @@ export function AgentSettings() {
             agentApi.getAgentStatus(id!),
             agentApi.getAgentAnchor(id!),
           ]);
-          if (ck.status === "fulfilled") setCheckinEtag(ck.value.etag ?? ck.value.value.etag ?? "");
-          if (uc.status === "fulfilled") setUserContextEtag(uc.value.etag ?? uc.value.value.etag ?? "");
-          if (st.status === "fulfilled") setStatusEtag(st.value.etag ?? st.value.value.etag ?? "");
-          if (an.status === "fulfilled") setAnchorEtag(an.value.etag ?? an.value.value.etag ?? "");
+          // For each file: re-pin etag + snapshot, and if the user hadn't
+          // edited it (field still equals the old snapshot) fast-forward the
+          // field too. Otherwise an untouched textarea would read as dirty
+          // against the fresh snapshot and the next Save would overwrite the
+          // concurrent update with stale content under the new etag.
+          if (ck.status === "fulfilled") {
+            const fresh = ck.value.value.content;
+            if (cronMessage === loadedCheckin) setCronMessage(fresh);
+            setLoadedCheckin(fresh);
+            setCheckinEtag(ck.value.etag ?? ck.value.value.etag ?? "");
+          }
+          if (uc.status === "fulfilled") {
+            const fresh = uc.value.value.content;
+            if (userContext === loadedUser) setUserContext(fresh);
+            setLoadedUser(fresh);
+            setUserContextEtag(uc.value.etag ?? uc.value.value.etag ?? "");
+          }
+          if (st.status === "fulfilled") {
+            const fresh = st.value.value.content;
+            if (statusContent === loadedStatus || statusIsDefault) {
+              setStatusContent(fresh);
+              // Remount StatusField so its rows rebuild from the fresh body.
+              setStatusLoadGen((g) => g + 1);
+            }
+            setLoadedStatus(fresh);
+            setStatusEtag(st.value.etag ?? st.value.value.etag ?? "");
+          }
+          if (an.status === "fulfilled") {
+            const fresh = an.value.value.content;
+            if (anchorContent === loadedAnchor) setAnchorContent(fresh);
+            setLoadedAnchor(fresh);
+            setAnchorEtag(an.value.etag ?? an.value.value.etag ?? "");
+          }
         } catch {
           /* swallow — primary error is already shown */
         }
@@ -928,13 +973,88 @@ export function AgentSettings() {
 
   const activeSection = useScrollSpy(SECTION_IDS, !!agent);
 
+  // Order-insensitive compare for the checkbox-driven string arrays —
+  // unchecking and re-checking an entry must not read as dirty just
+  // because it moved to the end of the array.
+  const setEq = (a: string[], b: string[]) => {
+    if (a.length !== b.length) return false;
+    const sa = [...a].sort();
+    const sb = [...b].sort();
+    return sa.every((v, i) => v === sb[i]);
+  };
+
+  // Dirty when a field the save payload actually sends differs from the
+  // persisted agent row, or a workspace-file textarea differs from its
+  // loaded snapshot. Drives the sticky save bar. Mirrors
+  // buildAgentSavePayload: trimmed strings compare trimmed, and fields the
+  // payload omits for the current tool / provider (effort, customBaseURL,
+  // thinkingMode, allowedTools, allowProtectedPaths, publicProfile body,
+  // gemini-only TTS fields) are skipped so hidden inputs can't leave the
+  // form un-clearably dirty.
+  const dirty =
+    !!agent &&
+    (name.trim() !== agent.name ||
+      persona.trim() !== agent.persona ||
+      (publicProfileOverride && publicProfile.trim() !== (agent.publicProfile ?? "")) ||
+      publicProfileOverride !== (agent.publicProfileOverride ?? false) ||
+      model.trim() !== agent.model ||
+      (supportsEffort(tool) && effort !== ((agent.effort || "") as EffortLevel | "")) ||
+      autoEffort !== (agent.autoEffort ?? true) ||
+      tool.trim() !== agent.tool ||
+      (needsCustomURLFor(tool) &&
+        customBaseURL.trim() !== (agent.customBaseURL ?? "http://localhost:8080")) ||
+      (tool === "llama.cpp" && thinkingMode !== (agent.thinkingMode ?? "")) ||
+      workDir.trim() !== (agent.workDir ?? "") ||
+      cronExpr !== (agent.cronExpr ?? "") ||
+      timeoutMinutes !== (agent.timeoutMinutes || 10) ||
+      resumeIdleMinutes !== (agent.resumeIdleMinutes ?? 0) ||
+      silentStart !== (agent.silentStart ?? "") ||
+      silentEnd !== (agent.silentEnd ?? "") ||
+      notifyDuringSilent !== (agent.notifyDuringSilent ?? true) ||
+      (tool === "custom" && !setEq(allowedTools, agent.allowedTools ?? [])) ||
+      ((tool === "claude" || tool === "custom") &&
+        !setEq(allowProtectedPaths, agent.allowProtectedPaths ?? [])) ||
+      !setEq(disabledInjections, agent.disabledInjections ?? []) ||
+      ttsEnabled !== (agent.tts?.enabled ?? false) ||
+      ttsProvider !== (agent.tts?.provider === "grok" ? "grok" : "gemini") ||
+      (ttsProvider === "gemini" && ttsModel !== (agent.tts?.model ?? "")) ||
+      ttsVoice !== (agent.tts?.voice ?? "") ||
+      (ttsProvider === "gemini" && ttsStylePrompt.trim() !== (agent.tts?.stylePrompt ?? "")) ||
+      cronMessage !== loadedCheckin ||
+      userContext !== loadedUser ||
+      (statusContent !== loadedStatus && !statusIsDefault) ||
+      anchorContent !== loadedAnchor);
+
+  // Rehydrate every form field from the persisted agent row / loaded
+  // workspace-file snapshots, dropping unsaved edits.
+  const handleDiscard = () => {
+    if (!agent) return;
+    hydrateFromAgent(agent);
+    setCronMessage(loadedCheckin);
+    setUserContext(loadedUser);
+    setStatusContent(loadedStatus);
+    setAnchorContent(loadedAnchor);
+    // Remount StatusField so its internal rows rebuild from the snapshot.
+    setStatusLoadGen((g) => g + 1);
+    setError("");
+  };
+
   if (!agent) return null;
 
   return (
     <div className="min-h-full bg-app text-ink">
       <PageHeader
         title={t("common.settings")}
-        onBack={() => navigate(`/agents/${id}`, { replace: true })}
+        onBack={() =>
+          // Settings is pushed onto the stack from chat, so the UI back
+          // button pops that entry (navigate(-1)) rather than pushing a new
+          // chat route — otherwise browser back would then land on a
+          // duplicate chat. Deep links / refreshes have no chat entry to pop
+          // (no fromChat flag), so fall back to a replace-navigate.
+          (location.state as { fromChat?: boolean } | null)?.fromChat
+            ? navigate(-1)
+            : navigate(`/agents/${id}`, { replace: true })
+        }
         below={
           // Mobile section nav: sticky, horizontally scrollable chip row.
           <nav className="flex gap-1.5 overflow-x-auto border-t border-hairline px-4 py-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden lg:hidden">
@@ -1538,17 +1658,6 @@ export function AgentSettings() {
             </div>
           )}
 
-          {/* Local Save button so users editing TTS settings don't have
-              to scroll up to the main Save Changes button. handleSave
-              already includes the TTS payload, so this just re-uses it. */}
-          <Button
-            variant="primary"
-            onClick={handleSave}
-            disabled={saving}
-            className="mt-4 w-full"
-          >
-            {saving ? t("settings.saving") : t("settings.saveTts")}
-          </Button>
         </SectionCard>
 
         {/* ── Integrations ── */}
@@ -1614,21 +1723,6 @@ export function AgentSettings() {
           </div>
         </SectionCard>
 
-        {/* Banners + primary save (covers every form field via handleSave). */}
-        <div className="space-y-3">
-          {error && <Banner tone="error">{error}</Banner>}
-          {success && <Banner tone="success">{t("common.saved")}</Banner>}
-          {checkinNotice && <Banner tone="warn">{checkinNotice}</Banner>}
-          <Button
-            variant="primary"
-            onClick={handleSave}
-            disabled={saving}
-            className="w-full py-3"
-          >
-            {saving ? t("settings.saving") : t("settings.saveChanges")}
-          </Button>
-        </div>
-
         {/* ── Danger Zone ── */}
         <SectionCard id="danger" title={t("settings.card.danger")} danger>
           <div className="space-y-4">
@@ -1680,6 +1774,32 @@ export function AgentSettings() {
           <div>{t("settings.idLabel", { id: agent.id })}</div>
           <div>{t("settings.createdLabel", { date: new Date(agent.createdAt).toLocaleString() })}</div>
         </div>
+
+        {/* Sticky save bar — appears at the bottom of the pane whenever the
+            form has unsaved changes (or a banner needs attention) and covers
+            every field, TTS included, via handleSave. */}
+        {(dirty || saving || error || success || checkinNotice) && (
+          <div className="sticky bottom-0 z-10 -mx-4 border-t border-hairline bg-app/95 px-4 py-3 backdrop-blur">
+            <div className="space-y-2">
+              {error && <Banner tone="error">{error}</Banner>}
+              {success && <Banner tone="success">{t("common.saved")}</Banner>}
+              {checkinNotice && <Banner tone="warn">{checkinNotice}</Banner>}
+              {(dirty || saving) && (
+                <div className="flex items-center gap-2">
+                  <span className="min-w-0 flex-1 truncate text-[12px] text-ink-faint">
+                    {t("settings.unsavedChanges")}
+                  </span>
+                  <Button onClick={handleDiscard} disabled={saving}>
+                    {t("settings.discard")}
+                  </Button>
+                  <Button variant="primary" onClick={handleSave} disabled={saving}>
+                    {saving ? t("settings.saving") : t("settings.saveChanges")}
+                  </Button>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
         </main>
       </div>
 
