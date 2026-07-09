@@ -86,6 +86,21 @@ type claudeSession struct {
 	// races the turn end returns ErrAgentNotBusy instead of injecting into a
 	// pipe the CLI stopped reading (see claudeTurnSteer).
 	turnSteer *claudeTurnSteer
+
+	// Queued-steer reaper (guarded by mu). Interrupting a steered turn does
+	// NOT discard the steer user-lines already queued on the CLI's stdin
+	// (verified against claude 2.1.205: the interrupt control_response
+	// reports still_queued:[] regardless, and the CLI auto-starts a fresh
+	// turn per queued line ~1s after the aborted turn's result). Those
+	// auto-turns open as unsolicited turns here, which have no abort
+	// wiring — so a stop during a steered turn would "stop" for an instant
+	// and then visibly resume, unkillable from the UI. The abort watcher
+	// arms this counter with the aborted turn's steer write count; each
+	// unsolicited turn opened before the deadline is interrupted on open.
+	// A solicited startTurn disarms it (the user re-engaged; killing their
+	// new turn would be worse than letting a stale steer reply through).
+	killQueuedSteerTurns int
+	killQueuedSteerUntil time.Time
 }
 
 // sessionSend delivers e to the turn sink, but never blocks the shared
@@ -468,6 +483,11 @@ func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage
 	s.turnCtx = ctx
 	s.turnDone = done
 	s.turnSteer = &claudeTurnSteer{stdinW: s.stdinW}
+	steerGate := s.turnSteer
+	// A fresh solicited turn disarms the queued-steer reaper: whatever was
+	// queued has either been consumed already or will be answered within
+	// this turn the user just started — killing it would eat their turn.
+	s.killQueuedSteerTurns = 0
 	s.lastActivity = time.Now()
 	s.acc = newTurnAccumulator(s.logger, func(e ChatEvent) bool {
 		return sessionSend(ctx, sink, e)
@@ -525,6 +545,37 @@ func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage
 			}()
 			select {
 			case <-done:
+				// The turn ended after our interrupt — but interrupt does
+				// not discard steer lines still queued on stdin, and the
+				// CLI will auto-start a fresh turn per queued line. Arm
+				// the reaper so openUnsolicitedLocked interrupts those
+				// auto-turns instead of letting the "stopped" turn
+				// visibly resume. Deadline bounds the blast radius: a
+				// genuine background notification arriving later must not
+				// be killed by a stale abort.
+				if n := int(steerGate.writes.Load()); n > 0 {
+					s.mu.Lock()
+					// Re-check turn identity before arming: this goroutine
+					// can be scheduled late, after a successor solicited
+					// turn already started (and deliberately disarmed the
+					// reaper in startTurn). The turn teardown nils
+					// s.turnDone at the result boundary and every
+					// startTurn/openUnsolicitedLocked replaces it, so
+					// nil (idle, no successor yet) or OUR done (teardown
+					// not reached yet) proves no successor turn exists;
+					// anything else means a successor already started and
+					// arming now would override its deliberate disarm.
+					if s.turnDone == nil || s.turnDone == done {
+						s.killQueuedSteerTurns = n
+						// Deadline is deliberately tight: the CLI starts the
+						// queued-steer auto-turn ~1s after the aborted
+						// turn's result (measured), and a stale armed
+						// counter would kill a genuine background
+						// notification arriving in the window.
+						s.killQueuedSteerUntil = time.Now().Add(5 * time.Second)
+					}
+					s.mu.Unlock()
+				}
 			case <-time.After(10 * time.Second):
 				s.logger.Warn("claude interrupt unanswered; killing session process", "agent", s.agentID)
 				// Kill the process group directly — close() funnels through
@@ -755,7 +806,56 @@ func (s *claudeSession) openUnsolicitedLocked() {
 	s.acc = newTurnAccumulator(s.logger, func(e ChatEvent) bool {
 		return sessionSend(context.Background(), sink, e)
 	})
-	go s.b.onBackgroundTurn(s.agentID, sink, s.qstate.answer)
+	// abort lets the Manager's Abort interrupt this turn on the CLI itself.
+	// turnDone identity pins it to THIS turn: a late abort (user mashing stop
+	// around the turn boundary) must never interrupt a successor turn.
+	abortTurn := s.turnDone
+	abort := func() {
+		// Fully async: callers include Manager.Abort (WS main loop) — a
+		// deny/interrupt write to a wedged stdin, or the 10s escalation
+		// wait, must never block them.
+		go func() {
+			s.mu.Lock()
+			stale := s.turnDone != abortTurn || s.state != sessInTurn
+			s.mu.Unlock()
+			if stale {
+				return
+			}
+			// Mirror the solicited abort watcher: deny any question the
+			// model is blocked on first (so the CLI can act on the
+			// interrupt instead of idling on an unanswered
+			// control_response), then interrupt, then escalate to a
+			// process-group kill if the turn's result never arrives —
+			// without the escalation a wedged CLI would leave the busy
+			// slot stuck until a kojo restart.
+			s.qstate.denyAllPending("turn aborted")
+			s.interrupt()
+			select {
+			case <-abortTurn:
+			case <-time.After(10 * time.Second):
+				s.logger.Warn("claude interrupt unanswered on unsolicited turn; killing session process", "agent", s.agentID)
+				s.forceKill()
+			}
+		}()
+	}
+	go s.b.onBackgroundTurn(s.agentID, sink, s.qstate.answer, abort)
+	// Queued-steer reaper: this unsolicited turn is (within the deadline)
+	// the CLI auto-consuming a steer line queued behind an aborted turn.
+	// Interrupt it immediately — the operator already said stop. The
+	// interrupt is sent from a goroutine so the shared readLoop (our
+	// caller) never blocks behind the stdin mutex.
+	if s.killQueuedSteerTurns > 0 {
+		if time.Now().Before(s.killQueuedSteerUntil) {
+			s.killQueuedSteerTurns--
+			s.logger.Info("interrupting queued-steer auto-turn after abort", "agent", s.agentID, "remaining", s.killQueuedSteerTurns)
+			// abort is identity-pinned to THIS turn and runs async
+			// itself, so it can neither block the readLoop (our caller)
+			// nor interrupt a successor turn.
+			abort()
+		} else {
+			s.killQueuedSteerTurns = 0
+		}
+	}
 }
 
 // absorbNotification handles a task-notification result that raced into an
@@ -771,7 +871,9 @@ func (s *claudeSession) absorbNotification(event claudeStreamEvent, rawParent st
 	acc := newTurnAccumulator(s.logger, func(e ChatEvent) bool {
 		return sessionSend(context.Background(), sink, e)
 	})
-	go s.b.onBackgroundTurn(s.agentID, sink, s.qstate.answer)
+	// nil abort: the absorbed notification is already complete — there is
+	// nothing running on the CLI to interrupt.
+	go s.b.onBackgroundTurn(s.agentID, sink, s.qstate.answer, nil)
 	acc.feed(event, rawParent)
 	res := acc.finalize()
 	turnUsage := s.turnUsageDelta(res)

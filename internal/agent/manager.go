@@ -2511,7 +2511,7 @@ func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, back
 // plumbing of Chat so the turn shows up live for connected WS clients and in
 // the transcript on next connect, and marks the agent busy for its duration so
 // status displays are truthful.
-func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent, answer AnswerFunc) {
+func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent, answer AnswerFunc, abort func()) {
 	// The session reports idle at the previous turn's result, but the Manager's
 	// chat goroutine may still be finishing persistence/indexing with the busy
 	// entry set. Briefly retry acquiring the slot before giving up, so a
@@ -2540,9 +2540,29 @@ func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent, 
 			outCh = make(chan ChatEvent, 64)
 			bc := newChatBroadcaster(outCh)
 			acc := newChatAccumulator()
+			// The busy entry's cancel must reach the CLI, not just our event
+			// processing: without the backend abort an operator stop on an
+			// unsolicited turn cancelled processChatEvents while the CLI kept
+			// generating — the turn looked stopped, then resumed, and steers
+			// bounced 409 until a restart. The wrapped abort is identity-
+			// guarded by the session (never lands on a successor turn), and
+			// the deferred plain cancel below keeps normal completion from
+			// sending a spurious interrupt.
+			entryCancel := cancel
+			if abort != nil {
+				entryCancel = func() {
+					cancel()
+					// Async: every entry.cancel() caller (Abort, the reset
+					// guard, Shutdown) holds busyMu, and abort takes the
+					// session mutex + writes to the CLI stdin — a wedged
+					// pipe must never stall the whole daemon behind busyMu.
+					// abort is identity-guarded, so late execution is safe.
+					go abort()
+				}
+			}
 			// answer lets a watching human resolve an AskUserQuestion raised on
 			// this automated turn (surfaced as a card, held with a timeout).
-			m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, source: BusySourceNotification, accumulator: acc, outCh: outCh, unsolicited: true, answer: answer}
+			m.busy[agentID] = busyEntry{cancel: entryCancel, startedAt: time.Now(), broadcaster: bc, source: BusySourceNotification, accumulator: acc, outCh: outCh, unsolicited: true, answer: answer}
 			// Count this in-flight unsolicited turn so drains (waitChatIdle /
 			// WaitAllChatsIdle) don't observe idle while it is writing.
 			m.notifying[agentID]++

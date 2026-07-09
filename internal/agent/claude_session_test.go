@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -88,7 +90,7 @@ func TestSessionSolicitedTurn(t *testing.T) {
 
 func TestSessionUnsolicitedTurn(t *testing.T) {
 	bgCh := make(chan (<-chan ChatEvent), 1)
-	_, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc) {
+	_, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc, _ func()) {
 		bgCh <- events
 	})
 	// No solicited turn: feed an unsolicited notification segment.
@@ -120,7 +122,7 @@ func TestSessionUnsolicitedTurn(t *testing.T) {
 // the user turn's content.
 func TestSessionNotifResultDuringSolicitedTurn(t *testing.T) {
 	bgCh := make(chan (<-chan ChatEvent), 1)
-	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc) {
+	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc, _ func()) {
 		bgCh <- events
 	})
 	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false, false)
@@ -168,7 +170,7 @@ func TestSessionNotifResultDuringSolicitedTurn(t *testing.T) {
 
 func TestSessionEmptyUnsolicitedDropped(t *testing.T) {
 	bgCh := make(chan (<-chan ChatEvent), 1)
-	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc) {
+	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc, _ func()) {
 		bgCh <- events
 	})
 	// Stray content-less segment: should open+close the bg turn with no done.
@@ -231,7 +233,7 @@ func TestSessionBusyRejectsSecondTurn(t *testing.T) {
 
 func TestSessionStrayIdleEventsDoNotOpenTurn(t *testing.T) {
 	called := make(chan struct{}, 1)
-	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc) {
+	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc, _ func()) {
 		called <- struct{}{}
 		for range events {
 		}
@@ -277,4 +279,181 @@ func TestFingerprintExcludesSessionFlag(t *testing.T) {
 	if a == d {
 		t.Fatal("fingerprint must change when model differs")
 	}
+}
+
+// syncBuffer is a threadsafe writer capturing stdin lines for assertions.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *syncBuffer) Close() error { return nil }
+
+// Aborting a steered turn must arm the queued-steer reaper: the CLI does not
+// discard steer lines queued on stdin, so the unsolicited auto-turn it starts
+// right after the aborted turn's result must be interrupted on open.
+func TestSessionQueuedSteerReaperInterruptsAutoTurn(t *testing.T) {
+	bgCh := make(chan (<-chan ChatEvent), 2)
+	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc, _ func()) {
+		bgCh <- events
+	})
+	stdin := &syncBuffer{}
+	s.stdinW = &claudeStdinWriter{w: stdin}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sink, err := s.startTurn(ctx, &Agent{ID: "test-agent"}, "hi", false, false)
+	if err != nil {
+		t.Fatalf("startTurn: %v", err)
+	}
+	go func() {
+		for range sink {
+		}
+	}()
+
+	// Steer the running turn, then abort it.
+	if err := s.turnSteerFunc()("queued steer"); err != nil {
+		t.Fatalf("steer: %v", err)
+	}
+	cancel()
+
+	// The abort watcher must write an interrupt control_request.
+	waitFor := func(what string, n int) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if strings.Count(stdin.String(), what) >= n {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("stdin did not receive %d× %q; stdin=%q", n, what, stdin.String())
+	}
+	waitFor(`"subtype":"interrupt"`, 1)
+
+	// The CLI answers the interrupt with the aborted turn's result.
+	io.WriteString(pw, `{"type":"result","subtype":"error_during_execution","session_id":"sess-1"}`+"\n")
+
+	// Reaper must be armed with the steer count once the turn ends.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		s.mu.Lock()
+		armed := s.killQueuedSteerTurns
+		s.mu.Unlock()
+		if armed == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("reaper not armed; killQueuedSteerTurns=%d", armed)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The queued steer line now auto-starts an unsolicited turn — the reaper
+	// must interrupt it immediately (a second interrupt on stdin).
+	io.WriteString(pw, `{"type":"assistant","message":{"content":[{"type":"text","text":"auto turn"}]}}`+"\n")
+	waitFor(`"subtype":"interrupt"`, 2)
+
+	s.mu.Lock()
+	remaining := s.killQueuedSteerTurns
+	s.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("killQueuedSteerTurns = %d, want 0", remaining)
+	}
+	pw.Close()
+}
+
+// A fresh solicited turn must disarm the reaper so a user's new turn is never
+// killed by a stale abort.
+func TestSessionQueuedSteerReaperDisarmedBySolicitedTurn(t *testing.T) {
+	s, pw := newTestSession(t, nil)
+	s.mu.Lock()
+	s.killQueuedSteerTurns = 2
+	s.killQueuedSteerUntil = time.Now().Add(15 * time.Second)
+	s.mu.Unlock()
+
+	if _, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false, false); err != nil {
+		t.Fatalf("startTurn: %v", err)
+	}
+	s.mu.Lock()
+	armed := s.killQueuedSteerTurns
+	s.mu.Unlock()
+	if armed != 0 {
+		t.Fatalf("killQueuedSteerTurns = %d, want 0 after solicited startTurn", armed)
+	}
+	pw.Close()
+}
+
+// An unsolicited turn's abort func must interrupt the CLI while the turn is
+// live, and must be a no-op once the turn ended (never hitting a successor).
+func TestSessionUnsolicitedAbortInterruptsCLI(t *testing.T) {
+	abortCh := make(chan func(), 2)
+	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc, abort func()) {
+		abortCh <- abort
+		go func() {
+			for range events {
+			}
+		}()
+	})
+	stdin := &syncBuffer{}
+	s.stdinW = &claudeStdinWriter{w: stdin}
+
+	// Open an unsolicited turn.
+	io.WriteString(pw, `{"type":"assistant","message":{"content":[{"type":"text","text":"bg turn"}]}}`+"\n")
+	var abort func()
+	select {
+	case abort = <-abortCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("background handler not invoked")
+	}
+	if abort == nil {
+		t.Fatal("abort func is nil for a live unsolicited turn")
+	}
+
+	// abort is async (it must never block Manager.Abort behind a wedged
+	// stdin) — poll for the interrupt write.
+	abort()
+	interruptDeadline := time.Now().Add(3 * time.Second)
+	for !strings.Contains(stdin.String(), `"subtype":"interrupt"`) {
+		if time.Now().After(interruptDeadline) {
+			t.Fatalf("abort did not write an interrupt; stdin=%q", stdin.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// End the turn; a late abort must now be a no-op.
+	io.WriteString(pw, `{"type":"result","subtype":"success","result":"bg turn","origin":{"kind":"task-notification"}}`+"\n")
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		s.mu.Lock()
+		idle := s.state != sessInTurn
+		s.mu.Unlock()
+		if idle {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("unsolicited turn did not end")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	before := strings.Count(stdin.String(), `"subtype":"interrupt"`)
+	abort()
+	// Async no-op: give the goroutine time to (incorrectly) write before
+	// asserting nothing changed.
+	time.Sleep(200 * time.Millisecond)
+	if got := strings.Count(stdin.String(), `"subtype":"interrupt"`); got != before {
+		t.Fatalf("stale abort wrote an interrupt (%d -> %d)", before, got)
+	}
+	pw.Close()
 }

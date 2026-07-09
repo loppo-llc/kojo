@@ -123,6 +123,12 @@ func (s *claudeStdinWriter) close() {
 type claudeTurnSteer struct {
 	stdinW *claudeStdinWriter
 	over   atomic.Bool
+	// writes counts user lines successfully injected into this turn. The
+	// abort watcher reads it: the CLI does NOT discard queued steer lines on
+	// interrupt (it auto-starts a fresh turn per queued line right after the
+	// aborted turn's result), so an abort of a steered turn must arm the
+	// queued-steer reaper (see claudeSession.killQueuedSteerTurns).
+	writes atomic.Int32
 }
 
 // writeUserLine is the per-turn SteerFunc. It refuses (ErrAgentNotBusy) once
@@ -138,7 +144,17 @@ func (t *claudeTurnSteer) writeUserLine(text string) error {
 	if t.over.Load() {
 		return ErrAgentNotBusy
 	}
-	return t.stdinW.writeUserLine(text)
+	// Count BEFORE the write (rolled back on failure) so the abort watcher —
+	// which reads the counter right after the turn's result — can never miss
+	// a steer whose write succeeded but whose post-write increment hadn't
+	// executed yet. Overcounting a failed write is corrected immediately;
+	// the reaper deadline bounds any residual overshoot anyway.
+	t.writes.Add(1)
+	if err := t.stdinW.writeUserLine(text); err != nil {
+		t.writes.Add(-1)
+		return err
+	}
+	return nil
 }
 
 // markOver marks the turn finished so subsequent writeUserLine calls fail
@@ -447,7 +463,13 @@ type ClaudeBackend struct {
 // session when the turn's result arrives. answer resolves an AskUserQuestion
 // raised during the turn (nil if the session has no answer channel), letting a
 // watching human respond to a question on an otherwise-automated turn.
-type BackgroundTurnFunc func(agentID string, events <-chan ChatEvent, answer AnswerFunc)
+// abort interrupts the turn on the CLI itself (nil when the turn is already
+// complete, e.g. an absorbed racing notification). Without it the Manager's
+// Abort could only cancel event processing — the CLI kept generating, so a
+// stop pressed on an unsolicited turn (including the auto-turn a queued steer
+// starts after an abort) looked accepted and then visibly resumed, and the
+// busy slot stayed wedged until a kojo restart.
+type BackgroundTurnFunc func(agentID string, events <-chan ChatEvent, answer AnswerFunc, abort func())
 
 func NewClaudeBackend(logger *slog.Logger) *ClaudeBackend {
 	return &ClaudeBackend{logger: logger, sessions: make(map[string]*claudeSession)}

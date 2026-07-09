@@ -76,11 +76,20 @@ func (m *Manager) Subscribe(agentID string) (startedAt time.Time, past []ChatEve
 // goroutine removes itself via untrackOneShot. Idempotent — a
 // second Abort on a finished chat is a no-op for both halves.
 func (m *Manager) Abort(agentID string) {
+	// Call the cancel OUTSIDE busyMu: an unsolicited turn's cancel is
+	// wrapped with the backend abort (session mutex + stdin write) — running
+	// it under the global busy lock would let one wedged session stall every
+	// agent in the daemon, and invites lock-order inversions against code
+	// that takes the session mutex before busyMu.
 	m.busyMu.Lock()
+	var cancel context.CancelFunc
 	if entry, ok := m.busy[agentID]; ok {
-		entry.cancel()
+		cancel = entry.cancel
 	}
 	m.busyMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	m.cancelOneShots(agentID)
 }
 
