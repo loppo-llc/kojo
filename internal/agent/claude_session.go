@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -609,9 +608,20 @@ func (s *claudeSession) handleControlRequest(cr *controlRequestMsg) {
 
 // readLoop parses the process stdout for its whole lifetime, demuxing turns.
 func (s *claudeSession) readLoop(stdout interface{ Read([]byte) (int, error) }) {
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	// Skip-mode scanner: a single oversized stream-json line (e.g. a
+	// tool_result carrying a base64 image Read) must drop only that event,
+	// NOT kill the read loop. With the old fixed-cap bufio.Scanner the loop
+	// died silently on ErrTooLong while the CLI process kept working: every
+	// subsequent tool_use / tool_result vanished from the record and the
+	// turn ended as a spurious "制限時間超過" timeout.
+	scanner := newSkippingLineScanner(stdout)
+	loggedSkips := 0
 	for scanner.Scan() {
+		if n := scanner.Skipped(); n > loggedSkips {
+			s.logger.Warn("claude stream: dropped oversized JSONL line(s); event content lost, stream continues",
+				"dropped", n-loggedSkips, "totalDropped", n)
+			loggedSkips = n
+		}
 		line := scanner.Text()
 		if line == "" {
 			continue
@@ -695,6 +705,13 @@ func (s *claudeSession) readLoop(stdout interface{ Read([]byte) (int, error) }) 
 				s.completeTurn()
 			}
 		}
+	}
+	if n := scanner.Skipped(); n > loggedSkips {
+		s.logger.Warn("claude stream: dropped oversized JSONL line(s) at stream end",
+			"dropped", n-loggedSkips, "totalDropped", n)
+	}
+	if err := scanner.Err(); err != nil {
+		s.logger.Error("claude stream: read loop terminated by error", "err", err)
 	}
 	s.onEOF()
 }

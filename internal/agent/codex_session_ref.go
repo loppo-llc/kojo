@@ -100,7 +100,7 @@ func cloneStringAnyMap(in map[string]any) map[string]any {
 	return out
 }
 
-func waitCodexRPCResponse(scanner *codexLineScanner, id int64) (*rpcMessage, bool) {
+func waitCodexRPCResponse(scanner *jsonlLineScanner, id int64) (*rpcMessage, bool) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {

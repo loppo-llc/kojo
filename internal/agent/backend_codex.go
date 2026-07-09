@@ -1,13 +1,11 @@
 package agent
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -20,106 +18,10 @@ import (
 	"github.com/loppo-llc/kojo/internal/chathistory"
 )
 
-// codexLineScanner reads newline-delimited JSON from an io.Reader with a
-// per-line cap large enough for real Codex command output. bufio.Scanner caps
-// each token at MaxScanTokenSize (and the Buffer max we set), failing with
-// "token too long" when Codex emits a single multi-MB item/completed line.
-// bufio.Reader.ReadSlice avoids that fixed scanner cap, while the explicit
-// MaxJSONLLineBytes bound prevents a corrupted/adversarial stream from growing
-// one line without limit.
-type codexLineScanner struct {
-	r    *bufio.Reader
-	line []byte
-	err  error
-	buf  []byte
-}
-
-func newCodexLineScanner(r io.Reader) *codexLineScanner {
-	return &codexLineScanner{r: bufio.NewReaderSize(r, 64*1024)}
-}
-
-// Scan advances to the next line, stripping the trailing CR/LF. It returns
-// false at EOF (after yielding any final unterminated line) or on a read error.
-func (s *codexLineScanner) Scan() bool {
-	if s.err != nil {
-		return false
-	}
-	for {
-		chunk, err := s.r.ReadSlice('\n')
-		switch {
-		case err == nil:
-			if len(s.buf) > 0 {
-				if !s.appendChunk(chunk) {
-					return false
-				}
-				s.line = bytes.TrimRight(s.buf, "\r\n")
-				s.buf = nil
-				return true
-			}
-			if len(chunk) > chathistory.MaxJSONLLineBytes {
-				s.err = codexLineTooLargeErr()
-				return false
-			}
-			s.line = bytes.TrimRight(chunk, "\r\n")
-			return true
-
-		case errors.Is(err, bufio.ErrBufferFull):
-			if !s.appendChunk(chunk) {
-				return false
-			}
-			continue
-
-		case errors.Is(err, io.EOF):
-			if len(chunk) > 0 && !s.appendChunk(chunk) {
-				return false
-			}
-			s.err = io.EOF
-			if len(s.buf) == 0 {
-				return false
-			}
-			s.line = bytes.TrimRight(s.buf, "\r\n")
-			s.buf = nil
-			return true
-
-		default:
-			if len(chunk) > 0 && !s.appendChunk(chunk) {
-				return false
-			}
-			s.err = err
-			if len(s.buf) == 0 {
-				return false
-			}
-			s.line = bytes.TrimRight(s.buf, "\r\n")
-			s.buf = nil
-			return true
-		}
-	}
-}
-
-func (s *codexLineScanner) Text() string { return string(s.line) }
-
-// Err returns the first non-EOF read error, or nil. EOF is the normal
-// termination and is not reported as an error (matching bufio.Scanner).
-func (s *codexLineScanner) Err() error {
-	if s.err == io.EOF {
-		return nil
-	}
-	return s.err
-}
-
-func (s *codexLineScanner) appendChunk(chunk []byte) bool {
-	if len(s.buf)+len(chunk) > chathistory.MaxJSONLLineBytes {
-		s.buf = nil
-		s.err = codexLineTooLargeErr()
-		return false
-	}
-	s.buf = append(s.buf, chunk...)
-	return true
-}
-
-func codexLineTooLargeErr() error {
-	return fmt.Errorf("codex app-server JSON-RPC line exceeds %d bytes: %w", chathistory.MaxJSONLLineBytes, chathistory.ErrLineTooLarge)
-}
+// The codex app-server JSON-RPC stream is read via jsonlLineScanner (see
+// jsonl_scanner.go) in strict mode: an oversized line means the RPC framing
+// is broken and continuing is unsafe, so it surfaces as a fatal
+// chathistory.ErrLineTooLarge (rendered by codexReadErrorMessage).
 
 func codexReadErrorMessage(err error) string {
 	if err == nil {
@@ -532,7 +434,7 @@ func (r *codexStreamResult) hasOutput() bool {
 // steer may be nil; when set, the active turn id from the turn/start
 // response (or the turn/started notification) is forwarded to it so
 // mid-turn turn/steer requests can be issued.
-func parseCodexStream(scanner *codexLineScanner, turnStartID int64, steer *codexSteerer, logger *slog.Logger, send func(ChatEvent) bool) *codexStreamResult {
+func parseCodexStream(scanner *jsonlLineScanner, turnStartID int64, steer *codexSteerer, logger *slog.Logger, send func(ChatEvent) bool) *codexStreamResult {
 	res := &codexStreamResult{}
 	itemPhases := make(map[string]string) // itemID -> phase ("commentary" or "final_answer")
 

@@ -447,11 +447,12 @@ type grokChatToolCall struct {
 // cancelled) immediately stops parsing and marks the result cancelled.
 func parseGrokStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool) *grokStreamResult {
 	res := &grokStreamResult{}
-	scanner := bufio.NewScanner(r)
-	// Single events are tiny but allow a large max so a runaway delta
-	// (e.g. a single tool argument as one event) doesn't break the
-	// stream with bufio.ErrTooLong.
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	// Skip-mode scanner: an event line over the JSONL cap (e.g. a runaway
+	// tool argument or a base64 image payload) drops only that event
+	// instead of killing the whole stream — see claudeSession.readLoop for
+	// the failure mode this prevents.
+	scanner := newSkippingLineScanner(r)
+	loggedSkips := 0
 
 	var textBuf, thinkBuf strings.Builder
 	var toolUses []ToolUse
@@ -464,6 +465,11 @@ func parseGrokStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool
 	}
 
 	for scanner.Scan() {
+		if n := scanner.Skipped(); n > loggedSkips {
+			logger.Warn("grok stream: dropped oversized JSONL line(s); event content lost, stream continues",
+				"dropped", n-loggedSkips, "totalDropped", n)
+			loggedSkips = n
+		}
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 || line[0] != '{' {
 			continue
@@ -585,6 +591,10 @@ func parseGrokStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool
 				res.streamError = ev.Message
 			}
 		}
+	}
+	if n := scanner.Skipped(); n > loggedSkips {
+		logger.Warn("grok stream: dropped oversized JSONL line(s) at stream end",
+			"dropped", n-loggedSkips, "totalDropped", n)
 	}
 	if err := scanner.Err(); err != nil {
 		logger.Warn("grok scanner error", "err", err)

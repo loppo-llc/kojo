@@ -177,7 +177,7 @@ func equalStrings(a, b []string) bool {
 // "bufio.Scanner: token too long" hang: a single item/completed notification
 // carrying a multi-MB aggregatedOutput (e.g. a command that printed a huge
 // blob) must be read intact instead of killing the stream. bufio.Scanner with
-// a 1MB max token would have failed here; codexLineScanner must read it while
+// a 1MB max token would have failed here; jsonlLineScanner must read it while
 // still enforcing its larger MaxJSONLLineBytes safety cap.
 func TestParseCodexStream_OversizedLine(t *testing.T) {
 	bigOutput := strings.Repeat("x", 3*1024*1024) // 3MB, well over the old 1MB cap

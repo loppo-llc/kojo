@@ -893,11 +893,18 @@ func mergeStreamTexts(r *streamParseResult) string {
 // questionTimeout is 0 for watched user turns (held until turn end) and positive
 // for automated turns (held with an auto-deny timeout).
 func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool, onResult func(), stdinW *claudeStdinWriter, qstate *claudeQuestionState, questionTimeout time.Duration) *streamParseResult {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	// Skip-mode scanner: see claudeSession.readLoop — an oversized
+	// stream-json line drops only that event instead of killing the parse.
+	scanner := newSkippingLineScanner(r)
+	loggedSkips := 0
 
 	acc := newTurnAccumulator(logger, send)
 	for scanner.Scan() {
+		if n := scanner.Skipped(); n > loggedSkips {
+			logger.Warn("claude stream: dropped oversized JSONL line(s); event content lost, stream continues",
+				"dropped", n-loggedSkips, "totalDropped", n)
+			loggedSkips = n
+		}
 		line := scanner.Text()
 		if line == "" {
 			continue
@@ -929,6 +936,10 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 		if acc.res.cancelled {
 			return acc.finalize()
 		}
+	}
+	if n := scanner.Skipped(); n > loggedSkips {
+		logger.Warn("claude stream: dropped oversized JSONL line(s) at stream end",
+			"dropped", n-loggedSkips, "totalDropped", n)
 	}
 	if err := scanner.Err(); err != nil {
 		logger.Warn("claude stream scanner error", "err", err)
