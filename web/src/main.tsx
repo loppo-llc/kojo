@@ -15,6 +15,7 @@ import { AgentTodos } from "./components/agent/AgentTodos";
 import { GroupDMChat } from "./components/groupdm/GroupDMChat";
 import { GlobalSettings } from "./components/GlobalSettings";
 import { ReloadPrompt } from "./components/ui/ReloadPrompt";
+import { UpdatePrompt } from "./components/ui/UpdatePrompt";
 import "@fontsource/ibm-plex-mono/400.css";
 import "@fontsource/ibm-plex-mono/500.css";
 import "@fontsource/ibm-plex-mono/600.css";
@@ -57,7 +58,12 @@ createRoot(document.getElementById("root")!).render(
         <Route path="/agents/:id/data" element={<AgentDataBrowser />} />
         <Route path="/agents/:id/todos" element={<AgentTodos />} />
       </Routes>
-      <ReloadPrompt />
+      {/* Shared fixed stack: both prompts are max-w-md cards; flex-col
+          keeps them stacked when both are visible (Update above Reload). */}
+      <div className="pointer-events-none fixed inset-x-0 bottom-0 z-50 flex flex-col items-center gap-2 p-3">
+        <UpdatePrompt />
+        <ReloadPrompt />
+      </div>
     </BrowserRouter>
   </StrictMode>,
 );

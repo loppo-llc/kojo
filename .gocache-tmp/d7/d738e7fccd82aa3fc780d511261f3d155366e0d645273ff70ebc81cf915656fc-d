@@ -1,0 +1,6 @@
+./bot.go
+./config.go
+./files.go
+./format.go
+./history.go
+./hub.go

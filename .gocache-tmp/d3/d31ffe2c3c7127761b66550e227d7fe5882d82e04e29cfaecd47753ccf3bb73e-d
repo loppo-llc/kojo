@@ -1,0 +1,6 @@
+./alignment_pattern.go
+./alignment_pattern_finder.go
+./detector.go
+./finder_pattern.go
+./finder_pattern_finder.go
+./finder_pattern_info.go

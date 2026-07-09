@@ -1,0 +1,4 @@
+./atomicfile.go
+./atomicfile_windows.go
+./mksyscall.go
+./zsyscall_windows.go

@@ -1,0 +1,4 @@
+./safesocket.go
+./safesocket_darwin.go
+./safesocket_ps.go
+./unixsocket.go

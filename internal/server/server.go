@@ -29,6 +29,7 @@ import (
 	gitpkg "github.com/loppo-llc/kojo/internal/git"
 	"github.com/loppo-llc/kojo/internal/notify"
 	"github.com/loppo-llc/kojo/internal/peer"
+	"github.com/loppo-llc/kojo/internal/selfupdate"
 	"github.com/loppo-llc/kojo/internal/session"
 	"github.com/loppo-llc/kojo/internal/slackbot"
 	"github.com/loppo-llc/kojo/internal/store"
@@ -299,6 +300,27 @@ type Server struct {
 	repoDir string
 	// rebuildRunning guards against concurrent rebuilds (→ 409).
 	rebuildRunning atomic.Bool
+
+	// updateChecker polls GitHub Releases and applies in-place binary
+	// swaps for GET/POST /api/v1/system/update. Nil (tests, unsupported
+	// wiring) degrades GET to {"supported":false} and POST to 501.
+	updateChecker *selfupdate.Checker
+
+	// hubBinary* memoize the SHA-256 of the Hub executable advertised
+	// in hub-info and served by GET /api/v1/peers/binary. Guarded by
+	// hubBinaryMu. Keyed by (path, size, mtime) so a rebuild or
+	// self-update that rewrites the file without restarting this
+	// process recomputes; a prior failure leaves hubBinaryOK false so
+	// the next request retries rather than caching the miss forever.
+	// hubBinaryWarned suppresses repeated Warn logs on persistent
+	// open/hash failure.
+	hubBinaryMu         sync.Mutex
+	hubBinaryCachedPath string
+	hubBinarySize       int64
+	hubBinaryMtime      time.Time
+	hubBinaryDigest     string
+	hubBinaryOK         bool
+	hubBinaryWarned     bool
 }
 
 type Config struct {
@@ -402,6 +424,12 @@ type Config struct {
 	// os.Executable() (in-place deploy). Empty disables the endpoint
 	// (returns 409). cmd/kojo reads $KOJO_REPO_DIR to set this.
 	RepoDir string
+
+	// UpdateChecker is the process-wide GitHub Releases checker used by
+	// GET/POST /api/v1/system/update. Nil disables the endpoints
+	// (GET returns supported:false; POST returns 501). cmd/kojo always
+	// wires one so the API answers even when the periodic loop is off.
+	UpdateChecker *selfupdate.Checker
 }
 
 func New(cfg Config) *Server {
@@ -452,6 +480,7 @@ func New(cfg Config) *Server {
 		devMode:              cfg.DevMode,
 		version:              cfg.Version,
 		repoDir:              cfg.RepoDir,
+		updateChecker:        cfg.UpdateChecker,
 		unsafePeer:           cfg.Unsafe,
 		thumbPurgeDone:       make(chan struct{}),
 		ttsSweepDone:         make(chan struct{}),
@@ -642,6 +671,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	mux.HandleFunc("POST /api/v1/system/restart", s.handleSystemRestart)
 	mux.HandleFunc("GET /api/v1/system/restart", s.handleSystemRestartStatus)
 	mux.HandleFunc("POST /api/v1/system/rebuild", s.handleSystemRebuild)
+	mux.HandleFunc("GET /api/v1/system/update", s.handleSystemUpdateStatus)
+	mux.HandleFunc("POST /api/v1/system/update", s.handleSystemUpdate)
 	mux.HandleFunc("GET /api/v1/sessions", s.handleListSessions)
 	mux.HandleFunc("POST /api/v1/sessions", s.handleCreateSession)
 	mux.HandleFunc("GET /api/v1/sessions/{id}", s.handleGetSession)
@@ -764,6 +795,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		if s.peerEvents != nil {
 			mux.HandleFunc("GET /api/v1/peers/events", s.handlePeerEventsWS)
 		}
+		// Peer auto-update: serve this Hub's own binary so a paired
+		// peer on a matching platform can pull a newer build.
+		// Auth: RolePeer or RoleOwner (same surface as /peers/events).
+		mux.HandleFunc("GET /api/v1/peers/binary", s.handlePeerBinary)
 		// Cross-peer blob fetch (§3.7 step 4). Auth: RolePeer or
 		// RoleOwner. The path tail is the kojo:// URI of the
 		// blob; ParseURI decodes it. Wired only when the blob

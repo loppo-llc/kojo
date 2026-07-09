@@ -92,6 +92,22 @@ const messages = {
   },
   "reload.action": { ja: "リロード", en: "Reload" },
 
+  // ── Daemon self-update prompt ──
+  "update.available": {
+    ja: "kojo {latest} が利用可能です",
+    en: "kojo {latest} is available",
+  },
+  "update.action": { ja: "更新", en: "Update" },
+  "update.updating": {
+    ja: "更新中… アプリが再接続します",
+    en: "Updating… the app will reconnect",
+  },
+  "update.unsupported": {
+    ja: "端末で kojo update を実行して更新してください",
+    en: "Run kojo update in a terminal to update",
+  },
+  "update.notes": { ja: "リリースノート", en: "Release notes" },
+
   // ── Composer (shared by AgentChat + GroupDMChat) ──
   "composer.olderMessages": { ja: "過去のメッセージ", en: "older messages" },
   "composer.attachFiles": { ja: "ファイルを添付", en: "Attach files" },

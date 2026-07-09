@@ -1,0 +1,13 @@
+./attachment.go
+./conpty_windows.go
+./ctime_windows.go
+./errors.go
+./manager.go
+./platform.go
+./platform_windows.go
+./pty_windows.go
+./ringbuffer.go
+./session.go
+./shell_windows.go
+./signal_windows.go
+./store.go

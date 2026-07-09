@@ -1,0 +1,3 @@
+./dir.go
+./strict_windows.go
+./unsupported_windows.go

@@ -1,0 +1,11 @@
+./aum.go
+./builder.go
+./deeplink.go
+./key.go
+./sig.go
+./state.go
+./sync.go
+./tailchonk.go
+./tka.go
+./tka_clone.go
+./verify.go

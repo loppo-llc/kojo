@@ -1,0 +1,5 @@
+./gp_windows.go
+./mksyscall.go
+./policylock_windows.go
+./watcher_windows.go
+./zsyscall_windows.go

@@ -1,0 +1,13 @@
+./api.go
+./com.go
+./globalopts.go
+./guid.go
+./interface.go
+./mksyscall.go
+./object.go
+./process.go
+./stream.go
+./stream_not386.go
+./types.go
+./unknown.go
+./zsyscall_windows.go

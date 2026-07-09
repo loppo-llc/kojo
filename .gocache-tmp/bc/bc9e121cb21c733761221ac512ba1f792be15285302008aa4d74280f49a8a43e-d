@@ -1,0 +1,4 @@
+./importer.go
+./manifest.go
+./migrate.go
+./migrate_test.go

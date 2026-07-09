@@ -1,0 +1,7 @@
+./atomic.go
+./path.go
+./refs.go
+./scope.go
+./scrubber.go
+./store.go
+./storerefs.go

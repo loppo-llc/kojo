@@ -1,0 +1,3 @@
+./importer.go
+./manifest.go
+./migrate.go

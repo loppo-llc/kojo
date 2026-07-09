@@ -1,0 +1,7 @@
+./find.go
+./format.go
+./pack.go
+./parse.go
+./patch.go
+./standard.go
+./types.go

@@ -1,0 +1,3 @@
+./dnsmap.go
+./dohclient.go
+./tsdial.go

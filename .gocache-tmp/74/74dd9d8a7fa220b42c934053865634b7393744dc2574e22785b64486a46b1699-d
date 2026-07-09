@@ -1,0 +1,6 @@
+./checker.go
+./download.go
+./github.go
+./swap.go
+./swap_windows.go
+./version.go

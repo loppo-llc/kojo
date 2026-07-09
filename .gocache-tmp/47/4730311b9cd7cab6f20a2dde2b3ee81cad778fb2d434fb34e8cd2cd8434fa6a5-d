@@ -1,0 +1,3 @@
+./migrate.go
+./paths.go
+./paths_unix.go

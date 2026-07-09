@@ -1,0 +1,16 @@
+./address.go
+./agentlockguard.go
+./autoupdate.go
+./blobpull.go
+./blobpush.go
+./discovery.go
+./eventbus.go
+./identity.go
+./presence.go
+./registrar.go
+./resolve.go
+./subscriber.go
+./sweeper.go
+./validate.go
+./version.go
+./whois.go

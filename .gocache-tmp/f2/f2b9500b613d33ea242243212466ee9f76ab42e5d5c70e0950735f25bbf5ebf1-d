@@ -1,0 +1,4 @@
+./mksyscall.go
+./tshttpproxy.go
+./tshttpproxy_windows.go
+./zsyscall_windows.go

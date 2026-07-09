@@ -1,0 +1,9 @@
+./alphanumeric.go
+./automatic.go
+./blocks.go
+./encoder.go
+./errorcorrection.go
+./numeric.go
+./qrcode.go
+./unicode.go
+./versioninfo.go

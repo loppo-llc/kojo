@@ -1,0 +1,4 @@
+./mksyscall.go
+./osdiag.go
+./osdiag_windows.go
+./zsyscall_windows.go

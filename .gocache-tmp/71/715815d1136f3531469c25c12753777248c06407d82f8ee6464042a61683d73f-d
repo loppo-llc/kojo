@@ -1,0 +1,4 @@
+./rand.go
+./rand_linux_state_autogen.go
+./rand_state_autogen.go
+./rng.go

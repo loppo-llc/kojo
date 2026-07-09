@@ -1,0 +1,8 @@
+./client.go
+./event.go
+./log.go
+./request.go
+./response.go
+./socket_mode_managed_conn.go
+./socketmode.go
+./socketmode_handler.go

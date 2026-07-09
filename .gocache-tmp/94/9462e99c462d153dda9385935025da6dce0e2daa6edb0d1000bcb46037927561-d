@@ -1,0 +1,16 @@
+./blockforever_conn.go
+./debughttp.go
+./debugknobs.go
+./derp.go
+./disco_atomic.go
+./discopingpurpose_string.go
+./endpoint.go
+./endpoint_default.go
+./endpoint_tracker.go
+./magicsock.go
+./magicsock_default.go
+./magicsock_notplan9.go
+./peermap.go
+./peermtu_stubs.go
+./rebinding_conn.go
+./relaymanager.go

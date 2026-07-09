@@ -1,0 +1,3 @@
+./persist.go
+./persist_clone.go
+./persist_view.go

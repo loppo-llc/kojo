@@ -1,0 +1,13 @@
+./attachment.go
+./ctime_darwin.go
+./errors.go
+./manager.go
+./platform.go
+./platform_unix.go
+./pty.go
+./ringbuffer.go
+./session.go
+./signal_unix.go
+./store.go
+./tmux.go
+./tmux_lifecycle.go

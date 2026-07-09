@@ -1,0 +1,3 @@
+./mksyscall.go
+./osdiag.go
+./osdiag_notwindows.go

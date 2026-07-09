@@ -1,0 +1,8 @@
+./32b_64bit.go
+./aligned_64bit.go
+./atomicbitops.go
+./atomicbitops_64bit_state_autogen.go
+./atomicbitops_arm64.go
+./atomicbitops_arm64_state_autogen.go
+./atomicbitops_float64.go
+./atomicbitops_arm64.s

@@ -1,0 +1,3 @@
+./sockopts.go
+./sockopts_default.go
+./sockopts_notwindows.go

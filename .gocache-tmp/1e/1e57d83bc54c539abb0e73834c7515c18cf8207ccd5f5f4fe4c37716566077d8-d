@@ -1,0 +1,5 @@
+./mksyscall.go
+./netns.go
+./netns_darwin.go
+./netns_dw.go
+./socks.go

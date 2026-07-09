@@ -1,0 +1,8 @@
+./checksum.go
+./checksum_amd64.go
+./checksum_generated_amd64.go
+./errors.go
+./offload.go
+./tun.go
+./tun_windows.go
+./checksum_generated_amd64.s

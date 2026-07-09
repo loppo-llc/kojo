@@ -1,0 +1,7 @@
+./error.go
+./guid.go
+./guid_windows.go
+./hresult.go
+./osversion.go
+./time.go
+./util.go

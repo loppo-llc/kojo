@@ -1,0 +1,8 @@
+./defaultroute_darwin.go
+./interfaces.go
+./interfaces_bsd.go
+./interfaces_darwin.go
+./loghelper.go
+./netmon.go
+./netmon_darwin.go
+./state.go

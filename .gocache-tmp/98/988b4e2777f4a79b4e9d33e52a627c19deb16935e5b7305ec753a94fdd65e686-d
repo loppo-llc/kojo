@@ -1,0 +1,6 @@
+./legacy_upnp.go
+./pcp.go
+./pcpresultcode_string.go
+./pmpresultcode_string.go
+./portmapper.go
+./upnp.go

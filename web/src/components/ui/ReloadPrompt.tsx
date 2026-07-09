@@ -14,28 +14,28 @@ export function ReloadPrompt() {
   const pending = useReloadPrompt();
   if (pending === null) return null;
 
+  // Positioning lives on the shared bottom stack in main.tsx so this
+  // banner and UpdatePrompt can sit above each other without overlapping.
   return (
-    <div className="pointer-events-none fixed inset-x-0 bottom-0 z-50 flex justify-center p-3">
-      <div className="pointer-events-auto w-full max-w-md shadow-lg">
-        <Banner
-          tone="info"
-          action={
-            <div className="flex shrink-0 items-center gap-2">
-              <button
-                className="text-[13px] text-ink-faint hover:text-ink"
-                onClick={dismissReloadPrompt}
-              >
-                {t("common.dismiss")}
-              </button>
-              <Button variant="primary" onClick={() => location.reload()}>
-                {t("reload.action")}
-              </Button>
-            </div>
-          }
-        >
-          {t("reload.available")}
-        </Banner>
-      </div>
+    <div className="pointer-events-auto w-full max-w-md shadow-lg">
+      <Banner
+        tone="info"
+        action={
+          <div className="flex shrink-0 items-center gap-2">
+            <button
+              className="text-[13px] text-ink-faint hover:text-ink"
+              onClick={dismissReloadPrompt}
+            >
+              {t("common.dismiss")}
+            </button>
+            <Button variant="primary" onClick={() => location.reload()}>
+              {t("reload.action")}
+            </Button>
+          </div>
+        }
+      >
+        {t("reload.available")}
+      </Banner>
     </div>
   );
 }

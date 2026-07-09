@@ -1,0 +1,6 @@
+./block_pair.go
+./byte_matrix.go
+./encoder.go
+./mask_util.go
+./matrix_util.go
+./qrcode.go

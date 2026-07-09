@@ -1,0 +1,4 @@
+./deephash.go
+./pointer.go
+./pointer_norace.go
+./types.go

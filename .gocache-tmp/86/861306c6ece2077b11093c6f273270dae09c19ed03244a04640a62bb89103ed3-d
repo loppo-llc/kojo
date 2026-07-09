@@ -1,0 +1,6 @@
+./cert.go
+./debugportmapper.go
+./local.go
+./serve.go
+./syspolicy.go
+./tailnetlock.go

@@ -1,0 +1,3 @@
+./hostinfo.go
+./hostinfo_darwin.go
+./hostinfo_uname.go

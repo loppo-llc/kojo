@@ -1,0 +1,12 @@
+./bot.go
+./config.go
+./files.go
+./format.go
+./history.go
+./hub.go
+./bot_helpers_test.go
+./bot_test.go
+./files_test.go
+./format_test.go
+./hub_test.go
+./tool_status_test.go

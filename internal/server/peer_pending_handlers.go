@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"strings"
 	"time"
 
@@ -83,6 +84,12 @@ type hubInfoResponse struct {
 	NodeKey         string `json:"nodeKey,omitempty"`
 	Version         string `json:"version"`
 	ProtocolVersion int    `json:"protocolVersion"`
+	// GOOS / GOARCH / BinarySha256 advertise this Hub's binary so a
+	// paired peer can auto-update when platforms match. binarySha256
+	// is omitted when the Hub executable cannot be hashed.
+	GOOS         string `json:"goos,omitempty"`
+	GOARCH       string `json:"goarch,omitempty"`
+	BinarySha256 string `json:"binarySha256,omitempty"`
 }
 
 // handleHubInfo returns the Hub's identity row + dial URL so a
@@ -96,22 +103,40 @@ func (s *Server) handleHubInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	rec, err := s.agents.Store().GetPeer(r.Context(), s.peerID.DeviceID)
 	if err != nil {
-		writeJSONResponse(w, http.StatusOK, hubInfoResponse{
+		resp := hubInfoResponse{
 			DeviceID:        s.peerID.DeviceID,
 			Name:            s.peerID.Name,
 			Version:         s.version,
 			ProtocolVersion: peer.PairingProtocolVersion,
-		})
+		}
+		s.enrichHubInfoPlatform(&resp)
+		writeJSONResponse(w, http.StatusOK, resp)
 		return
 	}
-	writeJSONResponse(w, http.StatusOK, hubInfoResponse{
+	resp := hubInfoResponse{
 		DeviceID:        rec.DeviceID,
 		Name:            rec.Name,
 		URL:             rec.URL,
 		NodeKey:         rec.NodeKey,
 		Version:         s.version,
 		ProtocolVersion: peer.PairingProtocolVersion,
-	})
+	}
+	s.enrichHubInfoPlatform(&resp)
+	writeJSONResponse(w, http.StatusOK, resp)
+}
+
+// enrichHubInfoPlatform stamps runtime GOOS/GOARCH and a lazily
+// memoized SHA-256 of the Hub executable onto a hub-info response.
+// Hash failure omits binarySha256 (logged once via hubBinarySHA256).
+func (s *Server) enrichHubInfoPlatform(resp *hubInfoResponse) {
+	if resp == nil {
+		return
+	}
+	resp.GOOS = runtime.GOOS
+	resp.GOARCH = runtime.GOARCH
+	if dig, ok := s.hubBinarySHA256(); ok {
+		resp.BinarySha256 = dig
+	}
 }
 
 // joinRequestBody is the wire shape a peer POSTs to
@@ -432,22 +457,26 @@ func (s *Server) buildHubInfoResponse(ctx context.Context) *hubInfoResponse {
 		return nil
 	}
 	rec, err := s.agents.Store().GetPeer(ctx, s.peerID.DeviceID)
+	var resp *hubInfoResponse
 	if err != nil {
-		return &hubInfoResponse{
+		resp = &hubInfoResponse{
 			DeviceID:        s.peerID.DeviceID,
 			Name:            s.peerID.Name,
 			Version:         s.version,
 			ProtocolVersion: peer.PairingProtocolVersion,
 		}
+	} else {
+		resp = &hubInfoResponse{
+			DeviceID:        rec.DeviceID,
+			Name:            rec.Name,
+			URL:             rec.URL,
+			NodeKey:         rec.NodeKey,
+			Version:         s.version,
+			ProtocolVersion: peer.PairingProtocolVersion,
+		}
 	}
-	return &hubInfoResponse{
-		DeviceID:        rec.DeviceID,
-		Name:            rec.Name,
-		URL:             rec.URL,
-		NodeKey:         rec.NodeKey,
-		Version:         s.version,
-		ProtocolVersion: peer.PairingProtocolVersion,
-	}
+	s.enrichHubInfoPlatform(resp)
+	return resp
 }
 
 // peerPendingResponse mirrors PeerPendingRecord on the wire.

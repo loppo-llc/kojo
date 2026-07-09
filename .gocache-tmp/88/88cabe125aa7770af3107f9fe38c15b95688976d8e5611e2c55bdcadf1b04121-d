@@ -1,0 +1,11 @@
+./config.go
+./direct.go
+./dns_clone.go
+./dns_view.go
+./flush_default.go
+./manager.go
+./manager_darwin.go
+./noop.go
+./osconfig.go
+./resolvconfpath_default.go
+./utf.go

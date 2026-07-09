@@ -1,0 +1,12 @@
+./addr_range.go
+./addr_set.go
+./complete_list.go
+./decode.go
+./decode_unsafe.go
+./deferred_list.go
+./encode.go
+./encode_unsafe.go
+./state.go
+./state_norace.go
+./stats.go
+./types.go

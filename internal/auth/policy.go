@@ -141,6 +141,12 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			if path == "/api/v1/peers/events" {
 				return true
 			}
+			if path == "/api/v1/peers/binary" {
+				// Peer auto-update: paired peer pulls the Hub's
+				// own binary after hub-info advertises a newer
+				// version + matching platform + binarySha256.
+				return true
+			}
 			if strings.HasPrefix(path, "/api/v1/peers/blobs/") {
 				return true
 			}

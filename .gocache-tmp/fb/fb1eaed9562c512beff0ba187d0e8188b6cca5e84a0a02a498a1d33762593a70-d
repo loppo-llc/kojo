@@ -1,0 +1,5 @@
+./certstore.go
+./certstore_windows.go
+./crypt_strings_windows.go
+./syscall_windows.go
+./zsyscall_windows.go

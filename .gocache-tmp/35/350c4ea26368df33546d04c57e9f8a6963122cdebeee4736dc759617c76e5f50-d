@@ -1,0 +1,7 @@
+./errors.go
+./origin.go
+./policy_scope.go
+./raw_item.go
+./setting.go
+./snapshot.go
+./summary.go

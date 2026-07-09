@@ -1,0 +1,7 @@
+./c2ntypes.go
+./derpmap.go
+./proto_port_range.go
+./tailcfg.go
+./tailcfg_clone.go
+./tailcfg_view.go
+./tka.go

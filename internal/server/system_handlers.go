@@ -268,35 +268,9 @@ func (s *Server) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
 		return
 	}
-	wakeID := ""
-	if body.Wake {
-		wakeID = body.AgentID
-		if p.IsAgent() {
-			// Agents may only wake themselves — waking someone else
-			// would drop an unexpected system turn into that agent's
-			// transcript.
-			if wakeID == "" {
-				wakeID = p.AgentID
-			} else if wakeID != p.AgentID {
-				writeError(w, http.StatusForbidden, "forbidden",
-					"agents may only wake themselves")
-				return
-			}
-		}
-		if wakeID == "" {
-			writeError(w, http.StatusBadRequest, "bad_request",
-				"wake requires agentId when called by the Owner")
-			return
-		}
-		if s.agents == nil {
-			writeError(w, http.StatusNotImplemented, "unsupported",
-				"wake is not supported in this run mode")
-			return
-		}
-		if _, ok := s.agents.Get(wakeID); !ok {
-			writeError(w, http.StatusNotFound, "not_found", "agent not found: "+wakeID)
-			return
-		}
+	wakeID, ok := s.validateRestartWake(w, p, body.Wake, body.AgentID)
+	if !ok {
+		return
 	}
 	// Capture the thread the calling turn is running on NOW, while that
 	// turn is still in flight. By the time the drain goroutine arms the
@@ -310,16 +284,100 @@ func (s *Server) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 	// misdeliver it to an arbitrary groupdm thread. Default to the main
 	// conversation for owner-driven wakes.
 	wakeSessionKey := wakeThreadForRestart(p, wakeID, s.agents.InFlightOneShotSessionKey)
-	s.restartMu.Lock()
-	trigger := s.restartTrigger
-	s.restartMu.Unlock()
-	if trigger == nil {
+	claimed, unsupported := s.tryClaimRestart()
+	if unsupported {
 		writeError(w, http.StatusNotImplemented, "unsupported",
 			"restart is not supported in this run mode")
 		return
 	}
-	if !s.restartPending.CompareAndSwap(false, true) {
+	if !claimed {
 		writeJSONResponse(w, http.StatusAccepted, map[string]any{"status": "already_pending"})
+		return
+	}
+	s.startRestartDrain(wakeID, wakeSessionKey)
+	writeJSONResponse(w, http.StatusAccepted, map[string]any{
+		"status":  "pending",
+		"version": s.version,
+	})
+}
+
+// validateRestartWake parses the optional wake payload shared by
+// POST /system/restart and POST /system/update. On failure it writes
+// the error response and returns ok=false. wakeID is empty when wake
+// was not requested.
+func (s *Server) validateRestartWake(w http.ResponseWriter, p auth.Principal, wake bool, agentID string) (wakeID string, ok bool) {
+	if !wake {
+		return "", true
+	}
+	wakeID = agentID
+	if p.IsAgent() {
+		// Agents may only wake themselves — waking someone else
+		// would drop an unexpected system turn into that agent's
+		// transcript.
+		if wakeID == "" {
+			wakeID = p.AgentID
+		} else if wakeID != p.AgentID {
+			writeError(w, http.StatusForbidden, "forbidden",
+				"agents may only wake themselves")
+			return "", false
+		}
+	}
+	if wakeID == "" {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"wake requires agentId when called by the Owner")
+		return "", false
+	}
+	if s.agents == nil {
+		writeError(w, http.StatusNotImplemented, "unsupported",
+			"wake is not supported in this run mode")
+		return "", false
+	}
+	if _, found := s.agents.Get(wakeID); !found {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+wakeID)
+		return "", false
+	}
+	return wakeID, true
+}
+
+// tryClaimRestart claims the single-flight restart slot shared by
+// POST /system/restart and POST /system/update. Returns:
+//
+//	claimed=true               — slot taken by this caller
+//	claimed=false, unsupported — restartTrigger is nil (caller → 501)
+//	claimed=false              — already pending (caller → already_pending)
+//
+// Update claims BEFORE Apply so a concurrent restart cannot arm a drain
+// mid-download; restart claims then immediately starts the drain.
+func (s *Server) tryClaimRestart() (claimed bool, unsupported bool) {
+	s.restartMu.Lock()
+	trigger := s.restartTrigger
+	s.restartMu.Unlock()
+	if trigger == nil {
+		return false, true
+	}
+	if !s.restartPending.CompareAndSwap(false, true) {
+		return false, false
+	}
+	return true, false
+}
+
+// startRestartDrain runs the shared quiesce → drain → arm-wake →
+// trigger sequence. Caller MUST already hold the restartPending claim
+// via tryClaimRestart; this does not re-claim. The abort path clears
+// restartPending exactly once.
+//
+// The drain body is intentionally byte-identical to the historical
+// handleSystemRestart goroutine so existing restart tests keep passing
+// without behavior drift.
+func (s *Server) startRestartDrain(wakeID, wakeSessionKey string) {
+	s.restartMu.Lock()
+	trigger := s.restartTrigger
+	s.restartMu.Unlock()
+	// tryClaimRestart already verified trigger != nil; re-read under the
+	// same lock pattern so a test that races SetRestartTrigger(nil) still
+	// has a defined (no-op) path rather than a nil panic.
+	if trigger == nil {
+		s.restartPending.Store(false)
 		return
 	}
 	go func() {
@@ -389,8 +447,4 @@ func (s *Server) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}()
-	writeJSONResponse(w, http.StatusAccepted, map[string]any{
-		"status":  "pending",
-		"version": s.version,
-	})
 }

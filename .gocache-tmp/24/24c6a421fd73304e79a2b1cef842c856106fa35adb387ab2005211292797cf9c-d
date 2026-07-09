@@ -1,0 +1,9 @@
+./cert.go
+./debug.go
+./debugderp.go
+./localapi.go
+./localapi_drive.go
+./pprof.go
+./serve.go
+./syspolicy_api.go
+./tailnetlock.go

@@ -1,0 +1,3 @@
+./dir.go
+./strict_unix.go
+./unsupported_unix.go

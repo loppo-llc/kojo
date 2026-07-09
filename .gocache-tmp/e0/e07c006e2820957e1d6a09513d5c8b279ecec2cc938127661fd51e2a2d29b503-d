@@ -1,0 +1,3 @@
+./debug.go
+./forwarder.go
+./tsdns.go

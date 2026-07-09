@@ -1,0 +1,5 @@
+./assets.go
+./auth.go
+./qnap.go
+./synology.go
+./web.go

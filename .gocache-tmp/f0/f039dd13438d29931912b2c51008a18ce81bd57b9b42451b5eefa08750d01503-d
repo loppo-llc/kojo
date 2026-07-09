@@ -1,0 +1,6 @@
+./interfaces.go
+./interfaces_windows.go
+./loghelper.go
+./netmon.go
+./netmon_windows.go
+./state.go

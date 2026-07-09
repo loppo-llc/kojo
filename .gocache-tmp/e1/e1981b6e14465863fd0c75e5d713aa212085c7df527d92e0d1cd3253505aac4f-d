@@ -1,0 +1,14 @@
+./config.go
+./direct.go
+./dns_clone.go
+./dns_view.go
+./flush_windows.go
+./ini.go
+./manager.go
+./manager_windows.go
+./noop.go
+./nrpt_windows.go
+./osconfig.go
+./resolvconfpath_default.go
+./utf.go
+./wsl_windows.go

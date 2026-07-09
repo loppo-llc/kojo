@@ -1,0 +1,4 @@
+./configdir.go
+./lock.go
+./lock_windows.go
+./probe_windows.go

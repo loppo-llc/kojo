@@ -1,0 +1,4 @@
+./automation.go
+./mksyscall.go
+./types.go
+./zsyscall_windows.go

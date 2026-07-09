@@ -1,0 +1,4 @@
+./deferred.go
+./lazy.go
+./map.go
+./unsync.go

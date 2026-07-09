@@ -1,0 +1,11 @@
+./atomic.go
+./path.go
+./refs.go
+./scope.go
+./scrubber.go
+./store.go
+./storerefs.go
+./path_test.go
+./scrubber_test.go
+./store_test.go
+./storerefs_test.go

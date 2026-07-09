@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install web dependencies
+        run: cd web && npm ci
+
+      - name: Build web
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: cd web && KOJO_VERSION="$TAG" npm run build
+
+      - name: Cross-compile binaries
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          targets="darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64"
+          for target in $targets; do
+            GOOS="${target%/*}"
+            GOARCH="${target#*/}"
+            staging="$(mktemp -d)"
+            if [ "$GOOS" = "windows" ]; then
+              out="$staging/kojo.exe"
+              CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+                go build -trimpath -ldflags "-s -w -X main.version=$TAG" \
+                -o "$out" ./cmd/kojo
+              (cd "$staging" && zip -q "kojo_${GOOS}_${GOARCH}.zip" kojo.exe)
+              mv "$staging/kojo_${GOOS}_${GOARCH}.zip" dist/
+            else
+              out="$staging/kojo"
+              CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+                go build -trimpath -ldflags "-s -w -X main.version=$TAG" \
+                -o "$out" ./cmd/kojo
+              tar -czf "dist/kojo_${GOOS}_${GOARCH}.tar.gz" -C "$staging" kojo
+            fi
+            rm -rf "$staging"
+          done
+          (cd dist && sha256sum *.tar.gz *.zip > checksums.txt)
+          ls -la dist
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" dist/* --clobber

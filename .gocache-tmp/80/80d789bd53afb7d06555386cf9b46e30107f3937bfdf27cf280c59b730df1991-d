@@ -1,0 +1,11 @@
+./interface_change_handler.go
+./luid.go
+./mksyscall.go
+./netsh.go
+./route_change_handler.go
+./types.go
+./types_64.go
+./types_test_64.go
+./unicast_address_change_handler.go
+./winipcfg.go
+./zwinipcfg_windows.go

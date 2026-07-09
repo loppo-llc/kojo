@@ -30,6 +30,7 @@ import (
 	"github.com/loppo-llc/kojo/internal/eventbus"
 	"github.com/loppo-llc/kojo/internal/notify"
 	"github.com/loppo-llc/kojo/internal/peer"
+	"github.com/loppo-llc/kojo/internal/selfupdate"
 	"github.com/loppo-llc/kojo/internal/server"
 	"github.com/loppo-llc/kojo/internal/session"
 	"github.com/loppo-llc/kojo/internal/store"
@@ -57,6 +58,13 @@ func applyConfigDirFlag(configDir string) {
 }
 
 func main() {
+	// Subcommands are intercepted before flag.Parse. Today every other
+	// mode is a flag; positional args were silently ignored, so claiming
+	// "update" here is strictly better than letting it fall through.
+	if len(os.Args) > 1 && os.Args[1] == "update" {
+		os.Exit(runUpdateCommand(os.Args[2:]))
+	}
+
 	port := flag.Int("port", 8080, "port number (auto-increments if busy)")
 	dev := flag.Bool("dev", false, "enable dev mode (proxy to Vite)")
 	local := flag.Bool("local", false, "listen on localhost only (no Tailscale)")
@@ -64,6 +72,8 @@ func main() {
 	configDir := flag.String("config-dir", "", "override config directory (default: ~/.config/kojo-v1)")
 	showVersion := flag.Bool("version", false, "show version")
 	noAuth := flag.Bool("no-auth", false, "disable agent-facing auth listener (--local/--dev only)")
+	noUpdateCheck := flag.Bool("no-update-check", false, "disable the periodic GitHub release update check (also via KOJO_NO_UPDATE_CHECK=1)")
+	noPeerAutoUpdate := flag.Bool("no-peer-autoupdate", false, "with --peer: do not auto-update this peer's binary from a newer Hub (also via KOJO_NO_PEER_AUTOUPDATE=1)")
 
 	// Upgrade-migration flags: import the legacy kojo/ config dir
 	// into the new kojo-v1 config dir.
@@ -925,6 +935,13 @@ func main() {
 		}
 	}
 
+	// Self-update checker: always built so GET /api/v1/system/update can
+	// answer even when the periodic loop is disabled (dev builds, operator
+	// opt-out). CleanupStaleBinaries reaps Windows .old leftovers at boot.
+	selfupdate.CleanupStaleBinaries()
+	updateClient := selfupdate.NewClient(version)
+	updateChecker := selfupdate.NewChecker(updateClient, version, logger)
+
 	srv := server.New(server.Config{
 		Addr:           fmt.Sprintf(":%d", *port),
 		DevMode:        *dev,
@@ -960,7 +977,8 @@ func main() {
 		// (which is never wired in --local/--dev anyway, so the
 		// sentinel ErrNodeKeyResolverNotReady would otherwise demote
 		// every caller to Guest and 403 the API).
-		Unsafe: *unsafePeer || *noAuth,
+		Unsafe:        *unsafePeer || *noAuth,
+		UpdateChecker: updateChecker,
 	})
 	if *unsafePeer {
 		logger.Warn("kojo: --unsafe set; tailnet identity disabled. Inter-peer endpoints are open to anyone reachable on the listener.")
@@ -1244,8 +1262,12 @@ func main() {
 	// Normally deferred; the restart path must run it explicitly
 	// because a successful exec never returns to run defers.
 	var tsShutdown func()
+	// requestRestart is shared by POST /api/v1/system/restart and
+	// peer auto-update so both funnel through the same graceful
+	// path (restartRequested + stop). Nil when restart is unsupported.
+	var requestRestart func() bool
 	if restartSupported {
-		srv.SetRestartTrigger(func() bool {
+		requestRestart = func() bool {
 			// If a signal already initiated shutdown, do NOT
 			// convert the operator's stop into a restart — the
 			// drain goroutine can fire this trigger while the
@@ -1256,7 +1278,8 @@ func main() {
 			restartRequested.Store(true)
 			stop()
 			return true
-		})
+		}
+		srv.SetRestartTrigger(requestRestart)
 	}
 
 	// Background sweep of expired idempotency_keys rows (3.5). The
@@ -1265,6 +1288,19 @@ func main() {
 	// sweep goroutine exits when ctx (the shutdown signal context)
 	// is cancelled so it lifecycles with the rest of the binary.
 	srv.StartIdempotencySweep(ctx)
+
+	// Periodic GitHub Releases check. Skipped for dev/unparseable
+	// stamps (never auto-notify against a dirty describe), operator
+	// opt-out, or env kill-switch. The checker itself is still on
+	// server.Config so the HTTP endpoints can CheckNow/Apply on demand.
+	if *noUpdateCheck || os.Getenv("KOJO_NO_UPDATE_CHECK") == "1" {
+		logger.Info("selfupdate: periodic check disabled by flag or KOJO_NO_UPDATE_CHECK")
+	} else if _, err := selfupdate.ParseVersion(version); err != nil {
+		logger.Debug("selfupdate: periodic check skipped (unparseable version)",
+			"version", version, "err", err)
+	} else {
+		updateChecker.StartLoop(ctx, 30*time.Second, 6*time.Hour)
+	}
 
 	if *peerMode {
 		// Peer mode: plain HTTP listen on the Tailscale interface
@@ -1422,6 +1458,9 @@ func main() {
 				HubURLOverride: *hubURL,
 				DefaultHubPort: 8080,
 				PeerPublicURL:  peerPublicURL,
+				SelfVersion:    version,
+				AutoUpdate:     !*noPeerAutoUpdate && os.Getenv("KOJO_NO_PEER_AUTOUPDATE") != "1",
+				RequestRestart: requestRestart,
 			}, peerIdentity, agentMgr.Store(), logger)
 			if derr != nil {
 				logger.Warn("peer discovery: init failed; auto-onboarding disabled",

@@ -1,0 +1,10 @@
+./chal.go
+./control.go
+./derp.go
+./disco.go
+./doc.go
+./hardware_attestation.go
+./machine.go
+./nl.go
+./node.go
+./util.go

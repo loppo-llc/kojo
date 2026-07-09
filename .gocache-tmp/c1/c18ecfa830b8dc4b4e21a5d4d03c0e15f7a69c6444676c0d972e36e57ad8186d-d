@@ -1,0 +1,5 @@
+./handle.go
+./intset.go
+./set.go
+./slice.go
+./smallset.go

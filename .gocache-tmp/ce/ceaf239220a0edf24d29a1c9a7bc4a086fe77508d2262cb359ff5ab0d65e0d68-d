@@ -1,0 +1,4 @@
+./pipe_windows.go
+./safesocket.go
+./safesocket_ps.go
+./zsyscall_windows.go

@@ -1,0 +1,8 @@
+./mksyscall.go
+./restartmgr_windows.go
+./startupinfo_windows.go
+./svcdiag_windows.go
+./userprofile_windows.go
+./winutil.go
+./winutil_windows.go
+./zsyscall_windows.go

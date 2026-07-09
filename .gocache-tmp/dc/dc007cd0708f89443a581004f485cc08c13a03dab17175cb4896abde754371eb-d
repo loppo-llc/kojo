@@ -1,0 +1,9 @@
+./auth.go
+./fencing.go
+./policy.go
+./store.go
+./store_kv.go
+./tsnet_middleware.go
+./auth_test.go
+./fencing_test.go
+./store_kv_test.go

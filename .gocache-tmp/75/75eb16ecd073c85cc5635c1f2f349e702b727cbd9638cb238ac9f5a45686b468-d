@@ -1,0 +1,3 @@
+./derphttp_client.go
+./mesh_client.go
+./websocket_stub.go

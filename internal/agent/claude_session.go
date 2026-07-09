@@ -346,11 +346,11 @@ func (b *ClaudeBackend) spawnSession(agentID, dir, fp string, args []string) (*c
 	// kill leaves those children orphaned, and an orphaned child keeps the
 	// deterministic session id open — the next spawn then fails with
 	// "Session ID already in use".
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setProcGroup(cmd)
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
 			// Negative pid → signal the whole process group (parent + children).
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+			_ = termProcGroup(cmd.Process.Pid)
 			return cmd.Process.Signal(syscall.SIGTERM)
 		}
 		return nil
@@ -1011,7 +1011,7 @@ func (s *claudeSession) onEOF() {
 		// and keep the deterministic session id open — a group SIGKILL here
 		// releases it before the next spawn so it won't hit "already in use".
 		if s.cmd.Process != nil {
-			_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
+			_ = killProcGroup(s.cmd.Process.Pid)
 		}
 	}
 	// Cancel procCtx so anything tied to it — notably the subagent tailer's
@@ -1149,7 +1149,7 @@ func (s *claudeSession) forceKill() {
 	// process that ignored the earlier TERM would survive it. SIGKILL the
 	// group directly; ESRCH after exit is fine.
 	if s.cmd != nil && s.cmd.Process != nil {
-		_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
+		_ = killProcGroup(s.cmd.Process.Pid)
 	}
 }
 

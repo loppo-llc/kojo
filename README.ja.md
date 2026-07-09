@@ -252,9 +252,28 @@ $ kojo
 
 ## インストール
 
+推奨（最新リリースのバイナリ）:
+
 ```bash
-go install github.com/loppo-llc/kojo/cmd/kojo@latest
+curl -fsSL https://raw.githubusercontent.com/loppo-llc/kojo/main/scripts/install.sh | sh
 ```
+
+任意の環境変数: `KOJO_VERSION=vX.Y.Z` でタグ固定、`KOJO_INSTALL_DIR=/path` でインストール先を指定。
+
+別手段: [releases](https://github.com/loppo-llc/kojo/releases) からプラットフォーム用アセットを落として `PATH` に置く。
+
+ソースから: [ビルド](#ビルド) を参照。
+
+`go install ...@latest` は使えない。埋め込み Web UI (`web/dist`) が Go モジュールに含まれないため、素の `go install` ではフロント無しのバイナリになる。
+
+### アップデート
+
+- `kojo update` — このプラットフォーム向けの最新リリースを取得し、チェックサム検証のうえバイナリをその場で差し替える。新コードを動かすにはデーモンの再起動が必要。
+- Web UI の更新バナー — `POST /api/v1/system/update` でダウンロード・差し替え・グレースフル再起動まで行う。
+- ピア自動更新 — 同 OS/arch の新しい Hub に接続したピアは、Hub のバイナリを取得して差し替え、自身を再起動する。
+- 無効化: `--no-update-check` / `KOJO_NO_UPDATE_CHECK=1`（定期 GitHub チェック）、`--no-peer-autoupdate` / `KOJO_NO_PEER_AUTOUPDATE=1`（ピアからのバイナリ取得）。
+
+詳細: [docs/self-update.md](docs/self-update.md)（英語）。
 
 ## ライセンス
 

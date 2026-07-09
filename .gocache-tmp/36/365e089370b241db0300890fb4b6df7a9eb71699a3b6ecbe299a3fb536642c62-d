@@ -1,0 +1,5 @@
+./buffer.go
+./mksyscall.go
+./sspi.go
+./syscall.go
+./zsyscall_windows.go

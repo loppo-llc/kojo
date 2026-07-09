@@ -298,6 +298,13 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 			Principal{Role: RolePeer, PeerID: "src-device-0"}, false},
 		{http.MethodPost, "/api/v1/peers/pull", ag, false},
 		{http.MethodPost, "/api/v1/peers/pull", guest, false},
+		// Peer auto-update binary pull: RolePeer GET only.
+		{http.MethodGet, "/api/v1/peers/binary",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
+		{http.MethodPost, "/api/v1/peers/binary",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, false},
+		{http.MethodGet, "/api/v1/peers/binary", ag, false},
+		{http.MethodGet, "/api/v1/peers/binary", guest, false},
 		// §3.7 agent-sync surfaces. Same trust model: RolePeer
 		// only (handler enforces signer-equals-source + holder
 		// check). Agent / Guest principals MUST be denied —

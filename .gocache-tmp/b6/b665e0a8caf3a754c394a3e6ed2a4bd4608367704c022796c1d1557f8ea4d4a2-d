@@ -1,0 +1,11 @@
+./checker.go
+./download.go
+./github.go
+./swap.go
+./swap_unix.go
+./version.go
+./checker_test.go
+./download_test.go
+./github_test.go
+./swap_test.go
+./version_test.go

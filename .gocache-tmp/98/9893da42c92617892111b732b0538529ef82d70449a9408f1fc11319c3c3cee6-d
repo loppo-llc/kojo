@@ -1,0 +1,8 @@
+./bit_source.go
+./character_set_eci.go
+./decoder_result.go
+./default_grid_sampler.go
+./detector_result.go
+./grid_sampler.go
+./perspective_transform.go
+./string_utils.go

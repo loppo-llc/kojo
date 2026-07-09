@@ -1,0 +1,3 @@
+./mksyscall.go
+./winenv_windows.go
+./zsyscall_windows.go

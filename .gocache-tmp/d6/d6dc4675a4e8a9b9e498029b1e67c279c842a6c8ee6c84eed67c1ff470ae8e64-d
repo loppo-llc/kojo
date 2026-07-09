@@ -1,0 +1,5 @@
+./oh.go
+./pe.go
+./pe_amd64.go
+./pe_windows.go
+./version.go

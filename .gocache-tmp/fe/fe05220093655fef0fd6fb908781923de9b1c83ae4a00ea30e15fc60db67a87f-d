@@ -1,0 +1,5 @@
+./config.go
+./device.go
+./parser.go
+./wgcfg_clone.go
+./writer.go

@@ -1,0 +1,4 @@
+./configdir.go
+./lock.go
+./lock_unix.go
+./probe_unix.go

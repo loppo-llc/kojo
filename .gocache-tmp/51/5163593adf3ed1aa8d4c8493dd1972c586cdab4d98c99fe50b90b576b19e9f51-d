@@ -1,0 +1,8 @@
+./auto.go
+./client.go
+./direct.go
+./errors.go
+./map.go
+./sign.go
+./sign_supported.go
+./status.go

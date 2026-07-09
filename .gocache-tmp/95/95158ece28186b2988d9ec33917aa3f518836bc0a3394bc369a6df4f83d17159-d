@@ -1,0 +1,7 @@
+./cpuid.go
+./cpuid_arm64.go
+./cpuid_arm64_state_autogen.go
+./cpuid_state_autogen.go
+./features_arm64.go
+./hwcap_arm64.go
+./native_arm64.go

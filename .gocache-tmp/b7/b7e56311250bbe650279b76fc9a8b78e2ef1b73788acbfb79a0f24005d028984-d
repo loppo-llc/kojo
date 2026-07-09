@@ -1,0 +1,6 @@
+./mksyscall.go
+./netns.go
+./netns_dw.go
+./netns_windows.go
+./socks.go
+./zsyscall_windows.go

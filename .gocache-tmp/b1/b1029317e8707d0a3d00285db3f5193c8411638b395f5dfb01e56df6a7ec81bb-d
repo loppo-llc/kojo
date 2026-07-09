@@ -1,0 +1,6 @@
+./base1dcode.go
+./bitlist.go
+./galoisfield.go
+./gfpoly.go
+./reedsolomon.go
+./runeint.go

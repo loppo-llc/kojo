@@ -1,0 +1,5 @@
+./generic_gf.go
+./generic_gf_poly.go
+./reedsolomon_decoder.go
+./reedsolomon_encoder.go
+./reedsolomon_exception.go

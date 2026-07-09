@@ -1,0 +1,8 @@
+./backend.go
+./conf.go
+./doc.go
+./ipn_clone.go
+./ipn_view.go
+./prefs.go
+./serve.go
+./store.go

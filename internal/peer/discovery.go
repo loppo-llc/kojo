@@ -81,6 +81,13 @@ type HubInfo struct {
 	NodeKey         string `json:"nodeKey,omitempty"`
 	Version         string `json:"version"`
 	ProtocolVersion int    `json:"protocolVersion"`
+	// GOOS / GOARCH / BinarySha256 come from a newer Hub so this peer
+	// can decide whether auto-update is safe (platform match + pinned
+	// digest). Empty BinarySha256 means the Hub could not hash its
+	// executable; auto-update skips.
+	GOOS         string `json:"goos,omitempty"`
+	GOARCH       string `json:"goarch,omitempty"`
+	BinarySha256 string `json:"binarySha256,omitempty"`
 }
 
 // JoinResponse is the response shape of POST/GET /api/v1/peers/join-request.
@@ -94,6 +101,17 @@ type DiscoveryConfig struct {
 	HubURLOverride string
 	DefaultHubPort int
 	PeerPublicURL  string
+	// SelfVersion is this peer's stamped version (same string main
+	// passes to the Hub as server.Config.Version). Compared against
+	// hub-info Version via selfupdate.IsNewer before auto-update.
+	SelfVersion string
+	// AutoUpdate enables downloading a newer Hub binary when
+	// platforms match. Cleared by --no-peer-autoupdate / env.
+	AutoUpdate bool
+	// RequestRestart is the same graceful-restart closure wired to
+	// Server.SetRestartTrigger. Nil-safe: auto-update skips when unset
+	// (e.g. Windows, where in-place restart is unsupported).
+	RequestRestart func() bool
 }
 
 // Discovery is the long-running auto-pairing coordinator.
@@ -103,6 +121,11 @@ type Discovery struct {
 	store    *store.Store
 	logger   *slog.Logger
 	client   *http.Client
+	// attemptedHubVersions records hub versions this process already
+	// tried to auto-update to (including skipped platform/sha gates).
+	// Written only from maybeAutoUpdate, which refreshLoop calls on
+	// its single ticker goroutine — no mutex required.
+	attemptedHubVersions map[string]bool
 }
 
 // NewDiscovery wires a Discovery.
@@ -120,11 +143,12 @@ func NewDiscovery(cfg DiscoveryConfig, identity *Identity, st *store.Store, logg
 		cfg.DefaultHubPort = 8080
 	}
 	return &Discovery{
-		cfg:      cfg,
-		identity: identity,
-		store:    st,
-		logger:   logger,
-		client:   NoKeepAliveHTTPClient(10 * time.Second),
+		cfg:                  cfg,
+		identity:             identity,
+		store:                st,
+		logger:               logger,
+		client:               NoKeepAliveHTTPClient(10 * time.Second),
+		attemptedHubVersions: make(map[string]bool),
 	}, nil
 }
 
@@ -172,6 +196,17 @@ func (d *Discovery) Run(ctx context.Context) {
 				"hub", hubURL, "err", err)
 			d.sleep(ctx, JoinHeartbeat)
 			continue
+		}
+		// Auto-update BEFORE the protocol-version gate. A peer so old
+		// that PairingProtocolVersion mismatches never reaches
+		// refreshLoop, so without this call it can never pull a newer
+		// Hub binary to catch up. attemptedHubVersions dedupes against
+		// the refreshLoop path.
+		d.maybeAutoUpdate(ctx, hubURL, hub)
+		// RequestRestart cancels ctx; exit before protocol-wipe or
+		// registry writes race the in-flight graceful restart.
+		if ctx.Err() != nil {
+			return
 		}
 		// Pairing-protocol version gate. A Hub that does not speak
 		// our version is unsafe to keep in peer_registry: a stale row
@@ -287,6 +322,20 @@ func (d *Discovery) refreshLoop(ctx context.Context, hubURL string) {
 			d.logger.Warn("peer discovery: post-pair hub-info refresh failed; retrying next tick",
 				"hub", hubURL, "err", err)
 			continue
+		}
+		// Peer auto-update runs on every successful hub-info tick
+		// (including when NodeKey is unchanged, and before the
+		// pairing-protocol gate). A newer Hub that also bumped
+		// PairingProtocolVersion must still be able to push its
+		// binary so this peer can catch up rather than wipe-and-
+		// retry forever under a protocol mismatch. Strictly one
+		// attempt per distinct hub.Version for the life of this
+		// process.
+		d.maybeAutoUpdate(ctx, hubURL, hub)
+		// RequestRestart cancels ctx; exit before protocol-wipe or
+		// registry writes race the in-flight graceful restart.
+		if ctx.Err() != nil {
+			return
 		}
 		if hub.ProtocolVersion != PairingProtocolVersion {
 			// Protocol-version drift mid-life: wipe the local row

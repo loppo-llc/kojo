@@ -1,0 +1,4 @@
+./checksum.go
+./checksum_state_autogen.go
+./checksum_unsafe.go
+./checksum_unsafe_state_autogen.go
