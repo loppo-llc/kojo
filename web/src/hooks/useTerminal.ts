@@ -6,6 +6,16 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 // Filter terminal query responses (DA1/DA2/DA3) that xterm.js auto-generates.
 const DA_RESPONSE_RE = /\x1b\[[\?>=]?[\d;]*c/g;
 
+// True when the app has a mouse-tracking mode active that reports wheel
+// events (vt200/drag/any). x10 mode is excluded — it only reports button
+// presses, never wheel. Note: we always emit SGR-encoded reports; xterm's
+// modes API doesn't expose the negotiated encoding, but every wheel-aware
+// TUI in practice enables ?1006 (SGR) alongside tracking (Claude Code does).
+function wheelReportingMode(term: Terminal): boolean {
+  const mode = term.modes.mouseTrackingMode;
+  return mode === "vt200" || mode === "drag" || mode === "any";
+}
+
 interface UseTerminalOptions {
   /** Container ref for the terminal element */
   containerRef: React.RefObject<HTMLDivElement | null>;
@@ -271,7 +281,21 @@ export function useTerminal({
           const key = lines > 0 ? sk.up : sk.down;
           const count = Math.abs(lines);
           for (let i = 0; i < count; i++) sk.send(key);
-        } else if (touchMode === "mouse") {
+        } else if (touchMode === "mouse" || wheelReportingMode(term)) {
+          // Second condition: apps that enable mouse tracking at runtime
+          // (e.g. Claude Code's fullscreen alt-buffer UI, ?1049h + ?1000-1006h)
+          // manage their own viewport — xterm's scrollback is empty on the
+          // alternate buffer, so scrollLines() below would be a no-op.
+          // Forward the gesture as SGR wheel reports instead, mirroring what
+          // xterm itself does for desktop wheel events under mouse tracking.
+          // Checked per-event: Claude's pre-trust dialog runs on the normal
+          // buffer without mouse tracking and still wants plain scrollLines.
+          // The app owns the viewport here, so xterm itself should follow
+          // the bottom again — clear any stale scrollback pin left over from
+          // an earlier plain-scrollback session (sk.send/onInput bypass the
+          // term.onData path that normally resets it).
+          autoScrollRef.current = true;
+          savedDeltaRef.current = 0;
           // Convert touch scroll to SGR mouse-wheel escape sequences.
           // tmux intercepts these and scrolls the pane under the cursor.
           const rect = el.getBoundingClientRect();
