@@ -369,6 +369,9 @@ export interface AgentTask {
   status: "open" | "done";
   createdAt: string;
   updatedAt: string;
+  // Strong entity tag of the backing store row; echo via If-Match on
+  // update/delete for optimistic concurrency. Absent on legacy rows.
+  etag?: string;
 }
 
 export interface SlackBotStatus {
@@ -674,10 +677,17 @@ export const agentApi = {
       ),
     create: (agentId: string, title: string) =>
       post<AgentTask>(`/api/v1/agents/${agentId}/tasks`, { title }),
-    update: (agentId: string, taskId: string, data: { title?: string; status?: string }) =>
-      patch<AgentTask>(`/api/v1/agents/${agentId}/tasks/${taskId}`, data),
-    delete: (agentId: string, taskId: string) =>
-      del<{ ok: boolean }>(`/api/v1/agents/${agentId}/tasks/${taskId}`),
+    // etag (from AgentTask.etag) is sent as If-Match when provided so a
+    // stale row (edited meanwhile by the agent or another device) fails
+    // with PreconditionFailedError instead of silently last-write-wins.
+    update: (agentId: string, taskId: string, data: { title?: string; status?: string }, etag?: string) =>
+      patchWithIfMatch<AgentTask>(`/api/v1/agents/${agentId}/tasks/${taskId}`, data, etag).then(
+        (r) => r.value,
+      ),
+    delete: (agentId: string, taskId: string, etag?: string) =>
+      delWithIfMatch<{ ok: boolean }>(`/api/v1/agents/${agentId}/tasks/${taskId}`, etag).then(
+        (r) => r.value,
+      ),
   },
 
   // Avatar / preview / files URLs go straight into <img src> so the

@@ -11,6 +11,7 @@ import { AgentCreate } from "./components/agent/AgentCreate";
 import { AgentSettings } from "./components/agent/AgentSettings";
 import { AgentCredentials } from "./components/agent/AgentCredentials";
 import { AgentDataBrowser } from "./components/agent/AgentDataBrowser";
+import { AgentTodos } from "./components/agent/AgentTodos";
 import { GroupDMChat } from "./components/groupdm/GroupDMChat";
 import { GlobalSettings } from "./components/GlobalSettings";
 import { ReloadPrompt } from "./components/ui/ReloadPrompt";
@@ -54,6 +55,7 @@ createRoot(document.getElementById("root")!).render(
         <Route path="/agents/:id/settings" element={<AgentSettings />} />
         <Route path="/agents/:id/credentials" element={<AgentCredentials />} />
         <Route path="/agents/:id/data" element={<AgentDataBrowser />} />
+        <Route path="/agents/:id/todos" element={<AgentTodos />} />
       </Routes>
       <ReloadPrompt />
     </BrowserRouter>

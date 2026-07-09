@@ -172,8 +172,29 @@ const messages = {
   "chat.autoTtsOn": { ja: "自動読み上げ: ON", en: "Auto TTS: ON" },
   "chat.autoTtsOff": { ja: "自動読み上げ: OFF", en: "Auto TTS: OFF" },
   "chat.credentials": { ja: "認証情報", en: "Credentials" },
+  "chat.todos": { ja: "ToDo", en: "Todos" },
   "chat.dataFolder": { ja: "データフォルダ", en: "Data folder" },
   "chat.settings": { ja: "設定", en: "Settings" },
+
+  // ── AgentTodos ──
+  "todos.title": { ja: "ToDoリスト", en: "Todo list" },
+  "todos.openCount": { ja: "件", en: "open" },
+  "todos.addPlaceholder": { ja: "ToDoを追加…", en: "Add a todo…" },
+  "todos.add": { ja: "追加", en: "Add" },
+  "todos.empty": { ja: "ToDoはまだない", en: "No todos yet" },
+  "todos.emptyHint": {
+    ja: "上の入力欄から追加できる。エージェント自身もToDo APIで追加する",
+    en: "Add one above — the agent can also add todos via its API",
+  },
+  "todos.doneSection": { ja: "完了 {count}", en: "Done {count}" },
+  "todos.markDone": { ja: "完了にする", en: "Mark done" },
+  "todos.reopen": { ja: "未完了に戻す", en: "Reopen" },
+  "todos.delete": { ja: "削除", en: "Delete" },
+  "todos.editTitle": { ja: "タイトルを編集", en: "Edit title" },
+  "todos.conflict": {
+    ja: "別の場所で先に更新されていた。最新の状態を読み込み直した",
+    en: "Changed elsewhere first — reloaded the latest state",
+  },
   "chat.emptyPrompt": { ja: "メッセージを送って会話を始めて", en: "Send a message to start chatting" },
   "chat.holderOfflineBannerPre": { ja: "ホスト端末 ", en: "Host device " },
   "chat.holderOfflineBannerPost": {
