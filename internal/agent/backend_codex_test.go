@@ -658,3 +658,26 @@ func TestCodexStreamResult_HasOutput(t *testing.T) {
 		t.Error("result with tool uses should have output")
 	}
 }
+
+func TestCodexEffortForProtocol_MaxGating(t *testing.T) {
+	// gpt-5.6 family: max passes through (codex CLI 0.144.1).
+	for _, m := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+		if got := codexEffortForProtocol(m, "max"); got != "max" {
+			t.Errorf("codexEffortForProtocol(%q, max) = %q, want max", m, got)
+		}
+	}
+	// Older codex models and the empty (CLI-default) model drop max so
+	// the CLI falls back to its default effort instead of erroring.
+	for _, m := range []string{"gpt-5.5", ""} {
+		if got := codexEffortForProtocol(m, "max"); got != "" {
+			t.Errorf("codexEffortForProtocol(%q, max) = %q, want empty", m, got)
+		}
+	}
+	// Non-max levels are model-independent.
+	if got := codexEffortForProtocol("", "xhigh"); got != "xhigh" {
+		t.Errorf("codexEffortForProtocol(\"\", xhigh) = %q, want xhigh", got)
+	}
+	if got := codexEffortForProtocol("gpt-5.6-sol", "bogus"); got != "" {
+		t.Errorf("expected bogus effort to map to empty, got %q", got)
+	}
+}

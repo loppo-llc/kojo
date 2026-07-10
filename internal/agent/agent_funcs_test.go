@@ -191,6 +191,18 @@ func TestValidModelEffort(t *testing.T) {
 			t.Errorf("expected minimal to be valid for codex model %q", m)
 		}
 	}
+	// gpt-5.6 family (codex CLI 0.144.1): xhigh AND max are valid.
+	for _, m := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+		if !ValidModelEffort(m, "xhigh") {
+			t.Errorf("expected xhigh to be valid for codex model %q", m)
+		}
+		if !ValidModelEffort(m, "max") {
+			t.Errorf("expected max to be valid for codex model %q", m)
+		}
+		if !ValidModelEffort(m, "minimal") {
+			t.Errorf("expected minimal to be valid for codex model %q", m)
+		}
+	}
 	if ValidModelEffort("sonnet", "minimal") {
 		t.Errorf("expected minimal to be invalid for non-codex model")
 	}

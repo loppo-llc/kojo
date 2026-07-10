@@ -66,10 +66,30 @@ describe("toolModels — Opus 4.8 / effort defaults", () => {
     expect(defaultEffortForModel("claude-sonnet-4-6")).toBe("high");
   });
 
-  it("codex models support xhigh, default to medium, and omit max", () => {
+  it("codex models before gpt-5.6 support xhigh, default to medium, and omit max", () => {
     expect(effortLevelsForModel("gpt-5.5")).toContain("xhigh");
     expect(effortLevelsForModel("gpt-5.5")).not.toContain("max");
     expect(defaultEffortForModel("gpt-5.5")).toBe("medium");
+  });
+
+  it("lists the gpt-5.6 family and defaults codex to gpt-5.6-sol", () => {
+    expect(modelsForTool("codex")).toContain("gpt-5.6-sol");
+    expect(modelsForTool("codex")).toContain("gpt-5.6-terra");
+    expect(modelsForTool("codex")).toContain("gpt-5.6-luna");
+    expect(defaultModelForTool("codex")).toBe("gpt-5.6-sol");
+  });
+
+  it("gpt-5.6 family supports xhigh and max", () => {
+    for (const m of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+      expect(effortLevelsForModel(m)).toContain("xhigh");
+      expect(effortLevelsForModel(m)).toContain("max");
+    }
+  });
+
+  it("gpt-5.6-sol defaults to low; terra and luna default to medium", () => {
+    expect(defaultEffortForModel("gpt-5.6-sol")).toBe("low");
+    expect(defaultEffortForModel("gpt-5.6-terra")).toBe("medium");
+    expect(defaultEffortForModel("gpt-5.6-luna")).toBe("medium");
   });
 
   it("lists both grok models", () => {

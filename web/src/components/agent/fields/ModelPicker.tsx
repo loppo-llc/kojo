@@ -32,6 +32,11 @@ export function ModelPicker({
     <Field label={t("settings.model")}>
       {models.length > 0 ? (
         <Select value={model} onChange={(e) => onChange(e.target.value)}>
+          {/* An unset model means "backend CLI default". Always offered
+              so users can return to it, and so an empty stored value is
+              shown as such instead of the browser faking the first list
+              entry as selected. */}
+          <option value="">{t("field.modelDefault")}</option>
           {model && !models.includes(model) && (
             <option value={model}>{model}</option>
           )}

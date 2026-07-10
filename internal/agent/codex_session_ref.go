@@ -133,10 +133,21 @@ func decodeCodexThreadResult(raw *json.RawMessage) (threadID, rolloutPath string
 	return result.Thread.ID, result.Thread.Path
 }
 
-func codexEffortForProtocol(effort string) string {
+func codexEffortForProtocol(model, effort string) string {
 	switch effort {
 	case "none", "minimal", "low", "medium", "high", "xhigh":
 		return effort
+	case "max":
+		// codex CLI 0.144.1 accepts "max" only for the gpt-5.6 family.
+		// ValidModelEffort rejects codex-model+max combos elsewhere, but
+		// an agent with an EMPTY model (CLI-default) can hold effort=max
+		// — dropping it here keeps the pre-gpt-5.6 behavior (CLI default
+		// effort with a warn) instead of erroring the turn when the CLI
+		// default resolves to an older model.
+		if codexMaxEffortModels[model] {
+			return effort
+		}
+		return ""
 	default:
 		return ""
 	}

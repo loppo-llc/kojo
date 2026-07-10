@@ -318,7 +318,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				{"type": "text", "text": userMessage},
 			},
 		}
-		if effort := codexEffortForProtocol(agent.Effort); effort != "" {
+		if effort := codexEffortForProtocol(agent.Model, agent.Effort); effort != "" {
 			turnParams["effort"] = effort
 		} else if agent.Effort != "" {
 			b.logger.Warn("codex: unsupported effort value; using CLI default",

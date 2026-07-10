@@ -163,13 +163,25 @@ var xhighModels = map[string]bool{
 	// grok-4.5 and an empty efforts list for grok-composer-2.5-fast, so
 	// neither offers xhigh/max here. Keep this in sync with
 	// web/src/lib/toolModels.ts xhighModels.
+	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 	"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true,
 	"gpt-5.3-codex": true, "gpt-5.2": true,
 }
 
 var codexEffortModels = map[string]bool{
+	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 	"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true,
 	"gpt-5.3-codex": true, "gpt-5.2": true,
+}
+
+// codexMaxEffortModels lists codex models that support the "max" effort
+// level. codex CLI 0.144.1 models_cache.json advertises
+// low/medium/high/xhigh/max for the gpt-5.6 family (sol and terra also
+// list "ultra", which kojo's effort scale doesn't model). Older gpt-5.x
+// models stop at xhigh. Keep in sync with web/src/lib/toolModels.ts
+// codexMaxModels.
+var codexMaxEffortModels = map[string]bool{
+	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 }
 
 // grokEffortModels only advertise low/medium/high (grok CLI 0.2.91:
@@ -189,7 +201,7 @@ func ValidModelEffort(model, effort string) bool {
 	if (effort == "none" || effort == "minimal") && !codexEffortModels[model] {
 		return false
 	}
-	if effort == "max" && (codexEffortModels[model] || grokEffortModels[model]) {
+	if effort == "max" && ((codexEffortModels[model] && !codexMaxEffortModels[model]) || grokEffortModels[model]) {
 		return false
 	}
 	if effort == "xhigh" && !xhighModels[model] {

@@ -855,6 +855,7 @@ const messages = {
   "field.personaGenPrompt": { ja: "人格生成プロンプト", en: "Persona generation prompt" },
   "field.effort": { ja: "Effort", en: "Effort" },
   "field.effortDefault": { ja: "既定 ({level})", en: "default ({level})" },
+  "field.modelDefault": { ja: "既定 (CLI 設定)", en: "default (CLI config)" },
   "field.tool": { ja: "ツール", en: "Tool" },
   "field.modelName": { ja: "モデル名", en: "model name" },
   "field.fileStorage": { ja: "ファイル保存先", en: "File Storage" },
