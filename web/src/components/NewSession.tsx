@@ -86,10 +86,11 @@ export function NewSession() {
       setInfo(info);
       const paramTool = searchParams.get("tool");
       const paramDir = searchParams.get("workDir");
-      if (paramTool && info.tools?.[paramTool]?.available) {
+      const tools = info.tools ?? {};
+      if (paramTool && tools[paramTool]?.available) {
         setTool(paramTool);
-      } else if (info.tools) {
-        const available = Object.entries(info.tools).find(([, toolInfo]) => toolInfo.available);
+      } else {
+        const available = Object.entries(tools).find(([, toolInfo]) => toolInfo.available);
         if (available) setTool(available[0]);
         else setTool("");
       }
@@ -241,7 +242,7 @@ export function NewSession() {
             <Field label={t("field.tool")}>
               <div className="space-y-2">
                 {info &&
-                  Object.entries(info.tools).map(([name, toolInfo]) => (
+                  Object.entries(info.tools ?? {}).map(([name, toolInfo]) => (
                     <label
                       key={name}
                       className={`flex cursor-pointer items-center gap-3 rounded-[10px] border p-3 transition-colors ${
