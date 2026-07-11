@@ -129,7 +129,7 @@ export function AgentSettings() {
   const [thinkingMode, setThinkingMode] = useState("");
   const [workDir, setWorkDir] = useState("");
   const [cronExpr, setCronExpr] = useState("");
-  const [timeoutMinutes, setTimeoutMinutes] = useState(10);
+  const [timeoutMinutes, setTimeoutMinutes] = useState(-1);
   const [resumeIdleMinutes, setResumeIdleMinutes] = useState(0);
   const [silentStart, setSilentStart] = useState("");
   const [silentEnd, setSilentEnd] = useState("");

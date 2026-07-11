@@ -685,10 +685,15 @@ const messages = {
   "sched.intervalTime": { ja: "実行時刻", en: "Run time" },
   "sched.relAgo": { ja: "{amount} 前", en: "{amount} ago" },
   "sched.relIn": { ja: "{amount} 後", en: "in {amount}" },
+  // Duration segments for the relative next-check-in label — concatenated
+  // without separators ("2h30m" / "2時間30分").
+  "sched.durMinutes": { ja: "{n}分", en: "{n}m" },
+  "sched.durHours": { ja: "{n}時間", en: "{n}h" },
+  "sched.durDays": { ja: "{n}日", en: "{n}d" },
   "sched.timeout": { ja: "タイムアウト", en: "Timeout" },
   "sched.timeoutHelp": {
-    ja: "スケジュール実行と手動チェックインそれぞれの最大時間。",
-    en: "Max duration for each scheduled or manual check-in run.",
+    ja: "スケジュール実行と手動チェックインそれぞれの最大時間。空欄でタイムアウトなし。",
+    en: "Max duration for each scheduled or manual check-in run. Leave blank for no timeout.",
   },
   "sched.resumeWindow": { ja: "Resume ウィンドウ", en: "Resume Window" },
   "sched.resumeWindowSub": {
@@ -696,8 +701,8 @@ const messages = {
     en: "(claude session reset threshold)",
   },
   "sched.resumeWindowHelp": {
-    ja: "コンテキスト超過のセッションを、最後の対話ターンからどれだけの間 resume し続けるか。短いほど早くリセットし、長いほど長い休止をまたいでコンテキストを保つ。既定値は Anthropic のプロンプトキャッシュ TTL に合わせている。",
-    en: "How long an over-context session keeps being resumed after the last interactive turn. Smaller resets sooner; larger keeps context across longer pauses. Default matches Anthropic's prompt-cache TTL.",
+    ja: "コンテキスト超過のセッションを、最後の対話ターンからどれだけの間 resume し続けるか。短いほど早くリセットし、長いほど長い休止をまたいでコンテキストを保つ。空欄で既定 (30分)。",
+    en: "How long an over-context session keeps being resumed after the last interactive turn. Smaller resets sooner; larger keeps context across longer pauses. Leave blank for the default (30 min).",
   },
   "sched.silentHours": { ja: "静音時間", en: "Silent Hours" },
   "sched.from": { ja: "開始", en: "From" },
@@ -732,9 +737,10 @@ const messages = {
     ja: "最近の出来事や気づきがあれば memory/{date}.md に記録し、必要なタスクを実行して。",
     en: "If there are recent events or observations, record them in memory/{date}.md, and execute any necessary tasks.",
   },
-  "sched.resumeDefault": { ja: "既定 (5分)", en: "default (5m)" },
-  "sched.timeoutNone": { ja: "タイムアウトなし", en: "No timeout" },
-  "sched.timeoutDefault": { ja: "既定 (10分)", en: "default (10m)" },
+  // Placeholders inside the w-24 numeric inputs — keep them short enough
+  // not to truncate ("空欄 = なし/既定" semantics live in the help text).
+  "sched.resumeDefault": { ja: "30分", en: "30 min" },
+  "sched.timeoutNone": { ja: "なし", en: "none" },
   "sched.advancedHelp": {
     ja: "5 フィールドの cron (分 時 日 月 曜日)。空 = 無効。Enter かフォーカスを外すと適用。",
     en: "5-field cron (minute hour day-of-month month day-of-week). Empty = off. Press Enter or tab away to apply.",

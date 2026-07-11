@@ -1660,13 +1660,12 @@ var preResetSummarize = func(agentID, tool string, logger *slog.Logger) error {
 // Per-agent override comes through Agent.ResumeIdleMinutes →
 // Agent.ResumeIdleDuration().
 //
-// Rationale for the 5-minute default: an active chat produces many short
+// Rationale for the 30-minute default: an active chat produces many short
 // turns that never reach the autosummary / MEMORY.md path, so resetting
 // mid-conversation would discard recent context the agent can't recover
-// from files. The interval-driven agents we're actually trying to curb
-// fire every 10+ minutes and always fall well outside this window, so the
-// gate only protects interactive users. 5 minutes also matches Anthropic's
-// default prompt cache TTL, keeping cache warm across back-to-back turns.
+// from files — and every reset replays the full prompt, so keeping the
+// session across a typical interactive lull saves tokens. Agents that
+// should reset faster override per-agent via ResumeIdleMinutes.
 // If an active chat genuinely blows past the token threshold, claude's
 // auto-compact (CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=85) still fires as a
 // safety net.

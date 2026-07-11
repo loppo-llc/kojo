@@ -889,6 +889,14 @@ func (st *agentStore) normalizeAgent(a *Agent) {
 			"agent", a.ID, "value", a.ResumeIdleMinutes)
 		a.ResumeIdleMinutes = 0
 	}
+	// Same defence for timeoutMinutes: cronRunContext treats any negative
+	// value as "no timeout", so a hand-edited -5 would silently mean
+	// unbounded. Normalize out-of-range values to 0 (= runtime default).
+	if !ValidTimeout(a.TimeoutMinutes) {
+		st.logger.Warn("invalid timeoutMinutes in stored data, resetting to default",
+			"agent", a.ID, "value", a.TimeoutMinutes)
+		a.TimeoutMinutes = 0
+	}
 	if a.LegacyActiveStart != "" && a.LegacyActiveEnd != "" && a.SilentStart == "" && a.SilentEnd == "" {
 		a.SilentStart = a.LegacyActiveEnd
 		a.SilentEnd = a.LegacyActiveStart

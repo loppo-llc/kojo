@@ -228,38 +228,35 @@ func validateCronMessage(s string) (string, error) {
 	return trimmed, nil
 }
 
-// allowedTimeouts defines the valid timeoutMinutes values.
-// 0 means "use default" (10 minutes at runtime) for backward compatibility.
-// -1 means "no timeout" — the check-in run gets an unbounded context.
-var allowedTimeouts = map[int]bool{
-	-1: true, 0: true, 5: true, 10: true, 15: true, 20: true, 30: true, 45: true, 60: true,
-}
+// maxScheduleMinutes caps free-form minute inputs (timeoutMinutes,
+// resumeIdleMinutes) at one week. The UI is a free numeric field, so the
+// bound exists only to reject absurd values (typos, hand-edited JSON), not
+// to enumerate presets.
+const maxScheduleMinutes = 7 * 24 * 60
 
-// ValidTimeout returns true if the given timeout is in the allowed set.
+// ValidTimeout reports whether minutes is an acceptable timeoutMinutes
+// value: -1 = no timeout (unbounded check-in context), 0 = "use default"
+// (10 minutes at runtime, backward compat), or any positive minute count
+// up to one week.
 func ValidTimeout(minutes int) bool {
-	return allowedTimeouts[minutes]
+	return minutes == -1 || (minutes >= 0 && minutes <= maxScheduleMinutes)
 }
 
-// allowedResumeIdles defines the valid resumeIdleMinutes values.
-// 0 means "use default" (5 minutes at runtime, matching Anthropic's prompt
-// cache TTL). Per-agent override lets high-frequency cron agents reset more
-// aggressively, and lets long-form interactive agents extend the protection
-// window before kojo abandons --resume on an over-token-threshold session.
-var allowedResumeIdles = map[int]bool{
-	0: true, 1: true, 3: true, 5: true, 10: true, 15: true, 30: true, 60: true,
-}
-
-// ValidResumeIdle returns true if the given resume-idle window is in the
-// allowed set.
+// ValidResumeIdle reports whether minutes is an acceptable
+// resumeIdleMinutes value: 0 = "use default" (30 minutes at runtime), or
+// any positive minute count up to one week. Per-agent override lets
+// high-frequency cron agents reset more aggressively, and lets long-form
+// interactive agents extend the protection window before kojo abandons
+// --resume on an over-token-threshold session.
 func ValidResumeIdle(minutes int) bool {
-	return allowedResumeIdles[minutes]
+	return minutes >= 0 && minutes <= maxScheduleMinutes
 }
 
 // defaultResumeIdleDuration is the fallback window when ResumeIdleMinutes
-// is 0 (unset). Mirrors the original sessionResetMinIdleDuration constant —
-// chosen to match Anthropic's prompt cache TTL so back-to-back interactive
-// turns stay cache-warm.
-const defaultResumeIdleDuration = 5 * time.Minute
+// is 0 (unset). 30 minutes: generous enough that a typical interactive
+// lull doesn't reset an over-token-threshold session (token saving beats
+// cache-warmth here — resets replay the whole prompt).
+const defaultResumeIdleDuration = 30 * time.Minute
 
 // Agent represents a persistent AI persona (friend).
 type Agent struct {
@@ -277,7 +274,7 @@ type Agent struct {
 	TimeoutMinutes int    `json:"timeoutMinutes"` // max duration per cron run in minutes (0 = default 10, -1 = no timeout)
 	// ResumeIdleMinutes is the idle-window threshold (in minutes) below
 	// which kojo keeps an over-token-threshold claude session via --resume
-	// instead of resetting. 0 = use defaultResumeIdleDuration (5 min).
+	// instead of resetting. 0 = use defaultResumeIdleDuration (30 min).
 	// claude-only; ignored by other backends.
 	ResumeIdleMinutes int    `json:"resumeIdleMinutes,omitempty"`
 	SilentStart       string `json:"silentStart,omitempty"` // HH:MM — start of silent window (empty = no restriction)
@@ -518,11 +515,10 @@ func (a *Agent) IsAutoEffortEnabled() bool {
 
 // ResumeIdleDuration returns the configured idle window for keeping an
 // over-token-threshold claude session via --resume. ResumeIdleMinutes==0
-// (the default for legacy agents) maps to defaultResumeIdleDuration so
-// existing behavior is preserved. Values outside the validated whitelist
-// (e.g. left over from a hand-edited agents.json or a future schema) also
-// fall back to the default — the API layer's whitelist must not be the
-// only line of defence.
+// (unset) maps to defaultResumeIdleDuration (30 min). Values outside the
+// validated range (e.g. left over from a hand-edited agents.json or a
+// future schema) also fall back to the default — the API layer's
+// validation must not be the only line of defence.
 func (a *Agent) ResumeIdleDuration() time.Duration {
 	if a == nil || !ValidResumeIdle(a.ResumeIdleMinutes) || a.ResumeIdleMinutes <= 0 {
 		return defaultResumeIdleDuration
@@ -579,9 +575,9 @@ type AgentConfig struct {
 	// instead of silently dropping the value (Go's default Unmarshal behaviour
 	// for unknown fields). Validated in newAgent / Manager.Update.
 	LegacyIntervalMinutes *int `json:"intervalMinutes,omitempty"`
-	TimeoutMinutes        *int `json:"timeoutMinutes"` // nil = use default (0 = 10 min, -1 = no timeout)
+	TimeoutMinutes        *int `json:"timeoutMinutes"` // nil/-1 = no timeout (default for new agents), 0 = legacy 10-min default
 	// ResumeIdleMinutes overrides the per-agent claude --resume idle window.
-	// nil/0 = use defaultResumeIdleDuration (5 min).
+	// nil/0 = use defaultResumeIdleDuration (30 min).
 	ResumeIdleMinutes  *int    `json:"resumeIdleMinutes"`
 	SilentStart        *string `json:"silentStart"`        // HH:MM or empty
 	SilentEnd          *string `json:"silentEnd"`          // HH:MM or empty
@@ -747,14 +743,14 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		cronExpr = ResolveCronPreset(cronExpr, id)
 	}
 
-	timeoutMin := 0 // default (= 10 min at runtime)
+	timeoutMin := -1 // default for new agents: no timeout
 	if cfg.TimeoutMinutes != nil {
 		timeoutMin = *cfg.TimeoutMinutes
 	}
 	if !ValidTimeout(timeoutMin) {
 		return nil, fmt.Errorf("unsupported timeout: %d minutes", timeoutMin)
 	}
-	resumeIdleMin := 0 // default (= 5 min at runtime)
+	resumeIdleMin := 0 // default (= 30 min at runtime)
 	if cfg.ResumeIdleMinutes != nil {
 		resumeIdleMin = *cfg.ResumeIdleMinutes
 	}

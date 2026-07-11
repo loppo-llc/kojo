@@ -54,8 +54,9 @@ func readBoundedFile(path string) ([]byte, error) {
 // fallback when an agent has no checkin.md. Surfaced as the pre-filled
 // template by ReadCheckinFileOrDefault so what the settings UI shows and
 // what cron / manual check-ins actually run agree. `{date}` expands to
-// today's YYYY-MM-DD at runtime.
-const DefaultCheckinContent = "If there are recent events or observations, record them in memory/{date}.md, and execute any necessary tasks."
+// today's YYYY-MM-DD at runtime. Japanese to match the rest of the
+// check-in prompt (cronPromptAt's meta header is hard-coded Japanese).
+const DefaultCheckinContent = "最近の出来事や気づきがあれば memory/{date}.md に記録し、必要なタスクを実行して。"
 
 // DefaultUserContent is the template surfaced by the settings UI when an
 // agent has no user.md yet. NOT written to disk until the user saves, so

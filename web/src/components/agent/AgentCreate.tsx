@@ -41,7 +41,8 @@ export function AgentCreate() {
   // and bunch up at the same minute.
   const [cronExpr, setCronExpr] = useState("*/30 * * * *");
   const [cronExprDirty, setCronExprDirty] = useState(false);
-  const [timeoutMinutes, setTimeoutMinutes] = useState(10);
+  // -1 = no timeout: the default for new agents.
+  const [timeoutMinutes, setTimeoutMinutes] = useState(-1);
   const [resumeIdleMinutes, setResumeIdleMinutes] = useState(0);
   const [silentStart, setSilentStart] = useState("");
   const [silentEnd, setSilentEnd] = useState("");

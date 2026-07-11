@@ -1008,7 +1008,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 
 	t.Run("per-agent idleThreshold shrinks the active-chat guard", func(t *testing.T) {
 		// A 1-minute override should let a session that was modified 90s ago
-		// (still well inside the package default of 5m) be reset, proving
+		// (still well inside the package default of 30m) be reset, proving
 		// the threshold parameter is honored end-to-end.
 		entry := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":160000,"cache_creation_input_tokens":1000}}}`
 		os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644)
@@ -1061,12 +1061,13 @@ func TestAgent_ResumeIdleDuration_Default(t *testing.T) {
 		{"explicit 5", &Agent{ResumeIdleMinutes: 5}, 5 * time.Minute},
 		{"explicit 1", &Agent{ResumeIdleMinutes: 1}, 1 * time.Minute},
 		{"explicit 60", &Agent{ResumeIdleMinutes: 60}, 60 * time.Minute},
+		{"free-form 2", &Agent{ResumeIdleMinutes: 2}, 2 * time.Minute},
+		{"free-form 999", &Agent{ResumeIdleMinutes: 999}, 999 * time.Minute},
 		{"negative falls back", &Agent{ResumeIdleMinutes: -3}, defaultResumeIdleDuration},
-		// Off-whitelist positive values must not be honored — covers the
+		// Over-cap positive values must not be honored — covers the
 		// store-layer-bypass case where a hand-edited agents.json carries
-		// e.g. 2 (legal int, not in allowedResumeIdles).
-		{"invalid positive falls back", &Agent{ResumeIdleMinutes: 2}, defaultResumeIdleDuration},
-		{"invalid large falls back", &Agent{ResumeIdleMinutes: 999}, defaultResumeIdleDuration},
+		// something absurd (> maxScheduleMinutes).
+		{"over cap falls back", &Agent{ResumeIdleMinutes: maxScheduleMinutes + 1}, defaultResumeIdleDuration},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

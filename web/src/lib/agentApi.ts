@@ -28,34 +28,15 @@ export const INTERVAL_MINUTE_OPTIONS = [5, 10, 15, 20, 30] as const;
 export const INTERVAL_HOUR_OPTIONS = [1, 2, 3, 4, 6, 8, 12] as const;
 export const INTERVAL_DAY_OPTIONS = [1, 2, 3, 4, 5, 6, 7] as const;
 
-// TIMEOUT_PRESETS: per-run cap for scheduled check-ins. -1 = no timeout
-// (label is translated in the editor). Mirrors backend allowedTimeouts.
-export const TIMEOUT_PRESETS = [
-  { label: "5m", value: 5 },
-  { label: "10m", value: 10 },
-  { label: "15m", value: 15 },
-  { label: "20m", value: 20 },
-  { label: "30m", value: 30 },
-  { label: "45m", value: 45 },
-  { label: "1h", value: 60 },
-  { label: "none", value: -1 },
-] as const;
+// MAX_SCHEDULE_MINUTES caps the free-form minute inputs (timeoutMinutes,
+// resumeIdleMinutes) at one week. Mirrors backend maxScheduleMinutes.
+export const MAX_SCHEDULE_MINUTES = 7 * 24 * 60;
 
-// RESUME_IDLE_PRESETS: per-agent override for the claude-only idle window
-// that protects an over-token-threshold session from being reset out from
-// under an active interactive chat. 0 = default (5m, matching Anthropic's
-// prompt cache TTL). Smaller = reset more aggressively (fits high-frequency
-// agents); larger = keep context across longer pauses.
-export const RESUME_IDLE_PRESETS = [
-  { label: "default (5m)", value: 0 },
-  { label: "1m", value: 1 },
-  { label: "3m", value: 3 },
-  { label: "5m", value: 5 },
-  { label: "10m", value: 10 },
-  { label: "15m", value: 15 },
-  { label: "30m", value: 30 },
-  { label: "1h", value: 60 },
-] as const;
+// DEFAULT_TIMEOUT_MINUTES mirrors the backend's cronTimeout — what the
+// legacy timeoutMinutes=0 sentinel resolves to at runtime. The editor
+// renders 0 as this value. (The resume-window default lives only in the
+// "sched.resumeDefault" i18n label; the editor keeps 0 = server default.)
+export const DEFAULT_TIMEOUT_MINUTES = 10;
 
 // TransferSkip is one session file the §3.7 device-switch transfer
 // left behind (see AgentInfo.lastTransferSkips).

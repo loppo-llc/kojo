@@ -3,8 +3,8 @@ import {
   INTERVAL_MINUTE_OPTIONS,
   INTERVAL_HOUR_OPTIONS,
   INTERVAL_DAY_OPTIONS,
-  TIMEOUT_PRESETS,
-  RESUME_IDLE_PRESETS,
+  MAX_SCHEDULE_MINUTES,
+  DEFAULT_TIMEOUT_MINUTES,
 } from "../../lib/agentApi";
 import {
   cronFromInterval,
@@ -21,13 +21,51 @@ import { Textarea } from "../ui/Textarea";
 import { Toggle } from "../ui/Toggle";
 import { t as i18nT, useT, type MessageKey } from "../../lib/i18n";
 
-// Shared chip style for the resume-idle preset toggles.
-function chipClass(selected: boolean): string {
-  return `rounded-lg border px-3 py-1.5 text-[13px] transition-colors ${
-    selected
-      ? "border-copper bg-copper/15 text-copper-bright"
-      : "border-hairline bg-raised text-ink-dim hover:border-ink-faint hover:text-ink"
-  }`;
+/**
+ * Free-form "N minutes" input shared by the timeout and resume-window
+ * fields. `value <= 0` renders as an empty field with `emptyLabel` as the
+ * placeholder; clearing the field commits `emptyValue` (the sentinel the
+ * caller uses for "none" / "default").
+ */
+function MinutesField({
+  value,
+  emptyValue,
+  emptyLabel,
+  onChange,
+  ariaLabel,
+}: {
+  value: number;
+  emptyValue: number;
+  emptyLabel: string;
+  onChange: (v: number) => void;
+  ariaLabel: string;
+}) {
+  const t = useT();
+  return (
+    <div className="flex items-center gap-2">
+      <div className="w-24">
+        <Input
+          type="number"
+          min={1}
+          max={MAX_SCHEDULE_MINUTES}
+          value={value > 0 ? String(value) : ""}
+          placeholder={emptyLabel}
+          aria-label={ariaLabel}
+          onChange={(e) => {
+            // valueAsNumber (not parseInt) so "1e2" reads as 100, not 1;
+            // floor drops fractional input.
+            const v = Math.floor(e.target.valueAsNumber);
+            if (!Number.isFinite(v) || v < 1) {
+              onChange(emptyValue);
+            } else {
+              onChange(Math.min(v, MAX_SCHEDULE_MINUTES));
+            }
+          }}
+        />
+      </div>
+      <span className="text-[13px] text-ink-dim">{t("sched.unitMinutes")}</span>
+    </div>
+  );
 }
 
 interface Props {
@@ -37,7 +75,7 @@ interface Props {
   timeoutMinutes: number;
   onTimeoutChange: (v: number) => void;
   // claude-only: idle window before kojo abandons --resume on an
-  // over-token-threshold session. 0 = use server default (5m). Pass `tool`
+  // over-token-threshold session. 0 = use server default (30m). Pass `tool`
   // so we hide the control for non-claude backends where it has no effect.
   resumeIdleMinutes?: number;
   onResumeIdleChange?: (v: number) => void;
@@ -117,16 +155,21 @@ function formatNextCron(
   const diffMs = dt.getTime() - now;
   const past = diffMs < 0;
   const mins = Math.max(1, Math.round(Math.abs(diffMs) / 60000));
+  // Unit words come from i18n ("12m" / "12分") — composed by concatenation,
+  // which works for both locales since neither separates the segments.
+  const fmtM = (n: number) => i18nT("sched.durMinutes", { n: String(n) });
+  const fmtH = (n: number) => i18nT("sched.durHours", { n: String(n) });
+  const fmtD = (n: number) => i18nT("sched.durDays", { n: String(n) });
   let amount: string;
-  if (mins < 60) amount = `${mins}m`;
+  if (mins < 60) amount = fmtM(mins);
   else if (mins < 60 * 24) {
     const h = Math.floor(mins / 60);
     const m = mins % 60;
-    amount = m === 0 ? `${h}h` : `${h}h${m}m`;
+    amount = m === 0 ? fmtH(h) : fmtH(h) + fmtM(m);
   } else {
     const d = Math.floor(mins / (60 * 24));
     const h = Math.floor((mins % (60 * 24)) / 60);
-    amount = h === 0 ? `${d}d` : `${d}d${h}h`;
+    amount = h === 0 ? fmtD(d) : fmtD(d) + fmtH(h);
   }
   return { abs, rel: past ? i18nT("sched.relAgo", { amount }) : i18nT("sched.relIn", { amount }) };
 }
@@ -312,31 +355,22 @@ export function ScheduleEditor({
         </p>
       </div>
 
-      {/* Timeout */}
+      {/* Timeout — free-form minutes; empty = no timeout (-1). Legacy 0
+          (= server default) renders as the 10 the runtime resolves it to. */}
       {(enabled || onCheckin) && (
         <Field label={t("sched.timeout")} help={t("sched.timeoutHelp")}>
-          <div className="max-w-[220px]">
-            <Select
-              value={String(timeoutMinutes)}
-              onChange={(e) => onTimeoutChange(parseInt(e.target.value, 10))}
-            >
-              {/* 0 (= server default) isn't a preset the UI offers, but old
-                  agents may still carry it — surface it instead of showing
-                  a blank select. */}
-              {timeoutMinutes === 0 && (
-                <option value="0">{t("sched.timeoutDefault")}</option>
-              )}
-              {TIMEOUT_PRESETS.map((opt) => (
-                <option key={opt.value} value={String(opt.value)}>
-                  {opt.value === -1 ? t("sched.timeoutNone") : opt.label}
-                </option>
-              ))}
-            </Select>
-          </div>
+          <MinutesField
+            value={timeoutMinutes === 0 ? DEFAULT_TIMEOUT_MINUTES : timeoutMinutes}
+            emptyValue={-1}
+            emptyLabel={t("sched.timeoutNone")}
+            onChange={onTimeoutChange}
+            ariaLabel={t("sched.timeout")}
+          />
         </Field>
       )}
 
-      {/* Resume Idle (claude only) */}
+      {/* Resume Idle (claude only) — free-form minutes; empty = server
+          default (0 sentinel, 30 min at runtime). */}
       {showResumeIdle && (
         <Field
           label={
@@ -347,18 +381,13 @@ export function ScheduleEditor({
           }
           help={t("sched.resumeWindowHelp")}
         >
-          <div className="flex flex-wrap gap-1.5">
-            {RESUME_IDLE_PRESETS.map((opt) => (
-              <button
-                key={opt.value}
-                type="button"
-                onClick={() => onResumeIdleChange?.(opt.value)}
-                className={chipClass((resumeIdleMinutes ?? 0) === opt.value)}
-              >
-                {opt.value === 0 ? t("sched.resumeDefault") : opt.label}
-              </button>
-            ))}
-          </div>
+          <MinutesField
+            value={resumeIdleMinutes ?? 0}
+            emptyValue={0}
+            emptyLabel={t("sched.resumeDefault")}
+            onChange={(v) => onResumeIdleChange?.(v)}
+            ariaLabel={t("sched.resumeWindow")}
+          />
         </Field>
       )}
 
