@@ -140,16 +140,22 @@ func requireFiveFields(expr string) error {
 	return nil
 }
 
-// legacyAllowedIntervals lists every value the pre-CronExpr UI ever accepted
-// for intervalMinutes. Mirrors the old `allowedIntervals` map exactly so a
-// migration of an existing 3h / 6h / 12h agent doesn't silently lose its
-// schedule. The helper below refuses anything outside this set so a hand-
-// edited or schema-drifted JSON value (1, 90, 999, …) can't get translated
-// into a confidently-wrong cron expression that fires at the wrong cadence
-// forever. Callers receive "" for rejected inputs and are expected to warn +
-// persist scheduling-disabled.
+// legacyAllowedIntervals lists every interval (in minutes) the "@preset:N"
+// sentinel accepts. It started as the pre-CronExpr UI's `allowedIntervals`
+// whitelist (kept exactly so a migration of an existing 3h / 6h / 12h agent
+// doesn't silently lose its schedule) and now also carries the values the
+// simplified interval editor offers. Every entry is a divisor of 60 (minutes)
+// or of 1440 with an hour count dividing 24, so intervalToCronExpr always
+// produces an exactly-even cadence. The helper below refuses anything outside
+// this set so a hand-edited or schema-drifted value (1, 90, 999, …) can't get
+// translated into a confidently-wrong cron expression that fires at the wrong
+// cadence forever. Callers receive "" for rejected inputs and are expected to
+// warn + persist scheduling-disabled.
+//
+// Mirrors CRON_PRESET_ALLOWED in web/src/lib/cronExpr.ts — keep in sync.
 var legacyAllowedIntervals = map[int]struct{}{
-	5: {}, 10: {}, 30: {}, 60: {}, 180: {}, 360: {}, 720: {}, 1440: {},
+	5: {}, 10: {}, 15: {}, 20: {}, 30: {},
+	60: {}, 120: {}, 180: {}, 240: {}, 360: {}, 480: {}, 720: {}, 1440: {},
 }
 
 // intervalToCronExpr converts a legacy intervalMinutes value to a 5-field cron

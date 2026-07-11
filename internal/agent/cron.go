@@ -16,6 +16,25 @@ import (
 const cronTimeout = 10 * time.Minute     // default timeout; per-agent override via TimeoutMinutes
 const cronMinInterval = 50 * time.Second // minimum interval between runs for same agent
 
+// cronRunContext maps an agent's TimeoutMinutes to the context a check-in
+// run executes under: >0 = that many minutes, 0 = default (cronTimeout),
+// <0 = no timeout (a plain cancellable context, so the deferred cancel keeps
+// working uniformly at every call site). The returned duration is 0 for the
+// unbounded case — callers that log or report the effective timeout treat
+// 0 as "none".
+func cronRunContext(timeoutMinutes int) (context.Context, context.CancelFunc, time.Duration) {
+	if timeoutMinutes < 0 {
+		ctx, cancel := context.WithCancel(context.Background())
+		return ctx, cancel, 0
+	}
+	timeout := cronTimeout
+	if timeoutMinutes > 0 {
+		timeout = time.Duration(timeoutMinutes) * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	return ctx, cancel, timeout
+}
+
 // cronLockFile is the legacy v0 throttle marker filename. Kept as
 // a constant so runtime helpers (acquireCronLock + the reset path
 // in manager_lifecycle.go) can recognise and best-effort unlink a
@@ -543,15 +562,10 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 
 	nextRun := cs.nextRun(agentID, silentStart, silentEnd)
 
-	// Per-agent timeout (0 = use default)
-	timeout := cronTimeout
-	if timeoutMinutes > 0 {
-		timeout = time.Duration(timeoutMinutes) * time.Minute
-	}
-	effectiveTimeoutMin := int(timeout / time.Minute)
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	// Per-agent timeout (0 = default, <0 = no timeout)
+	ctx, cancel, timeout := cronRunContext(timeoutMinutes)
 	defer cancel()
+	effectiveTimeoutMin := int(timeout / time.Minute)
 
 	events, err := cs.mgr.Chat(ctx, agentID, cronPrompt(nextRun, effectiveTimeoutMin, cronMessage), "system", nil, BusySourceCron)
 	if err != nil {

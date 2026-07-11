@@ -92,3 +92,50 @@ func TestValidateCronMessage(t *testing.T) {
 		}
 	})
 }
+
+func TestCronRunContext(t *testing.T) {
+	// 0 = default timeout
+	ctx, cancel, timeout := cronRunContext(0)
+	defer cancel()
+	if timeout != cronTimeout {
+		t.Errorf("default: timeout = %v, want %v", timeout, cronTimeout)
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		t.Error("default: expected a deadline")
+	}
+
+	// >0 = explicit minutes
+	ctx, cancel, timeout = cronRunContext(30)
+	defer cancel()
+	if timeout != 30*time.Minute {
+		t.Errorf("explicit: timeout = %v, want 30m", timeout)
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		t.Error("explicit: expected a deadline")
+	}
+
+	// <0 = no timeout: unbounded context, zero duration reported
+	ctx, cancel, timeout = cronRunContext(-1)
+	if timeout != 0 {
+		t.Errorf("unlimited: timeout = %v, want 0", timeout)
+	}
+	if _, ok := ctx.Deadline(); ok {
+		t.Error("unlimited: expected no deadline")
+	}
+	// cancel must still work (context becomes done)
+	cancel()
+	select {
+	case <-ctx.Done():
+	default:
+		t.Error("unlimited: cancel did not cancel the context")
+	}
+}
+
+func TestValidTimeoutAllowsNoTimeout(t *testing.T) {
+	if !ValidTimeout(-1) {
+		t.Error("ValidTimeout(-1) = false, want true (no-timeout sentinel)")
+	}
+	if ValidTimeout(-2) {
+		t.Error("ValidTimeout(-2) = true, want false")
+	}
+}

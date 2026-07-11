@@ -250,12 +250,7 @@ func (m *Manager) WakeChat(agentID, message string) error {
 	timeoutMinutes := a.TimeoutMinutes
 	m.mu.Unlock()
 
-	timeout := cronTimeout
-	if timeoutMinutes > 0 {
-		timeout = time.Duration(timeoutMinutes) * time.Minute
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel, timeout := cronRunContext(timeoutMinutes)
 	events, err := m.Chat(ctx, agentID, message, "system", nil, BusySourceCron)
 	if err != nil {
 		cancel()

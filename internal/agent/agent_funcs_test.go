@@ -54,12 +54,18 @@ func TestIntervalToCronExpr(t *testing.T) {
 		{"360 min produces 6-hourly", 360, "ag_test", false},
 		{"720 min produces 12-hourly", 720, "ag_test", false},
 		{"1440 min produces daily", 1440, "ag_test", false},
-		// Values outside the legacy whitelist must be rejected — bypassing
-		// the whitelist would let a hand-edited "intervalMinutes": 1 land
-		// every-minute cron during migration.
+		// Interval-editor additions: minutes divide 60, hour counts divide 24
+		{"15 min produces sub-hourly", 15, "ag_test", false},
+		{"20 min produces sub-hourly", 20, "ag_test", false},
+		{"120 min produces 2-hourly", 120, "ag_test", false},
+		{"240 min produces 4-hourly", 240, "ag_test", false},
+		{"480 min produces 8-hourly", 480, "ag_test", false},
+		// Values outside the whitelist must be rejected — bypassing it would
+		// let a hand-edited "intervalMinutes": 1 land every-minute cron
+		// during migration.
 		{"1 min rejected (not in whitelist)", 1, "ag_test", true},
 		{"90 min rejected (not in whitelist)", 90, "ag_test", true},
-		{"240 min rejected (not in whitelist)", 240, "ag_test", true},
+		{"25 min rejected (not in whitelist)", 25, "ag_test", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

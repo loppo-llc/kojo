@@ -14,28 +14,22 @@ import {
 import { appendTokenQuery } from "./auth";
 import type { DirEntry, FileView } from "./api";
 
-// SCHEDULE_PRESETS surface the most common cron cadences as one-click chips.
-// The cron field uses an "@preset:N" sentinel that the backend expands at
-// Save time into a real 5-field expression with a per-agent offset baked in
-// (see internal/agent/cron_expr.go). Sending a literal "0 */3 * * *" instead
-// would have every agent fire at exactly :00 — the original per-agent
-// stagger from the IntervalMinutes era would be lost.
-//
-// "Daily 09:00" is intentionally a literal expression: a fixed wall-clock
-// time is what the user is asking for, so spreading it across agents would
-// defeat the point. Off is the empty string (= scheduling disabled).
-export const SCHEDULE_PRESETS = [
-  { label: "Off", cron: "" },
-  { label: "5m", cron: "@preset:5" },
-  { label: "10m", cron: "@preset:10" },
-  { label: "30m", cron: "@preset:30" },
-  { label: "1h", cron: "@preset:60" },
-  { label: "3h", cron: "@preset:180" },
-  { label: "6h", cron: "@preset:360" },
-  { label: "12h", cron: "@preset:720" },
-  { label: "Daily 09:00", cron: "0 9 * * *" },
-] as const;
+// INTERVAL_*_OPTIONS drive the simplified "every N unit" schedule editor.
+// Minute values are divisors of 60 and hour values divisors of 24, so the
+// cadence is always exactly even. Minutes/hours are sent as the "@preset:N"
+// sentinel that the backend expands at Save time into a real 5-field
+// expression with a per-agent offset baked in (see internal/agent/
+// cron_expr.go). Sending a literal "0 */3 * * *" instead would have every
+// agent fire at exactly :00. Days are emitted client-side as a literal
+// "M H */n * *" with a user-chosen wall-clock time — a fixed time is what
+// the user is asking for there, so spreading it across agents would defeat
+// the point.
+export const INTERVAL_MINUTE_OPTIONS = [5, 10, 15, 20, 30] as const;
+export const INTERVAL_HOUR_OPTIONS = [1, 2, 3, 4, 6, 8, 12] as const;
+export const INTERVAL_DAY_OPTIONS = [1, 2, 3, 4, 5, 6, 7] as const;
 
+// TIMEOUT_PRESETS: per-run cap for scheduled check-ins. -1 = no timeout
+// (label is translated in the editor). Mirrors backend allowedTimeouts.
 export const TIMEOUT_PRESETS = [
   { label: "5m", value: 5 },
   { label: "10m", value: 10 },
@@ -44,6 +38,7 @@ export const TIMEOUT_PRESETS = [
   { label: "30m", value: 30 },
   { label: "45m", value: 45 },
   { label: "1h", value: 60 },
+  { label: "none", value: -1 },
 ] as const;
 
 // RESUME_IDLE_PRESETS: per-agent override for the claude-only idle window

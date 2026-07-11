@@ -1,20 +1,27 @@
-import { useEffect, useMemo, useState } from "react";
-import { SCHEDULE_PRESETS, TIMEOUT_PRESETS, RESUME_IDLE_PRESETS } from "../../lib/agentApi";
+import { useEffect, useState } from "react";
 import {
-  cronEquivalentToPreset,
-  cronFromSimple,
-  detectSimpleMode,
+  INTERVAL_MINUTE_OPTIONS,
+  INTERVAL_HOUR_OPTIONS,
+  INTERVAL_DAY_OPTIONS,
+  TIMEOUT_PRESETS,
+  RESUME_IDLE_PRESETS,
+} from "../../lib/agentApi";
+import {
+  cronFromInterval,
+  detectInterval,
   humanizeCron,
   isCronExprSyntaxValid,
-  parseCronExpr,
+  type IntervalSpec,
+  type IntervalUnit,
 } from "../../lib/cronExpr";
 import { Field } from "../ui/Field";
 import { Input } from "../ui/Input";
+import { Select } from "../ui/Select";
 import { Textarea } from "../ui/Textarea";
 import { Toggle } from "../ui/Toggle";
 import { t as i18nT, useT, type MessageKey } from "../../lib/i18n";
 
-// Shared chip style for the preset / tab / day-of-week toggles.
+// Shared chip style for the resume-idle preset toggles.
 function chipClass(selected: boolean): string {
   return `rounded-lg border px-3 py-1.5 text-[13px] transition-colors ${
     selected
@@ -57,7 +64,6 @@ interface Props {
   onCheckin?: () => void;
   checkingIn?: boolean;
 }
-
 
 // CRON_MESSAGE_MAX_LEN matches the server-side workspaceFileBodyCap (1 MiB)
 // divided by 4 — UTF-8 worst-case is 4 bytes per code unit, so capping
@@ -125,54 +131,51 @@ function formatNextCron(
   return { abs, rel: past ? i18nT("sched.relAgo", { amount }) : i18nT("sched.relIn", { amount }) };
 }
 
-type TabId = "preset" | "hourly" | "daily" | "weekly" | "advanced";
+type Mode = "off" | "interval" | "cron";
 
-const TABS: { id: TabId; labelKey: MessageKey }[] = [
-  { id: "preset", labelKey: "sched.tabPreset" },
-  { id: "hourly", labelKey: "sched.tabHourly" },
-  { id: "daily", labelKey: "sched.tabDaily" },
-  { id: "weekly", labelKey: "sched.tabWeekly" },
-  { id: "advanced", labelKey: "sched.tabAdvanced" },
+const MODES: { id: Mode; labelKey: MessageKey }[] = [
+  { id: "off", labelKey: "sched.modeOff" },
+  { id: "interval", labelKey: "sched.modeInterval" },
+  { id: "cron", labelKey: "sched.modeCron" },
 ];
 
-const DOW_KEYS: MessageKey[] = [
-  "sched.dowSun",
-  "sched.dowMon",
-  "sched.dowTue",
-  "sched.dowWed",
-  "sched.dowThu",
-  "sched.dowFri",
-  "sched.dowSat",
-];
+const INTERVAL_OPTS = {
+  minutes: INTERVAL_MINUTE_OPTIONS,
+  hours: INTERVAL_HOUR_OPTIONS,
+  days: INTERVAL_DAY_OPTIONS,
+} as const;
+
+const UNIT_KEYS: Record<IntervalUnit, MessageKey> = {
+  minute: "sched.unitMinutes",
+  hour: "sched.unitHours",
+  day: "sched.unitDays",
+};
+
+function optionsForUnit(unit: IntervalUnit): ReadonlyArray<number> {
+  switch (unit) {
+    case "minute":
+      return INTERVAL_OPTS.minutes;
+    case "hour":
+      return INTERVAL_OPTS.hours;
+    case "day":
+      return INTERVAL_OPTS.days;
+  }
+}
+
+// Default N when the user switches to a unit whose option list doesn't
+// contain the current value: 30 minutes / 1 hour / 1 day.
+function defaultNForUnit(unit: IntervalUnit): number {
+  return unit === "minute" ? 30 : 1;
+}
 
 /**
- * Pick which tab to surface when the editor mounts (or the value changes
- * out from under us, e.g. after Save). Falls back to Advanced if the
- * expression doesn't fit any of the simple-mode primitives — that's the
- * tab that can faithfully render anything.
+ * Pick which mode to surface for an expression: "" = off, anything the
+ * interval editor can faithfully render = interval, everything else = cron
+ * (the tab that can render anything verbatim).
  */
-function tabForExpr(expr: string): TabId {
-  const detected = detectSimpleMode(expr, SCHEDULE_PRESETS);
-  if (!detected) return "advanced";
-  switch (detected.mode) {
-    case "preset":
-      return "preset";
-    case "everyN":
-      // everyN is folded into the preset chips so users see one row of
-      // options instead of two near-duplicates. Match by cadence
-      // equivalence, NOT string equality, so an already-expanded preset
-      // ("7,37 * * * *") that re-loaded from the server still resolves
-      // back to the Preset tab.
-      return SCHEDULE_PRESETS.some((p) => cronEquivalentToPreset(expr, p.cron))
-        ? "preset"
-        : "advanced";
-    case "hourly":
-      return "hourly";
-    case "daily":
-      return "daily";
-    case "weekly":
-      return "weekly";
-  }
+function modeForExpr(expr: string): Mode {
+  if (expr === "") return "off";
+  return detectInterval(expr, INTERVAL_OPTS) ? "interval" : "cron";
 }
 
 export function ScheduleEditor({
@@ -208,26 +211,47 @@ export function ScheduleEditor({
     return () => clearInterval(id);
   }, [nextCronAt, scheduleDirty]);
 
-  // Active tab. Re-sync when cronExpr changes externally (e.g. after Save
-  // re-issues a fresh agent record) but otherwise keep whatever the user
-  // last clicked so editing doesn't fight the auto-detect.
-  const [tab, setTab] = useState<TabId>(() => tabForExpr(cronExpr));
-  const [advancedDraft, setAdvancedDraft] = useState(cronExpr);
+  // Active mode. Re-syncs when cronExpr changes externally (e.g. after Save
+  // re-issues a fresh agent record) — except that the cron tab is sticky:
+  // it can faithfully render any expression, and jumping the user out of it
+  // mid-edit (because they typed something the interval editor happens to
+  // recognise) would fight the edit.
+  const [mode, setMode] = useState<Mode>(() => modeForExpr(cronExpr));
+  const [cronDraft, setCronDraft] = useState(cronExpr);
+  // Last-known interval selection; preserved across mode/unit switches so
+  // flipping Off → Interval restores what the user had.
+  const [spec, setSpec] = useState<IntervalSpec>(
+    () => detectInterval(cronExpr, INTERVAL_OPTS) ?? { unit: "minute", n: 30 },
+  );
   useEffect(() => {
-    setTab(tabForExpr(cronExpr));
-    setAdvancedDraft(cronExpr);
+    setCronDraft(cronExpr);
+    const d = detectInterval(cronExpr, INTERVAL_OPTS);
+    if (d) setSpec(d);
+    setMode((prev) => {
+      if (prev === "cron" && cronExpr !== "") return prev;
+      return modeForExpr(cronExpr);
+    });
   }, [cronExpr]);
 
-  const detected = useMemo(
-    () => detectSimpleMode(cronExpr, SCHEDULE_PRESETS),
-    [cronExpr],
-  );
+  const selectMode = (m: Mode) => {
+    if (m === mode) return;
+    setMode(m);
+    if (m === "off") {
+      onCronExprChange("");
+    } else if (m === "interval") {
+      onCronExprChange(cronFromInterval(spec));
+    } else {
+      // cron: start editing from whatever is currently set.
+      setCronDraft(cronExpr);
+    }
+  };
 
-  // Parsed cronExpr for the tab editors — these read the structure once
-  // and re-emit a freshly-built expression on each input change.
-  const parsed = parseCronExpr(cronExpr);
+  const changeSpec = (next: IntervalSpec) => {
+    setSpec(next);
+    onCronExprChange(cronFromInterval(next));
+  };
 
-  // ---- Silent hours toggle (unchanged from the old editor) ----
+  // ---- Silent hours toggle ----
   const [silentEnabled, setSilentEnabled] = useState(silentStart !== "" && silentEnd !== "");
   useEffect(() => {
     setSilentEnabled(silentStart !== "" && silentEnd !== "");
@@ -251,96 +275,38 @@ export function ScheduleEditor({
 
   return (
     <div className="space-y-4">
-      {/* Mode tabs */}
+      {/* Mode segments — the enclosing SectionCard already titles this
+          "スケジュール", so no inner label. */}
       <div>
-        <label className="mb-2 block text-[12px] font-medium text-ink-dim">{t("settings.sec.schedule")}</label>
         <div className="mb-3 flex gap-1 rounded-lg border border-hairline bg-raised p-1">
-          {TABS.map((tb) => (
+          {MODES.map((m) => (
             <button
-              key={tb.id}
+              key={m.id}
               type="button"
-              onClick={() => setTab(tb.id)}
+              onClick={() => selectMode(m.id)}
               className={`flex-1 rounded-md px-2 py-1 text-[12px] transition-colors ${
-                tab === tb.id
+                mode === m.id
                   ? "bg-copper/15 text-copper-bright"
                   : "text-ink-dim hover:text-ink"
               }`}
             >
-              {t(tb.labelKey)}
+              {t(m.labelKey)}
             </button>
           ))}
         </div>
 
-        {tab === "preset" && (
-          <div className="flex flex-wrap gap-1.5">
-            {SCHEDULE_PRESETS.map((opt) => {
-              // cronEquivalentToPreset (NOT ===) so a Save round-trip
-              // that expanded "@preset:30" into "7,37 * * * *" still
-              // highlights the original "30m" chip.
-              const selected = cronEquivalentToPreset(cronExpr, opt.cron);
-              return (
-                <button
-                  key={opt.label}
-                  type="button"
-                  onClick={() => onCronExprChange(opt.cron)}
-                  className={chipClass(selected)}
-                >
-                  {opt.label === "Off"
-                    ? t("sched.presetOff")
-                    : opt.label === "Daily 09:00"
-                      ? t("sched.presetDaily9")
-                      : opt.label}
-                </button>
-              );
-            })}
-          </div>
-        )}
+        {mode === "interval" && <IntervalEditor spec={spec} onChange={changeSpec} />}
 
-        {tab === "hourly" && (
-          <HourlyEditor
-            initialMinute={
-              detected?.mode === "hourly"
-                ? detected.hourlyMinute ?? 0
-                : parsed && /^\d+$/.test(parsed.minute)
-                  ? parseInt(parsed.minute, 10)
-                  : 0
-            }
-            onChange={(m) =>
-              onCronExprChange(cronFromSimple("hourly", { minute: m }))
-            }
-          />
-        )}
-
-        {tab === "daily" && (
-          <DailyEditor
-            hh={detected?.mode === "daily" ? detected.hh ?? 9 : 9}
-            mm={detected?.mode === "daily" ? detected.mm ?? 0 : 0}
-            onChange={(hh, mm) =>
-              onCronExprChange(cronFromSimple("daily", { hh, mm }))
-            }
-          />
-        )}
-
-        {tab === "weekly" && (
-          <WeeklyEditor
-            hh={detected?.mode === "weekly" ? detected.hh ?? 9 : 9}
-            mm={detected?.mode === "weekly" ? detected.mm ?? 0 : 0}
-            dows={detected?.mode === "weekly" ? detected.dows ?? [1] : [1]}
-            onChange={(hh, mm, dows) =>
-              onCronExprChange(cronFromSimple("weekly", { hh, mm, dows }))
-            }
-          />
-        )}
-
-        {tab === "advanced" && (
-          <AdvancedEditor
-            value={advancedDraft}
-            onLocalChange={setAdvancedDraft}
+        {mode === "cron" && (
+          <CronEditor
+            value={cronDraft}
+            onLocalChange={setCronDraft}
             onCommit={(v) => onCronExprChange(v)}
           />
         )}
 
-        {/* Live human-readable preview — shown across all tabs. */}
+        {/* Live human-readable preview — the single readout of what will
+            actually fire, shown across all modes. */}
         <p className="mt-2 text-[11px] text-ink-faint">
           {humanizeCron(cronExpr)}
         </p>
@@ -349,17 +315,23 @@ export function ScheduleEditor({
       {/* Timeout */}
       {(enabled || onCheckin) && (
         <Field label={t("sched.timeout")} help={t("sched.timeoutHelp")}>
-          <div className="flex flex-wrap gap-1.5">
-            {TIMEOUT_PRESETS.map((opt) => (
-              <button
-                key={opt.value}
-                type="button"
-                onClick={() => onTimeoutChange(opt.value)}
-                className={chipClass(timeoutMinutes === opt.value)}
-              >
-                {opt.label}
-              </button>
-            ))}
+          <div className="max-w-[220px]">
+            <Select
+              value={String(timeoutMinutes)}
+              onChange={(e) => onTimeoutChange(parseInt(e.target.value, 10))}
+            >
+              {/* 0 (= server default) isn't a preset the UI offers, but old
+                  agents may still carry it — surface it instead of showing
+                  a blank select. */}
+              {timeoutMinutes === 0 && (
+                <option value="0">{t("sched.timeoutDefault")}</option>
+              )}
+              {TIMEOUT_PRESETS.map((opt) => (
+                <option key={opt.value} value={String(opt.value)}>
+                  {opt.value === -1 ? t("sched.timeoutNone") : opt.label}
+                </option>
+              ))}
+            </Select>
           </div>
         </Field>
       )}
@@ -522,142 +494,83 @@ export function ScheduleEditor({
 
 // ---- Sub-editors ----
 
-function HourlyEditor({
-  initialMinute,
+/**
+ * "Every [N] [minutes|hours|days] (at HH:MM)" — the single row that replaces
+ * the old preset/hourly/daily/weekly tab set. Word order differs between
+ * locales, so the surrounding words come from intervalPrefix/intervalSuffix
+ * keys (en: "Every … —", ja: "… おき").
+ */
+function IntervalEditor({
+  spec,
   onChange,
 }: {
-  initialMinute: number;
-  onChange: (m: number) => void;
+  spec: IntervalSpec;
+  onChange: (spec: IntervalSpec) => void;
 }) {
   const t = useT();
-  const [m, setM] = useState(initialMinute);
-  useEffect(() => setM(initialMinute), [initialMinute]);
-  return (
-    <div className="flex items-center gap-3">
-      <label className="text-[13px] text-ink-dim">{t("sched.everyHourAt")}</label>
-      <Input
-        type="number"
-        min={0}
-        max={59}
-        value={m}
-        onChange={(e) => {
-          const v = clampInt(e.target.value, 0, 59);
-          setM(v);
-          onChange(v);
-        }}
-        className="w-20"
-      />
-      <span className="text-[13px] text-ink-dim">{t("sched.minuteUnit")}</span>
-    </div>
-  );
-}
+  const prefix = t("sched.intervalPrefix");
+  const suffix = t("sched.intervalSuffix");
 
-function DailyEditor({
-  hh,
-  mm,
-  onChange,
-}: {
-  hh: number;
-  mm: number;
-  onChange: (hh: number, mm: number) => void;
-}) {
-  const t = useT();
-  const [h, setH] = useState(hh);
-  const [m, setM] = useState(mm);
-  useEffect(() => {
-    setH(hh);
-    setM(mm);
-  }, [hh, mm]);
-  const value = `${pad(h)}:${pad(m)}`;
-  return (
-    <div className="flex items-center gap-3">
-      <label className="text-[13px] text-ink-dim">{t("sched.everyDayAt")}</label>
-      <Input
-        type="time"
-        value={value}
-        onChange={(e) => {
-          const [nh, nm] = e.target.value.split(":").map(Number);
-          if (Number.isFinite(nh) && Number.isFinite(nm)) {
-            setH(nh);
-            setM(nm);
-            onChange(nh, nm);
-          }
-        }}
-        className="w-auto"
-      />
-    </div>
-  );
-}
-
-function WeeklyEditor({
-  hh,
-  mm,
-  dows,
-  onChange,
-}: {
-  hh: number;
-  mm: number;
-  dows: number[];
-  onChange: (hh: number, mm: number, dows: number[]) => void;
-}) {
-  const t = useT();
-  const [h, setH] = useState(hh);
-  const [m, setM] = useState(mm);
-  const [d, setD] = useState<number[]>(dows);
-  useEffect(() => {
-    setH(hh);
-    setM(mm);
-    setD(dows);
-  }, [hh, mm, dows]);
-
-  const toggleDow = (n: number) => {
-    const next = d.includes(n) ? d.filter((x) => x !== n) : [...d, n].sort((a, b) => a - b);
-    setD(next);
-    onChange(h, m, next);
+  const changeUnit = (unit: IntervalUnit) => {
+    const opts = optionsForUnit(unit);
+    const n = opts.includes(spec.n) ? spec.n : defaultNForUnit(unit);
+    const next: IntervalSpec = { unit, n };
+    if (unit === "day") {
+      next.hh = spec.hh ?? 9;
+      next.mm = spec.mm ?? 0;
+    }
+    onChange(next);
   };
 
   return (
-    <div className="space-y-2">
-      <div className="flex flex-wrap gap-1.5">
-        {DOW_KEYS.map((key, i) => {
-          const selected = d.includes(i);
-          return (
-            <button
-              key={i}
-              type="button"
-              onClick={() => toggleDow(i)}
-              className={chipClass(selected)}
-            >
-              {t(key)}
-            </button>
-          );
-        })}
+    <div className="flex flex-wrap items-center gap-2">
+      {prefix && <span className="text-[13px] text-ink-dim">{prefix}</span>}
+      <div className="w-20">
+        <Select
+          value={String(spec.n)}
+          onChange={(e) => onChange({ ...spec, n: parseInt(e.target.value, 10) })}
+          aria-label={t("sched.intervalN")}
+        >
+          {optionsForUnit(spec.unit).map((n) => (
+            <option key={n} value={String(n)}>
+              {n}
+            </option>
+          ))}
+        </Select>
       </div>
-      <div className="flex items-center gap-3">
+      <div className="w-24">
+        <Select
+          value={spec.unit}
+          onChange={(e) => changeUnit(e.target.value as IntervalUnit)}
+          aria-label={t("sched.intervalUnit")}
+        >
+          {(Object.keys(UNIT_KEYS) as IntervalUnit[]).map((u) => (
+            <option key={u} value={u}>
+              {t(UNIT_KEYS[u])}
+            </option>
+          ))}
+        </Select>
+      </div>
+      {suffix && <span className="text-[13px] text-ink-dim">{suffix}</span>}
+      {spec.unit === "day" && (
         <Input
           type="time"
-          value={`${pad(h)}:${pad(m)}`}
+          value={`${pad(spec.hh ?? 9)}:${pad(spec.mm ?? 0)}`}
           onChange={(e) => {
             const [nh, nm] = e.target.value.split(":").map(Number);
             if (Number.isFinite(nh) && Number.isFinite(nm)) {
-              setH(nh);
-              setM(nm);
-              onChange(nh, nm, d);
+              onChange({ ...spec, hh: nh, mm: nm });
             }
           }}
           className="w-auto"
+          aria-label={t("sched.intervalTime")}
         />
-      </div>
-      {d.length === 0 && (
-        <p className="text-[12px] text-lamp-warn">
-          {t("sched.weeklyNoDow")}
-        </p>
       )}
     </div>
   );
 }
 
-function AdvancedEditor({
+function CronEditor({
   value,
   onLocalChange,
   onCommit,
@@ -697,10 +610,4 @@ function AdvancedEditor({
 
 function pad(n: number): string {
   return n.toString().padStart(2, "0");
-}
-
-function clampInt(s: string, lo: number, hi: number): number {
-  const n = parseInt(s, 10);
-  if (Number.isNaN(n)) return lo;
-  return Math.max(lo, Math.min(hi, n));
 }

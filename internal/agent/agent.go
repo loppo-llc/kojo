@@ -230,8 +230,9 @@ func validateCronMessage(s string) (string, error) {
 
 // allowedTimeouts defines the valid timeoutMinutes values.
 // 0 means "use default" (10 minutes at runtime) for backward compatibility.
+// -1 means "no timeout" — the check-in run gets an unbounded context.
 var allowedTimeouts = map[int]bool{
-	0: true, 5: true, 10: true, 15: true, 20: true, 30: true, 45: true, 60: true,
+	-1: true, 0: true, 5: true, 10: true, 15: true, 20: true, 30: true, 45: true, 60: true,
 }
 
 // ValidTimeout returns true if the given timeout is in the allowed set.
@@ -273,7 +274,7 @@ type Agent struct {
 	// Empty = scheduling disabled. Validated via ValidateCronExpr; rejected
 	// expressions never reach this field.
 	CronExpr       string `json:"cronExpr"`
-	TimeoutMinutes int    `json:"timeoutMinutes"` // max duration per cron run in minutes (0 = default 10)
+	TimeoutMinutes int    `json:"timeoutMinutes"` // max duration per cron run in minutes (0 = default 10, -1 = no timeout)
 	// ResumeIdleMinutes is the idle-window threshold (in minutes) below
 	// which kojo keeps an over-token-threshold claude session via --resume
 	// instead of resetting. 0 = use defaultResumeIdleDuration (5 min).
@@ -578,7 +579,7 @@ type AgentConfig struct {
 	// instead of silently dropping the value (Go's default Unmarshal behaviour
 	// for unknown fields). Validated in newAgent / Manager.Update.
 	LegacyIntervalMinutes *int `json:"intervalMinutes,omitempty"`
-	TimeoutMinutes        *int `json:"timeoutMinutes"` // nil = use default (0 = 10 min)
+	TimeoutMinutes        *int `json:"timeoutMinutes"` // nil = use default (0 = 10 min, -1 = no timeout)
 	// ResumeIdleMinutes overrides the per-agent claude --resume idle window.
 	// nil/0 = use defaultResumeIdleDuration (5 min).
 	ResumeIdleMinutes  *int    `json:"resumeIdleMinutes"`

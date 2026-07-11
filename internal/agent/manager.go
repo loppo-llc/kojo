@@ -3104,13 +3104,8 @@ func (m *Manager) Checkin(agentID string) error {
 		return fmt.Errorf("read checkin.md: %w", err)
 	}
 
-	timeout := cronTimeout
-	if timeoutMinutes > 0 {
-		timeout = time.Duration(timeoutMinutes) * time.Minute
-	}
+	ctx, cancel, timeout := cronRunContext(timeoutMinutes)
 	effectiveTimeoutMin := int(timeout / time.Minute)
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
 	prompt := checkinPrompt(time.Now(), effectiveTimeoutMin, cronMessage)
 	events, err := m.Chat(ctx, agentID, prompt, "system", nil, BusySourceCron)

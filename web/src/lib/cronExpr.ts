@@ -14,22 +14,17 @@ export interface CronStruct {
   dow: string;
 }
 
-export type SimpleMode = "preset" | "everyN" | "hourly" | "daily" | "weekly";
+// IntervalSpec describes the one simple-mode primitive the schedule editor
+// exposes: "every N minutes/hours/days". Days carry a wall-clock fire time;
+// minutes/hours use the per-agent-offset sentinel so no time is stored.
+export type IntervalUnit = "minute" | "hour" | "day";
 
-export interface SimpleSpec {
-  mode: SimpleMode;
-  // preset: matches one of SCHEDULE_PRESETS labels
-  presetCron?: string;
-  // everyN: minute interval (5/10/30) or hour interval (1/3/6/12)
-  everyN?: number;
-  everyUnit?: "minute" | "hour";
-  // hourly: minute (0..59)
-  hourlyMinute?: number;
-  // daily: hh / mm
+export interface IntervalSpec {
+  unit: IntervalUnit;
+  n: number;
+  // day only: fire time (defaults 09:00 when absent)
   hh?: number;
   mm?: number;
-  // weekly: numeric days-of-week (0=Sun..6=Sat) plus hh/mm
-  dows?: number[];
 }
 
 // Accepts digits, wildcard, list/range/step separators, AND the case-insensitive
@@ -45,55 +40,12 @@ const FIELD_RE = /^[\dA-Z*,/\-]+$/i;
 export const CRON_PRESET_PREFIX = "@preset:";
 
 // CRON_PRESET_ALLOWED mirrors backend's legacyAllowedIntervals exactly.
-// The Advanced editor uses this to reject "@preset:7" or any other value
+// The cron editor uses this to reject "@preset:7" or any other value
 // the server would refuse, so the user gets immediate feedback instead of
 // a 400 on Save.
-const CRON_PRESET_ALLOWED = new Set([5, 10, 30, 60, 180, 360, 720, 1440]);
-
-/**
- * Returns true when `currentExpr` represents the same cadence as `presetCron`.
- * Used by the Preset chip strip to highlight the chip the user originally
- * picked even after a Save round-trip — the persisted form is the per-agent-
- * offset expansion (e.g. "7,37 * * * *"), so a literal === comparison would
- * never match the sentinel ("@preset:30") that the chip carries.
- *
- * Match rules:
- *   - empty preset → only matches empty currentExpr
- *   - "@preset:N" sentinel → matches when currentExpr resolves to the same
- *     N via detectStepMinute / detectStepHour (handles both "*\/N" and the
- *     "M1,M2,…" offset-list form intervalToCronExpr emits)
- *   - literal cron (e.g. "0 9 * * *") → exact string equality
- */
-export function cronEquivalentToPreset(
-  currentExpr: string,
-  presetCron: string,
-): boolean {
-  if (presetCron === "") return currentExpr === "";
-  if (currentExpr === presetCron) return true;
-  const presetN = parseCronPresetSentinel(presetCron);
-  if (presetN === null) return false;
-  const c = parseCronExpr(currentExpr);
-  if (!c) return false;
-  if (presetN < 60) {
-    if (c.hour !== "*" || c.dom !== "*" || c.month !== "*" || c.dow !== "*") return false;
-    return detectStepMinute(c.minute) === presetN;
-  }
-  if (presetN === 1440) {
-    // Daily: a single fixed M H * * *
-    if (!/^\d+$/.test(c.minute) || !/^\d+$/.test(c.hour)) return false;
-    return c.dom === "*" && c.month === "*" && c.dow === "*";
-  }
-  // 60..720: every-N hours at fixed minute
-  if (!/^\d+$/.test(c.minute) || c.dom !== "*" || c.month !== "*" || c.dow !== "*") return false;
-  if (presetN === 60) {
-    // intervalToCronExpr emits "M 0,1,2,...,23 * * *" for the 1h case
-    // (hours=1 → hourList covers every hour), so a literal "*" check
-    // misses the post-Save form. detectStepHour returns 1 for the
-    // expanded list AND for the "*\/1" form, so it covers both shapes.
-    return c.hour === "*" || detectStepHour(c.hour) === 1;
-  }
-  return detectStepHour(c.hour) === presetN / 60;
-}
+const CRON_PRESET_ALLOWED = new Set([
+  5, 10, 15, 20, 30, 60, 120, 180, 240, 360, 480, 720, 1440,
+]);
 
 /**
  * Match the "@preset:N" sentinel and return N when N is in the allowed
@@ -215,6 +167,17 @@ export function humanizeCron(expr: string): string {
     return `${ja ? "毎日" : "daily"} ${pad2(parseInt(c.hour, 10))}:${pad2(parseInt(c.minute, 10))}`;
   }
 
+  // Every-N days at HH:MM: "M H */n * *". The step resets at each month
+  // boundary (cron semantics), which the interval editor accepts.
+  if (/^\d+$/.test(c.minute) && /^\d+$/.test(c.hour) && c.month === "*" && c.dow === "*") {
+    const domStep = c.dom.match(/^\*\/(\d+)$/);
+    if (domStep) {
+      const n = parseInt(domStep[1], 10);
+      const hhmm = `${pad2(parseInt(c.hour, 10))}:${pad2(parseInt(c.minute, 10))}`;
+      return ja ? `${n} 日おき ${hhmm}` : `every ${n} days at ${hhmm}`;
+    }
+  }
+
   // Weekly at HH:MM on a list/range of DOWs.
   if (/^\d+$/.test(c.minute) && /^\d+$/.test(c.hour) && c.dom === "*" && c.month === "*") {
     const dows = expandDowField(c.dow);
@@ -228,111 +191,103 @@ export function humanizeCron(expr: string): string {
 }
 
 /**
- * Generate a cron expression from one of the simple-mode primitives the UI
- * exposes. Used by the tab editor so users never have to type cron syntax
- * for the common cases.
+ * Generate a cron expression from an IntervalSpec. Minutes/hours use the
+ * "@preset:N" sentinel so the server bakes in a per-agent offset; days emit
+ * a literal expression with the user-chosen fire time ("M H *\/n * *", or
+ * plain daily "M H * * *" for n=1). Values outside the editor's option
+ * lists are clamped by the caller — this function trusts its input except
+ * for the time fields.
  */
-export function cronFromSimple(
-  mode: "everyN" | "hourly" | "daily" | "weekly",
-  params: {
-    everyN?: number;
-    everyUnit?: "minute" | "hour";
-    minute?: number;
-    hh?: number;
-    mm?: number;
-    dows?: number[];
-  },
-): string {
-  switch (mode) {
-    case "everyN": {
-      const n = params.everyN ?? 5;
-      if (params.everyUnit === "hour") {
-        return `0 */${n} * * *`;
-      }
-      return `*/${n} * * * *`;
-    }
-    case "hourly": {
-      const m = clamp(params.minute ?? 0, 0, 59);
-      return `${m} * * * *`;
-    }
-    case "daily": {
-      const h = clamp(params.hh ?? 9, 0, 23);
-      const m = clamp(params.mm ?? 0, 0, 59);
-      return `${m} ${h} * * *`;
-    }
-    case "weekly": {
-      const h = clamp(params.hh ?? 9, 0, 23);
-      const m = clamp(params.mm ?? 0, 0, 59);
-      const dows = (params.dows ?? []).filter((d) => d >= 0 && d <= 6);
-      // Empty selection used to fall through to "*" — that fired the job
-      // every day, the opposite of what "I deselected everything" means.
-      // Emit "" (= scheduling disabled) so the user gets the obvious result
-      // and the editor can flag it before save.
-      if (dows.length === 0) return "";
-      const dowField = dows.slice().sort((a, b) => a - b).join(",");
-      return `${m} ${h} * * ${dowField}`;
+export function cronFromInterval(spec: IntervalSpec): string {
+  switch (spec.unit) {
+    case "minute":
+      return `${CRON_PRESET_PREFIX}${spec.n}`;
+    case "hour":
+      return `${CRON_PRESET_PREFIX}${spec.n * 60}`;
+    case "day": {
+      const h = clamp(spec.hh ?? 9, 0, 23);
+      const m = clamp(spec.mm ?? 0, 0, 59);
+      return spec.n === 1 ? `${m} ${h} * * *` : `${m} ${h} */${spec.n} * *`;
     }
   }
 }
 
 /**
- * Look at an existing cron expression and decide which simple-mode tab
- * should pre-select it. Returns null when nothing matches — the caller
- * falls through to the Advanced tab and shows the raw string.
+ * Decide whether an existing cron expression fits the interval editor.
+ * Recognises the sentinel form, the "*\/N" step forms, the even offset-list
+ * forms that the server's expansion emits ("7,37 * * * *"), plain daily
+ * ("M H * * *"), and the day-step form ("M H *\/n * *"). Only steps that
+ * appear in the editor's option lists match — anything else returns null so
+ * the caller falls through to the cron tab and shows the raw string.
  */
-export function detectSimpleMode(
+export function detectInterval(
   expr: string,
-  presets: ReadonlyArray<{ label: string; cron: string }>,
-): SimpleSpec | null {
-  if (!expr) {
-    return { mode: "preset", presetCron: "" };
-  }
-  for (const p of presets) {
-    if (p.cron === expr) return { mode: "preset", presetCron: expr };
+  opts: {
+    minutes: ReadonlyArray<number>;
+    hours: ReadonlyArray<number>;
+    days: ReadonlyArray<number>;
+  },
+): IntervalSpec | null {
+  const presetN = parseCronPresetSentinel(expr);
+  if (presetN !== null) {
+    if (presetN < 60 && opts.minutes.includes(presetN)) {
+      return { unit: "minute", n: presetN };
+    }
+    if (presetN % 60 === 0 && opts.hours.includes(presetN / 60)) {
+      return { unit: "hour", n: presetN / 60 };
+    }
+    // e.g. the legacy "@preset:1440" daily sentinel — no fire time to
+    // surface, so let the cron tab render it verbatim.
+    return null;
   }
   const c = parseCronExpr(expr);
-  if (!c) return null;
+  if (!c || c.month !== "*" || c.dow !== "*") return null;
 
-  // everyN minutes: "*/N * * * *" or its even-list equivalent ("7,37 * * * *")
-  if (c.hour === "*" && c.dom === "*" && c.month === "*" && c.dow === "*") {
+  // every N minutes: "*/N * * * *" or its even-list equivalent.
+  // NOTE: "M * * * *" (hourly at a FIXED minute, the old Hourly tab's
+  // output) deliberately does NOT match — IntervalSpec has no slot for the
+  // minute phase, so treating it as "every 1 hour" would silently move the
+  // firing minute on the next edit. It renders in the cron tab instead.
+  if (c.hour === "*" && c.dom === "*") {
     const stepMin = detectStepMinute(c.minute);
-    if (stepMin !== null) {
-      return { mode: "everyN", everyN: stepMin, everyUnit: "minute" };
+    if (stepMin !== null && opts.minutes.includes(stepMin)) {
+      return { unit: "minute", n: stepMin };
     }
+    return null;
   }
 
-  // everyN hours at minute=N: "M */N * * *" or even hour-list equivalent
-  if (/^\d+$/.test(c.minute) && c.dom === "*" && c.month === "*" && c.dow === "*") {
+  if (!/^\d+$/.test(c.minute)) return null;
+
+  // every N hours at fixed minute: "M */N * * *" or even hour-list form
+  if (c.dom === "*") {
     const stepHour = detectStepHour(c.hour);
-    if (stepHour !== null) {
-      return { mode: "everyN", everyN: stepHour, everyUnit: "hour" };
+    if (stepHour !== null && opts.hours.includes(stepHour)) {
+      return { unit: "hour", n: stepHour };
     }
-  }
-
-  // hourly at minute=M: "M * * * *"
-  if (/^\d+$/.test(c.minute) && c.hour === "*" && c.dom === "*" && c.month === "*" && c.dow === "*") {
-    return { mode: "hourly", hourlyMinute: parseInt(c.minute, 10) };
-  }
-
-  // daily at HH:MM
-  if (/^\d+$/.test(c.minute) && /^\d+$/.test(c.hour) && c.dom === "*" && c.month === "*" && c.dow === "*") {
-    return { mode: "daily", hh: parseInt(c.hour, 10), mm: parseInt(c.minute, 10) };
-  }
-
-  // weekly: HH:MM on listed DOWs
-  if (/^\d+$/.test(c.minute) && /^\d+$/.test(c.hour) && c.dom === "*" && c.month === "*") {
-    const dows = expandDowField(c.dow);
-    if (dows && dows.length > 0) {
+    // daily at HH:MM
+    if (/^\d+$/.test(c.hour) && opts.days.includes(1)) {
       return {
-        mode: "weekly",
+        unit: "day",
+        n: 1,
         hh: parseInt(c.hour, 10),
         mm: parseInt(c.minute, 10),
-        dows,
       };
     }
+    return null;
   }
 
-  return null;
+  // every N days at HH:MM: "M H */n * *"
+  if (!/^\d+$/.test(c.hour)) return null;
+  const domStep = c.dom.match(/^\*\/(\d+)$/);
+  if (!domStep) return null;
+  const n = parseInt(domStep[1], 10);
+  if (!opts.days.includes(n)) return null;
+  return {
+    unit: "day",
+    n,
+    hh: parseInt(c.hour, 10),
+    mm: parseInt(c.minute, 10),
+  };
 }
 
 // ---------- helpers ----------
