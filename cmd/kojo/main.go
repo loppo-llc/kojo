@@ -457,6 +457,43 @@ func main() {
 			var homePeer string
 			if peerIdentity != nil {
 				homePeer = peerIdentity.DeviceID
+				// One-shot backfill the v0→v1 blobs importer deferred
+				// ("Phase 4 peer_registry will rewrite these"): rows
+				// stamped with the hostname placeholder (or the
+				// "kojo-local" fallback) never got rewritten to the
+				// device_id, so every home_peer == DeviceID comparison
+				// failed — most visibly the device-switch wrong_source
+				// gate, which told the operator to orchestrate the
+				// switch from the very peer they were already on.
+				// Idempotent, so running it every boot is cheap.
+				// Retry a few times before giving up: the plausible
+				// failure is a transient SQLite BUSY during boot, and
+				// a skipped backfill leaves device-switch 409ing
+				// wrong_source until the next restart. Still warn-and-
+				// continue on exhaustion — a booting daemon with a
+				// degraded switch beats no daemon at all, and the next
+				// boot retries anyway.
+				hostname, _ := os.Hostname()
+				aliases := []string{peerIdentity.Name, hostname, "kojo-local"}
+				for attempt := 1; ; attempt++ {
+					rhCtx, rhCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					n, err := st.RehomeBlobRefs(rhCtx, aliases, homePeer)
+					rhCancel()
+					if err == nil {
+						if n > 0 {
+							logger.Info("blob_refs home_peer backfill: rewrote legacy alias rows to device_id",
+								"rows", n, "device_id", homePeer)
+						}
+						break
+					}
+					if attempt >= 3 {
+						logger.Warn("blob_refs home_peer backfill failed; device-switch from this peer may 409 wrong_source until next restart",
+							"err", err, "attempts", attempt)
+						break
+					}
+					logger.Warn("blob_refs home_peer backfill failed; retrying", "err", err, "attempt", attempt)
+					time.Sleep(2 * time.Second)
+				}
 			} else {
 				homePeer, _ = os.Hostname()
 				if homePeer == "" {

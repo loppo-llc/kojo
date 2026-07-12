@@ -305,3 +305,65 @@ func TestListBlobRefsPrefixIsLiteralAndCaseSensitive(t *testing.T) {
 		t.Errorf("range scan over-matched: %+v", got)
 	}
 }
+
+func TestRehomeBlobRefs(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	seed := func(uri, homePeer string) {
+		t.Helper()
+		if _, err := s.InsertOrReplaceBlobRef(ctx, &BlobRefRecord{
+			URI: uri, Scope: "global", HomePeer: homePeer, SHA256: "abc", Size: 1,
+		}, BlobRefInsertOptions{}); err != nil {
+			t.Fatalf("seed %s: %v", uri, err)
+		}
+	}
+	const deviceID = "2f5f7361-4694-4512-b169-242caeefbd45"
+	seed("kojo://global/agents/ag_1/avatar.png", "HOST-A.local") // legacy hostname alias
+	seed("kojo://global/agents/ag_1/b.pdf", "kojo-local")        // legacy fallback alias
+	seed("kojo://global/agents/ag_2/c.png", deviceID)            // already canonical
+	seed("kojo://global/agents/ag_3/d.png", "other-device-id")   // foreign peer — untouched
+
+	// Aliases with empties / duplicates / the target itself are tolerated.
+	n, err := s.RehomeBlobRefs(ctx, []string{"HOST-A.local", "HOST-A.local", "", "kojo-local", deviceID}, deviceID)
+	if err != nil {
+		t.Fatalf("RehomeBlobRefs: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("rows = %d, want 2", n)
+	}
+
+	for uri, want := range map[string]string{
+		"kojo://global/agents/ag_1/avatar.png": deviceID,
+		"kojo://global/agents/ag_1/b.pdf":      deviceID,
+		"kojo://global/agents/ag_2/c.png":      deviceID,
+		"kojo://global/agents/ag_3/d.png":      "other-device-id",
+	} {
+		got, err := s.GetBlobRef(ctx, uri)
+		if err != nil {
+			t.Fatalf("Get %s: %v", uri, err)
+		}
+		if got.HomePeer != want {
+			t.Errorf("%s home_peer = %s, want %s", uri, got.HomePeer, want)
+		}
+	}
+
+	// Idempotent: second run matches nothing.
+	n, err = s.RehomeBlobRefs(ctx, []string{"HOST-A.local", "kojo-local"}, deviceID)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("second run rows = %d, want 0", n)
+	}
+
+	// No usable aliases → no-op, no SQL error.
+	if n, err = s.RehomeBlobRefs(ctx, []string{"", deviceID}, deviceID); err != nil || n != 0 {
+		t.Fatalf("no-alias run: n=%d err=%v", n, err)
+	}
+
+	// Missing target is an error.
+	if _, err = s.RehomeBlobRefs(ctx, []string{"x"}, ""); err == nil {
+		t.Fatal("empty to_peer should error")
+	}
+}

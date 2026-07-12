@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // BlobRefRecord mirrors one row of the `blob_refs` table. The blob URI
@@ -587,6 +588,64 @@ func (s *Store) SwitchBlobRefHome(ctx context.Context, uri, newHomePeer string) 
 		return ErrNotFound
 	}
 	return nil
+}
+
+// RehomeBlobRefs rewrites blob_refs.home_peer from legacy local
+// aliases to the canonical device_id. Rows written before peer
+// identity existed carry os.Hostname() (stamped by the v0→v1 blobs
+// importer as an explicit placeholder — "Phase 4 peer_registry will
+// rewrite these" — and by the identity-less blob.Store wiring
+// fallback) or the "kojo-local" fallback. Every home_peer consumer
+// (device-switch wrong_source gate, peer blob fetch, fetch-candidate
+// probing) compares against Identity.DeviceID, so alias rows made an
+// agent un-switchable from its own home machine: the switch 409'd
+// wrong_source telling the operator to orchestrate from the very
+// peer they were on.
+//
+// Called at boot once peer identity is loaded. Idempotent: rewritten
+// rows no longer match any alias. Alias values that are empty or
+// already equal toPeer are skipped. Safe against foreign rows: blobs
+// arriving via §3.7 ingest/handoff always carry a device_id (the
+// ingest handler enforces signer/hub identity), so a hostname-valued
+// home_peer can only have been written locally.
+//
+// updated_at is bumped for consistency with every other blob_refs
+// writer (and so the RestoreBlobRef OCC gate can't match a pre-rewrite
+// snapshot). Note this does NOT notify /api/v1/changes subscribers —
+// that cursor reads the events table, not blob_refs.updated_at.
+// Returns the number of rows updated.
+func (s *Store) RehomeBlobRefs(ctx context.Context, fromAliases []string, toPeer string) (int64, error) {
+	if toPeer == "" {
+		return 0, errors.New("store.RehomeBlobRefs: to_peer required")
+	}
+	args := make([]any, 0, len(fromAliases)+2)
+	now := NowMillis()
+	args = append(args, toPeer, now)
+	placeholders := make([]string, 0, len(fromAliases))
+	seen := make(map[string]bool, len(fromAliases))
+	for _, alias := range fromAliases {
+		if alias == "" || alias == toPeer || seen[alias] {
+			continue
+		}
+		seen[alias] = true
+		placeholders = append(placeholders, "?")
+		args = append(args, alias)
+	}
+	if len(placeholders) == 0 {
+		return 0, nil
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE blob_refs SET home_peer = ?, updated_at = ? WHERE home_peer IN (`+strings.Join(placeholders, ",")+`)`,
+		args...,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("store.RehomeBlobRefs: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store.RehomeBlobRefs: rows affected: %w", err)
+	}
+	return n, nil
 }
 
 // MarkBlobRefForGC stamps marked_for_gc_at = now on the row. Used by
