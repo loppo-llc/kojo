@@ -27,7 +27,13 @@ bootstrapTokenFromURL();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <BrowserRouter unstable_useTransitions={false}>
+    {/* useTransitions={false}: keep router state updates synchronous.
+        BrowserRouter wraps navigations in React.startTransition by
+        default, and Dashboard polling (3-5s setState) interrupts those
+        transitions — flashing UI / wrong destination after back. Prop
+        was unstable_useTransitions until react-router 7.15 stabilized
+        it (the unstable_ name is gone, not aliased). */}
+    <BrowserRouter useTransitions={false}>
       <Routes>
         {/* Two-pane shell: at lg+ the Dashboard list is a persistent
             sidebar and these render in the right pane; below lg they
