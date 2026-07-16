@@ -51,14 +51,17 @@ jobs:
               CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
                 go build -trimpath -ldflags "-s -w -X main.version=$TAG" \
                 -o "$out" ./cmd/kojo
-              (cd "$staging" && zip -q "kojo_${GOOS}_${GOARCH}.zip" kojo.exe)
+              cp scripts/launchers/kojo_hub.bat scripts/launchers/kojo_peer.bat "$staging/"
+              (cd "$staging" && zip -q "kojo_${GOOS}_${GOARCH}.zip" kojo.exe kojo_hub.bat kojo_peer.bat)
               mv "$staging/kojo_${GOOS}_${GOARCH}.zip" dist/
             else
               out="$staging/kojo"
               CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
                 go build -trimpath -ldflags "-s -w -X main.version=$TAG" \
                 -o "$out" ./cmd/kojo
-              tar -czf "dist/kojo_${GOOS}_${GOARCH}.tar.gz" -C "$staging" kojo
+              cp scripts/launchers/kojo_hub.sh scripts/launchers/kojo_peer.sh "$staging/"
+              chmod 0755 "$staging/kojo_hub.sh" "$staging/kojo_peer.sh"
+              tar -czf "dist/kojo_${GOOS}_${GOARCH}.tar.gz" -C "$staging" kojo kojo_hub.sh kojo_peer.sh
             fi
             rm -rf "$staging"
           done
