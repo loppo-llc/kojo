@@ -147,3 +147,62 @@ func TestEnsureAgentDir_SeedsStatus(t *testing.T) {
 		t.Errorf("ensureAgentDir clobbered an existing status.json: %s", data)
 	}
 }
+
+// TestEnsureAgentDir_SeedsMission: a task-first create materialises the
+// transient Mission into MEMORY.md as a "## Mission" section and clears
+// the field so it never reaches settings_json.
+func TestEnsureAgentDir_SeedsMission(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	a := &Agent{ID: "ag_test_mission_seed", Name: "seed", Mission: "  Watch the CI pipeline and report failures.  "}
+	if err := ensureAgentDir(a); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(agentDir(a.ID), "MEMORY.md"))
+	if err != nil {
+		t.Fatalf("MEMORY.md not seeded: %v", err)
+	}
+	for _, want := range []string{"# seed's Memory", "## Mission", "Watch the CI pipeline and report failures."} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("MEMORY.md missing %q:\n%s", want, data)
+		}
+	}
+	if a.Mission != "" {
+		t.Errorf("Mission not cleared after materialisation: %q", a.Mission)
+	}
+
+	// An existing MEMORY.md must never be clobbered by a later Mission.
+	edited := "# seed's Memory\n\ncustom content\n"
+	if err := os.WriteFile(filepath.Join(agentDir(a.ID), "MEMORY.md"), []byte(edited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a.Mission = "new mission"
+	if err := ensureAgentDir(a); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(filepath.Join(agentDir(a.ID), "MEMORY.md"))
+	if string(data) != edited {
+		t.Errorf("ensureAgentDir clobbered an existing MEMORY.md: %s", data)
+	}
+	if a.Mission != "" {
+		t.Errorf("Mission not cleared on the existing-file path: %q", a.Mission)
+	}
+}
+
+// TestEnsureAgentDir_NoMissionKeepsDefaultSeed: without a Mission the
+// seed is exactly the historical default (no stray Mission header).
+func TestEnsureAgentDir_NoMissionKeepsDefaultSeed(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	a := &Agent{ID: "ag_test_mission_none", Name: "plain"}
+	if err := ensureAgentDir(a); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(agentDir(a.ID), "MEMORY.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "## Mission") {
+		t.Errorf("default seed must not contain a Mission section:\n%s", data)
+	}
+}

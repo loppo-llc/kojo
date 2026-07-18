@@ -16,11 +16,23 @@ import { SectionCard } from "../ui/SectionCard";
 import { Field } from "../ui/Field";
 import { Input } from "../ui/Input";
 import { Select } from "../ui/Select";
+import { Textarea } from "../ui/Textarea";
 import { Button } from "../ui/Button";
 import { Banner } from "../ui/Banner";
 import { useT } from "../../lib/i18n";
+import {
+  TONE_AUTO,
+  TONE_MODEL_DEFAULT,
+  builtinTemplates,
+  listCustomTemplates,
+  resolveTonePersona,
+  buildTaskPersonaPrompt,
+  type PersonaTemplate,
+} from "../../lib/personaTemplates";
 
 type GenPhase = "idle" | "persona" | "name" | "avatar" | "all-name" | "all-avatar";
+
+type CreateMode = "task" | "persona";
 
 export function AgentCreate() {
   const t = useT();
@@ -28,6 +40,14 @@ export function AgentCreate() {
   const [info, setInfo] = useState<ServerInfo>();
   const [name, setName] = useState("");
   const [persona, setPersona] = useState("");
+  // ── Task-first mode state ──
+  const [mode, setMode] = useState<CreateMode>("task");
+  const [mission, setMission] = useState("");
+  const [tone, setTone] = useState(TONE_AUTO);
+  const [toneHint, setToneHint] = useState("");
+  // The AI-derived persona for tone=auto; editable by the user.
+  const [autoPersona, setAutoPersona] = useState("");
+  const [customTemplates, setCustomTemplates] = useState<PersonaTemplate[]>([]);
   const [model, setModel] = useState("sonnet");
   const [effort, setEffort] = useState<EffortLevel | "">("");
   const [tool, setTool] = useState("claude");
@@ -66,9 +86,26 @@ export function AgentCreate() {
 
   useEffect(() => {
     api.info().then(setInfo).catch(console.error);
+    // Best-effort: the picker degrades to built-ins when the list fails.
+    listCustomTemplates().then(setCustomTemplates).catch(console.error);
   }, []);
 
   const { needsCustomURL, customModels } = useCustomModels(tool, customBaseURL, setModel);
+
+  const templates = [...builtinTemplates(), ...customTemplates];
+
+  // The persona that will be sent on create for the current mode/tone.
+  const effectivePersona =
+    mode === "persona" ? persona : resolveTonePersona(tone, autoPersona, templates);
+
+  // Prompt material for name/avatar generation: persona when we have
+  // one, else (task mode only) the task text — the model-default tone
+  // has no persona but the task still describes the character. In
+  // persona mode a stale mission from a tab switch must NOT leak in.
+  const genMaterial =
+    mode === "persona"
+      ? persona.trim()
+      : effectivePersona.trim() || mission.trim();
 
   // Revoke blob URL on unmount
   useEffect(() => {
@@ -105,16 +142,39 @@ export function AgentCreate() {
     }
   };
 
+  // Derives a persona from the task description (tone = auto).
+  // Always generates from scratch — "generate again" means a fresh
+  // attempt, not a refinement drift on the previous output.
+  const handleGenerateTonePersona = async () => {
+    if (!mission.trim()) {
+      setError(t("create.taskRequired"));
+      return;
+    }
+    setGenPhase("persona");
+    setError("");
+    try {
+      const result = await agentApi.generatePersona(
+        "",
+        buildTaskPersonaPrompt(mission, toneHint),
+      );
+      setAutoPersona(result.persona);
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setGenPhase("idle");
+    }
+  };
+
   const handleGenerateName = async () => {
-    if (!persona.trim()) {
-      setError(t("create.personaRequired"));
+    if (!genMaterial) {
+      setError(t("create.taskOrPersonaRequired"));
       return;
     }
     setGenPhase("name");
     setError("");
     try {
       const result = await agentApi.generateName(
-        persona.trim(),
+        genMaterial,
         genPrompt.trim(),
       );
       setName(result.name);
@@ -129,8 +189,8 @@ export function AgentCreate() {
 
   const handleGenerateAvatar = async (nameOverride?: string) => {
     const n = nameOverride || name.trim();
-    if (!persona.trim()) {
-      setError(t("create.personaRequired"));
+    if (!genMaterial) {
+      setError(t("create.taskOrPersonaRequired"));
       return;
     }
     setGenPhase("avatar");
@@ -138,7 +198,7 @@ export function AgentCreate() {
     const hadTempPath = !!avatarTempPath;
     try {
       const result = await agentApi.generateAvatar(
-        persona.trim(),
+        genMaterial,
         n,
         genPrompt.trim(),
         avatarTempPath || undefined,
@@ -162,8 +222,8 @@ export function AgentCreate() {
   };
 
   const handleGenerateAll = async () => {
-    if (!persona.trim()) {
-      setError(t("create.personaRequired"));
+    if (!genMaterial) {
+      setError(t("create.taskOrPersonaRequired"));
       return;
     }
     setError("");
@@ -173,7 +233,7 @@ export function AgentCreate() {
     let generatedName: string | null = null;
     try {
       const result = await agentApi.generateName(
-        persona.trim(),
+        genMaterial,
         genPrompt.trim(),
       );
       generatedName = result.name;
@@ -189,7 +249,7 @@ export function AgentCreate() {
     const hadTempPath = !!avatarTempPath;
     try {
       const result = await agentApi.generateAvatar(
-        persona.trim(),
+        genMaterial,
         generatedName,
         genPrompt.trim(),
         avatarTempPath || undefined,
@@ -232,12 +292,23 @@ export function AgentCreate() {
       setError(t("settings.nameRequired"));
       return;
     }
+    if (mode === "task") {
+      if (!mission.trim()) {
+        setError(t("create.taskRequired"));
+        return;
+      }
+      if (tone === TONE_AUTO && !autoPersona.trim()) {
+        setError(t("create.tonePersonaRequired"));
+        return;
+      }
+    }
     setLoading(true);
     setError("");
     try {
       const agent = await agentApi.create({
         name: name.trim(),
-        persona: persona.trim(),
+        persona: effectivePersona.trim(),
+        mission: mode === "task" ? mission.trim() : undefined,
         model,
         effort: supportsEffort(tool) && effort ? effort : undefined,
         tool,
@@ -287,18 +358,103 @@ export function AgentCreate() {
         {/* ── Identity ── */}
         <SectionCard id="identity" title={t("settings.sec.identity")}>
           <div className="space-y-5">
-            <PersonaField
-              persona={persona}
-              setPersona={setPersona}
-              textareaRows={5}
-              textareaPlaceholder={t("create.personaPlaceholder")}
-              personaPrompt={personaPrompt}
-              setPersonaPrompt={setPersonaPrompt}
-              promptPlaceholder={t("create.personaPromptPlaceholder")}
-              busy={isGenerating}
-              spinning={genPhase === "persona"}
-              onGenerate={handleGeneratePersona}
-            />
+            {/* Mode switch: task-first (default) vs classic persona-first */}
+            <div className="flex rounded-lg border border-hairline bg-raised p-0.5" role="tablist">
+              {(["task", "persona"] as const).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  role="tab"
+                  aria-selected={mode === m}
+                  onClick={() => setMode(m)}
+                  className={`flex-1 rounded-md px-3 py-1.5 text-sm transition-colors ${
+                    mode === m ? "bg-app text-ink" : "text-ink-faint hover:text-ink"
+                  }`}
+                >
+                  {m === "task" ? t("create.tabTask") : t("create.tabPersona")}
+                </button>
+              ))}
+            </div>
+
+            {mode === "task" ? (
+              <>
+                <Field label={t("create.taskLabel")} help={t("create.taskHelp")}>
+                  <Textarea
+                    value={mission}
+                    onChange={(e) => setMission(e.target.value)}
+                    placeholder={t("create.taskPlaceholder")}
+                    rows={4}
+                  />
+                </Field>
+
+                <Field label={t("create.tone")}>
+                  <Select value={tone} onChange={(e) => setTone(e.target.value)}>
+                    <option value={TONE_AUTO}>{t("create.toneAuto")}</option>
+                    <option value={TONE_MODEL_DEFAULT}>{t("create.toneModelDefault")}</option>
+                    {templates.map((tpl) => (
+                      <option key={tpl.id} value={tpl.id}>
+                        {tpl.name}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+
+                {tone === TONE_AUTO && (
+                  <div className="space-y-2">
+                    <div className="flex gap-2">
+                      <Input
+                        aria-label={t("create.toneHintPlaceholder")}
+                        value={toneHint}
+                        onChange={(e) => setToneHint(e.target.value)}
+                        placeholder={t("create.toneHintPlaceholder")}
+                        className="flex-1"
+                      />
+                      <Button
+                        onClick={handleGenerateTonePersona}
+                        disabled={isGenerating || !mission.trim()}
+                        className="flex shrink-0 items-center gap-1"
+                      >
+                        {genPhase === "persona" ? (
+                          <span className="animate-spin">↻</span>
+                        ) : (
+                          <>✨ {t("create.toneGenerate")}</>
+                        )}
+                      </Button>
+                    </div>
+                    {autoPersona && (
+                      <Field label={t("create.tonePreview")}>
+                        <Textarea
+                          value={autoPersona}
+                          onChange={(e) => setAutoPersona(e.target.value)}
+                          rows={6}
+                        />
+                      </Field>
+                    )}
+                  </div>
+                )}
+
+                {tone !== TONE_AUTO && tone !== TONE_MODEL_DEFAULT && effectivePersona && (
+                  <Field label={t("create.tonePreviewTemplate")}>
+                    <div className="max-h-40 overflow-y-auto whitespace-pre-wrap rounded-lg border border-hairline bg-raised px-3 py-2 text-sm text-ink-faint">
+                      {effectivePersona}
+                    </div>
+                  </Field>
+                )}
+              </>
+            ) : (
+              <PersonaField
+                persona={persona}
+                setPersona={setPersona}
+                textareaRows={5}
+                textareaPlaceholder={t("create.personaPlaceholder")}
+                personaPrompt={personaPrompt}
+                setPersonaPrompt={setPersonaPrompt}
+                promptPlaceholder={t("create.personaPromptPlaceholder")}
+                busy={isGenerating}
+                spinning={genPhase === "persona"}
+                onGenerate={handleGeneratePersona}
+              />
+            )}
 
             {/* Avatar + Name + Hint */}
             <div className="flex gap-4">
@@ -338,7 +494,7 @@ export function AgentCreate() {
                   <button
                     type="button"
                     onClick={() => handleGenerateAvatar()}
-                    disabled={isGenerating || !persona.trim()}
+                    disabled={isGenerating || !genMaterial}
                     className="absolute -bottom-1 -right-1 flex h-6 w-6 items-center justify-center rounded-full border border-hairline bg-raised text-xs transition-colors hover:bg-hover disabled:opacity-40"
                     title={t("create.regenAvatarTitle")}
                   >
@@ -366,7 +522,7 @@ export function AgentCreate() {
                     />
                     <Button
                       onClick={() => handleGenerateName()}
-                      disabled={isGenerating || !persona.trim()}
+                      disabled={isGenerating || !genMaterial}
                       title={t("create.genNameTitle")}
                       className="shrink-0"
                     >
@@ -391,7 +547,7 @@ export function AgentCreate() {
             <div className="flex gap-2">
               <Button
                 onClick={handleGenerateAll}
-                disabled={isGenerating || !persona.trim()}
+                disabled={isGenerating || !genMaterial}
                 className="flex flex-1 items-center justify-center gap-2"
               >
                 {genPhase.startsWith("all-") ? (
@@ -405,7 +561,7 @@ export function AgentCreate() {
               </Button>
               <Button
                 onClick={() => handleGenerateAvatar()}
-                disabled={isGenerating || !persona.trim() || !name.trim()}
+                disabled={isGenerating || !genMaterial || !name.trim()}
                 className="flex items-center justify-center gap-2"
                 title={!name.trim() ? t("create.setNameFirst") : t("create.genAvatarOnly")}
               >

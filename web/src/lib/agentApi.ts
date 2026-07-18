@@ -208,6 +208,9 @@ export interface TTSConfig {
 export interface AgentConfig {
   name: string;
   persona: string;
+  // Task description from the task-first create flow. Seeded into the
+  // new agent's MEMORY.md as a "## Mission" section server-side.
+  mission?: string;
   model?: string;
   effort?: string;
   tool?: string;

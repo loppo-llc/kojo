@@ -977,6 +977,22 @@ func escapePersonaAnchorClose(s string) string {
 	return strings.ReplaceAll(s, "</persona-anchor>", "&lt;/persona-anchor&gt;")
 }
 
+// writeFileExclusive creates path with O_EXCL so an existing (or
+// concurrently created) file is never truncated by the seed write.
+// The error satisfies os.IsExist when the file already exists.
+func writeFileExclusive(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	_, werr := f.Write(data)
+	cerr := f.Close()
+	if werr != nil {
+		return werr
+	}
+	return cerr
+}
+
 // ensureAgentDir creates the agent's data directory and default files.
 //
 // DB sync is intentionally NOT run here: when called from Manager.Create
@@ -991,14 +1007,30 @@ func ensureAgentDir(a *Agent) error {
 		return err
 	}
 
-	// Create MEMORY.md if it doesn't exist
+	// Create MEMORY.md if it doesn't exist. A task-first create carries
+	// a transient Mission (AgentConfig.Mission → Agent.Mission) that is
+	// seeded here as a "## Mission" section and then cleared — MEMORY.md
+	// is canonical from that point; the field must never be persisted.
 	memPath := filepath.Join(dir, "MEMORY.md")
-	if _, err := os.Stat(memPath); os.IsNotExist(err) {
-		initial := fmt.Sprintf("# %s's Memory\n\nThis file stores persistent memories. Update it as you learn new things.\n", a.Name)
-		if err := os.WriteFile(memPath, []byte(initial), 0o644); err != nil {
+	if _, err := os.Stat(memPath); err != nil {
+		// A non-ENOENT stat error must abort (and keep Mission intact)
+		// rather than silently skip the seed and drop the mission.
+		if !os.IsNotExist(err) {
 			return err
 		}
+		initial := fmt.Sprintf("# %s's Memory\n\nThis file stores persistent memories. Update it as you learn new things.\n", a.Name)
+		if mission := strings.TrimSpace(a.Mission); mission != "" {
+			initial += "\n## Mission\n\n" + mission + "\n"
+		}
+		// O_EXCL: the stat above is advisory — an exclusive create
+		// guarantees a concurrent writer's MEMORY.md is never
+		// truncated by this seed. A lost race (ErrExist) means the
+		// file appeared; treat it like the stat-exists path.
+		if werr := writeFileExclusive(memPath, []byte(initial)); werr != nil && !os.IsExist(werr) {
+			return werr
+		}
 	}
+	a.Mission = "" // materialised (or MEMORY.md already existed); disk wins
 
 	// Write persona.md
 	if err := writePersonaFile(a.ID, a.Persona); err != nil {

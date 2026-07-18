@@ -200,6 +200,37 @@ export async function putWithIfMatch<T>(
 }
 
 /**
+ * PUT with `If-None-Match: *` — create-only CAS. Used by kv-backed
+ * resources (e.g. persona templates) so a create can never clobber a
+ * row that appeared concurrently, and so the write passes the
+ * KOJO_REQUIRE_IF_MATCH strict gate (bare kv PUTs get 428 there).
+ * 412 → PreconditionFailedError: the row already exists.
+ */
+export async function putCreateOnly<T>(
+  path: string,
+  body: unknown,
+): Promise<EtaggedResponse<T>> {
+  const headers = new Headers({
+    "Content-Type": "application/json",
+    "If-None-Match": "*",
+  });
+  const res = await fetch(
+    BASE + path,
+    withAuth({ method: "PUT", headers, body: JSON.stringify(body) }),
+  );
+  if (res.status === 412) {
+    const text = await res.text().catch(() => "");
+    throw new PreconditionFailedError(text || "resource already exists");
+  }
+  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+  const etag = unquoteEtag(res.headers.get("ETag"));
+  if (res.status === 204 || res.headers.get("content-length") === "0") {
+    return { value: undefined as T, etag };
+  }
+  return { value: await res.json(), etag };
+}
+
+/**
  * POST with optional If-Match precondition. Used for non-PATCH state
  * mutations that still want optimistic locking against a specific row's
  * etag — primarily POST /messages/{msgId}/regenerate, which truncates

@@ -293,8 +293,15 @@ type Agent struct {
 	// agentToSettings without erroring on the unknown key for rows
 	// written by older binaries.
 	CronMessage string `json:"cronMessage,omitempty"`
-	CreatedAt   string `json:"createdAt"` // RFC3339
-	UpdatedAt   string `json:"updatedAt"` // RFC3339
+	// Mission is a create-time transient: the task description from a
+	// task-first AgentCreate. ensureAgentDir materialises it into the
+	// seeded MEMORY.md as a "## Mission" section and clears the field,
+	// so it is never persisted into settings_json (omitempty + zero
+	// value). MEMORY.md is canonical from then on — the agent evolves
+	// its own mission there.
+	Mission   string `json:"mission,omitempty"`
+	CreatedAt string `json:"createdAt"` // RFC3339
+	UpdatedAt string `json:"updatedAt"` // RFC3339
 
 	// LegacyIntervalMinutes is a transient field consumed by store.Load to
 	// migrate the old `intervalMinutes` JSON key into CronExpr. Cleared
@@ -557,8 +564,13 @@ type DirectoryEntry struct {
 
 // AgentConfig is the request body for creating an agent.
 type AgentConfig struct {
-	Name          string `json:"name"`
-	Persona       string `json:"persona"`
+	Name    string `json:"name"`
+	Persona string `json:"persona"`
+	// Mission is the optional task description from the task-first
+	// create flow. Seeded into the new agent's MEMORY.md as a
+	// "## Mission" section (see ensureAgentDir); not a persisted
+	// agent setting.
+	Mission       string `json:"mission"`
 	Model         string `json:"model"`
 	Effort        string `json:"effort"`
 	Tool          string `json:"tool"`
@@ -716,6 +728,12 @@ func generateID() string {
 	return generatePrefixedID("ag_")
 }
 
+// maxMissionBytes caps the create-time task description. The text is
+// seeded verbatim into MEMORY.md (injected into every system prompt),
+// so an unbounded value would bloat the prompt and the memory DB row.
+// 64 KiB is far beyond any legitimate task brief.
+const maxMissionBytes = 64 << 10
+
 func newAgent(cfg AgentConfig) (*Agent, error) {
 	// Reject pre-CronExpr clients up front so a stale mobile build doesn't
 	// silently land an agent with the default schedule when it intended to
@@ -783,6 +801,9 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	if err := ValidSilentHours(silentStart, silentEnd); err != nil {
 		return nil, err
 	}
+	if len(cfg.Mission) > maxMissionBytes {
+		return nil, fmt.Errorf("mission exceeds %d bytes", maxMissionBytes)
+	}
 	if !ValidModelEffort(cfg.Model, cfg.Effort) {
 		return nil, fmt.Errorf("unsupported effort level %q for model %q", cfg.Effort, cfg.Model)
 	}
@@ -811,6 +832,7 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		ID:                 id,
 		Name:               cfg.Name,
 		Persona:            cfg.Persona,
+		Mission:            strings.TrimSpace(cfg.Mission),
 		Model:              cfg.Model,
 		Effort:             cfg.Effort,
 		Tool:               cfg.Tool,

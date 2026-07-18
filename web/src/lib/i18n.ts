@@ -791,6 +791,36 @@ const messages = {
   "create.avatar": { ja: "アバター", en: "Avatar" },
   "create.apiBaseUrl": { ja: "API Base URL", en: "API Base URL" },
   "create.createAgent": { ja: "エージェントを作成", en: "Create agent" },
+  "create.tabTask": { ja: "タスクから作る", en: "From a task" },
+  "create.tabPersona": { ja: "人格から作る", en: "From a persona" },
+  "create.taskLabel": { ja: "タスク", en: "Task" },
+  "create.taskPlaceholder": {
+    ja: "このエージェントに任せたいタスクを書く。例: 毎朝 CI の結果を確認して、落ちていたら原因を調べて報告する",
+    en: "Describe what this agent should do. e.g. Check CI results every morning and investigate any failures",
+  },
+  "create.taskHelp": {
+    ja: "作成時にエージェントの MEMORY.md へ Mission として記録される",
+    en: "Recorded as the Mission in the agent's MEMORY.md at creation",
+  },
+  "create.tone": { ja: "性格・口調", en: "Personality & tone" },
+  "create.toneAuto": { ja: "タスクから自動生成", en: "Derive from the task" },
+  "create.toneModelDefault": { ja: "モデル既定", en: "Model default" },
+  "create.toneGenerate": { ja: "性格を生成", en: "Generate personality" },
+  "create.toneHintPlaceholder": {
+    ja: "生成への追加要望 (任意)。例: 女性、関西弁",
+    en: "Extra wishes for generation (optional)",
+  },
+  "create.tonePreview": { ja: "生成された人格 (編集可)", en: "Generated persona (editable)" },
+  "create.tonePreviewTemplate": { ja: "テンプレートの人格", en: "Template persona" },
+  "create.taskRequired": { ja: "タスクを入力して", en: "Enter a task first" },
+  "create.tonePersonaRequired": {
+    ja: "先に「性格を生成」を実行して",
+    en: "Generate the personality first",
+  },
+  "create.taskOrPersonaRequired": {
+    ja: "先にタスクか人格を入力して",
+    en: "Enter a task or persona first",
+  },
 
   // ── AgentCredentials ──
   "cred.importTotp": { ja: "TOTP をインポート", en: "Import TOTP" },
@@ -942,6 +972,42 @@ const messages = {
   "gs.rebuilding": { ja: "再ビルド中...", en: "Rebuilding..." },
   "gs.rebuildRestart": { ja: "再ビルドして再起動", en: "Rebuild & Restart" },
   "gs.restart": { ja: "再起動", en: "Restart" },
+  "gs.personaTemplates": { ja: "人格テンプレート", en: "Persona templates" },
+  "gs.personaTemplatesHelp": {
+    ja: "新規エージェント作成の「性格・口調」で選べるカスタムテンプレート",
+    en: "Custom templates selectable as the personality & tone when creating an agent",
+  },
+  "gs.tplAdd": { ja: "テンプレートを追加", en: "Add template" },
+  "gs.tplEdit": { ja: "編集", en: "Edit" },
+  "gs.tplDelete": { ja: "削除", en: "Delete" },
+  "gs.tplName": { ja: "テンプレート名", en: "Template name" },
+  "gs.tplPersona": { ja: "人格 (persona)", en: "Persona" },
+  "gs.tplSave": { ja: "保存", en: "Save" },
+  "gs.tplCancel": { ja: "キャンセル", en: "Cancel" },
+  "gs.tplEmpty": { ja: "カスタムテンプレートはまだない", en: "No custom templates yet" },
+  "gs.tplNameRequired": { ja: "テンプレート名を入力して", en: "Enter a template name" },
+  "gs.tplPersonaRequired": { ja: "人格を入力して", en: "Enter a persona" },
+  "gs.tplDeleteConfirm": {
+    ja: "テンプレート「{name}」を削除する?",
+    en: 'Delete template "{name}"?',
+  },
+
+  // ── Built-in tone templates (AgentCreate task-first flow) ──
+  "tone.polite": { ja: "丁寧なアシスタント", en: "Polite assistant" },
+  "tone.politePersona": {
+    ja: "- 丁寧で落ち着いた敬語で話す。相手を尊重し、押し付けない\n- 依頼には正確に、過不足なく応える。不明な点は正直に不明と言う\n- 報告は結論から。余計な前置きや飾りを付けない",
+    en: "- Speaks in a calm, courteous, professional register; respectful and never pushy\n- Answers requests precisely, no more and no less; honestly says so when unsure\n- Reports lead with the conclusion, without filler or preamble",
+  },
+  "tone.casual": { ja: "フランクな相棒", en: "Casual sidekick" },
+  "tone.casualPersona": {
+    ja: "- 気さくなタメ口で話す軽快な相棒。堅苦しさゼロ\n- ノリは軽いが仕事は確実。手は抜かない\n- 難しい話も噛み砕いて、たとえ話でわかりやすく伝える",
+    en: "- A breezy, friendly sidekick who keeps things totally informal\n- Light in tone but rigorous in the work; never cuts corners\n- Breaks down hard topics with plain language and analogies",
+  },
+  "tone.taciturn": { ja: "寡黙な職人", en: "Taciturn craftsman" },
+  "tone.taciturnPersona": {
+    ja: "- 口数が少ない。必要なことだけを短く言う\n- 仕事は速く正確。結果で語る\n- 報告は一文目が結論。装飾なし",
+    en: "- Speaks little; says only what is necessary, briefly\n- Fast and precise; lets the results do the talking\n- The first sentence of every report is the conclusion, no ornament",
+  },
 
   // ── PeersSection ──
   "peers.title": { ja: "ピア", en: "Peers" },

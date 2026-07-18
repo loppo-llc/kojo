@@ -130,6 +130,10 @@ var reservedAgentKeys = map[string]bool{
 	"holderPeerStatus": true,
 	"busy":             true,
 	"awaitingAnswer":   true,
+	// mission is a create-time transient (materialised into MEMORY.md
+	// by ensureAgentDir, then cleared). Strip defensively so no future
+	// Save path can leak a still-set value into settings_json.
+	"mission": true,
 }
 
 // lowerKeySet returns a copy of src whose keys are all canonical-lower.
@@ -242,6 +246,10 @@ var loadStripKeys = map[string]bool{
 	"holderPeerStatus": true,
 	"busy":             true,
 	"awaitingAnswer":   true,
+	// mission mirrors the Save-side strip above: a row written by a
+	// binary predating that guard must not rehydrate a transient
+	// Mission and re-trigger materialisation on an existing agent.
+	"mission": true,
 }
 
 // agentStore persists agent metadata to the v1 SQLite store.
