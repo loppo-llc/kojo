@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from "react";
-import { useParams, useNavigate } from "react-router";
+import { useLocation, useParams, useNavigate } from "react-router";
 import { agentApi, type AgentInfo, type Credential, type OTPEntry } from "../../lib/agentApi";
 import { errMsg } from "../../lib/utils";
 import { PageHeader } from "../ui/PageHeader";
@@ -364,6 +364,7 @@ export function AgentCredentials() {
   const t = useT();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const [credentials, setCredentials] = useState<Credential[]>([]);
   const [agent, setAgent] = useState<AgentInfo | null>(null);
   const [listError, setListError] = useState("");
@@ -537,7 +538,7 @@ export function AgentCredentials() {
 
   return (
     <div className="min-h-full bg-app text-ink">
-      <PageHeader title={t("chat.credentials")} onBack={() => navigate(`/agents/${id}`, { replace: true })}>
+      <PageHeader title={t("chat.credentials")} onBack={() => (location.state as { fromChat?: boolean } | null)?.fromChat ? navigate(-1) : navigate(`/agents/${id}`, { replace: true })}>
         <Button
           onClick={() => { setShowForm((v) => !v); setEditingId(null); }}
           disabled={isSwitching}

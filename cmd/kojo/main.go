@@ -1611,7 +1611,7 @@ func main() {
 			Logf:     func(format string, args ...any) { logger.Debug(fmt.Sprintf(format, args...)) },
 		}
 
-		ln, err := tsServer.ListenTLS("tcp", fmt.Sprintf(":%d", *port))
+		ln, err := listenTsnetTLS(tsServer, fmt.Sprintf(":%d", *port))
 		if err != nil {
 			logger.Error("failed to listen on tailscale", "err", err)
 			os.Exit(1)
@@ -1688,7 +1688,10 @@ func main() {
 		// tsnet.ListenTLS returns a tls.Listener, serve directly
 		go func() {
 			// ServeTLS with empty cert/key since TLS is already handled by the listener
-			srv.SetTLSConfig(&tls.Config{})
+			// NextProtos must list h2 here too: http.Server.Serve only
+			// registers its HTTP/2 handler when TLSConfig is nil or
+			// advertises h2, and the listener below negotiates h2.
+			srv.SetTLSConfig(tsnetServeTLSConfig())
 			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 				logger.Error("server error", "err", err)
 				stop()
@@ -2296,4 +2299,48 @@ func listenWithFallback(host string, startPort, maxAttempts int, logger *slog.Lo
 		}
 	}
 	return nil, fmt.Errorf("all ports %d-%d are in use", startPort, startPort+maxAttempts-1)
+}
+
+// listenTsnetTLS is tsnet.Server.ListenTLS with ALPN advertising h2.
+// tsnet's own ListenTLS builds a tls.Config with no NextProtos, so every
+// browser connection negotiates HTTP/1.1 and is capped at ~6 per host;
+// a few slow requests (peer-proxied calls to an unreachable host) then
+// starve unrelated UI fetches, which sit "pending" until they drain.
+// http.Server.Serve upgrades a tls.Conn that negotiated "h2" on its own.
+// WebSockets stay on HTTP/1.1: extended CONNECT (RFC 8441) is off by
+// default in net/http, so browsers open a separate h1 connection for them.
+func listenTsnetTLS(s *tsnet.Server, addr string) (net.Listener, error) {
+	st, err := s.Up(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	if !st.CurrentTailnet.MagicDNSEnabled {
+		return nil, errors.New("tsnet: you must enable MagicDNS in the DNS page of the admin panel to proceed. See https://tailscale.com/s/https")
+	}
+	if len(st.CertDomains) == 0 {
+		return nil, errors.New("tsnet: you must enable HTTPS in the admin panel to proceed. See https://tailscale.com/s/https")
+	}
+	lc, err := s.LocalClient()
+	if err != nil {
+		return nil, err
+	}
+	ln, err := s.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return tls.NewListener(ln, tsnetListenerTLSConfig(lc.GetCertificate)), nil
+}
+
+var tsnetALPN = []string{"h2", "http/1.1"}
+
+// tsnetListenerTLSConfig is the handshake config for the tsnet listener.
+func tsnetListenerTLSConfig(getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *tls.Config {
+	return &tls.Config{GetCertificate: getCert, NextProtos: tsnetALPN}
+}
+
+// tsnetServeTLSConfig is the http.Server.TLSConfig paired with
+// tsnetListenerTLSConfig. It must advertise h2 as well, or Serve skips
+// HTTP/2 setup and an h2-negotiated connection gets served as HTTP/1.
+func tsnetServeTLSConfig() *tls.Config {
+	return &tls.Config{NextProtos: tsnetALPN}
 }

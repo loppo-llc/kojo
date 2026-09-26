@@ -176,6 +176,12 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
     const peerCacheTTL = 60_000;
     let inflight = false;
     let cancelled = false;
+    // Abort in-flight list calls on unmount. A peer-routed call to an
+    // unreachable peer can sit pending for the proxy's timeout; without
+    // the abort every remount (e.g. browser back/forward through a
+    // thread) leaks another held connection until the browser's
+    // per-host pool starves and unrelated fetches hang.
+    const abort = new AbortController();
     const peerCache = peerCacheRef.current;
     const tombstones = tombstonesRef.current;
 
@@ -212,7 +218,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
       if (inflight) return;
       inflight = true;
       try {
-        const local = await api.sessions.list();
+        const local = await api.sessions.list(undefined, abort.signal);
         if (cancelled) return;
         // Paint local + last-known remote up front. This is the
         // line that keeps the dashboard responsive when a peer is
@@ -257,7 +263,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
             // the slowest peer in this batch finally settled.
             // Otherwise a 60s stale-while-error window can stretch
             // toward 60 + slowestTimeout for the fast peer.
-            api.sessions.list(p.deviceId).then((rows) => ({
+            api.sessions.list(p.deviceId, abort.signal).then((rows) => ({
               rows: rows.map((r) => ({ ...r, peer: r.peer || p.deviceId })),
               completedAt: Date.now(),
             })),
@@ -288,6 +294,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
     const interval = setInterval(() => void loadSessions(), 3000);
     return () => {
       cancelled = true;
+      abort.abort();
       clearInterval(interval);
     };
   }, []);

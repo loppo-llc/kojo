@@ -10,6 +10,8 @@ const mocks = vi.hoisted(() => ({
   createThread: vi.fn(),
   agentList: vi.fn(),
   clearAttention: vi.fn(),
+  sessionsList: vi.fn(),
+  peersList: vi.fn(),
 }));
 
 vi.mock("../lib/groupdmApi", async (importOriginal) => ({
@@ -28,7 +30,7 @@ vi.mock("../lib/groupdmApi", async (importOriginal) => ({
 }));
 
 vi.mock("../lib/api", () => ({
-  api: { sessions: { list: vi.fn().mockResolvedValue([]) } },
+  api: { sessions: { list: mocks.sessionsList } },
 }));
 
 // Partial mock: keep the real module (pure helpers like
@@ -45,7 +47,7 @@ vi.mock("../lib/agentApi", async (importOriginal) => ({
 }));
 
 vi.mock("../lib/peerApi", () => ({
-  peersApi: { list: vi.fn().mockResolvedValue({ items: [] }) },
+  peersApi: { list: mocks.peersList },
 }));
 
 vi.mock("../hooks/usePushNotifications", () => ({
@@ -85,6 +87,8 @@ function renderDashboard(initialPath = "/", variant: "page" | "sidebar" = "page"
 }
 
 beforeEach(() => {
+  mocks.sessionsList.mockResolvedValue([]);
+  mocks.peersList.mockResolvedValue({ items: [] });
   mocks.agentList.mockResolvedValue([
     {
       id: "ag_a",
@@ -218,6 +222,23 @@ describe("Dashboard room list", () => {
     renderDashboard();
     expect(await screen.findByText("Threads · 1")).toBeInTheDocument();
     expect(screen.getByText("Group DMs · 2")).toBeInTheDocument();
+  });
+
+  it("aborts a pending peer session list on unmount", async () => {
+    let peerSignal: AbortSignal | undefined;
+    mocks.peersList.mockResolvedValue({
+      items: [{ deviceId: "p_off", name: "offline", isSelf: false }],
+    });
+    mocks.sessionsList.mockImplementation((peerId?: string, signal?: AbortSignal) => {
+      if (!peerId) return Promise.resolve([]);
+      peerSignal = signal;
+      return new Promise(() => {});
+    });
+    renderDashboard();
+    await waitFor(() => expect(peerSignal).toBeDefined());
+    expect(peerSignal!.aborted).toBe(false);
+    cleanup();
+    expect(peerSignal!.aborted).toBe(true);
   });
 
   it("renders unread and mention badges from the unread endpoint", async () => {

@@ -130,7 +130,8 @@ export const api = {
   },
 
   sessions: {
-    list: (peerId?: string) => get<{ sessions: SessionInfo[] }>(withPeer("/api/v1/sessions", peerId)).then((r) => r.sessions),
+    list: (peerId?: string, signal?: AbortSignal) =>
+      get<{ sessions: SessionInfo[] }>(withPeer("/api/v1/sessions", peerId), signal ? { signal } : undefined).then((r) => r.sessions),
     // peerId, when present, gets appended as `?peer=<id>` so the
     // Hub's sessionPeerProxyMiddleware forwards the request to the
     // peer that holds the session. Empty / undefined = local.

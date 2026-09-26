@@ -137,8 +137,8 @@ export async function patchWithIfMatch<T>(
 
 const jsonHeaders = { "Content-Type": "application/json" } as const;
 
-export function get<T>(path: string): Promise<T> {
-  return request<T>(path);
+export function get<T>(path: string, init?: RequestInit): Promise<T> {
+  return request<T>(path, init);
 }
 
 export function post<T>(path: string, body?: unknown): Promise<T> {

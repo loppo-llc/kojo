@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/auth"
 )
@@ -65,6 +66,20 @@ func isPeerProxyPath(p string) bool {
 	return false
 }
 
+// peerSessionListTimeout bounds the Dashboard's per-peer session list
+// poll. The generic proxy has no client timeout (large uploads), so an
+// unreachable peer would otherwise hold the browser's connection for
+// the full ~30s dial timeout on every poll/remount — enough of those
+// starve the browser's per-host HTTP/1.1 pool and unrelated UI fetches
+// sit pending.
+const peerSessionListTimeout = 8 * time.Second
+
+// isPeerSessionListRequest reports whether r is the bodiless session
+// list GET (the only proxied call that is both polled and small).
+func isPeerSessionListRequest(r *http.Request) bool {
+	return r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions"
+}
+
 func (s *Server) proxySessionRequest(w http.ResponseWriter, r *http.Request, peerID string) {
 	st, ok := s.requireAgentStore(w, "peer routing not available on this host")
 	if !ok {
@@ -112,6 +127,10 @@ func (s *Server) proxySessionRequest(w http.ResponseWriter, r *http.Request, pee
 	// file downloads need Content-Disposition + Content-Length to land
 	// as proper saves; the body is streamed, not buffered, so big
 	// downloads aren't silently truncated.
+	timeout := time.Duration(0)
+	if isPeerSessionListRequest(r) {
+		timeout = peerSessionListTimeout
+	}
 	s.forwardHTTPToPeer(w, r.Context(), peerHTTPForward{
 		method:         r.Method,
 		url:            target,
@@ -119,7 +138,7 @@ func (s *Server) proxySessionRequest(w http.ResponseWriter, r *http.Request, pee
 		contentLength:  r.ContentLength,
 		srcHeader:      r.Header,
 		reqHeaderKeys:  []string{"Content-Type", "If-Match", "Idempotency-Key"},
-		timeout:        0,
+		timeout:        timeout,
 		buildErrStatus: http.StatusBadGateway,
 		buildErrCode:   "proxy_build",
 		dialErrStatus:  http.StatusBadGateway,

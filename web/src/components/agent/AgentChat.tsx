@@ -1051,7 +1051,7 @@ export function AgentChat() {
         )}
         {!(agent.disabledInjections ?? []).includes("todo_api") && (
           <button
-            onClick={() => navigate(`/agents/${agent.id}/todos`, { replace: true })}
+            onClick={() => navigate(`/agents/${agent.id}/todos`, { state: { fromChat: true } })}
             className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink"
             title={t("chat.todos")}
             aria-label={t("chat.todos")}
@@ -1063,7 +1063,7 @@ export function AgentChat() {
         )}
         {!(agent.disabledInjections ?? []).includes("credentials") && (
           <button
-            onClick={() => navigate(`/agents/${agent.id}/credentials`, { replace: true })}
+            onClick={() => navigate(`/agents/${agent.id}/credentials`, { state: { fromChat: true } })}
             className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink"
             title={t("chat.credentials")}
             aria-label={t("chat.credentials")}
@@ -1077,7 +1077,7 @@ export function AgentChat() {
           // Pushed (not replaced) so browser back — and the data browser's
           // root back, which is navigate(-1) — both return to this chat.
           onClick={() => navigate(`/agents/${agent.id}/data`, {
-            state: { kojoFileBrowser: "root", kojoFileBrowserDepth: 0 },
+            state: { kojoFileBrowser: "root", kojoFileBrowserDepth: 0, fromChat: true },
           })}
           className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink"
           title={t("chat.dataFolder")}

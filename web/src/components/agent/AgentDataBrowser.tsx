@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router";
+import { useLocation, useNavigate, useParams } from "react-router";
 import { FileDataBrowser } from "../FileDataBrowser";
 import { agentApi, type AgentInfo } from "../../lib/agentApi";
 import { AgentAvatar } from "./AgentAvatar";
@@ -9,6 +9,7 @@ export function AgentDataBrowser() {
   const t = useT();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const navigateRef = useRef(navigate);
   navigateRef.current = navigate;
   const [agent, setAgent] = useState<AgentInfo | null>(null);
@@ -57,7 +58,7 @@ export function AgentDataBrowser() {
           <div className="h-8 w-8 rounded-full bg-surface" />
         )
       }
-      onExit={() => navigate(`/agents/${id}`, { replace: true })}
+      onExit={() => (location.state as { fromChat?: boolean } | null)?.fromChat ? navigate(-1) : navigate(`/agents/${id}`, { replace: true })}
     />
   );
 }

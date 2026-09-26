@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router";
+import { useLocation, useNavigate, useParams } from "react-router";
 import { agentApi, type AgentInfo, type AgentTask } from "../../lib/agentApi";
 import { PreconditionFailedError } from "../../lib/httpClient";
 import { errMsg, localRFC3339 } from "../../lib/utils";
@@ -18,6 +18,7 @@ export function AgentTodos() {
   const t = useT();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const navigateRef = useRef(navigate);
   navigateRef.current = navigate;
 
@@ -285,7 +286,8 @@ export function AgentTodos() {
       <header className="flex h-[52px] shrink-0 items-center gap-2 border-b border-hairline px-3">
         <button
           type="button"
-          onClick={() => navigate(`/agents/${id}`, { replace: true })}
+          // Pushed from chat (fromChat) → pop that entry; deep link → replace.
+          onClick={() => (location.state as { fromChat?: boolean } | null)?.fromChat ? navigate(-1) : navigate(`/agents/${id}`, { replace: true })}
           className="-ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] text-ink-dim transition-colors hover:bg-hover hover:text-ink"
           aria-label={t("common.back")}
         >

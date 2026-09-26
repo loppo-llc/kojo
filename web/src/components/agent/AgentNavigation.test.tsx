@@ -126,7 +126,7 @@ afterEach(() => {
 });
 
 describe("agent route navigation", () => {
-  it("moves credential management to the chat header and keeps browser back on home", async () => {
+  it("pushes credentials so browser back returns to chat", async () => {
     const router = createMemoryRouter(
       [
         { path: "/", element: homeRoute() },
@@ -143,6 +143,29 @@ describe("agent route navigation", () => {
 
     fireEvent.click(credentialsButton);
     await waitFor(() => expect(router.state.location.pathname).toBe("/agents/demo/credentials"));
+
+    await router.navigate(-1);
+    expect(router.state.location.pathname).toBe("/agents/demo");
+    await router.navigate(-1);
+    expect(router.state.location.pathname).toBe("/");
+  });
+
+  it("credentials UI back pops to chat without a duplicate entry", async () => {
+    const router = createMemoryRouter(
+      [
+        { path: "/", element: homeRoute() },
+        { path: "/agents/:id", element: <AgentChat /> },
+        { path: "/agents/:id/credentials", element: <AgentCredentials /> },
+      ],
+      { initialEntries: ["/", "/agents/demo"], initialIndex: 1 },
+    );
+
+    render(<RouterProvider router={router} />);
+
+    fireEvent.click(await screen.findByLabelText("Credentials"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/agents/demo/credentials"));
+    fireEvent.click(await screen.findByRole("button", { name: "←" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/agents/demo"));
 
     await router.navigate(-1);
     expect(router.state.location.pathname).toBe("/");
