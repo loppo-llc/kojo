@@ -196,6 +196,27 @@ describe("agent route navigation", () => {
     expect(router.state.location.pathname).toBe("/");
   });
 
+  it("pushes the data folder so browser back returns to chat", async () => {
+    const router = createMemoryRouter(
+      [
+        { path: "/", element: homeRoute() },
+        { path: "/agents/:id", element: <AgentChat /> },
+        { path: "/agents/:id/data", element: <div>Data page</div> },
+      ],
+      { initialEntries: ["/", "/agents/demo"], initialIndex: 1 },
+    );
+
+    render(<RouterProvider router={router} />);
+
+    fireEvent.click(await screen.findByLabelText("Data folder"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/agents/demo/data"));
+
+    await router.navigate(-1);
+    expect(router.state.location.pathname).toBe("/agents/demo");
+    await router.navigate(-1);
+    expect(router.state.location.pathname).toBe("/");
+  });
+
   it("UI back then browser back does not land on a duplicate chat", async () => {
     const router = createMemoryRouter(
       [

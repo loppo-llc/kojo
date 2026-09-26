@@ -1074,8 +1074,9 @@ export function AgentChat() {
           </button>
         )}
         <button
+          // Pushed (not replaced) so browser back — and the data browser's
+          // root back, which is navigate(-1) — both return to this chat.
           onClick={() => navigate(`/agents/${agent.id}/data`, {
-            replace: true,
             state: { kojoFileBrowser: "root", kojoFileBrowserDepth: 0 },
           })}
           className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink"
