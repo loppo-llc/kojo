@@ -1544,7 +1544,7 @@ func threadSystemPrompt(stageDir string) string {
 }
 
 func threadAttachmentPrompt(stageDir string) string {
-	return fmt.Sprintf("For file attachments in this thread, stage each file as `%s/<basename>` (`mkdir -p` first). Use this exact thread-specific directory, not `.kojo/attach`; Kojo ingests files from it while the reply is in progress and attaches them to this thread reply.", stageDir)
+	return fmt.Sprintf("File attachments in this thread: stage each file as `%s/<basename>` (`mkdir -p` first; a symlink to the file also works). Use this exact thread-specific directory, not `.kojo/attach`; Kojo ingests files from it while the reply is in progress and attaches them to this thread reply. Whenever this turn produces a file the operator is meant to see or use (a document, PDF, image, audio, data export, etc.), attach it this way even if they did not explicitly ask for an attachment — do not just print its path. You need not repeat the path in your reply.", stageDir)
 }
 
 // runThreadTurn executes one temporary side-thread turn for a thread room

@@ -862,6 +862,22 @@ export function GroupDMChat() {
           </svg>
         </button>
         )}
+        {isThread && group.members[0] && (
+          <button
+            // Pushed (not replaced): the browser's root "back" is
+            // navigate(-1), which must land back on this thread (or draft).
+            onClick={() => navigate(`/agents/${group.members[0].agentId}/data`, {
+              state: { kojoFileBrowser: "root", kojoFileBrowserDepth: 0 },
+            })}
+            className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink"
+            title={t("chat.dataFolder")}
+            aria-label={t("chat.dataFolder")}
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
+              <path d="M3.75 3A1.75 1.75 0 002 4.75v1.5c0 .199.034.39.096.568A1.75 1.75 0 002 8.25v7A1.75 1.75 0 003.75 17h12.5A1.75 1.75 0 0018 15.25v-7a1.75 1.75 0 00-.096-.932c.062-.179.096-.37.096-.568v-1.5A1.75 1.75 0 0016.25 3h-4.086a1.75 1.75 0 01-1.237-.513l-.707-.707A1.75 1.75 0 009.086 1.28L8.914 1.28H3.75z" />
+            </svg>
+          </button>
+        )}
         {isThread && isDraft ? null : isThread ? (
           <button
             onClick={() => {
