@@ -277,3 +277,130 @@ func TestGoalResumeAuthorizationUsesLockNotCachedSource(t *testing.T) {
 		t.Fatal("did not refresh stale hint")
 	}
 }
+
+func TestGoalResumeRejectsHubOwnerPeerIdentityMismatch(t *testing.T) {
+	s, router, id := prepareRemoteExternalChat(t, "http://holder.example:8080")
+	s.externalChat = router
+	q := goalRecoveryRequest{AgentID: id, HolderID: "holder", SessionKey: id + ":slack:C:T", ThreadID: "019e7cc9-dd5e-7971-b654-7840c683879e", Generation: 5, UserID: "UOWNER"}
+	body, _ := json.Marshal(q)
+	req := authedRequest(httptest.NewRequest("POST", "/", bytes.NewReader(body)), auth.Principal{Role: auth.RoleOwner, PeerID: "other-peer"})
+	w := httptest.NewRecorder()
+	s.handlePeerGoalResume(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "holder identity mismatch") {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestReconcileResolvedGoalHandoffRetiresUncertainFinalize(t *testing.T) {
+	s := newChunkedSyncTestServer(t)
+	s.peerID = &peer.Identity{DeviceID: "target"}
+	pending, db := newPendingSyncTestServer(t)
+	s.pendingSyncDB, s.pendingSyncKEK = db, pending.pendingSyncKEK
+	ctx := context.Background()
+	a, err := s.agents.Create(agent.AgentConfig{Name: "goal-reconcile", Tool: agent.ToolCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepareFencedIncomingForTest(t, s, a.ID, originTestOp, "source")
+	if _, err = s.agents.Store().AcceptIncomingHandoff(ctx, a.ID, originTestOp, "source", "target", "source", store.NowMillis(), time.Minute.Milliseconds()); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.agents.Store().ActivateIncomingHandoff(ctx, a.ID, originTestOp); err != nil {
+		t.Fatal(err)
+	}
+	entry := pendingSyncEntry{SourceDeviceID: "source", IncomingFenced: true, RawToken: "secret", ArrivalUncertain: true}
+	if err = s.recordPendingAgentSync(ctx, a.ID, originTestOp, entry); err != nil {
+		t.Fatal(err)
+	}
+	b := agent.GoalBinding{Handoff: &agent.GoalHandoff{ID: originTestOp, SourcePeerID: "source", TargetPeerID: "target", Phase: "resuming"}}
+	if err = s.reconcileResolvedGoalHandoff(a.ID, b); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.consumePendingAgentSync(ctx, a.ID, originTestOp); err != nil || ok {
+		t.Fatalf("pending remains: ok=%v err=%v", ok, err)
+	}
+	receipt, err := s.agents.Store().GetIncomingHandoff(ctx, a.ID, originTestOp)
+	if err != nil || string(receipt.Phase) != "done" {
+		t.Fatalf("receipt=%+v err=%v", receipt, err)
+	}
+}
+
+func TestReconcileResolvedGoalHandoffRejectsMismatchedSource(t *testing.T) {
+	s := newChunkedSyncTestServer(t)
+	s.peerID = &peer.Identity{DeviceID: "target"}
+	pending, db := newPendingSyncTestServer(t)
+	s.pendingSyncDB, s.pendingSyncKEK = db, pending.pendingSyncKEK
+	ctx := context.Background()
+	const id = "ag_goal_mismatch"
+	entry := pendingSyncEntry{SourceDeviceID: "source", IncomingFenced: true, RawToken: "secret", ArrivalUncertain: true}
+	if err := s.recordPendingAgentSync(ctx, id, originTestOp, entry); err != nil {
+		t.Fatal(err)
+	}
+	b := agent.GoalBinding{Handoff: &agent.GoalHandoff{ID: originTestOp, SourcePeerID: "other", TargetPeerID: "target", Phase: "resuming"}}
+	if err := s.reconcileResolvedGoalHandoff(id, b); err == nil {
+		t.Fatal("mismatched source reconciled")
+	}
+	got, ok, err := s.consumePendingAgentSync(ctx, id, originTestOp)
+	if err != nil || !ok || !got.ArrivalUncertain || got.ArrivalHandled {
+		t.Fatalf("pending changed: %+v ok=%v err=%v", got, ok, err)
+	}
+}
+
+func TestReconcileResolvedGoalHandoffRejectsEmptyDurableSource(t *testing.T) {
+	s := newChunkedSyncTestServer(t)
+	pending, db := newPendingSyncTestServer(t)
+	s.pendingSyncDB, s.pendingSyncKEK = db, pending.pendingSyncKEK
+	ctx := context.Background()
+	const id = "ag_goal_empty_source"
+	entry := pendingSyncEntry{IncomingFenced: true, RawToken: "secret", ArrivalUncertain: true}
+	if err := s.recordPendingAgentSync(ctx, id, originTestOp, entry); err != nil {
+		t.Fatal(err)
+	}
+	b := agent.GoalBinding{Handoff: &agent.GoalHandoff{ID: originTestOp, SourcePeerID: "source", TargetPeerID: "target", Phase: "resuming"}}
+	if err := s.reconcileResolvedGoalHandoff(id, b); err == nil {
+		t.Fatal("empty durable source reconciled")
+	}
+}
+
+func TestReconcileResolvedGoalHandoffCompletesPersistedDecision(t *testing.T) {
+	for _, receiptDone := range []bool{false, true} {
+		t.Run(map[bool]string{false: "after-arrival-decision", true: "after-receipt-finish"}[receiptDone], func(t *testing.T) {
+			s := newChunkedSyncTestServer(t)
+			s.peerID = &peer.Identity{DeviceID: "target"}
+			pending, db := newPendingSyncTestServer(t)
+			s.pendingSyncDB, s.pendingSyncKEK = db, pending.pendingSyncKEK
+			ctx := context.Background()
+			a, err := s.agents.Create(agent.AgentConfig{Name: "goal-reconcile-retry", Tool: agent.ToolCodex})
+			if err != nil {
+				t.Fatal(err)
+			}
+			prepareFencedIncomingForTest(t, s, a.ID, originTestOp, "source")
+			if _, err = s.agents.Store().AcceptIncomingHandoff(ctx, a.ID, originTestOp, "source", "target", "source", store.NowMillis(), time.Minute.Milliseconds()); err != nil {
+				t.Fatal(err)
+			}
+			if err = s.agents.Store().ActivateIncomingHandoff(ctx, a.ID, originTestOp); err != nil {
+				t.Fatal(err)
+			}
+			if receiptDone {
+				if err = s.agents.Store().FinishIncomingHandoff(ctx, a.ID, originTestOp); err != nil {
+					t.Fatal(err)
+				}
+			}
+			entry := pendingSyncEntry{SourceDeviceID: "source", IncomingFenced: true, RawToken: "secret", ArrivalHandled: true}
+			if err = s.recordPendingAgentSync(ctx, a.ID, originTestOp, entry); err != nil {
+				t.Fatal(err)
+			}
+			b := agent.GoalBinding{Handoff: &agent.GoalHandoff{ID: originTestOp, SourcePeerID: "source", TargetPeerID: "target", Phase: "resuming"}}
+			if err = s.reconcileResolvedGoalHandoff(a.ID, b); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok, err := s.consumePendingAgentSync(ctx, a.ID, originTestOp); err != nil || ok {
+				t.Fatalf("pending remains: ok=%v err=%v", ok, err)
+			}
+			receipt, err := s.agents.Store().GetIncomingHandoff(ctx, a.ID, originTestOp)
+			if err != nil || string(receipt.Phase) != "done" {
+				t.Fatalf("receipt=%+v err=%v", receipt, err)
+			}
+		})
+	}
+}

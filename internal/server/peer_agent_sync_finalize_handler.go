@@ -65,14 +65,15 @@ type peerAgentSyncFinalizeRequest struct {
 	//
 	// Handler ordering (see handlePeerAgentSyncFinalize):
 	//   1. AcceptIncomingHandoff (atomic holder/token/proxy)
-	//   2. onAgentSyncFinalized hook, then activated receipt
+	//   2. onAgentSyncFinalized hook
 	//   3. applyFinalizeTailMessage — UPSERTs the row by id under
 	//      a FencingPredicate keyed on the post-hook lock token,
 	//      so a force-reclaim race aborts the apply with
 	//      errTailLockNotSelf (caller 503s, source retries).
-	//   4. admit the arrival either to the initiating Slack/WebUI
+	//   4. activate the receipt only after the tail is durable
+	//   5. admit the arrival either to the initiating Slack/WebUI
 	//      thread or, for legacy/main turns, to main WebUI
-	//   5. commitPendingAgentSync
+	//   6. commitPendingAgentSync
 	//
 	// Nil/empty on non-self-call paths and on self-call paths where
 	// the source turn never emitted a done event within the wait

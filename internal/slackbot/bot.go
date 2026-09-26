@@ -73,6 +73,13 @@ type Bot struct {
 	// !stop in that gap could cancel the next queued FIFO turn.
 	stoppingTurns map[string]*activeTurn // key: "channel:threadTS"
 
+	// stopAll coalesces repeated `!stop all` per thread: a repeat that finds
+	// nothing because an in-flight or just-finished stop already took the
+	// tasks must not answer "nothing to stop" next to that stop's notice.
+	stopAllMu       sync.Mutex
+	stopAllInflight map[string]int       // key: keyed session key
+	stopAllDone     map[string]time.Time // last successful stop per key
+
 	// userCache caches Slack user ID → display name for the Bot's lifetime.
 	// Display names rarely change; the cache is cleared on Bot restart.
 	userCacheMu sync.RWMutex
@@ -204,11 +211,15 @@ func trimStreamDeathsOutsideWindow(deaths []time.Time, now time.Time) []time.Tim
 	return recent
 }
 
-// isNoReplyResponse reports whether text is the exact Slack no-reply control
-// response. Exact matching prevents ordinary discussion of the token from
-// suppressing a reply.
+// isNoReplyResponse reports whether text is a Slack no-reply control
+// response: one or more exact tokens and nothing else. The holder already
+// drops token-only segments and terminates an all-token turn with a single
+// canonical token; accepting repeated tokens keeps older holders (which
+// concatenate segments) from posting "[[NO_REPLY]][[NO_REPLY]]". Exact
+// matching still prevents ordinary discussion of the token from suppressing a
+// reply.
 func isNoReplyResponse(text string) bool {
-	return strings.TrimSpace(text) == noReplyToken
+	return agent.IsNoReplyOnly(text)
 }
 
 // couldBeNoReplyResponse is used while text is still streaming. Holding a
@@ -217,8 +228,7 @@ func isNoReplyResponse(text string) bool {
 // normally. An exact token remains a candidate because a later delta may still
 // turn it into ordinary prose.
 func couldBeNoReplyResponse(text string) bool {
-	trimmed := strings.TrimSpace(text)
-	return strings.HasPrefix(noReplyToken, trimmed)
+	return agent.CouldBeNoReplyOnly(text)
 }
 
 // discardSuppressedStreams removes every Slack message artifact created before
@@ -357,6 +367,8 @@ func (b *Bot) Run() {
 	}
 	b.botUserID = authResp.UserID
 	b.logger.Info("slack bot connected", "botUser", b.botUserID, "team", authResp.Team)
+	unregisterKeyed := b.registerKeyedBackground()
+	defer unregisterKeyed()
 
 	go func() {
 		if err := b.sm.RunContext(ctx); err != nil && ctx.Err() == nil {
@@ -656,6 +668,14 @@ func isStopCommand(text string) bool {
 	}
 }
 
+// isStopAllCommand matches `!stop all`: stop the current turn (like !stop)
+// and every run_in_background task still running for this thread. A plain
+// !stop only ends the turn; the thread's background tasks keep running.
+func isStopAllCommand(text string) bool {
+	f := strings.Fields(strings.ToLower(text))
+	return len(f) == 2 && (f[0] == "!stop" || f[0] == "!cancel") && f[1] == "all"
+}
+
 // Command notices are posted synchronously from the Socket Mode event loop,
 // so a hung Slack API call must not stall every later event (including the
 // next !stop). Bound each notice by the single-chunk delivery budget.
@@ -700,7 +720,9 @@ func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, message
 
 	// Avoid resolving user mentions just to reject an ordinary message. App
 	// mentions have already had the bot mention stripped by their handler.
-	if !isStopCommand(SlackToPlain(text, nil)) {
+	plain := SlackToPlain(text, nil)
+	stopAll := isStopAllCommand(plain)
+	if !stopAll && !isStopCommand(plain) {
 		return false
 	}
 
@@ -708,7 +730,13 @@ func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, message
 	if replyTS == "" && b.config.ThreadReplies {
 		replyTS = messageTS
 	}
-	active, started, denied := b.cancelActiveTurnForCommand(channel, replyTS, userID)
+	active, started, denied := b.cancelActiveTurnInternal(channel, replyTS, true, userID, stopAll)
+	if stopAll && !denied {
+		// Stopping the tasks is an RPC (possibly to a peer holder); keep the
+		// Socket Mode loop free. Their stop notice is posted by the abandoned
+		// path through the thread FIFO, i.e. after the stopped turn's reply.
+		go b.stopThreadBackgroundTasks(ctx, channel, replyTS, active != nil)
+	}
 	if active != nil && started {
 		// Cancellation is immediate, but its terminal path must not publish the
 		// completion notice before this acknowledgement has finished posting.
@@ -722,7 +750,7 @@ func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, message
 		}()
 	} else if denied {
 		b.postCommandNotice(ctx, channel, replyTS, stopCommandNotOwner)
-	} else if active == nil {
+	} else if active == nil && !stopAll {
 		if stopper, ok := b.mgr.(interface {
 			StopIdleGoal(context.Context, string, string, string) (bool, error)
 		}); ok {
@@ -1144,6 +1172,7 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 		ExpectedHolderPeer:                expectedHolder,
 		HandoffArrivalReservation:         arrivalReservation,
 		PreserveTerminalOnCancel:          true,
+		LingerBackgroundTasks:             true,
 	})
 	if err != nil {
 		b.clearAssistantStatus(ctx, channel, threadTS)
@@ -1156,7 +1185,56 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 		return
 	}
 
-	var response strings.Builder       // full response text
+	b.deliverAgentTurn(ctx, slackTurnDelivery{
+		channel:            channel,
+		threadTS:           threadTS,
+		messageTS:          messageTS,
+		text:               text,
+		displayName:        displayName,
+		userID:             userID,
+		sessionKey:         sessionKey,
+		turnCtx:            turnCtx,
+		turnCancel:         turnCancel,
+		active:             active,
+		arrivalReservation: arrivalReservation,
+		userTurn:           true,
+	}, events)
+}
+
+// slackTurnDelivery is the per-turn context deliverAgentTurn needs to stream,
+// finalize, and record an agent turn in a Slack thread.
+type slackTurnDelivery struct {
+	channel, threadTS   string
+	messageTS, text     string // triggering user message ("" for background turns)
+	displayName, userID string
+	sessionKey          string
+	turnCtx             context.Context
+	turnCancel          context.CancelFunc
+	active              *activeTurn
+	arrivalReservation  *slackHandoffReservation // nil for background turns
+	userTurn            bool                     // a user message triggered this turn (history bookkeeping)
+}
+
+// deliverAgentTurn consumes an agent event stream and delivers it into the
+// Slack thread: live streaming, NO_REPLY suppression, final chat.update /
+// batch post, dead-stream cleanup, and bot-reply history. Shared by ordinary
+// user turns and keyed background (task-notification) turns.
+func (b *Bot) deliverAgentTurn(ctx context.Context, d slackTurnDelivery, events <-chan agent.ChatEvent) {
+	channel, threadTS := d.channel, d.threadTS
+	messageTS, text, displayName, userID := d.messageTS, d.text, d.displayName, d.userID
+	sessionKey, turnCtx, active, arrivalReservation := d.sessionKey, d.turnCtx, d.active, d.arrivalReservation
+	turnCancel := d.turnCancel
+	_ = ctx
+	// backgroundPending is the number of run_in_background tasks still
+	// running when the turn ended on a lingering keyed session.
+	backgroundPending := 0
+	var response strings.Builder // full response text
+	// rawResponse is response without the separators inserted between text
+	// segments; it is what the backend's terminal Message.Content contains.
+	var rawResponse strings.Builder
+	// segmentBoundary is set by main-turn tool activity so the next text
+	// delta starts a new paragraph instead of running into the previous one.
+	segmentBoundary := false
 	var pendingDelta strings.Builder   // text not yet flushed via AppendStream
 	var streamTS string                // ts of the streaming message (empty = not started, dead, or fallback)
 	var deadStreams []string           // streamTS values that died mid-response (TTL/external stop); finalized best-effort at end
@@ -1320,6 +1398,19 @@ streamLoop:
 				}
 			}
 		case "text":
+			// Subagent text belongs under its Task tool, not in the reply;
+			// the terminal body never contains it either.
+			if evt.ParentToolUseID != "" {
+				continue
+			}
+			if segmentBoundary && evt.Delta != "" {
+				if sep := textSegmentSeparator(response.String(), evt.Delta); sep != "" {
+					response.WriteString(sep)
+					pendingDelta.WriteString(sep)
+				}
+				segmentBoundary = false
+			}
+			rawResponse.WriteString(evt.Delta)
 			response.WriteString(evt.Delta)
 			pendingDelta.WriteString(evt.Delta)
 
@@ -1357,6 +1448,9 @@ streamLoop:
 			}
 
 		case "tool_use":
+			if evt.ParentToolUseID == "" {
+				segmentBoundary = true
+			}
 			// Surface what the agent is actually doing, not just which
 			// tool fired. Codex routes everything through "shell", so
 			// without the command detail every step would read the same
@@ -1426,6 +1520,9 @@ streamLoop:
 			lastAppend = time.Now()
 
 		case "tool_result":
+			if evt.ParentToolUseID == "" {
+				segmentBoundary = true
+			}
 			// Revert the assistant status to "Thinking…" while the agent
 			// processes the tool result and decides the next action.
 			b.setStatus(turnCtx, channel, threadTS, typingStatus)
@@ -1456,6 +1553,7 @@ streamLoop:
 			if evt.Message != nil {
 				terminalContent = evt.Message.Content
 			}
+			backgroundPending = evt.BackgroundTasksPending
 		}
 	}
 	// The model stream has ended. Remove the active entry before Slack
@@ -1486,9 +1584,33 @@ streamLoop:
 	// before interpreting the control token or finalizing normal delivery. An
 	// empty terminal body is not authoritative because some test/custom
 	// backends emit a bare done event after otherwise valid text deltas.
+	//
+	// The terminal body has no separators between text segments. When it
+	// matches what was streamed (optionally plus an undelivered tail), keep the
+	// separated form so segments written around tool calls stay readable.
 	if terminalContent != "" && terminalContent != response.String() {
-		response.Reset()
-		response.WriteString(terminalContent)
+		raw := rawResponse.String()
+		switch {
+		case raw != "" && strings.HasPrefix(terminalContent, raw):
+			tail := terminalContent[len(raw):]
+			separated := response.String()
+			if segmentBoundary && tail != "" {
+				// The segment after the last tool never streamed.
+				separated += textSegmentSeparator(separated, tail)
+			}
+			separated += tail
+			response.Reset()
+			response.WriteString(separated)
+		case raw != "" && strings.HasSuffix(terminalContent, raw):
+			// The backend prepended text that never streamed (an earlier
+			// assistant message merged ahead of this turn's deltas).
+			separated := terminalContent[:len(terminalContent)-len(raw)] + response.String()
+			response.Reset()
+			response.WriteString(separated)
+		default:
+			response.Reset()
+			response.WriteString(terminalContent)
+		}
 		// Do not append the authoritative full body onto a stream that may
 		// already contain most of it. chat.update below replaces the stream
 		// with response; the batch fallback also reads response directly.
@@ -1521,7 +1643,9 @@ streamLoop:
 		failedSuperseded := append([]string(nil), failedSupersededStreams...)
 		failedSupersededMu.Unlock()
 		b.discardSuppressedStreams(channel, streamTS, append(deadStreams, failedSuperseded...))
-		b.ensureUserTurnInHistory(channel, threadTS, messageTS, text, displayName, userID)
+		if d.userTurn {
+			b.ensureUserTurnInHistory(channel, threadTS, messageTS, text, displayName, userID)
+		}
 		clearCtx, clearCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
 		b.clearAssistantStatus(clearCtx, channel, threadTS)
 		clearCancel()
@@ -1534,6 +1658,34 @@ streamLoop:
 		response.Reset()
 		pendingDelta.Reset()
 		hasError = true
+	}
+
+	// The CLI process lingers for still-running background tasks: tell the
+	// thread a follow-up will be posted here when they finish.
+	// A stopped turn ends only itself (P3): its background tasks keep running
+	// unless the stop was `!stop all`, so say so on the partial reply or on
+	// the stop notice below.
+	stoppedPending := 0
+	if stopped && backgroundPending > 0 && !active.stopAllRequested() {
+		stoppedPending = backgroundPending
+	}
+	if stoppedPending > 0 && response.Len() > 0 && !hasError {
+		note := stoppedBackgroundNote(stoppedPending)
+		response.WriteString("\n\n" + note)
+		if streamTS != "" {
+			pendingDelta.WriteString("\n\n" + note)
+		}
+	}
+	if backgroundPending > 0 && completedCleanly && !hasError && !stopped {
+		note := backgroundPendingNote(backgroundPending)
+		sep := ""
+		if response.Len() > 0 {
+			sep = "\n\n"
+		}
+		response.WriteString(sep + note)
+		if streamTS != "" {
+			pendingDelta.WriteString(sep + note)
+		}
 	}
 
 	// Flush any remaining text delta before finalizing. If the final
@@ -1653,7 +1805,7 @@ streamLoop:
 			// Either way, dead partials are now superseded.
 			finalDelivered = deliveredAll
 		} else if stopped {
-			finalDelivered = b.postStopNotice(channel, threadTS, active)
+			finalDelivered = b.postStopNoticeWithPending(channel, threadTS, active, stoppedPending)
 			if finalDelivered {
 				// The explicit stop notice replaces the tool/progress-only live
 				// stream; remove that stale artifact during orphan cleanup.
@@ -1688,7 +1840,7 @@ streamLoop:
 		// stream died and we fell back). Dead partials are superseded.
 		finalDelivered = deliveredAll
 	} else if stopped {
-		finalDelivered = b.postStopNotice(channel, threadTS, active)
+		finalDelivered = b.postStopNoticeWithPending(channel, threadTS, active, stoppedPending)
 	} else if hasError || streamFailed || len(deadStreams) > 0 {
 		// Either an explicit agent error, StartStream failed, or a stream
 		// was opened and then died (every streamTS dropped, so streamTS is
@@ -1841,7 +1993,7 @@ func slackSessionKey(agentID, channel, threadTS string) string {
 func buildSlackSystemPromptExtra(channel, threadTS, displayName, userID string) string {
 	var sb strings.Builder
 	sb.WriteString("## Slack Conversation Context\n\n")
-	sb.WriteString("This message was received via Slack. Your text response will be automatically posted to the Slack thread — just respond normally. If no Slack response should be posted, output exactly `" + noReplyToken + "` and nothing else. Kojo consumes that token as a control signal and posts no message; never explain that you are withholding a reply. Do NOT use Slack MCP tools (slack_post_message, slack_reply_to_thread, etc.) to reply to this conversation. Slack MCP tools remain available for OTHER actions: posting to a different channel, adding reactions, uploading files, listing channels/users.\n\n")
+	sb.WriteString("This message was received via Slack. Your text response will be automatically posted to the Slack thread — just respond normally. Every text you output during this turn is posted, not only the last one: text written before, between, or after tool calls is joined in order (separated by blank lines) into the Slack reply. If no Slack response should be posted, output exactly `" + noReplyToken + "` and nothing else. Kojo consumes that token as a control signal and posts no message; never explain that you are withholding a reply. Do NOT use Slack MCP tools (slack_post_message, slack_reply_to_thread, etc.) to reply to this conversation. Slack MCP tools remain available for OTHER actions: posting to a different channel, adding reactions, uploading files, listing channels/users.\n\n")
 	if threadTS != "" {
 		sb.WriteString(fmt.Sprintf("You are participating in Slack channel %s, thread %s.\n", channel, threadTS))
 	} else {
@@ -2276,6 +2428,12 @@ func (b *Bot) postDeliveryFailureNotice(channel, threadTS string) {
 }
 
 func (b *Bot) postStopNotice(channel, threadTS string, active *activeTurn) bool {
+	return b.postStopNoticeWithPending(channel, threadTS, active, 0)
+}
+
+// postStopNoticeWithPending posts the stop notice; pending > 0 adds that the
+// thread's background tasks keep running (a stop ends only the turn).
+func (b *Bot) postStopNoticeWithPending(channel, threadTS string, active *activeTurn, pending int) bool {
 	// cancelActiveTurnForCommand cancels the backend before posting the
 	// acknowledgement so stop latency stays low. The cancelled backend may
 	// reach this terminal path immediately (especially through a peer relay),
@@ -2293,7 +2451,11 @@ func (b *Bot) postStopNotice(channel, threadTS string, active *activeTurn) bool 
 	// fallback and rate-limit retries.
 	noticeCtx, noticeCancel := context.WithTimeout(context.Background(), chunkPostTimeout(1))
 	defer noticeCancel()
-	return b.postMessage(noticeCtx, channel, threadTS, stopCommandDone)
+	msg := stopCommandDone
+	if pending > 0 {
+		msg += "\n" + stoppedBackgroundNote(pending)
+	}
+	return b.postMessage(noticeCtx, channel, threadTS, msg)
 }
 
 // setStatus updates the assistant typing indicator for a thread
@@ -2421,7 +2583,13 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) b
 type activeTurn struct {
 	// ownerUserID is immutable after registration; empty means an internal turn.
 	ownerUserID string
-	mu          sync.Mutex
+	// anyoneMayStop (immutable) lets any requester !stop an ownerless turn:
+	// set for keyed background (task-notification) turns.
+	anyoneMayStop bool
+	mu            sync.Mutex
+	// stopAll: the stop came from `!stop all`, so the thread's background
+	// tasks are being stopped too (the reply must not say they continue).
+	stopAll     bool
 	cancel      context.CancelFunc
 	stopUser    bool
 	stopOnce    sync.Once
@@ -2529,6 +2697,21 @@ func (t *activeTurn) stopRequested() bool {
 	return t.stopUser
 }
 
+func (t *activeTurn) markStopAll() {
+	t.mu.Lock()
+	t.stopAll = true
+	t.mu.Unlock()
+}
+
+func (t *activeTurn) stopAllRequested() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.stopAll
+}
+
 func activeTurnKey(channel, threadTS string) string { return channel + ":" + threadTS }
 
 func (b *Bot) registerActiveTurn(channel, threadTS string, cancel context.CancelFunc) *activeTurn {
@@ -2539,13 +2722,23 @@ func (b *Bot) registerActiveTurnForUser(channel, threadTS, userID string, cancel
 	return b.registerActiveTurnAfter(channel, threadTS, nil, userID, cancel)
 }
 
+// registerBackgroundActiveTurn registers an ownerless keyed background turn
+// that any requester in the thread may !stop.
+func (b *Bot) registerBackgroundActiveTurn(channel, threadTS string, cancel context.CancelFunc) *activeTurn {
+	return b.registerActiveTurnWith(channel, threadTS, nil, "", true, cancel)
+}
+
 // registerActiveTurnAfter inserts a reserved handoff arrival immediately after
 // its source. Handoff FIFO reserves source→arrival atomically; ordinary Slack
 // events accepted later must not overtake that order in the stop registry.
 func (b *Bot) registerActiveTurnAfter(channel, threadTS string, after *activeTurn, ownerUserID string, cancel context.CancelFunc) *activeTurn {
+	return b.registerActiveTurnWith(channel, threadTS, after, ownerUserID, false, cancel)
+}
+
+func (b *Bot) registerActiveTurnWith(channel, threadTS string, after *activeTurn, ownerUserID string, anyoneMayStop bool, cancel context.CancelFunc) *activeTurn {
 	steerReady := make(chan struct{})
 	close(steerReady)
-	turn := &activeTurn{cancel: cancel, ownerUserID: ownerUserID, stopCh: make(chan struct{}), steerTail: steerReady}
+	turn := &activeTurn{cancel: cancel, ownerUserID: ownerUserID, anyoneMayStop: anyoneMayStop, stopCh: make(chan struct{}), steerTail: steerReady}
 	key := activeTurnKey(channel, threadTS)
 	b.activeTurnsMu.Lock()
 	if b.activeTurns == nil {
@@ -2645,24 +2838,28 @@ func (b *Bot) unregisterActiveTurn(channel, threadTS string, turn *activeTurn) {
 }
 
 func (b *Bot) cancelActiveTurn(channel, threadTS string) bool {
-	active, _, _ := b.cancelActiveTurnInternal(channel, threadTS, false, "")
+	active, _, _ := b.cancelActiveTurnInternal(channel, threadTS, false, "", false)
 	return active != nil
 }
 
 func (b *Bot) cancelActiveTurnForCommand(channel, threadTS, userID string) (*activeTurn, bool, bool) {
-	return b.cancelActiveTurnInternal(channel, threadTS, true, userID)
+	return b.cancelActiveTurnInternal(channel, threadTS, true, userID, false)
 }
 
 // The results are the selected turn, whether stopping started, and whether
 // authorization failed. Check ownership under the registry lock before cancel
 // or acknowledgement setup, including duplicate commands during finalization.
-func (b *Bot) cancelActiveTurnInternal(channel, threadTS string, waitForAck bool, userID string) (*activeTurn, bool, bool) {
+func (b *Bot) cancelActiveTurnInternal(channel, threadTS string, waitForAck bool, userID string, stopAll bool) (*activeTurn, bool, bool) {
 	key := activeTurnKey(channel, threadTS)
 	b.activeTurnsMu.Lock()
 	defer b.activeTurnsMu.Unlock()
 	if waitForAck {
 		if stopping := b.stoppingTurns[key]; stopping != nil {
-			return stopping, false, userID == "" || stopping.ownerUserID != userID
+			denied := userID == "" || (stopping.ownerUserID != userID && !stopping.anyoneMayStop)
+			if stopAll && !denied {
+				stopping.markStopAll()
+			}
+			return stopping, false, denied
 		}
 	}
 	turns := b.activeTurns[key]
@@ -2670,8 +2867,13 @@ func (b *Bot) cancelActiveTurnInternal(channel, threadTS string, waitForAck bool
 		return nil, false, false
 	}
 	turn := turns[0]
-	if waitForAck && (userID == "" || turn.ownerUserID != userID) {
+	// A background (task-notification) turn has no owner: anyone in the
+	// thread may stop it, like the tasks themselves.
+	if waitForAck && (userID == "" || (turn.ownerUserID != userID && !turn.anyoneMayStop)) {
 		return turn, false, true
+	}
+	if stopAll {
+		turn.markStopAll()
 	}
 	// Holding activeTurnsMu orders this against unregisterActiveTurn: either
 	// the completed turn unregisters first, or the stop flag is visible before
@@ -2981,4 +3183,20 @@ func (r *slackHandoffReservation) WaitSourceComplete(ctx context.Context) error 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.sourceCompleteErr
+}
+
+// textSegmentSeparator returns the blank-line separator to insert between an
+// assistant text segment already in prev and the next segment starting with
+// next (segments are split by tool calls). Backends concatenate segments with
+// no delimiter, so without this "...ですか？次の文" runs together in Slack.
+func textSegmentSeparator(prev, next string) string {
+	if strings.TrimSpace(prev) == "" {
+		return ""
+	}
+	have := len(prev) - len(strings.TrimRight(prev, "\n"))
+	have += len(next) - len(strings.TrimLeft(next, "\n"))
+	if have >= 2 {
+		return ""
+	}
+	return strings.Repeat("\n", 2-have)
 }

@@ -69,25 +69,21 @@ var jevEffortCriteria = map[string]string{
 // tests. Returns the raw tier ("low"/"medium"/"high").
 var classifyEffortJev = runJevEffortClassifier
 
-// runJevEffortClassifier asks Jev one Choice question over the message
-// (and the recent-diary tail as context) and reduces the returned
-// distribution with pickEffortTier.
-func runJevEffortClassifier(ctx context.Context, apiKey, recentDiary, userMessage string) (string, error) {
+// runJevEffortClassifier asks Jev one Choice question over the current
+// message and reduces the returned distribution with pickEffortTier. Keep
+// historical diary context local: configuring a global classifier key must
+// not silently disclose an agent's activity log to a third party.
+func runJevEffortClassifier(ctx context.Context, apiKey, userMessage string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, jevEffortTimeout)
 	defer cancel()
 	state := map[string]string{
 		"message": headRunes(userMessage, effortClassifierMessageCap),
 	}
-	if d := strings.TrimSpace(recentDiary); d != "" {
-		state["recent_context"] = tailRunes(d, effortClassifierDiaryCap)
-	}
 	resp, err := jevCall(ctx, apiKey, state, map[string]jevQuestion{
 		"effort": {
-			Type: "choice",
-			Instructions: "How much reasoning effort will an AI coding/chat assistant need to answer `message`? " +
-				"`recent_context` (when present) is the assistant's own recent activity log; use it only to " +
-				"interpret references in the message, not as the thing being judged.",
-			Criteria: jevEffortCriteria,
+			Type:         "choice",
+			Instructions: "How much reasoning effort will an AI coding/chat assistant need to answer `message`?",
+			Criteria:     jevEffortCriteria,
 		},
 	})
 	if err != nil {
@@ -131,13 +127,10 @@ func pickEffortTier(ans jevAnswer) (string, error) {
 	}
 }
 
-// effortRank orders effort tiers for the ceiling comparison in
-// resolveTurnEffort. The empty string (model default) is treated as the
-// "high" tier — claude/grok models default to high (or better) effort.
-// claude-opus-5-5 is the one exception (its API default is medium); an
-// agent on it with an empty effort therefore has its ceiling read one
-// level above what the model actually runs at, which only ever lets the
-// classifier pin an explicit "medium" that equals the default anyway.
+// effortRank orders effort tiers for auto-effort mapping. The empty string
+// (model default) is normalized to "high". Thus claude-opus-5-5's medium API
+// default behaves like an explicit medium setting: a high classifier verdict
+// promotes the turn to explicit high, while only xhigh/max remain above it.
 var effortRank = map[string]int{
 	"none": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6,
 }
@@ -250,7 +243,7 @@ func resolveTurnEffort(ctx context.Context, a *Agent, userMessage string, system
 	// through to the claude CLI classifier (then the heuristic) so a
 	// TypeSafe outage never changes behavior beyond added latency.
 	if jevKey != "" {
-		tier, err := classifyEffortJev(ctx, jevKey, recentDiary, userMessage)
+		tier, err := classifyEffortJev(ctx, jevKey, userMessage)
 		if err == nil {
 			return mapTierToEffort(a, tier), "jev:" + tier
 		}

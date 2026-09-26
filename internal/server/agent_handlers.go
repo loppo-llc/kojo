@@ -90,6 +90,11 @@ type agentResponse struct {
 	// that would 409 with agent_busy: device switch in progress.
 	// Runtime-only — never persisted, never accepted on PATCH.
 	IsSwitching bool `json:"isSwitching,omitempty"`
+	// HolderSnapshotStale is true when a remote-held agent was served
+	// from this hub's row because the holder could not be read. The
+	// holder is the write authority, so the UI must not submit a
+	// full-form save built from this snapshot.
+	HolderSnapshotStale bool `json:"holderSnapshotStale,omitempty"`
 }
 
 // agentRuntimeSnapshot bundles the runtime-derived fields that feed
@@ -429,6 +434,17 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	// gets the Owner's view — including the archived rows it needs in
 	// order to unarchive them.
 	if p.IsOwner() || p.IsOwnerDeputy() {
+		// Best-effort: refresh the remote agents' config from their holder
+		// (the write authority for settings saved while remote) and their
+		// lastMessage timestamp from the holder's latest message. Without
+		// this the list reflects only what oplog has already replicated to
+		// our local store — during an active handoff that lag puts the
+		// agent in a stale sort position relative to local agents, and a
+		// holder-side archive/unarchive would be filtered on the stale
+		// hub flag. So enrich BEFORE the archive filter. Bounded total
+		// deadline and concurrency keep the list endpoint responsive when
+		// peers are slow.
+		s.enrichRemoteAgents(r.Context(), all, nil)
 		out := make([]*agent.Agent, 0, len(all))
 		for _, a := range all {
 			switch {
@@ -439,16 +455,6 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 			}
 			out = append(out, a)
 		}
-		// Best-effort: refresh the remote agents' lastMessage timestamp by
-		// asking each holder peer for its latest message. Without this the
-		// list reflects only what oplog has already replicated to our local
-		// store — during an active handoff that lag puts the agent in a
-		// stale sort position relative to local agents. Bounded total
-		// deadline keeps the list endpoint responsive when peers are slow.
-		// Restrict to the agents we're actually returning so we don't spend
-		// peer-signed HTTP budget enriching rows the caller never sees
-		// (archived filter, etc.).
-		s.enrichRemoteAgentsLatestActivity(r.Context(), out)
 		writeJSONResponse(w, http.StatusOK, map[string]any{"agents": out})
 		return
 	}
@@ -460,20 +466,20 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	// agent's own archived self is also filtered out — they should be
 	// asking the owner to revive them, not poking the API).
 	//
-	// Enrich only the agent's own (full-record) row — a directory view
-	// strips lastMessage/updatedAt anyway, so a peer fetch for those rows
-	// would be wasted budget.
-	var selfEnrich []*agent.Agent
+	// Remote rows (self or directory) still need the holder's live
+	// config — name/publicProfile edits land on the holder — but only
+	// the self row renders lastMessage, so activity is fetched for it
+	// alone. Enrichment runs before the archive filter below so a
+	// holder-side archive/unarchive is honoured ahead of the hub row.
+	var remoteRows []*agent.Agent
 	for _, a := range all {
-		if a.Archived {
-			continue
-		}
-		if p.IsAgent() && p.AgentID == a.ID {
-			selfEnrich = append(selfEnrich, a)
+		if a.HolderPeer != "" {
+			remoteRows = append(remoteRows, a)
 		}
 	}
-	if len(selfEnrich) > 0 {
-		s.enrichRemoteAgentsLatestActivity(r.Context(), selfEnrich)
+	if len(remoteRows) > 0 {
+		isSelf := func(a *agent.Agent) bool { return p.IsAgent() && p.AgentID == a.ID }
+		s.enrichRemoteAgents(r.Context(), remoteRows, isSelf)
 	}
 	out := make([]any, 0, len(all))
 	for _, a := range all {
@@ -553,18 +559,37 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 		if ra := s.agents.GetRemote(id); ra != nil {
 			p := auth.FromContext(r.Context())
 			if p.CanReadFull(id) {
-				// Remote-held agents have no local cron entry, and
-				// surfacing a row etag from the local store would
-				// expose an orphaned row's etag that no PATCH on
-				// this hub can satisfy. Construct an explicit
+				// The holder's in-memory agent is the write authority
+				// for every holder-only setting (cronExpr, model,
+				// persona, ...): a proxied PATCH lands there and this
+				// hub's row only catches up at the next device switch.
+				// Serving the hub row here made a just-saved setting
+				// appear to revert on reload, so read through to the
+				// holder while it is online and fall back to the hub
+				// row only when it is not reachable.
+				if s.writeHolderAgentView(w, r, ra, true) {
+					return
+				}
+				// Holder unreachable: serve the hub row. Remote-held
+				// agents have no local cron entry, and the hub row's
+				// etag is withheld because a holder-owned PATCH is
+				// checked against the holder's row, not this one. Construct an explicit
 				// minimal snapshot — only the global cronPaused
 				// flag carries over. The HTTP ETag header stays
 				// unset because rowETag is "" (see displayETag).
-				writeJSONResponse(w, http.StatusOK,
-					s.buildAgentResponse(ra, agentRuntimeSnapshot{
-						cronPaused: s.agents.CronPaused(),
-					}))
+				resp := s.buildAgentResponse(ra, agentRuntimeSnapshot{
+					cronPaused: s.agents.CronPaused(),
+				})
+				// Tell the Settings form this is the hub's possibly
+				// stale copy: its full-payload save would otherwise
+				// overwrite the holder's newer values once it is
+				// reachable again.
+				resp.HolderSnapshotStale = true
+				writeJSONResponse(w, http.StatusOK, resp)
 			} else {
+				if s.writeHolderAgentView(w, r, ra, false) {
+					return
+				}
 				writeJSONResponse(w, http.StatusOK, toDirectoryView(ra))
 			}
 			return
@@ -1528,16 +1553,23 @@ func (s *Server) proxyPeerGetMessages(w http.ResponseWriter, r *http.Request, ag
 	return true
 }
 
-// enrichRemoteAgentsLatestActivity refreshes the LastMessage preview and
-// UpdatedAt of every agent in `all` that lives on a remote peer (HolderPeer
-// != ""). Each enrichment is a one-message GET /messages?limit=1 against
-// the holder, parallel-fanned with a hard total deadline so a slow peer
-// can't stall the list endpoint.
+// enrichRemoteAgents refreshes every agent in `all` that lives on a
+// remote peer (HolderPeer != "") from its holder: the configuration
+// fields come from the holder's GET /agents/{id} (merged with the
+// hub-owned fields, see mergeHolderAgent) and — when withActivity is
+// nil or returns true — the LastMessage preview / UpdatedAt from a
+// one-message GET /messages?limit=1. Both reads are parallel-fanned
+// under one hard total deadline so a slow peer can't stall the list
+// endpoint.
 //
 // Mutates `all` in place. Best effort: agents whose holder is unreachable,
 // unsigned-peer, or whose response we can't parse are left with whatever
 // the local store had — the UI surfaces them as "転移中" anyway.
-func (s *Server) enrichRemoteAgentsLatestActivity(ctx context.Context, all []*agent.Agent) {
+// enrichRemoteAgentsConcurrency bounds concurrent per-agent holder
+// reads in enrichRemoteAgents.
+const enrichRemoteAgentsConcurrency = 8
+
+func (s *Server) enrichRemoteAgents(ctx context.Context, all []*agent.Agent, withActivity func(*agent.Agent) bool) {
 	if s.peerID == nil || s.agents.Store() == nil {
 		return
 	}
@@ -1565,12 +1597,68 @@ func (s *Server) enrichRemoteAgentsLatestActivity(ctx context.Context, all []*ag
 	ctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
 
+	// Cap in-flight holder reads: each job issues up to two peer
+	// requests (full agent read, up to holderAgentBodyLimit, plus the
+	// latest-message read), so an unbounded fan-out would scale memory
+	// and peer load with the fleet size.
+	sem := make(chan struct{}, enrichRemoteAgentsConcurrency)
 	var wg sync.WaitGroup
 	wg.Add(len(jobs))
 	for _, j := range jobs {
 		go func(j work) {
 			defer wg.Done()
-			ts, role, content, ok := s.fetchRemoteLatestMessage(ctx, j.agent.ID, j.agent.HolderPeer)
+			// Deadline hit while queued: skip the peer reads entirely
+			// (no post-deadline burst) and let the activity fall back
+			// to the local mirror below.
+			timedOut := false
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				timedOut = true
+			}
+			// Config read runs alongside the activity read; its merge
+			// is applied first so the activity update below compares
+			// against (and survives on) the merged row.
+			type holderRead struct {
+				merged *agent.Agent
+				ok     bool
+			}
+			cfgCh := make(chan holderRead, 1)
+			go func() {
+				if timedOut {
+					cfgCh <- holderRead{}
+					return
+				}
+				_, holder, ok := s.fetchHolderAgent(ctx, j.agent)
+				if !ok {
+					cfgCh <- holderRead{}
+					return
+				}
+				cfgCh <- holderRead{merged: s.mergeHolderAgent(ctx, j.agent, holder), ok: true}
+			}()
+			wantActivity := withActivity == nil || withActivity(j.agent)
+			var (
+				ts, role, content string
+				ok                bool
+			)
+			if wantActivity && !timedOut {
+				ts, role, content, ok = s.fetchRemoteLatestMessage(ctx, j.agent.ID, j.agent.HolderPeer)
+			}
+			if cfg := <-cfgCh; cfg.ok {
+				// Keep the hub's activity keys; the activity read below
+				// (or the mirror fallback) advances them.
+				merged := *cfg.merged
+				merged.LastMessage = j.agent.LastMessage
+				merged.LastMessageAt = j.agent.LastMessageAt
+				if !isRFC3339After(merged.UpdatedAt, j.agent.UpdatedAt) {
+					merged.UpdatedAt = j.agent.UpdatedAt
+				}
+				*j.agent = merged
+			}
+			if !wantActivity {
+				return
+			}
 			if !ok || ts == "" {
 				// holder offline 等で fetch 失敗 — 直前の成功 proxy
 				// 時に書いた remote_message_mirror から最新行を引いて

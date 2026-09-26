@@ -42,7 +42,8 @@ func (s *Server) RunNativeGoalRecovery(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.recoverNativeGoals("", "", true)
-			s.retryStalledGoalHandoffResumes()
+			blocked := s.reconcileResolvedGoalHandoffs()
+			s.retryStalledGoalHandoffResumes(blocked)
 		}
 	}
 }
@@ -56,7 +57,7 @@ const goalHandoffResumeGrace = 2 * time.Minute
 // command, or the daemon restarted in between). Bounded per handoff; the
 // origin stop check is repeated on every attempt so a stop issued after
 // finalize still fences the resume.
-func (s *Server) retryStalledGoalHandoffResumes() {
+func (s *Server) retryStalledGoalHandoffResumes(blocked map[pendingSyncKey]struct{}) {
 	if s.agents == nil || s.peerID == nil || s.agents.NativeGoalsShuttingDown() {
 		return
 	}
@@ -66,33 +67,101 @@ func (s *Server) retryStalledGoalHandoffResumes() {
 			if b.Handoff == nil || b.State == nil {
 				continue
 			}
-			if !s.agents.ClaimGoalHandoffResume(id, b.SessionKey, b.Handoff.ID) {
+			if _, unresolved := blocked[pendingSyncKey{AgentID: id, OpID: b.Handoff.ID}]; unresolved {
 				continue
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			// A temporary source outage must not consume the bounded resume
+			// budget: no resume has been dispatched yet. Authorize the exact
+			// enumerated handoff first, then atomically claim its next attempt;
+			// ClaimGoalHandoffResume rechecks the operation identity and phase
+			// so a stale enumeration cannot be dispatched after this check.
 			origin := b.OriginPeerID
 			if origin == "" {
 				origin = b.Handoff.SourcePeerID
 			}
-			err := s.callGoalHandoffOrigin(ctx, origin, goalHandoffOriginRequest{Action: "check", OpID: b.Handoff.ID, AgentID: id})
-			if err == nil {
-				req := goalRecoveryRequest{AgentID: id, SessionKey: b.SessionKey, ThreadID: b.State.ThreadID, Generation: b.Generation, UserID: b.UserID, RunID: b.RunID, HolderID: self, HandoffID: b.Handoff.ID}
-				// Same routing as finalize: main WebUI follows the agent, Slack
-				// retains the original Hub.
-				if b.SessionKey != "" && b.OriginPeerID != "" && b.OriginPeerID != self {
-					err = s.requestGoalRecovery(ctx, b.OriginPeerID, req)
-				} else {
-					err = s.resumeGoalSurface(ctx, req)
-				}
+			checkCtx, checkCancel := context.WithTimeout(context.Background(), 20*time.Second)
+			err := s.callGoalHandoffOrigin(checkCtx, origin, goalHandoffOriginRequest{Action: "check", OpID: b.Handoff.ID, AgentID: id})
+			checkCancel()
+			if err != nil {
+				s.logger.Warn("goal handoff resume authorization unavailable; retry not charged", "agent", id, "sessionKey", b.SessionKey, "handoff", b.Handoff.ID, "err", err)
+				continue
+			}
+			claimed, ok := s.agents.ClaimGoalHandoffResume(id, b.SessionKey, b.Handoff.ID)
+			if !ok || claimed.Handoff == nil || claimed.State == nil {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			req := goalRecoveryRequest{AgentID: id, SessionKey: claimed.SessionKey, ThreadID: claimed.State.ThreadID, Generation: claimed.Generation, UserID: claimed.UserID, RunID: claimed.RunID, HolderID: self, HandoffID: claimed.Handoff.ID}
+			// Same routing as finalize: main WebUI follows the agent, Slack
+			// retains the original Hub.
+			if claimed.SessionKey != "" && claimed.OriginPeerID != "" && claimed.OriginPeerID != self {
+				err = s.requestGoalRecovery(ctx, claimed.OriginPeerID, req)
+			} else {
+				err = s.resumeGoalSurface(ctx, req)
 			}
 			cancel()
 			if err != nil {
-				s.logger.Warn("goal handoff resume retry not admitted; explicit resume available", "agent", id, "sessionKey", b.SessionKey, "handoff", b.Handoff.ID, "attempt", b.Handoff.ResumeAttempts+1, "err", err)
+				s.logger.Warn("goal handoff resume retry not admitted; explicit resume available", "agent", id, "sessionKey", claimed.SessionKey, "handoff", claimed.Handoff.ID, "attempt", claimed.Handoff.ResumeAttempts, "err", err)
 			} else {
-				s.logger.Info("goal handoff resume re-dispatched", "agent", id, "sessionKey", b.SessionKey, "handoff", b.Handoff.ID, "attempt", b.Handoff.ResumeAttempts+1)
+				s.logger.Info("goal handoff resume re-dispatched", "agent", id, "sessionKey", claimed.SessionKey, "handoff", claimed.Handoff.ID, "attempt", claimed.Handoff.ResumeAttempts)
 			}
 		}
 	}
+}
+
+// reconcileResolvedGoalHandoffs retires a pending finalize row only after the
+// exact GoalBinding proves that the asynchronous resume reached backend
+// admission (resuming/resumed) or reached a terminal no-resume decision. It
+// shares finalize's per-agent lock so reconciliation cannot race a retry.
+func (s *Server) reconcileResolvedGoalHandoffs() map[pendingSyncKey]struct{} {
+	blocked := map[pendingSyncKey]struct{}{}
+	if s.agents == nil || s.peerID == nil {
+		return blocked
+	}
+	for id, bindings := range s.agents.ResolvedGoalHandoffs(s.peerID.DeviceID) {
+		for _, b := range bindings {
+			if b.Handoff == nil {
+				continue
+			}
+			op := b.Handoff.ID
+			key := pendingSyncKey{AgentID: id, OpID: op}
+			err := s.reconcileResolvedGoalHandoff(id, b)
+			if err != nil {
+				blocked[key] = struct{}{}
+				s.logger.Warn("goal handoff pending finalize reconciliation failed", "agent", id, "handoff", op, "err", err)
+			}
+		}
+	}
+	return blocked
+}
+
+func (s *Server) reconcileResolvedGoalHandoff(id string, b agent.GoalBinding) error {
+	if b.Handoff == nil {
+		return nil
+	}
+	op := b.Handoff.ID
+	unlock := s.lockPendingFinalize(pendingSyncKey{AgentID: id})
+	defer unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	entry, ok, err := s.consumePendingAgentSync(ctx, id, op)
+	if err != nil || !ok {
+		return err
+	}
+	if !entry.IncomingFenced || entry.SourceDeviceID == "" || entry.SourceDeviceID != b.Handoff.SourcePeerID {
+		return errors.New("pending finalize identity does not match resolved goal handoff")
+	}
+	if !entry.ArrivalHandled || entry.ArrivalUncertain {
+		entry.ArrivalUncertain = false
+		entry.ArrivalHandled = true
+		if err := s.updatePendingAgentSyncAfterSideEffect(ctx, id, op, entry); err != nil {
+			return err
+		}
+	}
+	if err := s.agents.Store().FinishIncomingHandoff(ctx, id, op); err != nil {
+		return err
+	}
+	return s.commitPendingAgentSync(ctx, id, op)
 }
 func (s *Server) recoverNativeGoals(onlyID, excludeKey string, pendingOnly bool) {
 	if s.agents == nil || s.agents.NativeGoalsShuttingDown() {
@@ -169,7 +238,10 @@ func (s *Server) handlePeerGoalResume(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "bad_request", err.Error())
 		return
 	}
-	if p.IsPeer() && p.PeerID != req.HolderID {
+	// Paired peers reaching the Hub-public listener are stamped RoleOwner with
+	// PeerID. Bind either peer-shaped principal to the claimed holder; only a
+	// local Owner without a peer identity may act without this comparison.
+	if p.PeerID != "" && p.PeerID != req.HolderID {
 		writeError(w, 403, "forbidden", "holder identity mismatch")
 		return
 	}

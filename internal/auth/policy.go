@@ -234,10 +234,12 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			// run inside the handler.
 			return true
 		}
-		if method == http.MethodPost && (path == "/api/v1/peers/handoff/arrival" || path == "/api/v1/peers/handoff/arrival/bind" || path == "/api/v1/peers/goals/resume" || path == "/api/v1/peers/goals/handoff") {
+		if method == http.MethodPost && (path == "/api/v1/peers/handoff/arrival" || path == "/api/v1/peers/handoff/arrival/bind" || path == "/api/v1/peers/goals/resume" || path == "/api/v1/peers/goals/handoff" || path == "/api/v1/peers/keyed-background/notify") {
 			// Target holder asks the origin Hub to resume the exact external
-			// conversation that initiated a completed device switch. The
-			// handler binds holder_device_id to the authenticated PeerID.
+			// conversation that initiated a completed device switch (or, for
+			// keyed-background/notify, to continue a lingering session's
+			// background turn). The handler binds the holder id to the
+			// authenticated PeerID.
 			return true
 		}
 		// kojo-attach hub-ingest path.
@@ -516,6 +518,10 @@ func isSelfScopedRoute(method, sub string) bool {
 		return false
 	case "/tasks":
 		return method == http.MethodGet || method == http.MethodPost
+	case "/background-sessions":
+		// Agent lists its own thread sessions still running
+		// run_in_background tasks (keyed lingering sessions).
+		return method == http.MethodGet
 	case "/attention":
 		// Non-blocking "look at me" page: POST raises it, DELETE
 		// retracts it. Self only — an agent must not be able to
@@ -561,6 +567,10 @@ func isSelfScopedRoute(method, sub string) bool {
 		return method == http.MethodPatch || method == http.MethodDelete || method == http.MethodPost
 	case strings.HasPrefix(sub, "/tasks/"):
 		return method == http.MethodPatch || method == http.MethodDelete
+	case strings.HasPrefix(sub, "/background-sessions/"):
+		// DELETE .../background-sessions/{key}[/tasks/{taskId}]: the
+		// agent stops its own lingering thread session / task.
+		return method == http.MethodDelete
 	case strings.HasPrefix(sub, "/credentials/"):
 		return method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete || method == http.MethodPost
 	}

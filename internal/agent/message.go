@@ -103,8 +103,12 @@ type ChatEvent struct {
 	Message         *Message            `json:"message,omitempty"`
 	Attachments     []MessageAttachment `json:"attachments,omitempty"` // streamed kojo-attach files
 	attachmentClaim *attachmentOwnership
-	Usage           *Usage `json:"usage,omitempty"`
-	ErrorMessage    string `json:"errorMessage,omitempty"`
+	// textSegmentStart marks the first delta of a new assistant text segment
+	// (Claude text content block, Codex agentMessage item). Holder-local only:
+	// the Slack no-reply filter consumes it before events leave the process.
+	textSegmentStart bool
+	Usage            *Usage `json:"usage,omitempty"`
+	ErrorMessage     string `json:"errorMessage,omitempty"`
 	// ErrorCode preserves the backend classification separately from human-readable text.
 	ErrorCode string `json:"errorCode,omitempty"`
 	// ParentToolUseID is set when this event originates from a subagent
@@ -133,6 +137,15 @@ type ChatEvent struct {
 	// backend stream. Populated only on "rate_limit" events, which arrive
 	// mid-turn whenever the Claude CLI reports a usage threshold crossing.
 	RateLimit *RateLimitInfo `json:"rateLimit,omitempty"`
+	// BackgroundTasksPending is set on a keyed turn's terminal "done" when the
+	// CLI process lingers because this many background tasks are still
+	// running; their completion arrives later as a keyed background turn.
+	BackgroundTasksPending int `json:"backgroundTasksPending,omitempty"`
+	// SteeredIntoBackground marks a keyed turn's synthetic "done" when its
+	// user message was steered into a running background notification turn
+	// instead (the reply arrives via the keyed background handler). Surfaces
+	// must post nothing for it.
+	SteeredIntoBackground bool `json:"steeredIntoBackground,omitempty"`
 }
 
 type attachmentOwnership struct {

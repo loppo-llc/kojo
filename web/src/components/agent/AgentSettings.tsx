@@ -619,7 +619,13 @@ export function AgentSettings() {
     }
   };
 
+  // Remote-held agent served from the hub's fallback row: its values
+  // may predate saves made on the holder, and the PATCH carries every
+  // field, so saving would silently revert them.
+  const holderSnapshotStale = !!agent?.holderPeer && !!agent?.holderSnapshotStale;
+
   const handleSave = async () => {
+    if (holderSnapshotStale) return;
     setSaving(true);
     setError("");
     setSuccess(false);
@@ -2200,12 +2206,19 @@ export function AgentSettings() {
         {/* Sticky save bar — appears at the bottom of the pane whenever the
             form has unsaved changes (or a banner needs attention) and covers
             every field, TTS included, via handleSave. */}
-        {(dirty || saving || error || success || checkinNotice) && (
+        {(dirty || saving || error || success || checkinNotice || holderSnapshotStale) && (
           <div className="sticky bottom-0 z-10 -mx-4 border-t border-hairline bg-app/95 px-4 py-3 backdrop-blur">
             <div className="space-y-2">
               {error && <Banner tone="error">{error}</Banner>}
               {success && <Banner tone="success">{t("common.saved")}</Banner>}
               {checkinNotice && <Banner tone="warn">{checkinNotice}</Banner>}
+              {holderSnapshotStale && (
+                <Banner tone="warn">
+                  {t("settings.holderSnapshotStale", {
+                    peer: agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8),
+                  })}
+                </Banner>
+              )}
               {(dirty || saving) && (
                 <div className="flex items-center gap-2">
                   <span className="min-w-0 flex-1 truncate text-[12px] text-ink-faint">
@@ -2218,7 +2231,7 @@ export function AgentSettings() {
                     variant="primary"
                     onClick={handleSave}
                     disabled={
-                      saving || customAPIKeySaving ||
+                      saving || customAPIKeySaving || holderSnapshotStale ||
                       (needsCustomURL && customModelsStatus === "loading") ||
                       customConnectionNeedsCompletion
                     }

@@ -608,3 +608,46 @@ func TestHandleGetGroupDMLive_ActiveSnapshotThenClears(t *testing.T) {
 	}
 	t.Fatalf("live snapshot still active after turn completed")
 }
+
+// TestHandleCreateThread_RemoteHeldAgent verifies the Hub can open a thread
+// with an agent whose runtime was device-switched to another peer: the agent
+// is gone from the local Manager map but agent_locks names a holder, and the
+// holder-aware one-shot router forwards thread turns there.
+func TestHandleCreateThread_RemoteHeldAgent(t *testing.T) {
+	srv, gdm, _, remote := newGroupDMHandlerTestServer(t)
+	srv.agents.TeardownAgentRuntime(remote.ID)
+	if _, ok := srv.agents.Get(remote.ID); ok {
+		t.Fatal("agent still local after teardown")
+	}
+	now := time.Now().UnixMilli()
+	if _, err := srv.agents.Store().AcquireAgentLock(context.Background(), remote.ID, "peer-remote", now, int64(time.Hour/time.Millisecond)); err != nil {
+		t.Fatalf("acquire lock: %v", err)
+	}
+
+	mk := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/threads", strings.NewReader(`{"agentId":"`+remote.ID+`"}`))
+		rr := httptest.NewRecorder()
+		srv.handleCreateThread(rr, authedRequest(req, auth.Principal{Role: auth.RoleOwner}))
+		return rr
+	}
+
+	// Without the holder-aware router the local Manager could not answer.
+	if rr := mk(); rr.Code != http.StatusBadRequest {
+		t.Fatalf("no-router status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	gdm.SetOneShotRouter(func(ctx context.Context, agentID, userMessage string, opts agent.OneShotOpts) (<-chan agent.ChatEvent, error) {
+		ch := make(chan agent.ChatEvent)
+		close(ch)
+		return ch, nil
+	})
+	rr := mk()
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("remote thread status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var th agent.GroupDM
+	readJSONResponse(t, rr, &th)
+	if th.Kind != agent.GroupDMKindThread || len(th.Members) != 1 || th.Members[0].AgentID != remote.ID || th.Members[0].AgentName != remote.Name {
+		t.Fatalf("thread = %+v", th)
+	}
+}

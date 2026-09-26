@@ -150,6 +150,11 @@ export interface AgentInfo {
   // add/edit/delete, etc.) that would 409 with agent_busy and show a
   // banner instead.
   isSwitching?: boolean;
+  // holderSnapshotStale is true when a remote-held agent's record was
+  // served from the hub's own (possibly stale) row because the holder
+  // could not be read. Settings must not submit a full-form save built
+  // from it — it would overwrite the holder's newer values.
+  holderSnapshotStale?: boolean;
   // disabledInjections lists context-injection keys turned OFF for this
   // agent (see CONTEXT_INJECTION_KEYS below). Absent/empty means every
   // injection is enabled — the common case, so the server omits the

@@ -111,10 +111,10 @@ describe("toolModels — Opus 5 / effort defaults", () => {
   it("lists exactly the public codex models, newest first, and defaults to gpt-6-astra", () => {
     // codex CLI 0.155.0 models_cache.json, visibility "list" only —
     // gpt-reserve and codex-auto-review are hidden and stay out. The gpt-6
-    // trio keeps the cache's own order (sol, astra, luna).
+    // trio keeps the cache's own order (astra, sol, luna).
     expect(modelsForTool("codex")).toEqual([
-      "gpt-6-sol",
       "gpt-6-astra",
+      "gpt-6-sol",
       "gpt-6-luna",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
@@ -128,13 +128,13 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(defaultModelForTool("codex")).toBe("gpt-6-astra");
   });
 
-  it("gpt-6 family supports xhigh and max; astra defaults to low, sol and luna to medium", () => {
+  it("gpt-6 family supports xhigh and max and defaults to medium", () => {
     // codex CLI 0.155.0 models_cache.json default_reasoning_level.
     for (const m of ["gpt-6-sol", "gpt-6-astra", "gpt-6-luna"]) {
       expect(effortLevelsForModel(m)).toEqual(["low", "medium", "high", "xhigh", "max"]);
     }
     expect(defaultEffortForModel("gpt-6-sol")).toBe("medium");
-    expect(defaultEffortForModel("gpt-6-astra")).toBe("low");
+    expect(defaultEffortForModel("gpt-6-astra")).toBe("medium");
     expect(defaultEffortForModel("gpt-6-luna")).toBe("medium");
   });
 
@@ -155,8 +155,8 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     }
   });
 
-  it("gpt-5.6 family defaults to medium (codex CLI 0.155.0 moved sol off low)", () => {
-    expect(defaultEffortForModel("gpt-5.6-sol")).toBe("medium");
+  it("gpt-5.6-sol defaults to low; terra and luna default to medium", () => {
+    expect(defaultEffortForModel("gpt-5.6-sol")).toBe("low");
     expect(defaultEffortForModel("gpt-5.6-terra")).toBe("medium");
     expect(defaultEffortForModel("gpt-5.6-luna")).toBe("medium");
   });

@@ -225,7 +225,7 @@ func TestBuildEffortClassifierPromptCaps(t *testing.T) {
 }
 
 // withFakeJevClassifier swaps the classifyEffortJev seam for a test.
-func withFakeJevClassifier(t *testing.T, fn func(ctx context.Context, apiKey, diary, msg string) (string, error)) {
+func withFakeJevClassifier(t *testing.T, fn func(ctx context.Context, apiKey, msg string) (string, error)) {
 	t.Helper()
 	orig := classifyEffortJev
 	classifyEffortJev = fn
@@ -246,9 +246,9 @@ func TestResolveTurnEffortJevPreferredOverCLI(t *testing.T) {
 		t.Fatal("claude classifier must not run when Jev answers")
 		return "", nil
 	})
-	var gotKey, gotDiary, gotMsg string
-	withFakeJevClassifier(t, func(_ context.Context, key, diary, msg string) (string, error) {
-		gotKey, gotDiary, gotMsg = key, diary, msg
+	var gotKey, gotMsg string
+	withFakeJevClassifier(t, func(_ context.Context, key, msg string) (string, error) {
+		gotKey, gotMsg = key, msg
 		return "low", nil
 	})
 	a := &Agent{Tool: "claude", Model: "sonnet", Effort: "high"}
@@ -256,14 +256,14 @@ func TestResolveTurnEffortJevPreferredOverCLI(t *testing.T) {
 	if eff != "low" || src != "jev:low" {
 		t.Fatalf("got (%q,%q), want (low,jev:low)", eff, src)
 	}
-	if gotKey != "ts-key" || gotDiary != "diary tail" || gotMsg != "thanks" {
-		t.Fatalf("jev inputs = (%q,%q,%q)", gotKey, gotDiary, gotMsg)
+	if gotKey != "ts-key" || gotMsg != "thanks" {
+		t.Fatalf("jev inputs = (%q,%q)", gotKey, gotMsg)
 	}
 }
 
 func TestResolveTurnEffortJevWorksWithoutClaudeCLI(t *testing.T) {
 	noClaudeInPath(t)
-	withFakeJevClassifier(t, func(context.Context, string, string, string) (string, error) {
+	withFakeJevClassifier(t, func(context.Context, string, string) (string, error) {
 		return "medium", nil
 	})
 	a := &Agent{Tool: "grok", Model: "grok-4", Effort: "high"}
@@ -275,7 +275,7 @@ func TestResolveTurnEffortJevWorksWithoutClaudeCLI(t *testing.T) {
 
 func TestResolveTurnEffortJevErrorFallsBackToCLI(t *testing.T) {
 	requireClaudeInPath(t)
-	withFakeJevClassifier(t, func(context.Context, string, string, string) (string, error) {
+	withFakeJevClassifier(t, func(context.Context, string, string) (string, error) {
 		return "", errors.New("typesafe: HTTP 503")
 	})
 	withFakeClassifier(t, fakeClassifierReturning("medium"))
@@ -288,7 +288,7 @@ func TestResolveTurnEffortJevErrorFallsBackToCLI(t *testing.T) {
 
 func TestResolveTurnEffortJevErrorNoCLIUsesHeuristic(t *testing.T) {
 	noClaudeInPath(t)
-	withFakeJevClassifier(t, func(context.Context, string, string, string) (string, error) {
+	withFakeJevClassifier(t, func(context.Context, string, string) (string, error) {
 		return "", context.DeadlineExceeded
 	})
 	a := &Agent{Tool: "claude", Model: "sonnet", Effort: "high"}
@@ -306,7 +306,7 @@ func TestResolveTurnEffortJevErrorNoCLIUsesHeuristic(t *testing.T) {
 
 func TestResolveTurnEffortJevTimeoutSkipsCLI(t *testing.T) {
 	requireClaudeInPath(t)
-	withFakeJevClassifier(t, func(context.Context, string, string, string) (string, error) {
+	withFakeJevClassifier(t, func(context.Context, string, string) (string, error) {
 		return "", context.DeadlineExceeded
 	})
 	withFakeClassifier(t, func(context.Context, string) (string, error) {
@@ -322,7 +322,7 @@ func TestResolveTurnEffortJevTimeoutSkipsCLI(t *testing.T) {
 
 func TestResolveTurnEffortJevCancelledTurnStaysStatic(t *testing.T) {
 	requireClaudeInPath(t)
-	withFakeJevClassifier(t, func(ctx context.Context, _, _, _ string) (string, error) {
+	withFakeJevClassifier(t, func(ctx context.Context, _, _ string) (string, error) {
 		return "", ctx.Err()
 	})
 	withFakeClassifier(t, func(context.Context, string) (string, error) {
@@ -340,7 +340,7 @@ func TestResolveTurnEffortJevCancelledTurnStaysStatic(t *testing.T) {
 
 func TestResolveTurnEffortJevNotCalledWithoutKey(t *testing.T) {
 	requireClaudeInPath(t)
-	withFakeJevClassifier(t, func(context.Context, string, string, string) (string, error) {
+	withFakeJevClassifier(t, func(context.Context, string, string) (string, error) {
 		t.Fatal("jev must not be called without a key")
 		return "", nil
 	})
@@ -396,15 +396,15 @@ func TestRunJevEffortClassifierRequestShape(t *testing.T) {
 		}}, nil
 	}
 	long := strings.Repeat("x", effortClassifierMessageCap+50)
-	tier, err := runJevEffortClassifier(context.Background(), "k", strings.Repeat("d", effortClassifierDiaryCap+50), long)
+	tier, err := runJevEffortClassifier(context.Background(), "k", long)
 	if err != nil || tier != "high" {
 		t.Fatalf("got (%q,%v)", tier, err)
 	}
 	if len([]rune(gotState["message"])) != effortClassifierMessageCap {
 		t.Fatalf("message not capped: %d", len([]rune(gotState["message"])))
 	}
-	if len([]rune(gotState["recent_context"])) != effortClassifierDiaryCap {
-		t.Fatalf("diary not capped: %d", len([]rune(gotState["recent_context"])))
+	if _, ok := gotState["recent_context"]; ok {
+		t.Fatal("historical diary context must not be sent to Jev")
 	}
 	q, ok := gotQ["effort"]
 	if !ok || q.Type != "choice" {
@@ -417,17 +417,11 @@ func TestRunJevEffortClassifierRequestShape(t *testing.T) {
 		}
 	}
 
-	// Empty diary → no recent_context key at all.
-	_, _ = runJevEffortClassifier(context.Background(), "k", "  ", "hi")
-	if _, ok := gotState["recent_context"]; ok {
-		t.Fatal("empty diary must not be sent")
-	}
-
 	// Missing answer → error.
 	jevCall = func(context.Context, string, any, map[string]jevQuestion) (*jevResponse, error) {
 		return &jevResponse{Answers: map[string]jevAnswer{"other": {}}}, nil
 	}
-	if _, err := runJevEffortClassifier(context.Background(), "k", "", "hi"); err == nil {
+	if _, err := runJevEffortClassifier(context.Background(), "k", "hi"); err == nil {
 		t.Fatal("expected error for missing effort answer")
 	}
 }

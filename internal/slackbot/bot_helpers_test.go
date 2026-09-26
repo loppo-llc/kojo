@@ -75,6 +75,8 @@ func TestNoReplyResponseMatching(t *testing.T) {
 	}{
 		{name: "exact", text: noReplyToken, want: true},
 		{name: "surrounding whitespace", text: " \n" + noReplyToken + "\t", want: true},
+		{name: "repeated tokens (older holder)", text: noReplyToken + noReplyToken + "\n" + noReplyToken, want: true},
+		{name: "token then prose", text: noReplyToken + noReplyToken + "了解", want: false},
 		{name: "discussion", text: noReplyToken + " means silence", want: false},
 		{name: "embedded", text: "Use " + noReplyToken, want: false},
 		{name: "empty", text: "", want: false},

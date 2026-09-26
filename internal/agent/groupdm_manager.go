@@ -229,6 +229,13 @@ type GroupDMManager struct {
 	// agentMgr.ChatOneShot; overridable in tests to stub the agent turn.
 	oneShot                 func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error)
 	holderAttachmentCapture bool
+	// remoteThreadMembers reports that oneShot is the holder-aware router
+	// (Hub only), so a thread room may target an agent whose runtime is
+	// held by another peer: its turns are forwarded to that holder rather
+	// than executed by the local Manager. Peer-only daemons and the
+	// default local oneShot leave this false, keeping thread creation
+	// restricted to locally-running agents that can actually answer.
+	remoteThreadMembers bool
 	// steerOneShot injects into the holder-local one-shot behind a thread
 	// room. The Hub replaces this with its external-chat router so WebUI
 	// steers follow a thread turn that is executing on a remote holder.
@@ -412,6 +419,7 @@ func (m *GroupDMManager) ThreadLive(groupID string) (active bool, snapshot Threa
 func (m *GroupDMManager) SetOneShotForTesting(fn func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error)) {
 	m.oneShot = fn
 	m.holderAttachmentCapture = false
+	m.remoteThreadMembers = false
 }
 
 // SetOneShotRouter installs the production response-surface router used by
@@ -420,6 +428,7 @@ func (m *GroupDMManager) SetOneShotForTesting(fn func(ctx context.Context, agent
 func (m *GroupDMManager) SetOneShotRouter(fn func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error)) {
 	m.oneShot = fn
 	m.holderAttachmentCapture = true
+	m.remoteThreadMembers = true
 }
 
 // SetOneShotSteerRouter installs the holder-aware steer companion to
@@ -624,7 +633,7 @@ func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int, s
 // it separately. One member means a human↔agent DM (the human operator is
 // an implicit participant of every room); two members is an agent↔agent DM.
 func (m *GroupDMManager) FindOrCreateDM(memberIDs []string) (*GroupDM, bool, error) {
-	members, err := m.resolveMembers(memberIDs)
+	members, err := m.resolveMembers(memberIDs, uniqueMemberCount(memberIDs) == 1)
 	if err != nil {
 		return nil, false, err
 	}
@@ -717,7 +726,14 @@ func (m *GroupDMManager) create(name string, memberIDs []string, cooldown int, s
 		return nil, ErrGroupTooFew
 	}
 
-	members, err := m.resolveMembers(memberIDs)
+	// Only thread rooms (kind "thread", or the legacy single-agent "dm")
+	// run their turns through the holder-aware oneShot router, so only
+	// they may target an agent currently held by another peer. Classic
+	// groups and two-agent DMs deliver via the local Manager.Chat fan-out
+	// and must keep requiring a locally-running member.
+	allowRemote := kind == GroupDMKindThread ||
+		(kind == GroupDMKindDM && uniqueMemberCount(memberIDs) == 1)
+	members, err := m.resolveMembers(memberIDs, allowRemote)
 	if err != nil {
 		return nil, err
 	}
@@ -767,7 +783,7 @@ func (m *GroupDMManager) create(name string, memberIDs []string, cooldown int, s
 	// this re-check we'd publish a group containing a now-archived (and
 	// already-removed-from-other-groups) or now-deleted agent.
 	for _, mem := range members {
-		a, ok := m.agentMgr.Get(mem.AgentID)
+		a, ok := m.lookupMember(mem.AgentID, allowRemote)
 		if !ok {
 			m.mu.Unlock()
 			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, mem.AgentID)
@@ -1025,6 +1041,15 @@ func (m *GroupDMManager) Delete(id string, notify bool) error {
 	// Thread teardown: abort a running turn and remove its session artifact.
 	if isThread {
 		m.cancelThreadTurn(id)
+		// A lingering keyed process (background tasks) would otherwise keep
+		// running for a room that no longer exists and re-create the JSONL.
+		if m.agentMgr != nil {
+			if cb := m.agentMgr.claudeBackend(); cb != nil {
+				cb.CloseKeyedSessionSync(threadAgentID, "groupdm:"+id, keyedThreadDeletedReason)
+			}
+			// One-time notes for the room can never be delivered now.
+			m.agentMgr.dropKeyedNotesAfterExitNotices(threadAgentID, "groupdm:"+id)
+		}
 		removeClaudeSession(threadAgentID, "groupdm:"+id)
 	}
 
@@ -1524,7 +1549,7 @@ func threadAttachmentPrompt(stageDir string) string {
 }
 
 // runThreadTurn executes one temporary side-thread turn for a thread room
-// (kind "dm", single agent member). It resumes a per-thread Claude session so
+// (kind "thread", or a legacy single-member "dm"). It resumes a per-thread Claude session so
 // successive posts share context, but stays isolated from the agent's main
 // chat. Serialized per room so two rapid posts never --resume the same session
 // concurrently; the reply is posted daemon-authored on the agent's behalf,
@@ -1730,7 +1755,7 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 	// (or the turn fails or is cancelled) — deferred cleanup covers
 	// every one of those exits uniformly.
 	var agentModel, agentEffort string
-	if a, ok := m.agentMgr.Get(agentID); ok {
+	if a, ok := m.threadAgentInfo(agentID); ok {
 		agentModel = a.Model
 		agentEffort = a.Effort
 	}
@@ -1763,6 +1788,10 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 		ForceFreshSession:                 forceFresh,
 		ExpectedHolderPeer:                expectedHolder,
 		HandoffArrivalReservation:         arrivalReservation,
+		// Keep the thread's claude process alive while run_in_background
+		// tasks are pending; their completion turns come back through
+		// HandleKeyedBackgroundTurn. Honored only for a Hub-local dispatch.
+		LingerBackgroundTasks: true,
 	}
 	if captureOnHolder {
 		oneShotOpts.SystemPromptExtra = threadSystemPromptExtra
@@ -1798,6 +1827,46 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 		return
 	}
 
+	m.consumeThreadTurn(ctx, events, threadTurnOutput{
+		agentID:            agentID,
+		groupID:            groupID,
+		payload:            payload,
+		agentModel:         agentModel,
+		agentEffort:        agentEffort,
+		replyMessageID:     replyMessageID,
+		attachmentStageDir: attachmentStageDir,
+		attachmentWatcher:  attachmentWatcher,
+		firstUserMessage:   firstUserMessage,
+	})
+}
+
+// threadFinalizeHook is a test seam: consumeThreadTurn calls it after the
+// attachment scan ("scanned") and after auto-titling ("titled"), the windows
+// in which a lifecycle cancel must still discard the reply.
+var threadFinalizeHook func(stage string)
+
+// threadTurnOutput carries the inputs consumeThreadTurn needs to post a
+// thread turn's reply.
+type threadTurnOutput struct {
+	agentID, groupID        string
+	payload                 string // dead-letter payload on failure
+	agentModel, agentEffort string
+	replyMessageID          string
+	attachmentStageDir      string
+	attachmentWatcher       *attachWatcher // nil when attachments are captured on the holder
+	firstUserMessage        string         // "" disables auto-titling
+}
+
+// consumeThreadTurn drains a thread turn's event stream into the live
+// snapshot and posts the resulting reply daemon-authored into the room: the
+// shared tail of a user-triggered thread turn and of a keyed background
+// (task-notification) turn. The caller registers the turn's cancel in
+// threadCancels (StopThreadTurn / archive) and the live snapshot.
+func (m *GroupDMManager) consumeThreadTurn(ctx context.Context, events <-chan ChatEvent, o threadTurnOutput) {
+	agentID, groupID, payload := o.agentID, o.groupID, o.payload
+	agentModel, agentEffort := o.agentModel, o.agentEffort
+	replyMessageID, attachmentStageDir := o.replyMessageID, o.attachmentStageDir
+	attachmentWatcher, firstUserMessage := o.attachmentWatcher, o.firstUserMessage
 	var reply strings.Builder
 	var doneText string
 	var streamErr string
@@ -1806,6 +1875,8 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 	var toolUses []ToolUse
 	var replyAttachments []MessageAttachment
 	var attachmentClaims []ChatEvent
+	var backgroundPending int
+	var steeredIntoBackground bool
 	attachmentClaimsFinished := false
 	finishAttachmentClaims := func(accepted bool) {
 		if attachmentClaimsFinished {
@@ -1872,6 +1943,8 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 				thinking = ev.Message.Thinking
 				toolUses = ev.Message.ToolUses
 			}
+			backgroundPending = ev.BackgroundTasksPending
+			steeredIntoBackground = ev.SteeredIntoBackground
 		case "error":
 			if streamErr == "" {
 				streamErr = ev.ErrorMessage
@@ -1905,6 +1978,19 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 	delete(m.threadCancels, groupID)
 	delete(m.threadStopped, groupID)
 	m.threadCancelMu.Unlock()
+	if stopped && backgroundPending == 0 && m.agentMgr != nil {
+		// A stopped turn's terminal event is dropped by the one-shot relay,
+		// so ask the (Hub-local) keyed session directly how many of its
+		// background tasks survive the stop.
+		backgroundPending = m.agentMgr.keyedBackgroundPending(agentID, webUIThreadKeyPrefix+groupID)
+	}
+
+	if steeredIntoBackground && streamErr == "" {
+		// The message was steered into the thread's running background
+		// (notification) turn; that turn posts the answer. Nothing to post.
+		m.agentMgr.deleteIngestedAttachments(replyAttachments)
+		return
+	}
 
 	// Stop live capture only after unregistering the completed turn. A large
 	// attachment may take time to finish forwarding; a stop request during
@@ -1952,6 +2038,9 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 			m.agentMgr.scanAndIngestAttachmentsFromDirReserved(scanCtx, agentID, replyMessageID, attachmentStageDir, replyAttachments)...)
 		scanCancel()
 	}
+	if threadFinalizeHook != nil {
+		threadFinalizeHook("scanned")
+	}
 	// The generic scan keeps an already-empty directory for the next normal
 	// chat turn. Thread directories are per-room and must not accumulate after
 	// successful turns, including replies that attached no files.
@@ -1963,7 +2052,12 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 	archiveCancelled := archiveCtx.Err() != nil
 	m.threadCancelMu.Unlock()
 	archiveCancel()
-	if archiveCancelled {
+	// lifecycleCancelled: ctx was cancelled after the stream ended. Only a
+	// keyed background turn's lifecycle context (reset / delete / shutdown)
+	// can do that — a normal turn's cancel is unregistered above — so the
+	// partial result is discarded exactly like the archive path.
+	lifecycleCancelled := func() bool { return !stopped && ctx.Err() != nil }
+	if archiveCancelled || lifecycleCancelled() {
 		m.agentMgr.deleteIngestedAttachments(replyAttachments)
 		if stageDir, ok := safeStageDirAt(agentID, attachmentStageDir, m.logger); ok {
 			_ = os.RemoveAll(stageDir)
@@ -1981,7 +2075,7 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 		m.handleThreadTurnError(groupID, agentID, payload, errors.New(streamErr))
 		return
 	}
-	if text == "" && thinking == "" && len(toolUses) == 0 && len(replyAttachments) == 0 && !stopped {
+	if text == "" && thinking == "" && len(toolUses) == 0 && len(replyAttachments) == 0 && !stopped && backgroundPending == 0 {
 		// Nothing substantive to post. A stopped turn still posts an
 		// (empty) interrupted reply so the UI's "replying…" wait resolves
 		// with a visible outcome instead of hanging on the user's post.
@@ -1993,6 +2087,22 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 	// the first rename; empty replies (above) still skip titling entirely.
 	if firstUserMessage != "" {
 		m.maybeAutoTitleThread(groupID, agentID, firstUserMessage)
+	}
+	if backgroundPending > 0 {
+		// A stop ends only the turn: its background tasks keep running on
+		// the lingering process and report back here when done.
+		note := threadBackgroundPendingNote(backgroundPending)
+		if stopped {
+			note = threadStoppedBackgroundNote(backgroundPending)
+		}
+		text = strings.TrimSpace(text + "\n\n" + note)
+	}
+	if threadFinalizeHook != nil {
+		threadFinalizeHook("titled")
+	}
+	if lifecycleCancelled() {
+		m.agentMgr.deleteIngestedAttachments(replyAttachments)
+		return
 	}
 	if _, err := m.postThreadReplyWithAttachments(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, stopped, replyMessageID, replyAttachments, func() { finishAttachmentClaims(true) }); err != nil {
 		m.logger.Warn("failed to post thread reply", "group", groupID, "agent", agentID, "err", err)
@@ -2100,16 +2210,18 @@ func (m *GroupDMManager) postThreadReply(groupID, agentID, content, model, effor
 // messageID is allocated before the one-shot stream starts so attachment blob
 // ownership and the persisted group message use the same stable ID.
 func (m *GroupDMManager) postThreadReplyWithAttachments(groupID, agentID, content, model, effort string, usage *Usage, thinking string, toolUses []ToolUse, interrupted bool, messageID string, attachments []MessageAttachment, onPersisted func()) (*GroupMessage, error) {
+	// Resolve the display name before taking m.mu: for an agent held by
+	// another peer this reads the persisted row from the DB.
+	var senderName string
+	if a, ok := m.threadAgentInfo(agentID); ok {
+		senderName = a.Name
+	}
 	m.mu.Lock()
 	g, err := m.liveGroupLocked(groupID)
 	if err != nil {
 		m.mu.Unlock()
 		m.agentMgr.deleteIngestedAttachments(attachments)
 		return nil, err
-	}
-	var senderName string
-	if a, ok := m.agentMgr.Get(agentID); ok {
-		senderName = a.Name
 	}
 	memberIDs := make([]string, 0, len(g.Members))
 	for _, mem := range g.Members {
@@ -2173,6 +2285,11 @@ func (m *GroupDMManager) maybeAutoTitleThread(groupID, agentID, firstUserMessage
 	if title == "" {
 		return
 	}
+	// Resolved outside m.mu (may hit the DB for a remote-held agent).
+	agentName := ""
+	if a, ok := m.threadAgentInfo(agentID); ok {
+		agentName = a.Name
+	}
 
 	m.mu.Lock()
 	g, err := m.liveGroupLocked(groupID)
@@ -2188,10 +2305,6 @@ func (m *GroupDMManager) maybeAutoTitleThread(groupID, agentID, firstUserMessage
 	// created with DefaultThreadName; a legacy single-agent "dm" room was
 	// created with the agent's display name. Accept either as "still
 	// default" so both shapes auto-title exactly once.
-	agentName := ""
-	if a, ok := m.agentMgr.Get(agentID); ok {
-		agentName = a.Name
-	}
 	isDefault := g.Name == DefaultThreadName || g.Name == agentName
 	if !isDefault || title == g.Name {
 		m.mu.Unlock()
@@ -3554,7 +3667,40 @@ func (m *GroupDMManager) verifyActiveMemberLocked(g *GroupDM, callerAgentID stri
 // The reserved UserSenderID is rejected to prevent a stray agent record
 // (e.g. from hand-edited agents.json) from being added as a group member
 // and colliding with human-user messages in the transcript.
-func (m *GroupDMManager) resolveMembers(ids []string) ([]GroupMember, error) {
+// uniqueMemberCount counts distinct IDs, mirroring resolveMembers' dedup so
+// callers can decide whether a request describes a single-agent room.
+func uniqueMemberCount(ids []string) int {
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		seen[id] = true
+	}
+	return len(seen)
+}
+
+// lookupMember resolves an agent for membership checks. Locally-running
+// agents always resolve. When allowRemote is set and this manager routes
+// thread turns through the holder-aware router, an agent whose runtime is
+// held by another peer (§3.7 device switch) resolves from its persisted
+// row as well — without this, a Hub could not open a thread with an agent
+// that is currently away, even though the thread turn itself would be
+// forwarded to the holder.
+func (m *GroupDMManager) lookupMember(id string, allowRemote bool) (*Agent, bool) {
+	if a, ok := m.agentMgr.Get(id); ok {
+		return a, true
+	}
+	if !allowRemote || !m.remoteThreadMembers {
+		return nil, false
+	}
+	return m.agentMgr.GetRemoteHeld(id)
+}
+
+// threadAgentInfo resolves display/config fields for a thread room's agent,
+// falling back to the persisted row when the agent is held by another peer.
+func (m *GroupDMManager) threadAgentInfo(id string) (*Agent, bool) {
+	return m.lookupMember(id, true)
+}
+
+func (m *GroupDMManager) resolveMembers(ids []string, allowRemote bool) ([]GroupMember, error) {
 	seen := make(map[string]bool, len(ids))
 	var members []GroupMember
 	for _, id := range ids {
@@ -3565,7 +3711,7 @@ func (m *GroupDMManager) resolveMembers(ids []string) ([]GroupMember, error) {
 			continue
 		}
 		seen[id] = true
-		a, ok := m.agentMgr.Get(id)
+		a, ok := m.lookupMember(id, allowRemote)
 		if !ok {
 			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 		}

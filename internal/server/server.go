@@ -272,6 +272,10 @@ type Server struct {
 	// externalChatRelays authorizes short-lived Hub callbacks for files
 	// produced by an agent during a remotely dispatched Slack turn.
 	externalChatRelays *externalChatRelayRegistry
+	// keyedBg holds remote keyed background continuation state: holder-side
+	// buffered turns awaiting the Hub's attach, Hub-side notify dedup.
+	// Zero value is ready to use.
+	keyedBg keyedBgRegistry
 	// externalChatAttachmentAcks holds the application-level acknowledgement
 	// for holder-produced attachment events until the Hub response adapter has
 	// accepted their metadata. It is an embedded value so zero-value test
@@ -984,6 +988,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		mux.HandleFunc("POST /api/v1/peers/agent-sync/finalize", s.handlePeerAgentSyncFinalize)
 		mux.HandleFunc("POST /api/v1/peers/handoff/arrival/bind", s.handleHandoffArrivalBind)
 		mux.HandleFunc("POST /api/v1/peers/goals/resume", s.handlePeerGoalResume)
+		mux.HandleFunc("POST "+keyedBgNotifyPath, s.handlePeerKeyedBackgroundNotify)
 		mux.HandleFunc("POST /api/v1/peers/handoff/arrival", s.handleHandoffArrivalContinuation)
 		mux.HandleFunc("POST /api/v1/peers/agent-sync/drop", s.handlePeerAgentSyncDrop)
 	}
@@ -1151,6 +1156,12 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/agents/{id}/tasks", s.handleCreateTask)
 	mux.HandleFunc("PATCH /api/v1/agents/{id}/tasks/{taskId}", s.handleUpdateTask)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}/tasks/{taskId}", s.handleDeleteTask)
+
+	// Background sessions (thread sessions lingering for run_in_background
+	// tasks) — self-only; see guides/background-sessions.md.
+	mux.HandleFunc("GET /api/v1/agents/{id}/background-sessions", s.handleListBackgroundSessions)
+	mux.HandleFunc("DELETE /api/v1/agents/{id}/background-sessions/{key}", s.handleStopBackgroundSession)
+	mux.HandleFunc("DELETE /api/v1/agents/{id}/background-sessions/{key}/tasks/{taskId}", s.handleStopBackgroundTask)
 
 	// Pre-compaction summary (called by Claude Code's PreCompact hook)
 	mux.HandleFunc("POST /api/v1/agents/{id}/pre-compact", s.handlePreCompact)
@@ -1459,9 +1470,10 @@ type pendingSyncEntry struct {
 	SourceDeviceID string `json:"source_device_id,omitempty"`
 	IncomingFenced bool   `json:"incoming_fenced,omitempty"`
 	RawToken       string `json:"raw_token"`
-	// ArrivalHandled records that origin continuation admission or its legacy
-	// fallback already succeeded. ArrivalUncertain records an attempted origin
-	// delivery whose outcome cannot be distinguished after a transport loss.
+	// ArrivalHandled records that origin continuation admission, a terminal
+	// goal-handoff decision, or its legacy fallback has been resolved.
+	// ArrivalUncertain records an attempted origin delivery whose outcome cannot
+	// be distinguished after a transport loss.
 	// Both survive target restart so a later finalize retry never duplicates an
 	// earlier arrival decision.
 	ArrivalHandled   bool `json:"arrival_handled,omitempty"`

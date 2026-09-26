@@ -272,6 +272,20 @@ type Manager struct {
 	oneShotQuestions map[int64]*oneShotQuestionTurn // guarded by oneShotCancelsMu
 	oneShotSteersMu  sync.Mutex
 
+	// keyedBgHandlers routes unsolicited turns from keyed (Slack-thread)
+	// lingering claude sessions to the response surface that owns the key.
+	// keyedBgMu is a leaf lock (nothing else is taken while holding it;
+	// the keyed stop stores notes under claudeSession.mu: s.mu -> keyedBgMu).
+	keyedBgMu       sync.Mutex
+	keyedBgHandlers map[string]keyedBgRegistration
+	keyedBgSeq      int64
+	// keyedBgSteers holds the steer handle of a running thread keyed
+	// background turn (fallback of SteerOneShot); keyedNotes holds one-time
+	// agent-facing notes (tasks abandoned / not continued) injected into the
+	// key's next turn. Both guarded by keyedBgMu.
+	keyedBgSteers map[string]keyedBgSteer
+	keyedNotes    map[string]keyedNote
+
 	// tokenStore, if set, is kept in sync with agent lifecycle: a per-agent
 	// token is created on Create/Fork and removed on Delete. The store is
 	// owned by the auth subsystem; agent.Manager only calls into the
@@ -532,6 +546,12 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		// (post-result usage windows) — the in-turn path already taps it via
 		// the turn sink; this covers the no-sink idle case.
 		cb.SetRateLimitHandler(m.recordRateLimit)
+		// Keyed (Slack-thread) lingering sessions: their notification turns
+		// go to the registered per-agent response surface, never the main
+		// transcript / busy slot.
+		cb.SetKeyedBackgroundTurnHandler(m.handleKeyedBackgroundTurn)
+		cb.SetKeyedTasksAbandonedHandler(m.handleKeyedTasksAbandoned)
+		cb.SetKeyedNoteLockedHandler(m.storeKeyedNoteLocked)
 	}
 
 	m.cron = newCronScheduler(m, logger)
@@ -1093,6 +1113,40 @@ func (m *Manager) GetRemote(id string) *Agent {
 		}
 	}
 	return a
+}
+
+// GetRemoteHeld returns the persisted row of an agent whose runtime is not
+// in the local manager AND whose agent_locks row names a holder peer. It is
+// a lightweight sibling of GetRemote (no last-message preview, avatar, or
+// peer-registry lookups) intended for callers that only need identity /
+// configuration fields and may run under their own locks. The result is a
+// fresh copy that callers must not use to execute the agent locally.
+func (m *Manager) GetRemoteHeld(id string) (*Agent, bool) {
+	if m == nil || m.store == nil || id == "" {
+		return nil, false
+	}
+	m.mu.Lock()
+	_, inMem := m.agents[id]
+	m.mu.Unlock()
+	if inMem {
+		return nil, false
+	}
+	st := m.Store()
+	if st == nil {
+		return nil, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	lock, err := st.GetAgentLock(ctx, id)
+	cancel()
+	if err != nil || lock == nil || lock.HolderPeer == "" {
+		return nil, false
+	}
+	a, err := m.store.LoadByID(id)
+	if err != nil || a == nil {
+		return nil, false
+	}
+	a.HolderPeer = lock.HolderPeer
+	return a, true
 }
 
 // GetAny returns an agent whether its runtime is local or held by a peer.
@@ -2619,6 +2673,24 @@ type OneShotOpts struct {
 	// Runtime peers use the canonical Hub URL so Slack credentials stay on the
 	// Hub while the agent backend itself runs on the holder.
 	SlackMCPBaseURL string
+
+	// LingerBackgroundTasks opts a keyed claude turn into keeping its CLI
+	// process alive after the result while run_in_background tasks are still
+	// pending, so their completion is delivered as a keyed background turn to
+	// the handler registered via RegisterKeyedBackgroundHandler. Ignored when
+	// SessionKey is empty, the backend is not claude, or neither a handler is
+	// registered for the agent nor KeyedSurface is set. Relayed to a remote
+	// holder only when it advertises keyedBackgroundV1 (the holder then binds
+	// a Hub-bound KeyedSurface).
+	LingerBackgroundTasks bool
+	// KeyedSurface binds the lingering keyed session to this surface instead
+	// of the agent-wide handler (Go-only; set by the holder's external-chat
+	// handler for the dispatching Hub).
+	KeyedSurface KeyedSessionSurface
+	// AttachBackgroundToken makes the router attach to the holder's buffered
+	// keyed background turn identified by this one-time token instead of
+	// starting a new turn (Hub side of the remote background continuation).
+	AttachBackgroundToken string
 }
 
 type HandoffArrivalReservation interface {
@@ -2791,6 +2863,11 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		var resetErr error
 		switch prep.backend.Name() {
 		case ToolClaude, ToolCustomClaude:
+			// A lingering keyed process still holds the discarded context
+			// (and would re-create the JSONL): close it first.
+			if cb, ok := prep.backend.(*ClaudeBackend); ok {
+				cb.CloseKeyedSessionSync(agentID, sessionKey, "新しいセッションで再開")
+			}
 			resetErr = resetClaudeSessionFilesStrict(agentID, sessionKey)
 		case ToolCodex, ToolCustomCodex:
 			resetErr = deleteCodexThreadRefStrict(agentID, sessionKey)
@@ -2823,6 +2900,22 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		MCPServers:           prep.mcpServers,
 		SessionKey:           sessionKey,
 		ConversationKey:      opts.SessionKey,
+		LingerBackgroundTasks: opts.LingerBackgroundTasks && sessionKey != "" &&
+			prep.backend.Name() == ToolClaude &&
+			(opts.KeyedSurface != nil || m.hasKeyedBackgroundHandler(agentID, sessionKey)),
+	}
+	if chatOpts.LingerBackgroundTasks {
+		chatOpts.KeyedSurface = opts.KeyedSurface
+	}
+	deliveredKeyedNote := ""
+	if chatOpts.LingerBackgroundTasks {
+		// Cheap per-turn awareness: pending notes for this key (tasks that
+		// were abandoned / could not be continued) and the other threads
+		// still running background tasks.
+		var note string
+		if note, deliveredKeyedNote = m.keyedTurnNote(agentID, sessionKey, prep.backend); note != "" {
+			effectiveMessage = injectRecentMessagesContext(effectiveMessage, note+"\n")
+		}
 	}
 	chatOpts.FreshSessionContext = opts.FreshSessionContext
 	chatOpts.ResumeSessionContext = opts.ResumeSessionContext
@@ -2864,6 +2957,12 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 			m.oneShotSteersMu.Unlock()
 		}
 		return nil, err
+	}
+	// The turn reached the backend: its one-time note is delivered.
+	m.commitKeyedNote(agentID, sessionKey, deliveredKeyedNote)
+	if isSlackConversationKey(agentID, opts.SessionKey) {
+		// Before any lossy forwarding: the filter must see every delta.
+		backendCh = filterSlackNoReplyEvents(backendCh)
 	}
 	backendCh = m.oneShotQuestionEvents(chatCtx, backendCh, questionTurn)
 	if responseAttachments != nil {
@@ -2962,13 +3061,30 @@ func (m *Manager) SteerOneShot(sessionKey, text string) error {
 	m.oneShotSteersMu.Lock()
 	fn, ok := m.oneShotSteers[sessionKey]
 	m.oneShotSteersMu.Unlock()
+	if !ok || fn == nil {
+		// A thread's keyed background (notification) turn is not a
+		// ChatOneShot but accepts steering the same way.
+		if bg := m.keyedBgSteerFor(sessionKey); bg != nil {
+			return bg(text)
+		}
+	}
 	if !ok {
 		return ErrAgentNotBusy
 	}
 	if fn == nil {
 		return ErrSteerUnsupported
 	}
-	return fn(text)
+	err := fn(text)
+	if errors.Is(err, ErrAgentNotBusy) {
+		// The entry can be stale: the previous turn's steer gate has closed
+		// but its cleanup has not removed it yet, while a keyed background
+		// turn already runs on the same key. ErrAgentNotBusy means nothing
+		// was written, so the background turn may take the message.
+		if bg := m.keyedBgSteerFor(sessionKey); bg != nil {
+			return bg(text)
+		}
+	}
+	return err
 }
 
 // SteerOneShotForAgent is the holder-facing fenced variant of SteerOneShot.
@@ -3017,13 +3133,30 @@ func (m *Manager) SteerOneShotFromOrigin(agentID, sessionKey, originPeerID, text
 	// lifetime registry before the backend call (Codex may wait up to 25s for
 	// turn readiness/ack); a replacement turn cannot redirect this closure.
 	m.oneShotCancelsMu.Unlock()
+	if !ok || fn == nil {
+		// A remote thread's keyed background turn is tracked with the
+		// dispatching Hub as origin (validated above, and re-checked on the
+		// registration itself) and steers like the local one.
+		if bg := m.keyedBgSteerFromOrigin(sessionKey, originPeerID); bg != nil {
+			return bg(text)
+		}
+	}
 	if !ok {
 		return ErrAgentNotBusy
 	}
 	if fn == nil {
 		return ErrSteerUnsupported
 	}
-	return fn(text)
+	err := fn(text)
+	if errors.Is(err, ErrAgentNotBusy) {
+		// Same stale-entry fallback as SteerOneShot: nothing was written.
+		// The validated turn is over, so the background turn must itself
+		// come from the same Hub.
+		if bg := m.keyedBgSteerFromOrigin(sessionKey, originPeerID); bg != nil {
+			return bg(text)
+		}
+	}
+	return err
 }
 
 // SteerOneShotAsUser checks Slack goal ownership on the holder before capturing

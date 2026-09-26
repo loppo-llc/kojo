@@ -1003,6 +1003,10 @@ export function AgentChat() {
         )}
         {agent.tool === "custom-bare" && (
           <button
+            // A fallback snapshot (holder online but unreadable) has no
+            // ETag, so cycling from its possibly stale value would be an
+            // unconditional PATCH to the holder.
+            disabled={!!agent.holderPeer && !!agent.holderSnapshotStale}
             onClick={async () => {
               const modes = ["", "on", "off"] as const;
               const idx = modes.indexOf((agent.thinkingMode ?? "") as typeof modes[number]);
@@ -1035,7 +1039,7 @@ export function AgentChat() {
                 }
               }
             }}
-            className={`rounded-[10px] border px-2 py-1 font-mono text-[11px] transition-colors ${
+            className={`rounded-[10px] border px-2 py-1 font-mono text-[11px] transition-colors disabled:opacity-50 ${
               agent.thinkingMode === "on"
                 ? "border-copper/50 bg-copper/10 text-copper"
                 : "border-hairline bg-surface text-ink-faint hover:text-ink"

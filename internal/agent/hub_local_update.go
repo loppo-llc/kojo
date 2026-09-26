@@ -256,33 +256,7 @@ func applyHubLocalCfg(a *Agent, cfg AgentUpdateConfig) error {
 		return err
 	}
 
-	if cfg.Name != nil {
-		a.Name = *cfg.Name
-	}
-	if cfg.PublicProfile != nil {
-		a.PublicProfile = *cfg.PublicProfile
-	}
-	if cfg.PublicProfileOverride != nil {
-		a.PublicProfileOverride = *cfg.PublicProfileOverride
-	}
-	if cfg.Effort != nil {
-		a.Effort = *cfg.Effort
-	}
-	if cfg.AutoEffort != nil {
-		a.AutoEffort = cfg.AutoEffort
-	}
-	if cfg.DisabledInjections != nil {
-		a.DisabledInjections = normalizeDisabledInjections(*cfg.DisabledInjections)
-	}
-	if cfg.SilentStart != nil {
-		a.SilentStart = *cfg.SilentStart
-	}
-	if cfg.SilentEnd != nil {
-		a.SilentEnd = *cfg.SilentEnd
-	}
-	if cfg.NotifyDuringSilent != nil {
-		a.NotifyDuringSilent = cfg.NotifyDuringSilent
-	}
+	assignHubLocalCfg(a, cfg)
 	// NOTE: no publicProfile LLM regen here (resolvePublicProfile)
 	// — persona is holder-only so the persona-edit regen trigger
 	// can't fire, and a hub-side LLM call against a remote agent
@@ -956,4 +930,76 @@ func (m *Manager) acquireMutationAllowSwitching(agentID string) (func(), error) 
 			delete(m.mutating, agentID)
 		}
 	}, nil
+}
+
+// assignHubLocalCfg writes the hub-local-safe fields present in cfg
+// onto a without validation or timestamp changes. Shared by the row
+// write path (applyHubLocalCfg, which validates first) and the
+// read-side projection (ProjectHubLocalOverrides).
+func assignHubLocalCfg(a *Agent, cfg AgentUpdateConfig) {
+	if cfg.Name != nil {
+		a.Name = *cfg.Name
+	}
+	if cfg.PublicProfile != nil {
+		a.PublicProfile = *cfg.PublicProfile
+	}
+	if cfg.PublicProfileOverride != nil {
+		a.PublicProfileOverride = *cfg.PublicProfileOverride
+	}
+	if cfg.Effort != nil {
+		a.Effort = *cfg.Effort
+	}
+	if cfg.AutoEffort != nil {
+		a.AutoEffort = cfg.AutoEffort
+	}
+	if cfg.DisabledInjections != nil {
+		a.DisabledInjections = normalizeDisabledInjections(*cfg.DisabledInjections)
+	}
+	if cfg.SilentStart != nil {
+		a.SilentStart = *cfg.SilentStart
+	}
+	if cfg.SilentEnd != nil {
+		a.SilentEnd = *cfg.SilentEnd
+	}
+	if cfg.NotifyDuringSilent != nil {
+		a.NotifyDuringSilent = cfg.NotifyDuringSilent
+	}
+}
+
+// ProjectHubLocalOverrides overlays this hub's confirmed hub-local
+// overrides onto a (typically the holder's live view of the agent)
+// using the same per-field 3-way merge the next sync ingest will run:
+// an override is shown only where the holder still carries the base
+// value, i.e. where the hub edit will win at ingest. Unconfirmed
+// Pending sections are ignored (merge-ineligible by contract), and a
+// merge ingest would reject as invalid is not shown. Read
+// only: the kv row is never modified here. Best effort — a missing or
+// unreadable record leaves a untouched.
+func (m *Manager) ProjectHubLocalOverrides(ctx context.Context, a *Agent) {
+	if m == nil || a == nil {
+		return
+	}
+	st := m.Store()
+	if st == nil {
+		return
+	}
+	rec, err := st.GetKV(ctx, hubLocalOverrideNamespace, hubLocalOverrideKey(a.ID))
+	if err != nil {
+		return
+	}
+	var ov hubLocalOverrideRecord
+	if json.Unmarshal([]byte(rec.Value), &ov) != nil {
+		return
+	}
+	ov.Pending = nil
+	cfg, _, _ := mergeAgainstIngestedRow(a, ov)
+	// Mirror ingest: applyHubLocalCfg rejects a merge that is invalid
+	// against the holder's row (e.g. an effort the holder's new model
+	// doesn't support), leaving the override queued and the row as the
+	// holder wrote it — so project nothing in that case.
+	probe := *a
+	if applyHubLocalCfg(&probe, cfg) != nil {
+		return
+	}
+	assignHubLocalCfg(a, cfg)
 }

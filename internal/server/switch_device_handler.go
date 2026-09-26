@@ -522,6 +522,13 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		// Drained: close the persistent claude process so its session file is
 		// released before the switch transfers session state to the peer.
 		s.agents.CloseClaudeSessionSync(agentID)
+		// Keyed sessions closed above report abandoned background tasks
+		// asynchronously (to a remote Hub for a holder). Deliver them while
+		// this peer still holds the lock: after the transfer the Hub rejects
+		// this now-stale holder's notices. Bounded; never blocks the switch.
+		if !s.agents.WaitKeyedExitNotices(agentID, keyedBgHandoffNoticeWait) {
+			s.logger.Warn("keyed background exit notices still pending at handoff", "agent", agentID)
+		}
 	}
 
 	// Step 0-pre: flush source's disk-side memory writes into the

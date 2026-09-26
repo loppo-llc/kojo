@@ -661,7 +661,8 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 		sb.WriteString("\n### Memory Write — MANDATORY\n\n")
 		sb.WriteString("Your memory files are your only durable record across sessions —\n")
 		sb.WriteString("anything worth remembering must be written to them.\n\n")
-		sb.WriteString(fmt.Sprintf("At the end of EVERY response involving a user request/decision, new information about the user, work you did or started, or errors/blockers, append to `%s` using the Edit tool.\n", todayDiary))
+		sb.WriteString(fmt.Sprintf("In EVERY response involving a user request/decision, new information about the user, work you did or started, or errors/blockers, append to `%s` using the Edit tool.\n", todayDiary))
+		sb.WriteString("Do this write after your work and BEFORE you write the reply, then write the reply once as your last output. Every text you output in a turn reaches the user, so do not write the reply first and restate it after the memory write.\n")
 		sb.WriteString(fmt.Sprintf("Format: `- HH:MM — <one-line summary>` appended under a `## %s` date header (create the header on the first write of the day; do not rewrite earlier entries).\n", today))
 		sb.WriteString("Short exchanges count. \"It felt too small to record\" is the failure mode —\n")
 		sb.WriteString("cumulative short turns are exactly where memory loss happens.\n\n")
@@ -765,7 +766,10 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	showCreds := hasTools && hasCreds && !a.InjectionDisabled(InjectionCredentials)
 	showGroupDM := hasTools && apiBase != "" && !a.InjectionDisabled(InjectionGroupDM)
 	showTodo := hasTools && apiBase != "" && !a.InjectionDisabled(InjectionTodoAPI)
-	if showCreds || showGroupDM || showTodo {
+	// Background sessions: only the claude backend keeps thread (keyed)
+	// sessions lingering for run_in_background tasks.
+	showBgSessions := apiBase != "" && NormalizeToolName(a.Tool) == ToolClaude
+	if showCreds || showGroupDM || showTodo || showBgSessions {
 		sb.WriteString("\n## kojo Guides\n\n")
 		sb.WriteString(fmt.Sprintf("Detailed how-to docs are on disk — Read them only when you actually need the capability. Placeholder values used inside the guides: `{AGENT_ID}` = `%s`, `{DATA_DIR}` = `%s`", a.ID, dir))
 		if apiBase != "" {
@@ -777,6 +781,9 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 		}
 		if showTodo {
 			sb.WriteString(fmt.Sprintf("- Persistent todos (survive context resets; create one for any multi-step job): read %s\n", filepath.Join(guideDir, "todos.md")))
+		}
+		if showBgSessions {
+			sb.WriteString(fmt.Sprintf("- Background tasks in threads (run_in_background keeps running after your reply; list/stop them): read %s\n", filepath.Join(guideDir, "background-sessions.md")))
 		}
 		if showCreds {
 			sb.WriteString(fmt.Sprintf("- Credentials: you have stored credentials (encrypted, API-only); usage: read %s\n", filepath.Join(guideDir, "credentials.md")))

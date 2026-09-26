@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"log/slog"
-	"strings"
 )
 
 // Native app-server owns continuation: goal/set active starts idle work itself.
@@ -38,7 +37,7 @@ func runCodexGoalWithReply(scanner *jsonlLineScanner, q *GoalRequest, r *codexGo
 	phases := map[string]string{}
 	// Slack control responses belong to each native turn, not the accumulated
 	// goal transcript. Filter before events leave this peer and before absorb.
-	slackTurn := strings.HasPrefix(r.key, r.agentID+":slack:")
+	slackTurn := isSlackConversationKey(r.agentID, r.key)
 	text := newGoalTurnText(slackTurn, false, send)
 	absorbCurrent := func() {
 		text.finish(current)

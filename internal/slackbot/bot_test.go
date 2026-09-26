@@ -2815,3 +2815,170 @@ func TestAppendStreamRateLimitNoExtraSleepOnFinalAttempt(t *testing.T) {
 		t.Errorf("rateLimitSleep invocations = %d, want %d (one per inter-attempt gap; no sleep after final attempt)", got, maxRateLimitRetry)
 	}
 }
+
+func TestTextSegmentSeparator(t *testing.T) {
+	cases := []struct{ prev, next, want string }{
+		{"", "next", ""},
+		{"  \n", "next", ""},
+		{"answer?", "next", "\n\n"},
+		{"answer\n", "next", "\n"},
+		{"answer\n\n", "next", ""},
+		{"answer", "\nnext", "\n"},
+		{"answer\n", "\nnext", ""},
+	}
+	for _, c := range cases {
+		if got := textSegmentSeparator(c.prev, c.next); got != c.want {
+			t.Errorf("textSegmentSeparator(%q, %q) = %q, want %q", c.prev, c.next, got, c.want)
+		}
+	}
+}
+
+func finalSlackBody(script *streamScript) string {
+	if script.updateCalls > 0 {
+		return script.lastUpdateMD
+	}
+	return script.lastPostMD
+}
+
+func TestSendToAgentSeparatesTextSegmentsAroundTools(t *testing.T) {
+	t.Run("terminal matches streamed text", func(t *testing.T) {
+		script := &streamScript{streamTSs: []string{"stream.1"}}
+		srv := newStreamServer(t, script)
+		mgr := &scriptedMgr{events: []agent.ChatEvent{
+			{Type: "text", Delta: "まとめてよいですか？"},
+			{Type: "tool_use", ToolName: "Bash", ToolInput: `{"command":"true"}`},
+			{Type: "tool_result", ToolName: "Bash"},
+			{Type: "text", Delta: "次の段落"},
+			{Type: "done", Message: &agent.Message{Content: "まとめてよいですか？次の段落"}},
+		}}
+		bot := newBotWithStream(t, mgr, srv)
+
+		bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+		if got, want := finalSlackBody(script), "まとめてよいですか？\n\n次の段落"; got != want {
+			t.Fatalf("final body = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("terminal carries an undelivered tail", func(t *testing.T) {
+		script := &streamScript{streamTSs: []string{"stream.1"}}
+		srv := newStreamServer(t, script)
+		mgr := &scriptedMgr{events: []agent.ChatEvent{
+			{Type: "text", Delta: "first"},
+			{Type: "tool_use", ToolName: "Bash", ToolInput: `{"command":"true"}`},
+			{Type: "text", Delta: "second"},
+			{Type: "done", Message: &agent.Message{Content: "firstsecond and tail"}},
+		}}
+		bot := newBotWithStream(t, mgr, srv)
+
+		bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+		if got, want := finalSlackBody(script), "first\n\nsecond and tail"; got != want {
+			t.Fatalf("final body = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("unstreamed segment after a tool", func(t *testing.T) {
+		script := &streamScript{streamTSs: []string{"stream.1"}}
+		srv := newStreamServer(t, script)
+		mgr := &scriptedMgr{events: []agent.ChatEvent{
+			{Type: "text", Delta: "first"},
+			{Type: "tool_use", ToolName: "Bash", ToolInput: `{"command":"true"}`},
+			{Type: "done", Message: &agent.Message{Content: "firstsecond"}},
+		}}
+		bot := newBotWithStream(t, mgr, srv)
+
+		bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+		if got, want := finalSlackBody(script), "first\n\nsecond"; got != want {
+			t.Fatalf("final body = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("terminal prepends unstreamed text", func(t *testing.T) {
+		script := &streamScript{streamTSs: []string{"stream.1"}}
+		srv := newStreamServer(t, script)
+		mgr := &scriptedMgr{events: []agent.ChatEvent{
+			{Type: "text", Delta: "first"},
+			{Type: "tool_use", ToolName: "Bash", ToolInput: `{"command":"true"}`},
+			{Type: "text", Delta: "second"},
+			{Type: "done", Message: &agent.Message{Content: "earlier\n\nfirstsecond"}},
+		}}
+		bot := newBotWithStream(t, mgr, srv)
+
+		bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+		if got, want := finalSlackBody(script), "earlier\n\nfirst\n\nsecond"; got != want {
+			t.Fatalf("final body = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("subagent text is not part of the reply", func(t *testing.T) {
+		script := &streamScript{streamTSs: []string{"stream.1"}}
+		srv := newStreamServer(t, script)
+		mgr := &scriptedMgr{events: []agent.ChatEvent{
+			{Type: "text", Delta: "main"},
+			{Type: "text", Delta: " child", ParentToolUseID: "toolu_parent"},
+			{Type: "done", Message: &agent.Message{Content: "main"}},
+		}}
+		bot := newBotWithStream(t, mgr, srv)
+
+		bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+		if got, want := finalSlackBody(script), "main"; got != want {
+			t.Fatalf("final body = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("diverging terminal stays authoritative", func(t *testing.T) {
+		script := &streamScript{streamTSs: []string{"stream.1"}}
+		srv := newStreamServer(t, script)
+		mgr := &scriptedMgr{events: []agent.ChatEvent{
+			{Type: "text", Delta: "first"},
+			{Type: "tool_use", ToolName: "Bash", ToolInput: `{"command":"true"}`},
+			{Type: "text", Delta: "second"},
+			{Type: "done", Message: &agent.Message{Content: "rewritten body"}},
+		}}
+		bot := newBotWithStream(t, mgr, srv)
+
+		bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+		if got, want := finalSlackBody(script), "rewritten body"; got != want {
+			t.Fatalf("final body = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("subagent tools do not split parent text", func(t *testing.T) {
+		script := &streamScript{streamTSs: []string{"stream.1"}}
+		srv := newStreamServer(t, script)
+		mgr := &scriptedMgr{events: []agent.ChatEvent{
+			{Type: "text", Delta: "one "},
+			{Type: "tool_use", ToolName: "Bash", ToolInput: `{"command":"true"}`, ParentToolUseID: "toolu_parent"},
+			{Type: "text", Delta: "sentence"},
+			{Type: "done", Message: &agent.Message{Content: "one sentence"}},
+		}}
+		bot := newBotWithStream(t, mgr, srv)
+
+		bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+		if got, want := finalSlackBody(script), "one sentence"; got != want {
+			t.Fatalf("final body = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestSlackSystemPromptSaysAllTextIsPosted(t *testing.T) {
+	script := &streamScript{streamTSs: []string{"stream.1"}}
+	srv := newStreamServer(t, script)
+	mgr := &scriptedMgr{events: []agent.ChatEvent{
+		{Type: "text", Delta: "hi"},
+		{Type: "done", Message: &agent.Message{Content: "hi"}},
+	}}
+	bot := newBotWithStream(t, mgr, srv)
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	if !strings.Contains(mgr.lastOneShotOpts.SystemPromptExtra, "Every text you output during this turn is posted, not only the last one") {
+		t.Fatalf("Slack prompt does not explain that all turn text is posted: %q", mgr.lastOneShotOpts.SystemPromptExtra)
+	}
+}

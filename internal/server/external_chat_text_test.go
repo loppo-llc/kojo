@@ -1002,3 +1002,45 @@ func TestExternalChatAttachmentAckIsBoundToAgentAndPeer(t *testing.T) {
 		t.Fatal("matching acknowledgement did not release holder")
 	}
 }
+
+// Slack `!stop all` follows the thread holder like a steer: the holder gets a
+// stopBackground request, and its "no session" answer maps back to
+// agent.ErrBackgroundSessionNotFound.
+func TestExternalChatRouterRelaysStopThreadBackgroundTasks(t *testing.T) {
+	requestSeen := make(chan externalChatSteerRequest, 2)
+	var missing atomic.Bool
+	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/external-chat/ready"):
+			_ = json.NewEncoder(w).Encode(externalChatReadyResponse{Ready: true, HolderPeer: "holder"})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/external-chat/steer"):
+			var req externalChatSteerRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			requestSeen <- req
+			if missing.Load() {
+				writeError(w, http.StatusNotFound, "background_session_not_found", "no background session")
+				return
+			}
+			writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+		default:
+			http.Error(w, "unexpected route", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(holder.Close)
+
+	_, router, agentID := prepareRemoteExternalChat(t, holder.URL)
+	key := agentID + ":slack:C1:1.0"
+	if err := router.StopThreadBackgroundTasks(context.Background(), agentID, key); err != nil {
+		t.Fatal(err)
+	}
+	if req := <-requestSeen; !req.StopBackground || req.SessionKey != key || req.Content != "" || req.Question != nil {
+		t.Fatalf("request = %#v", req)
+	}
+	missing.Store(true)
+	if err := router.StopThreadBackgroundTasks(context.Background(), agentID, key); !errors.Is(err, agent.ErrBackgroundSessionNotFound) {
+		t.Fatalf("err = %v, want ErrBackgroundSessionNotFound", err)
+	}
+}

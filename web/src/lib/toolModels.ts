@@ -13,8 +13,8 @@ export const toolModels: Record<string, ToolModelConfig> = {
   codex: {
     default: "gpt-6-astra",
     models: [
-      "gpt-6-sol",
       "gpt-6-astra",
+      "gpt-6-sol",
       "gpt-6-luna",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
@@ -74,11 +74,10 @@ const codexEffortModels = new Set(toolModels.codex.models);
 // kojo's effort scale doesn't model). Older gpt-5.x models stop at xhigh.
 // Keep in sync with agent.go codexMaxEffortModels.
 const codexMaxModels = new Set(["gpt-6-sol", "gpt-6-astra", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
-// codex CLI 0.155.0 models_cache.json default_reasoning_level: gpt-6-astra
-// is the only listed model that defaults to "low" (0.153.4 had it at medium
-// and gpt-5.6-sol at low; both flipped in 0.155.0). Every other codex model,
-// including gpt-6-sol and gpt-6-luna, defaults to "medium".
-const codexLowDefaultModels = new Set(["gpt-6-astra"]);
+// codex CLI 0.155.0 models_cache.json default_reasoning_level: gpt-5.6-sol
+// is the only listed model that defaults to "low". Every other codex model,
+// including the gpt-6 family, defaults to "medium".
+const codexLowDefaultModels = new Set(["gpt-5.6-sol"]);
 // Claude models whose API default effort is "medium" rather than "high":
 // https://platform.claude.com/docs/en/models/opus-5-5/overview (fetched
 // 2026-09-23) — Opus 5.5 is the first Claude model to default to medium.

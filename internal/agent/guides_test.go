@@ -17,7 +17,7 @@ func TestSyncGuides_WritesAllGuideFiles(t *testing.T) {
 
 	SyncGuides(testLogger())
 
-	want := []string{"groupdm.md", "todos.md", "credentials.md", "memory-conventions.md", "attachments.md"}
+	want := []string{"groupdm.md", "todos.md", "credentials.md", "memory-conventions.md", "attachments.md", "background-sessions.md"}
 	for _, name := range want {
 		p := filepath.Join(GuideDir(), name)
 		body, err := os.ReadFile(p)
@@ -187,5 +187,26 @@ func TestValidateDisabledInjections(t *testing.T) {
 	}
 	if err := ValidateDisabledInjections([]string{"bogus_key"}); err == nil {
 		t.Errorf("unknown key accepted")
+	}
+}
+
+// TestBuildSystemPrompt_BackgroundSessionsGuide: the background-sessions
+// pointer is claude-only (only ClaudeBackend lingers keyed sessions).
+func TestBuildSystemPrompt_BackgroundSessionsGuide(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	apiBase := "http://127.0.0.1:8080"
+	want := filepath.Join(GuideDir(), "background-sessions.md")
+
+	claude := &Agent{ID: "ag_bg", Tool: ToolClaude}
+	if p := buildSystemPrompt(claude, testLogger(), apiBase, nil, false); !strings.Contains(p, want) {
+		t.Errorf("claude prompt missing background-sessions guide pointer")
+	}
+	codex := &Agent{ID: "ag_bg", Tool: ToolCodex}
+	if p := buildSystemPrompt(codex, testLogger(), apiBase, nil, false); strings.Contains(p, want) {
+		t.Errorf("codex prompt must not point at background-sessions guide")
+	}
+	if p := buildSystemPrompt(claude, testLogger(), "", nil, false); strings.Contains(p, want) {
+		t.Errorf("prompt without API base must not point at background-sessions guide")
 	}
 }

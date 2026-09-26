@@ -916,6 +916,7 @@ type codexStreamResult struct {
 	questions        *codexQuestionState
 	questionText     string // fallback for a run ending immediately after an async question
 	fullText         strings.Builder
+	lastTextItemID   string // agentMessage item that produced the latest text delta
 	thinking         strings.Builder
 	toolUses         []ToolUse
 	usage            *Usage
@@ -1425,8 +1426,10 @@ func (res *codexStreamResult) handleAgentMessageDelta(msg *rpcMessage, itemPhase
 			return true
 		}
 	} else {
+		segmentStart := params.ItemID != "" && params.ItemID != res.lastTextItemID
+		res.lastTextItemID = params.ItemID
 		res.fullText.WriteString(params.Delta)
-		if !send(ChatEvent{Type: "text", Delta: params.Delta}) {
+		if !send(ChatEvent{Type: "text", Delta: params.Delta, textSegmentStart: segmentStart}) {
 			res.cancelled = true
 			return true
 		}

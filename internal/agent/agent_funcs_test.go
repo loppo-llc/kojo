@@ -257,6 +257,9 @@ func TestBuildSystemPrompt_MemoryWriteDirective(t *testing.T) {
 		"only durable record across sessions",
 		todayDiary, // absolute path, not relative — prevents cwd-dependent writes
 		"Short exchanges count",
+		// Writing memory after the reply made agents restate the reply in a
+		// second text block, which Slack posts joined to the first.
+		"BEFORE you write the reply",
 		// Lean-index rules live in the guide file now; the prompt keeps
 		// the short rule plus a pointer to memory-conventions.md.
 		"LEAN index",

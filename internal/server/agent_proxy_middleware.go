@@ -73,7 +73,9 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 		// the holder after a past device-switch). Proxy it to the holder
 		// like every other agent read so the UI shows the live avatar.
 
-		// Bare GET /agents/{id}: handler already has GetRemote fallback.
+		// Bare GET /agents/{id}: handleGetAgent reads through to the
+		// holder (overlaying hub-owned placement fields) and falls back
+		// to the hub row when the holder is unreachable.
 		if sub == "" && r.Method == http.MethodGet {
 			next.ServeHTTP(w, r)
 			return

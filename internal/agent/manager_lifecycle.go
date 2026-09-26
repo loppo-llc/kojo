@@ -576,6 +576,10 @@ func (m *Manager) Delete(id string) error {
 	m.mu.Lock()
 	delete(m.agents, id)
 	m.mu.Unlock()
+	// Thread notes of a deleted agent can never be delivered (a late
+	// abandoned notice sees the agent gone and sets none; one that checked
+	// just before is covered by the second drop).
+	m.dropKeyedNotesAfterExitNotices(id, "")
 	// Drop any outstanding page. Nothing else expires it, so a deleted
 	// agent would otherwise leak its entry for the life of the process.
 	m.ClearAttention(id)

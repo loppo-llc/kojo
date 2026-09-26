@@ -891,7 +891,9 @@ func (s *Server) handleFindOrCreateDM(w http.ResponseWriter, r *http.Request) {
 // handleCreateThread creates a brand-new parallel thread room (kind "thread")
 // for one agent. Unlike POST /api/v1/dms it never dedups — every call yields a
 // fresh room so an agent can hold many independent threads. The default name
-// is the agent's display name; the first agent reply may auto-title it.
+// is agent.DefaultThreadName; the first agent reply may auto-title it. On the
+// Hub the agent may be held by another peer: thread turns are forwarded to
+// that holder by the one-shot router.
 func (s *Server) handleCreateThread(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		AgentID string `json:"agentId"`

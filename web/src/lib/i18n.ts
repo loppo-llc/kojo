@@ -834,6 +834,10 @@ const messages = {
     ja: "未保存の変更がある",
     en: "Unsaved changes",
   },
+  "settings.holderSnapshotStale": {
+    ja: "移動先（{peer}）から最新の設定を読めなかったため、Hub側の古い控えを表示しています。上書きを防ぐため保存できません。移動先に接続できる状態で再読み込みしてください。",
+    en: "Couldn't read the latest settings from the host device ({peer}); showing the hub's possibly stale copy. Saving is disabled to avoid overwriting newer values — reload once the host is reachable.",
+  },
   "settings.discard": { ja: "破棄", en: "Discard" },
 
   // ── AgentSettings: Danger Zone ──

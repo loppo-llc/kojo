@@ -75,10 +75,15 @@ GET /api/v1/goal-handoffs/{op_id}
 proof that the destination's native resume completed. Inspect `!goal status`
 on the current holder for the latter.
 
-Interrupted operations are **not replayed after restart**. A lost origin
-completion barrier, unknown transfer result, or uncertain resume delivery
-requires inspection. Never blindly repeat the switch or force-reclaim. Check
-the current holder first; after confirming the data is there, use
+Interrupted external operations are **not replayed after restart**. For an
+accepted Goal handoff whose resume command never reaches backend admission,
+the destination may re-dispatch that exact identity up to three times after a
+two-minute grace period. Each retry rechecks the origin stop fence; an
+uncertain delivery that may already have been admitted remains blocked for
+inspection rather than replayed. A lost origin completion barrier or unknown
+transfer result likewise requires inspection. Never blindly repeat the switch
+or force-reclaim. Check the current holder first; after confirming the data is
+there, use
 `!goal pause` to cancel any stale reservation, then `!goal resume` if desired.
 A failed/uncertain operation never automatically rolls ownership back to source.
 Post-checkpoint transport/finalize failures do not start an extra model turn
