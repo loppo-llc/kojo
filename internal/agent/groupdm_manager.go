@@ -947,14 +947,13 @@ func (m *GroupDMManager) Rename(id, name, callerAgentID string) (*GroupDM, error
 
 	// Resolve caller name and collect recipients
 	var callerName string
-	var recipients []GroupMember
 	for _, mem := range g.Members {
 		if mem.AgentID == callerAgentID {
 			callerName = mem.AgentName
-		} else {
-			recipients = append(recipients, mem)
+			break
 		}
 	}
+	recipients := renameRecipientsLocked(g, callerAgentID)
 	if callerName == "" {
 		callerName = "the owner"
 	}
@@ -2798,11 +2797,7 @@ func (m *GroupDMManager) UpdateSettings(ctx context.Context, id string, patch Gr
 	if patch.Name != nil && oldName != g.Name {
 		notifyRename = true
 		newName = g.Name
-		for _, mem := range g.Members {
-			if mem.AgentID != patch.CallerAgentID {
-				recipients = append(recipients, mem)
-			}
-		}
+		recipients = renameRecipientsLocked(g, patch.CallerAgentID)
 		if callerName == "" {
 			callerName = "the owner"
 		}
@@ -2884,6 +2879,24 @@ func (m *GroupDMManager) SetVenue(id string, venue GroupDMVenue, callerAgentID s
 	m.save()
 	m.logger.Info("group DM venue updated", "id", id, "venue", venue)
 	return cp, nil
+}
+
+// renameRecipientsLocked returns the members to notify about a rename of g,
+// excluding the caller. Thread rooms return nil: a thread is the human's own
+// side conversation with its single agent, so its title is UI-only metadata.
+// Notifying would inject a system turn into the agent's MAIN chat, which the
+// operator sees as a stray DM there. Caller must hold m.mu.
+func renameRecipientsLocked(g *GroupDM, callerAgentID string) []GroupMember {
+	if isThreadRoom(g) {
+		return nil
+	}
+	var out []GroupMember
+	for _, mem := range g.Members {
+		if mem.AgentID != callerAgentID {
+			out = append(out, mem)
+		}
+	}
+	return out
 }
 
 // notifyRename sends a lightweight notification about a group rename.

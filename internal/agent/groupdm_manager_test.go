@@ -2046,3 +2046,31 @@ func TestGroupDMManager_StopThreadTurn_Idle(t *testing.T) {
 		t.Error("StopThreadTurn on idle room = true, want false")
 	}
 }
+
+// Renaming a thread room must not notify its agent: the notification lands
+// in the agent's main chat as a stray system turn.
+func TestRenameRecipients_ThreadRoomNotifiesNobody(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+
+	thread, err := gdm.CreateThread("ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gdm.mu.Lock()
+	got := renameRecipientsLocked(gdm.groups[thread.ID], "")
+	gdm.mu.Unlock()
+	if len(got) != 0 {
+		t.Errorf("thread rename recipients = %+v, want none", got)
+	}
+
+	group, err := gdm.Create("Team", []string{"ag_alice", "ag_bob"}, 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gdm.mu.Lock()
+	got = renameRecipientsLocked(gdm.groups[group.ID], "ag_alice")
+	gdm.mu.Unlock()
+	if len(got) != 1 || got[0].AgentID != "ag_bob" {
+		t.Errorf("group rename recipients = %+v, want [ag_bob]", got)
+	}
+}
