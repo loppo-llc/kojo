@@ -193,7 +193,9 @@ const agyPrintTimeout = "0s"
 // turn does not hang.
 var agyExitGrace = 30 * time.Second
 
-func buildAgyArgs(resumeID string, agent *Agent, withAgent bool) []string {
+// buildAgyArgs renders the argv of one run; agentName is the custom agent
+// to select, or "" for none.
+func buildAgyArgs(resumeID string, agent *Agent, agentName string) []string {
 	args := []string{
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
@@ -207,8 +209,8 @@ func buildAgyArgs(resumeID string, agent *Agent, withAgent bool) []string {
 	if resumeID != "" {
 		args = append(args, "--conversation", resumeID)
 	}
-	if withAgent {
-		args = append(args, "--agent", agyKojoAgentName)
+	if agentName != "" {
+		args = append(args, "--agent", agentName)
 	}
 	if agent.Model != "" {
 		args = append(args, "--model", agent.Model)
@@ -270,16 +272,25 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 	if err != nil {
 		return nil, fmt.Errorf("render agy MCP config: %w", err)
 	}
-	agentDef := renderAgyAgentDef(systemPrompt)
-	release, err := holdAgyWorkspace(ctx, dir, map[string]string{
-		agyMCPConfigPath(dir): mcpConfig,
-		agyAgentDefPath(dir):  agentDef,
-	})
+	// The custom agent is named after its prompt: a thread's prompt differs
+	// from the main chat's, and a shared name would make one wait for the
+	// other's agy to exit. (agy fixes the prompt when it creates a
+	// conversation; a resumed one keeps its own whatever --agent says.)
+	files := map[string]string{agyMCPConfigPath(dir): mcpConfig}
+	var agentName string
+	var ephemeral []string
+	if systemPrompt != "" {
+		agentName = agyAgentName(systemPrompt)
+		defPath := agyAgentDefPath(dir, agentName)
+		files[defPath] = renderAgyAgentDef(agentName, systemPrompt)
+		ephemeral = append(ephemeral, defPath)
+	}
+	release, err := holdAgyWorkspace(ctx, dir, files, ephemeral...)
 	if err != nil {
 		return nil, fmt.Errorf("prepare agy workspace: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, bin, buildAgyArgs(resumeID, agent, agentDef != "")...)
+	cmd := exec.CommandContext(ctx, bin, buildAgyArgs(resumeID, agent, agentName)...)
 	cmd.Env = appendKojoTurnEnv(filterEnv(agyEnvStrip, agent.ID, dir), opts)
 	cmd.Dir = dir
 	cmd.Stdin = bytes.NewReader(input)
