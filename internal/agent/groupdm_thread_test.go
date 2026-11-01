@@ -753,3 +753,68 @@ func TestArchiveThread_CancelsAndCleansSession(t *testing.T) {
 		t.Errorf("thread turn cancel entry did not drain after archive")
 	}
 }
+
+func TestThreadTurn_FiresOnThreadReply(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	stub := &threadStub{reply: "pong"}
+	gdm.oneShot = stub.fn
+	type call struct {
+		agentID, groupID, content string
+	}
+	got := make(chan call, 4)
+	gdm.OnThreadReply = func(agentID, groupID string, msg *GroupMessage) {
+		got <- call{agentID, groupID, msg.Content}
+	}
+
+	g, _, err := gdm.FindOrCreateDM([]string{"ag_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gdm.PostUserMessage(context.Background(), g.ID, "ping", nil, true); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case c := <-got:
+		if c.agentID != "ag_alice" || c.groupID != g.ID || c.content != "pong" {
+			t.Errorf("OnThreadReply = %+v, want ag_alice/%s/pong", c, g.ID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnThreadReply never fired")
+	}
+}
+
+func TestThreadTurn_StopDoesNotFireOnThreadReply(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _, err := gdm.FindOrCreateDM([]string{"ag_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fired atomic.Int32
+	gdm.OnThreadReply = func(string, string, *GroupMessage) { fired.Add(1) }
+	started := make(chan struct{})
+	gdm.SetOneShotForTesting(func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error) {
+		ch := make(chan ChatEvent)
+		go func() {
+			defer close(ch)
+			ch <- ChatEvent{Type: "text", Delta: "partial"}
+			close(started)
+			<-ctx.Done()
+		}()
+		return ch, nil
+	})
+	done := make(chan struct{})
+	go func() {
+		gdm.runThreadTurn("ag_alice", g.ID, "G", newGroupMessage(UserSenderID, UserSenderName, "q", nil))
+		close(done)
+	}()
+	<-started
+	for i := 0; i < 500 && !gdm.StopThreadTurn(g.ID); i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	<-done
+	waitForMessage(t, gdm, g.ID, "partial")
+	time.Sleep(100 * time.Millisecond)
+	if n := fired.Load(); n != 0 {
+		t.Errorf("OnThreadReply fired %d times on operator stop, want 0", n)
+	}
+}

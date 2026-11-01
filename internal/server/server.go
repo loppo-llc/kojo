@@ -624,15 +624,38 @@ func New(cfg Config) *Server {
 	// somehow, the peer must not push out a duplicate web-push.
 	if s.notify != nil && s.agents != nil && !cfg.PeerOnly {
 		s.agents.OnChatDone = func(ag *agent.Agent, msg *agent.Message) {
-			payload, _ := json.Marshal(map[string]any{
+			s.notify.Send(fitPushPayload(map[string]any{
 				"type":    "agent_chat_done",
 				"agentId": ag.ID,
 				// cap name and preview to stay well under the 2048-byte
 				// encrypted record budget enforced by the push provider.
 				"name":    truncateUTF8(ag.Name, 80),
 				"preview": truncateUTF8(msg.Content, 200),
-			})
-			s.notify.Send(payload)
+			}))
+		}
+	}
+
+	// Same push for a thread (single-agent group-DM room) turn: threads run
+	// through GroupDMManager's one-shot path, which never reaches
+	// OnChatDone. groupId lets the service worker open the thread itself.
+	if s.notify != nil && s.groupdms != nil && !cfg.PeerOnly {
+		s.groupdms.OnThreadReply = func(agentID, groupID string, msg *agent.GroupMessage) {
+			name := msg.AgentName
+			if name == "" {
+				name = agentID
+			}
+			var threadName string
+			if g, ok := s.groupdms.Get(groupID); ok {
+				threadName = g.Name
+			}
+			s.notify.Send(fitPushPayload(map[string]any{
+				"type":       "agent_chat_done",
+				"agentId":    agentID,
+				"groupId":    groupID,
+				"name":       truncateUTF8(name, 80),
+				"threadName": truncateUTF8(threadName, 40),
+				"preview":    truncateUTF8(msg.Content, 200),
+			}))
 		}
 	}
 
@@ -2072,6 +2095,30 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 // maxBytes bytes. If truncation is needed an ellipsis ("...") is appended,
 // and the cut is rolled back to a UTF-8 rune boundary so no multi-byte
 // sequence is split. maxBytes <= 0 returns "".
+// pushPayloadBudget bounds a marshalled web-push payload. notify.Manager
+// encrypts into a 2048-byte record (16-byte tag, 86-byte header, 1-byte
+// delimiter), leaving ~1945 plaintext bytes; keep a margin below that.
+const pushPayloadBudget = 1800
+
+// fitPushPayload marshals a push payload, shrinking "preview" (then
+// "threadName") when JSON escaping (`<` → `\u003c`, control characters)
+// inflates the byte-capped fields past pushPayloadBudget. Without this an
+// over-budget payload fails to encrypt and the push is silently dropped.
+func fitPushPayload(fields map[string]any) []byte {
+	payload, _ := json.Marshal(fields)
+	for _, key := range []string{"preview", "threadName"} {
+		for len(payload) > pushPayloadBudget {
+			v, _ := fields[key].(string)
+			if v == "" {
+				break
+			}
+			fields[key] = truncateUTF8(v, len(v)/2)
+			payload, _ = json.Marshal(fields)
+		}
+	}
+	return payload
+}
+
 func truncateUTF8(s string, maxBytes int) string {
 	if maxBytes <= 0 {
 		return ""

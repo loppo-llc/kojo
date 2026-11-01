@@ -12,7 +12,17 @@ self.addEventListener("push", (event) => {
   let navData = {};
   let renotify = false;
 
-  if (data.type === "agent_chat_done") {
+  if (data.type === "agent_chat_done" && data.groupId) {
+    // Thread reply: separate tag per thread so it neither replaces nor is
+    // replaced by the agent's main-chat notification; clicking opens the
+    // thread itself.
+    title = data.threadName
+      ? `${data.name || "Agent"} · ${data.threadName}`
+      : data.name || "Agent";
+    body = data.preview || "Response ready";
+    tag = `kojo-thread-${data.groupId}`;
+    navData = { agentId: data.agentId, groupId: data.groupId };
+  } else if (data.type === "agent_chat_done") {
     title = data.name || "Agent";
     body = data.preview || "Response ready";
     tag = `kojo-agent-${data.agentId}`;
@@ -48,8 +58,12 @@ self.addEventListener("push", (event) => {
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const { agentId } = event.notification.data || {};
-  const url = agentId ? `/agents/${agentId}` : "/";
+  const { agentId, groupId } = event.notification.data || {};
+  const url = groupId
+    ? `/groupdms/${encodeURIComponent(groupId)}`
+    : agentId
+      ? `/agents/${agentId}`
+      : "/";
   event.waitUntil(
     clients.matchAll({ type: "window" }).then((windowClients) => {
       for (const client of windowClients) {
