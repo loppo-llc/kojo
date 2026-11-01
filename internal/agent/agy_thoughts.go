@@ -22,11 +22,11 @@ import (
 // from there so the UI can show thinking like other backends.
 
 func agyConversationsDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
+	root := agyCLIDir()
+	if root == "" {
 		return ""
 	}
-	return filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+	return filepath.Join(root, "conversations")
 }
 
 // protoLenField returns the payload of the first length-delimited field

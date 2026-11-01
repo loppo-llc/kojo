@@ -76,6 +76,16 @@ type TruncateMemoryResult struct {
 	// dropping the referenced Codex threads.
 	CodexSessionFilesRemoved int `json:"codexSessionFilesRemoved"`
 
+	// AgyStepsRemoved counts steps cut from the agent's main agy
+	// (gemini-agy) conversation, which is trimmed at a turn boundary so
+	// the surviving turns stay in agy's context.
+	AgyStepsRemoved int `json:"agyStepsRemoved"`
+
+	// AgyConversationCleared reports that nothing of the main agy
+	// conversation survived the cut, so its ref was dropped and the next
+	// turn starts a fresh conversation.
+	AgyConversationCleared bool `json:"agyConversationCleared"`
+
 	// DiaryFilesRemoved counts memory/YYYY-MM-DD.md files we deleted
 	// outright because their date is strictly after the threshold's date
 	// (in JST — diary timestamps are JST-local). Also counts memory_entries
@@ -171,8 +181,9 @@ func (m *Manager) TruncateMemoryAt(agentID string, since time.Time) (*TruncateMe
 
 // RewindToMessage rolls the agent back to just before msgID: the message
 // and everything after it leave the kojo transcript, and each backend's
-// native session state (Claude session JSONL, grok session dirs, Codex
-// threads) is trimmed to the same boundary so the CLI-side context matches
+// native session state (Claude session JSONL, grok session dirs, the main
+// agy conversation, Codex threads) is trimmed to the same boundary so the
+// CLI-side context matches
 // what the UI now shows.
 //
 // Unlike TruncateMemoryFromMessage this does NOT touch the daily diary or
@@ -311,6 +322,21 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 		m.logger.Info("truncate: gemini sessions cleared", "agent", agentID, "files", geminiFilesRm)
 	}
 
+	// 2e. agy (gemini-agy) main conversation. Cut at a turn boundary:
+	//     the turns that produced the surviving transcript stay, so the
+	//     boundary is the last surviving message rather than `since`
+	//     (see findAgyCut). No-op for agents without an agy conversation.
+	if agyCutoff, agyHasSurvivor, lerr := lastSurvivingMessageTime(ctx, agentID); lerr != nil {
+		m.logger.Warn("truncate: agy conversation skipped", "agent", agentID, "err", lerr)
+	} else {
+		ar, aerr := truncateAgyMainConversation(agentID, agyCutoff, agyHasSurvivor)
+		if aerr != nil {
+			m.logger.Warn("truncate: agy conversation partial failure", "agent", agentID, "err", aerr)
+		}
+		res.AgyStepsRemoved = ar.stepsRemoved
+		res.AgyConversationCleared = ar.cleared
+	}
+
 	// 3. Daily diary (per-day .md files plus their pre-compaction summary
 	//    sections AND the corresponding memory_entries rows). Held under
 	//    memorySyncMu so a concurrent syncMemoryEntriesToDB can't race
@@ -434,10 +460,29 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 		"grokFiles", res.GrokSessionFilesRemoved,
 		"codexThreads", res.CodexThreadsRemoved,
 		"codexFiles", res.CodexSessionFilesRemoved,
+		"agySteps", res.AgyStepsRemoved,
+		"agyCleared", res.AgyConversationCleared,
 		"diaryEntries", res.DiaryEntriesRemoved,
 		"diaryFiles", res.DiaryFilesRemoved,
 	)
 	return res, nil
+}
+
+// lastSurvivingMessageTime returns the creation time of the agent's newest
+// live transcript message, or hasSurvivor=false for an empty transcript.
+func lastSurvivingMessageTime(ctx context.Context, agentID string) (t time.Time, hasSurvivor bool, err error) {
+	st := getGlobalStore()
+	if st == nil {
+		return time.Time{}, false, errStoreNotReady
+	}
+	rec, err := st.LatestMessage(ctx, agentID)
+	if errors.Is(err, store.ErrNotFound) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return time.UnixMilli(rec.CreatedAt).UTC(), true, nil
 }
 
 // truncateMessagesByTime tombstones every live agent_messages row whose
