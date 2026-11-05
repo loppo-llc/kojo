@@ -323,7 +323,7 @@ func TestBashCaptureRunner_CapsUnlinkedLog(t *testing.T) {
 	}
 	pidFile := filepath.Join(t.TempDir(), "writer.pid")
 	run, script, log := writeRunnerForTest(t,
-		"(sleep 1; echo $BASHPID > "+pidFile+"; exec yes 0123456789abcdef) & echo started")
+		"(sleep 1; exec sh -c 'echo $$ > "+pidFile+"; exec yes 0123456789abcdef') & echo started")
 	if out, err := exec.Command("bash", run, script, log, "1048576").CombinedOutput(); err != nil {
 		t.Fatalf("runner: %v %q", err, out)
 	}
