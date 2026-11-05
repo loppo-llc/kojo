@@ -778,7 +778,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                           {open && (
                             <>
                               {agent.attention && agent.attentionReason && (
-                                <div className="mt-0.5 truncate text-[13px] text-copper" title={agent.attentionReason}>
+                                <div className="mt-0.5 line-clamp-3 break-words text-[13px] text-copper" title={agent.attentionReason}>
                                   {agent.attentionReason}
                                 </div>
                               )}
