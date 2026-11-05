@@ -4,15 +4,22 @@ import (
 	"fmt"
 	"hash/fnv"
 	"strings"
+	"time"
 
 	"github.com/robfig/cron/v3"
 )
 
-// MaxCronExprLen caps the byte size of a stored cron expression. The 5-field
-// standard form never needs anywhere near this many characters; the limit is
-// purely a defence against pathological input getting persisted to agents.json
-// or echoed back into log lines.
-const MaxCronExprLen = 256
+// MaxCronExprLen caps the byte size of a stored cron expression. Even a
+// multi-line expression (see MaxCronExprLines) never needs anywhere near this
+// many characters; the limit is purely a defence against pathological input
+// getting persisted to agents.json or echoed back into log lines.
+const MaxCronExprLen = 1024
+
+// MaxCronExprLines caps how many newline-separated 5-field expressions one
+// CronExpr may carry. Multiple lines are OR'd together: the agent fires
+// whenever any line matches, which is how a single schedule expresses
+// different cadences per weekday ("*/30 * * * 1-5" + "0 */3 * * 0,6").
+const MaxCronExprLines = 16
 
 // cronStdParser is the canonical parser used everywhere in the agent package.
 // It accepts only the standard 5-field form (M H DOM Mon DOW) — no seconds,
@@ -32,8 +39,9 @@ const CronPresetSentinelPrefix = "@preset:"
 
 // ValidateCronExpr returns nil for an empty expression (= scheduling disabled),
 // for a valid "@preset:N" sentinel (N must be in legacyAllowedIntervals), or
-// for a valid 5-field cron expression. Anything else is rejected with a
-// wrapped parse error.
+// for one or more newline-separated valid 5-field cron expressions. Anything
+// else is rejected with a wrapped parse error. The sentinel is only valid as
+// the whole expression — it can't be mixed into a multi-line schedule.
 func ValidateCronExpr(expr string) error {
 	if expr == "" {
 		return nil
@@ -47,18 +55,8 @@ func ValidateCronExpr(expr string) error {
 		}
 		return nil
 	}
-	// robfig/cron's parser strips a leading TZ=/CRON_TZ= descriptor before
-	// counting fields, so "TZ=UTC * * * * *" would slip past a count-after-
-	// parse check (and worse, "TZ=UTC" alone panics inside cron.Parse on a
-	// nil schedule deref). Enforce exactly five whitespace-separated fields
-	// with no embedded descriptor before delegating.
-	if err := requireFiveFields(expr); err != nil {
-		return err
-	}
-	if _, err := cronStdParser.Parse(expr); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidCronExpr, err)
-	}
-	return nil
+	_, err := parseCronLines(expr)
+	return err
 }
 
 // ResolveCronPreset returns the per-agent-offset cron expression for a
@@ -108,18 +106,77 @@ func parseCronPresetSentinel(s string) (int, bool) {
 // ParseCronSchedule parses an expression into a cron.Schedule using the same
 // strict parser as ValidateCronExpr. Empty input is an error here — callers
 // that want to allow "disabled" must check upfront.
+//
+// A multi-line expression yields a schedule whose Next is the earliest Next
+// across all lines; a single line yields the plain parsed schedule.
 func ParseCronSchedule(expr string) (cron.Schedule, error) {
 	if expr == "" {
 		return nil, fmt.Errorf("%w: empty expression", ErrInvalidCronExpr)
 	}
-	if err := requireFiveFields(expr); err != nil {
+	scheds, err := parseCronLines(expr)
+	if err != nil {
 		return nil, err
 	}
-	sched, err := cronStdParser.Parse(expr)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidCronExpr, err)
+	if len(scheds) == 1 {
+		return scheds[0], nil
 	}
-	return sched, nil
+	return multiSchedule(scheds), nil
+}
+
+// parseCronLines splits expr on newlines and parses each line with the strict
+// 5-field parser. Every line must be non-blank (after trimming, which also
+// drops a CRLF's '\r'); the editor strips blank lines before saving, so a
+// blank line here means a hand-crafted or truncated value and is rejected
+// rather than silently skipped.
+func parseCronLines(expr string) ([]cron.Schedule, error) {
+	lines := strings.Split(expr, "\n")
+	if len(lines) > MaxCronExprLines {
+		return nil, fmt.Errorf("%w: at most %d lines allowed, got %d", ErrInvalidCronExpr, MaxCronExprLines, len(lines))
+	}
+	scheds := make([]cron.Schedule, 0, len(lines))
+	for i, line := range lines {
+		// robfig/cron's parser strips a leading TZ=/CRON_TZ= descriptor before
+		// counting fields, so "TZ=UTC * * * * *" would slip past a count-after-
+		// parse check (and worse, "TZ=UTC" alone panics inside cron.Parse on a
+		// nil schedule deref). Enforce exactly five whitespace-separated fields
+		// with no embedded descriptor before delegating.
+		if err := requireFiveFields(line); err != nil {
+			if len(lines) > 1 {
+				return nil, fmt.Errorf("line %d: %w", i+1, err)
+			}
+			return nil, err
+		}
+		sched, err := cronStdParser.Parse(strings.TrimSpace(line))
+		if err != nil {
+			if len(lines) > 1 {
+				return nil, fmt.Errorf("%w: line %d: %v", ErrInvalidCronExpr, i+1, err)
+			}
+			return nil, fmt.Errorf("%w: %v", ErrInvalidCronExpr, err)
+		}
+		scheds = append(scheds, sched)
+	}
+	return scheds, nil
+}
+
+// multiSchedule fires whenever any of its member schedules does. Next
+// returns the earliest member Next strictly after t; members that can never
+// fire again (robfig returns the zero time, e.g. "0 0 30 2 *") are ignored.
+// Two members matching the same instant collapse into one firing because
+// Next is computed once per tick.
+type multiSchedule []cron.Schedule
+
+func (m multiSchedule) Next(t time.Time) time.Time {
+	var best time.Time
+	for _, s := range m {
+		n := s.Next(t)
+		if n.IsZero() {
+			continue
+		}
+		if best.IsZero() || n.Before(best) {
+			best = n
+		}
+	}
+	return best
 }
 
 // requireFiveFields rejects any expression that doesn't tokenize to exactly

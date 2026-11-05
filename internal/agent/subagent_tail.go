@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/backenddiag"
 )
 
 // Background-subagent activity visibility (Option A live tail + Option C backfill).
@@ -84,10 +86,13 @@ type subagentActivityFunc func(agentID string, act subagentActivity) bool
 // the in-turn stream path exactly. isSidechain marks subagent (non-main) lines;
 // uuid is the per-entry id used for idempotent de-duplication.
 type subagentTranscriptLine struct {
-	Type        string `json:"type"`
-	UUID        string `json:"uuid"`
-	IsSidechain bool   `json:"isSidechain"`
-	Message     struct {
+	IsAPIErrorMessage       bool            `json:"isApiErrorMessage"`
+	IsStreamAPIErrorMessage bool            `json:"is_api_error_message"`
+	APIErrorCode            json.RawMessage `json:"error"`
+	Type                    string          `json:"type"`
+	UUID                    string          `json:"uuid"`
+	IsSidechain             bool            `json:"isSidechain"`
+	Message                 struct {
 		Content []claudeContentBlock `json:"content"`
 	} `json:"message"`
 }
@@ -117,13 +122,29 @@ func readSubagentMeta(metaPath string) string {
 //
 // Returns (nil, nil) for lines that carry no renderable content (summaries,
 // bookkeeping, unparseable JSON).
-func subagentEventsFromLine(line []byte, parentToolUseID string) (events []ChatEvent, children []ToolUse) {
+func subagentEventsFromLine(line []byte, parentToolUseID string, loggers ...*slog.Logger) (events []ChatEvent, children []ToolUse) {
 	var entry subagentTranscriptLine
 	if err := json.Unmarshal(line, &entry); err != nil {
 		return nil, nil
 	}
 	switch entry.Type {
 	case "assistant":
+		if entry.IsAPIErrorMessage || entry.IsStreamAPIErrorMessage {
+			var text strings.Builder
+			for _, block := range entry.Message.Content {
+				if block.Type == "text" {
+					text.WriteString(block.Text)
+				}
+			}
+			d := backenddiag.Claude(text.String(), "")
+			_ = json.Unmarshal(entry.APIErrorCode, &d.Code)
+			if len(loggers) > 0 && loggers[0] != nil {
+				loggers[0].Warn("claude child API failure", "code", d.Code, "category", d.Category,
+					"request_id", d.RequestID, "message_id", d.MessageID,
+					"detail", d.Detail, "parent_tool_use_id", parentToolUseID)
+			}
+			return nil, nil // original JSONL + diagnostic log, not child prose
+		}
 		for i, block := range entry.Message.Content {
 			switch block.Type {
 			case "text":
@@ -481,7 +502,7 @@ func (t *subagentTailer) scanFile(dir, name string, suppressLive bool) {
 	var events []ChatEvent
 	var children []ToolUse
 	for _, line := range lines {
-		evs, chs := subagentEventsFromLine(line, toolUseID)
+		evs, chs := subagentEventsFromLine(line, toolUseID, t.logger)
 		events = append(events, evs...)
 		children = append(children, chs...)
 	}

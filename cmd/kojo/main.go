@@ -1357,6 +1357,10 @@ func main() {
 	// is cancelled so it lifecycles with the rest of the binary.
 	srv.StartIdempotencySweep(ctx)
 
+	// Retry force-reclaim notices addressed to peers that were offline
+	// when an agent was reclaimed (reclaim_notice.go).
+	srv.StartReclaimNoticeLoop(ctx)
+
 	// Periodic GitHub Releases check. Skipped for dev/unparseable
 	// stamps (never auto-notify against a dirty describe), operator
 	// opt-out, or env kill-switch. The checker itself is still on

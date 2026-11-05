@@ -219,3 +219,29 @@ func TestUnsealRejectsTraversal(t *testing.T) {
 		t.Fatal("escaped to /tmp")
 	}
 }
+
+func TestArchiveSealRemovesBashCaptures(t *testing.T) {
+	mgr := newSealTestManager(t)
+	capBase := t.TempDir()
+	origBase := bashCaptureBaseDir
+	bashCaptureBaseDir = func() string { return capBase }
+	t.Cleanup(func() { bashCaptureBaseDir = origBase })
+
+	a, err := mgr.Create(AgentConfig{Name: "captures"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capDir := bashCaptureDir(a.ID)
+	if err := os.MkdirAll(capDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(capDir, "out-x.log"), []byte("secret output"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Archive(a.ID, "correct horse"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(capDir); !os.IsNotExist(err) {
+		t.Fatalf("bash capture dir survived the seal: %v", err)
+	}
+}

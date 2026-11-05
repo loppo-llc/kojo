@@ -236,6 +236,10 @@ type Server struct {
 	// DOES NOT write the handoff/released marker (that's the
 	// source-release path's job; purge is target-side cleanup).
 	onAgentRuntimePurged func(ctx context.Context, agentID string)
+	// Force-reclaim notice retry loop (reclaim_notice.go).
+	reclaimNoticeOnce   sync.Once
+	reclaimNoticeChOnce sync.Once
+	reclaimNoticeKick   chan struct{}
 	// pendingAgentSyncs holds the per-op state delivered by
 	// /api/v1/peers/agent-sync until the matching finalize or
 	// drop call arrives. Keyed by (agent_id, op_id) so a
@@ -1068,6 +1072,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		mux.HandleFunc("POST "+keyedBgNotifyPath, s.handlePeerKeyedBackgroundNotify)
 		mux.HandleFunc("POST /api/v1/peers/handoff/arrival", s.handleHandoffArrivalContinuation)
 		mux.HandleFunc("POST /api/v1/peers/agent-sync/drop", s.handlePeerAgentSyncDrop)
+		// Old-holder side of force-reclaim: the reclaiming device tells
+		// us to release a runtime we still believe we own.
+		mux.HandleFunc("POST "+reclaimedPeerPath, s.handlePeerAgentReclaimed)
 	}
 
 	// Static files / dev proxy — Hub only. --peer hosts have no

@@ -33,6 +33,12 @@ func (m *Manager) ResetData(id string) error {
 		return err
 	}
 	defer cleanup()
+	// Re-check under the guard: an Archive that sealed between the
+	// check above and acquiring the guard must not have plaintext
+	// files recreated beside its sealed archive.
+	if AgentSealed(id) {
+		return fmt.Errorf("%w: %s", ErrAgentSealed, id)
+	}
 
 	if err := m.waitBusyClear(id); err != nil {
 		return err
@@ -69,6 +75,12 @@ func (m *Manager) ResetData(id string) error {
 	}
 	// The reset conversation has no "previous turn" left to explain.
 	m.dropMainStopNote(id)
+	// Fail before erasing the transcript if native context cannot be
+	// cleared. Returning success with a resumable old Agy conversation
+	// would let forgotten content reappear on the next turn.
+	if _, err := clearAgySessionCounted(id); err != nil {
+		return fmt.Errorf("reset: clear agy sessions: %w", err)
+	}
 
 	dir := agentDir(id)
 
@@ -195,6 +207,8 @@ func (m *Manager) ResetData(id string) error {
 	if err := os.RemoveAll(filepath.Join(dir, ".claude")); err != nil {
 		m.logger.Warn("reset: failed to remove .claude dir", "agent", id, "err", err)
 	}
+	// Bash captures live outside the agent dir; wipe them alongside .claude.
+	removeBashCaptureDir(id, m.logger)
 	// (Global CLI session stores cleared above, BEFORE lockMemorySync,
 	// to avoid the lock-order inversion against the peer-agent-sync
 	// handler. See the comment at the top of this function for detail.)
@@ -320,6 +334,11 @@ func (m *Manager) Archive(id, passcode string) error {
 	}
 	defer cleanup()
 
+	// Terminate persistent claude processes (main + keyed) before the
+	// tree is packed: an idle lingering session would otherwise survive
+	// the archive and could recreate plaintext files after the seal.
+	m.closeClaudeSessionSync(id)
+
 	if already {
 		if err := m.waitOneShotClear(id); err != nil {
 			return fmt.Errorf("%w: chats are still draining; retry to encrypt", ErrAgentBusy)
@@ -396,11 +415,22 @@ func (m *Manager) sealArchived(id, passcode string) error {
 		if err := os.RemoveAll(agentDir(id)); err != nil {
 			return fmt.Errorf("archive: remove leftover plaintext dir: %w", err)
 		}
+		if err := removeBashCaptureDir(id, m.logger); err != nil {
+			return fmt.Errorf("archive: remove bash captures: %w", err)
+		}
 		return nil
 	}
 	if err := sealAgentDir(id, passcode); err != nil {
 		m.logger.Error("archive: sealing agent dir failed", "agent", id, "err", err)
 		return err
+	}
+	// Bash captures live outside the agent dir, so sealing doesn't pack
+	// or remove them; drop them so no plaintext command output survives
+	// the seal. They are disposable (the hook prunes them after 24h).
+	// A failure is surfaced so the caller retries; the retry takes the
+	// already-sealed branch above and finishes the removal.
+	if err := removeBashCaptureDir(id, m.logger); err != nil {
+		return fmt.Errorf("archive: sealed, but failed to remove bash captures: %w", err)
 	}
 	m.logger.Info("agent dir sealed", "id", id)
 	return nil
@@ -662,6 +692,9 @@ func (m *Manager) Delete(id string) error {
 	if err := os.RemoveAll(dir); err != nil {
 		m.logger.Warn("failed to remove agent dir", "agent", id, "err", err)
 	}
+	// Bash captures live outside the agent dir, so the RemoveAll above
+	// doesn't reach them.
+	removeBashCaptureDir(id, m.logger)
 	if err := removeSealedArchive(id); err != nil {
 		m.logger.Warn("failed to remove sealed archive", "agent", id, "err", err)
 	}
@@ -2397,6 +2430,7 @@ func (m *Manager) ResetSession(agentID string) error {
 		if cerr != nil {
 			m.logger.Warn("CLI session reset: gemini-cli clear partial failure",
 				"agent", agentID, "err", cerr, "filesRemoved", files)
+			return fmt.Errorf("reset session: clear agy sessions: %w", cerr)
 		} else {
 			m.logger.Debug("CLI session reset: gemini-cli cleared",
 				"agent", agentID, "filesRemoved", files)

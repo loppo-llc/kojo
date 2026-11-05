@@ -148,6 +148,9 @@ func (s *Server) handlePeerEventsWS(w http.ResponseWriter, r *http.Request) {
 			// transition is a delivery trigger for any messages
 			// queued while this holder was away.
 			s.kickHandoffQueueDrain()
+			// Same trigger for force-reclaim notices addressed to a
+			// peer that was asleep when the agent was reclaimed.
+			s.kickReclaimNotices()
 		}
 	}
 

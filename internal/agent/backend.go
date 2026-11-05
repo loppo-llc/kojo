@@ -6,6 +6,8 @@ import (
 	"os"
 	"runtime"
 	"strings"
+
+	"github.com/loppo-llc/kojo/internal/backenddiag"
 )
 
 // ctxSend delivers e on ch, returning false without blocking further if
@@ -145,6 +147,13 @@ type ChatOptions struct {
 	// prefix. Mixing channel-context tokens into the middle of the prompt
 	// would invalidate the cache for every Slack message.
 	SystemPromptExtra string
+
+	// SystemPromptExtraApplied is the per-call suffix the manager already
+	// appended to the systemPrompt argument (after a "\n\n" separator).
+	// Backends must not append it again; it only lets a backend that
+	// stores the prompt somewhere shared between concurrent turns (agy's
+	// workspace rules) keep the per-call part apart.
+	SystemPromptExtraApplied string
 
 	// OnSteerReady, if set, is invoked once by a backend that supports
 	// mid-turn steering (claude: extra user-message line on stdin; codex:
@@ -449,7 +458,7 @@ func appendKojoTurnEnv(env []string, opts ChatOptions) []string {
 // (channel buffer full + reader gone after ctx.Done) does not deadlock
 // the backend goroutine and leak post-stream cleanup work like temp
 // file removal.
-func emitCancelDone(ctx context.Context, ch chan<- ChatEvent, content, thinking string, toolUses []ToolUse, usage *Usage) {
+func emitCancelDone(ctx context.Context, ch chan<- ChatEvent, content, thinking string, toolUses []ToolUse, usage *Usage, diagnostics ...*backenddiag.Diagnostic) {
 	msg := newAssistantMessage()
 	msg.Content = content
 	msg.Thinking = thinking
@@ -464,6 +473,9 @@ func emitCancelDone(ctx context.Context, ch chan<- ChatEvent, content, thinking 
 		Message:      msg,
 		Usage:        usage,
 		ErrorMessage: errMsg,
+	}
+	if len(diagnostics) > 0 {
+		ev.BackendDiagnostic = diagnostics[0]
 	}
 	// Try a non-blocking send first so a live receiver with buffer
 	// space always wins over the (already-signaled) ctx.Done case

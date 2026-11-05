@@ -57,6 +57,48 @@ Slack hintには、その端末のholderと永続counterを付ける。
 出発元の遅延release、abort、未送信のfinalizeにも、取得時またはcomplete時の世代を使う。
 GuardのAdd、Remove、refreshもagent単位で直列化し、Remove前のsnapshotによる遅延取得を止める。
 
+## 強制復帰と旧holder
+
+強制復帰（`POST /api/v1/agents/{id}/handoff/force-reclaim`）は、復帰した端末のkojo.dbだけを書き換える。
+旧holderには自分がholderだという記録（lock行または`arrived/<id>`）が残り、cronや定期チェックインを持つ2つ目のruntimeが動き続ける。
+そのまま旧holderへ再移動すると、state probeが`wrong_holder`（409）で失敗する。
+`authorizeIncomingSource`は、sourceからの照会でlocalの所有権を消さない設計だからである。
+
+このため、強制復帰した端末は旧holderへ解放を通知する。
+
+1. 強制復帰は、commitの前に、自分以外の登録peer全員を宛先とする通知を`kv`（namespace `handoff_reclaim_notice`、machine scope）に保存する。commit直後にクラッシュしても通知が残るようにするためで、保存できなければ強制復帰自体を500で中止する。
+   commit後にその場で配信し、結果は応答の`reclaimNotice`（`releasedOn` / `notHolderOn` / `pendingPeers` / `supersededOn`）で確認できる。
+2. 受信側（`POST /api/v1/peers/agent-sync/reclaimed`）は、自分がまだagentを保持している場合だけ解放する。
+   - 署名peerは`reclaimer_device_id`と一致する必要がある。
+   - lock行または到着markerが自分を指しているかを確認する。
+   - 解放は、switch完了後のsourceと同じ処理で行う。
+     - 自分を指すlock行を消し、fencing counterを進める。到着markerだけで保持と判定した場合、他peerを指すlock行（shadow）とcounterには触れない。
+     - 未完了の`incoming_handoffs`をabortedにする。
+     - 到着markerとpendingを消す。
+     - `released/<id>`と`full_sync/<id>`を書き込む。
+     - ここまでを1 transactionで行い、その後cron、notify、one-shotを止め、AgentLockGuardから外す。200を返す時点で解放は永続化されているので、再起動してもruntimeは復活しない。
+   - 保持していなければ何もせず`released=false`を返す。このため全peerへの一斉送信でも安全で、多段移動の中継peerが記録されていても届く。
+3. 解放した端末に付いた`handoff/full_sync/<id>` markerにより、次にこの端末へ移動するときはstate probeが`Known=false`を返し、全量snapshotを要求する。
+   probeの後でmarkerが付いた場合も、差分の`agent-sync`は`409 full_sync_required`で拒否する。
+   markerは全量syncのcommitと同じtransactionで消える。
+4. 届かなかったpeerへの通知はpendingのまま残り、次の契機で再送する。
+   - 1分ごとの再送
+   - そのpeerがofflineからonlineに変わったとき
+   - そのpeerへのswitch-deviceの直前
+
+   再送時に復帰した端末自身がもうholderでなければ、通知は古いものとして捨てる。
+   通知はcommit前に書くため、commitされた強制復帰の記録（後述の`handoff_reclaimed_at`）が無ければ捨てる。直近の強制復帰が失敗して古い記録だけが残っている場合は、その記録の時刻で通知する。この記録は再起動を挟んでも有効なので、再起動後も再送は続く。
+   相手が`409 concurrent_reclaim`を返した場合は、再送しても結果が変わらないので配信済みとして扱う（`supersededOn`）。
+   7日経っても届かない通知も捨てる。
+
+旧holderが長期間offlineのときは、旧holder側でowner権限を使って同じendpointを手動で呼べる（`reclaimer_device_id`には復帰した端末のIDを指定する）。
+
+限界:
+
+- 2台がほぼ同時に強制復帰すると、双方がholderで互いに通知を送る状態になる。両方が解放すると誰も保持しなくなるため、各端末は最後に強制復帰した時刻をagentごとに保存し（`handoff_reclaimed_at`）、通知にも復帰時刻（`reclaimed_at`）を載せる。受信側は`(復帰時刻, device ID)`の順序で自分の方が後なら`409 concurrent_reclaim`で拒否し、先なら解放する。双方が同じ2組を比較するため、通知の到着順や再送に関係なく片方だけが残る。時計のずれは「どちらが残るか」を変えるだけで、両方が解放されることはない。復帰時刻は強制復帰と同じtransactionで新しいfencing tokenと組（`<時刻>:<token>`）にして書き、受信側の順序判定では、自端末が今もそのtokenでlockを保持している間だけ有効とする。agentが端末を離れた後（switchでの送出、通知による解放）、再起動でlockを取り直した後、強制復帰が失敗した場合（transactionごとrollback）は無効になるので、過去の復帰時刻が後の正当な強制復帰を拒否し続けることはない。無効な場合は譲る側に倒す。
+- 通知の認可は「署名peer＝`reclaimer_device_id`」と「受信側がまだ保持しているか」だけで、送信元が本当に強制復帰したかは検証できない（端末ローカルfencingのv1では、他端末の所有を証明する手段がない）。登録済みpeerは同じownerの端末として信頼する前提で、他のpeer間endpointと同じ信頼モデルである。誤って解放されても、データは消えない。その端末で強制復帰すれば戻せる。
+- この修正より前のkojoを動かすpeerは、新しいendpointを持たない（403または404を返す）。通知は、その端末を更新するか7日のTTLが切れるまでpendingのまま残る。
+
 ## 適用条件と限界
 
 - 修正対象のHubと参加peerをすべて更新してから往復を確認する。旧targetの通常取得処理はこの修正では変わらない。
@@ -74,3 +116,6 @@ GuardのAdd、Remove、refreshもagent単位で直列化し、Remove前のsnapsh
 - phase-1より先のdrop、credentials保存前のdrop、未知の旧opによる上書き拒否
 - 3 peer帰還の委譲確認と、照会中に起きたlocal強制復帰の保護
 - owner権限があるデバイスでもsource IDを偽装できないこと
+- 強制復帰の通知による旧holderの解放、非holderの無視、署名不一致の拒否（`reclaim_notice_test.go`）
+- 解放後のprobeが全量syncを要求することと、差分syncの拒否
+- offline peerへの通知をpendingのまま保持し、holderでなくなったときに破棄すること

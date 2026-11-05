@@ -210,9 +210,9 @@ func TestValidModelEffort(t *testing.T) {
 			t.Errorf("expected minimal to be valid for codex model %q", m)
 		}
 	}
-	// gpt-6.1-sol, the gpt-6 family (sol, astra, luna) and the gpt-5.6 family (codex
-	// CLI 0.159.2): xhigh AND max are valid.
-	for _, m := range []string{"gpt-6.1-sol", "gpt-6-sol", "gpt-6-astra", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+	// The gpt-6.1 family (sol, terra), the gpt-6 family (sol, astra, luna) and the
+	// gpt-5.6 family (codex CLI 0.164.0): xhigh AND max are valid.
+	for _, m := range []string{"gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-astra", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
 		if !ValidModelEffort(m, "xhigh") {
 			t.Errorf("expected xhigh to be valid for codex model %q", m)
 		}

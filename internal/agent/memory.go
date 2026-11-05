@@ -576,7 +576,14 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	if hasTools {
 		sb.WriteString(fmt.Sprintf("- Your file storage directory is: %s\n", fileDir))
 		sb.WriteString("  - IMPORTANT: When saving generated files (images, documents, downloads, etc.), always use absolute paths under this directory.\n")
-		sb.WriteString("  - NEVER save files to /tmp or other temporary directories — they will be lost.\n")
+		// /tmp is allowed only for truly disposable files. The original rule
+		// (d0d9925d) was an absolute "NEVER save to /tmp", meant to stop
+		// generated files from being lost there. Taken literally it also
+		// forbids short-lived copies some tools require — e.g. the Slack
+		// extension's slack_upload_file only reads from {tmp}/kojo/upload —
+		// and strict models refused those uploads. Keep the intent (nothing
+		// worth keeping lives only in /tmp) without the blanket ban.
+		sb.WriteString("  - Do NOT keep files in /tmp or other system temporary directories unless they are truly disposable — needed only for the operation at hand and fine to lose as soon as it completes (e.g. an intermediate file used within a single command, or a short-lived copy staged where a tool requires it, such as the kojo upload directory for file uploads, removed afterwards). /tmp contents can be lost, so everything else — including scratch outputs you may look at again — goes under this directory, following the discipline below.\n")
 		tempDir := filepath.Join(fileDir, "temp")
 		sb.WriteString("  - File output discipline (generated artifacts only; memory/, persona.md, MEMORY.md are unaffected):\n")
 		sb.WriteString(fmt.Sprintf("    - Ephemeral / ad-hoc outputs (scratch scripts, one-shot screenshots, blobs you'll inspect once) go under %s/ — default there when unsure; temp/ may be cleaned up at any time.\n", tempDir))

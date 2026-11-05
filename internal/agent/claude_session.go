@@ -1106,7 +1106,7 @@ func (s *claudeSession) absorbNotification(event claudeStreamEvent, rawParent st
 	finalText := finalStreamText(res, res.resultError != "")
 	if finalText == "" {
 		if res.resultError != "" {
-			sessionSend(context.Background(), sink, ChatEvent{Type: "error", ErrorMessage: res.resultError})
+			sessionSend(context.Background(), sink, ChatEvent{Type: "error", ErrorMessage: res.resultError, BackendDiagnostic: res.backendDiagnostic})
 		}
 		close(sink)
 		return
@@ -1115,7 +1115,7 @@ func (s *claudeSession) absorbNotification(event claudeStreamEvent, rawParent st
 		sessionSend(context.Background(), sink, ChatEvent{Type: "text", Delta: finalText})
 	}
 	msg := assembleAssistantMessage(finalText, res.thinking, res.toolUses, turnUsage)
-	sessionSend(context.Background(), sink, ChatEvent{Type: "done", Message: msg, Usage: turnUsage, ErrorMessage: res.resultError})
+	sessionSend(context.Background(), sink, ChatEvent{Type: "done", Message: msg, Usage: turnUsage, ErrorMessage: res.resultError, BackendDiagnostic: res.backendDiagnostic})
 	close(sink)
 }
 
@@ -1175,7 +1175,7 @@ func (s *claudeSession) completeTurn() {
 	// the background handler drops it.
 	if unsolicited && res.fullText == "" && res.lastAssistantText == "" && len(res.toolUses) == 0 {
 		if res.resultError != "" && !turnAborted {
-			sessionSend(turnCtx, sink, ChatEvent{Type: "error", ErrorMessage: res.resultError})
+			sessionSend(turnCtx, sink, ChatEvent{Type: "error", ErrorMessage: res.resultError, BackendDiagnostic: res.backendDiagnostic})
 		}
 		close(sink)
 		if done != nil {
@@ -1206,7 +1206,7 @@ func (s *claudeSession) completeTurn() {
 	}
 	// Session recovery re-reads the JSONL's last assistant text; for a
 	// stopped turn that is the PREVIOUS turn's reply, never this one's.
-	if finalText == "" && !keyedCancelled {
+	if finalText == "" && !keyedCancelled && res.backendDiagnostic == nil {
 		recoverID := res.streamSessionID
 		if recoverID == "" {
 			recoverID = s.sessionID
@@ -1221,7 +1221,7 @@ func (s *claudeSession) completeTurn() {
 		sessionSend(sendCtx, sink, ChatEvent{Type: "text", Delta: finalText})
 	}
 	msg := assembleAssistantMessage(finalText, res.thinking, res.toolUses, turnUsage)
-	sessionSend(sendCtx, sink, ChatEvent{Type: "done", Message: msg, Usage: turnUsage, ErrorMessage: turnError, BackgroundTasksPending: lingerPending})
+	sessionSend(sendCtx, sink, ChatEvent{Type: "done", Message: msg, Usage: turnUsage, ErrorMessage: turnError, BackendDiagnostic: res.backendDiagnostic, BackgroundTasksPending: lingerPending})
 	close(sink)
 	if done != nil {
 		close(done)
@@ -1356,7 +1356,11 @@ func (s *claudeSession) onEOF() {
 			content, thinking, toolUses, usage = mergeStreamTexts(res), res.thinking, res.toolUses, res.usage
 		}
 		msg := assembleAssistantMessage(content, thinking, toolUses, usage)
-		sessionSend(context.Background(), sink, ChatEvent{Type: "done", Message: msg, Usage: usage, ErrorMessage: cancelErrMessage(turnCtx)})
+		event := ChatEvent{Type: "done", Message: msg, Usage: usage, ErrorMessage: cancelErrMessage(turnCtx)}
+		if acc != nil {
+			event.BackendDiagnostic = acc.res.backendDiagnostic
+		}
+		sessionSend(context.Background(), sink, event)
 		close(sink)
 		sink = nil
 	}
@@ -1370,15 +1374,18 @@ func (s *claudeSession) onEOF() {
 	if sink != nil {
 		if acc != nil {
 			res := acc.finalize()
+			if res.backendDiagnostic != nil && !turnAborted {
+				processError = res.resultError
+			}
 			finalText := finalStreamText(res, !turnAborted)
 			if finalText != "" {
 				errorMessage := processError
 				if turnAborted {
 					errorMessage = ""
 				}
-				sessionSend(turnCtx, sink, ChatEvent{Type: "done", Message: assembleAssistantMessage(finalText, res.thinking, res.toolUses, res.usage), Usage: res.usage, ErrorMessage: errorMessage})
+				sessionSend(turnCtx, sink, ChatEvent{Type: "done", Message: assembleAssistantMessage(finalText, res.thinking, res.toolUses, res.usage), Usage: res.usage, ErrorMessage: errorMessage, BackendDiagnostic: res.backendDiagnostic})
 			} else if !turnAborted {
-				sessionSend(turnCtx, sink, ChatEvent{Type: "error", ErrorMessage: processError})
+				sessionSend(turnCtx, sink, ChatEvent{Type: "error", ErrorMessage: processError, BackendDiagnostic: res.backendDiagnostic})
 			}
 		} else if !turnAborted {
 			sessionSend(turnCtx, sink, ChatEvent{Type: "error", ErrorMessage: "claude process exited"})

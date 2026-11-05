@@ -36,6 +36,19 @@ func prepareFencedIncomingForTest(t *testing.T, srv *Server, agentID, opID, sour
 	}
 }
 
+// ignoreReclaimNotice answers the force-reclaim notice that
+// reclaimForRouteTest now sends to the old holder, so fake holders that
+// count or block on requests only see the traffic the test is about.
+func ignoreReclaimNotice(h http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == reclaimedPeerPath {
+			writeJSONResponse(w, http.StatusOK, peerAgentReclaimedResponse{})
+			return
+		}
+		h(w, r)
+	})
+}
+
 func reclaimForRouteTest(t *testing.T, srv *Server, id string) {
 	t.Helper()
 	req := authedRequest(httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+id+"/handoff/force-reclaim", nil), auth.Principal{Role: auth.RoleOwner})
@@ -77,7 +90,7 @@ func TestExternalChatLatePOSTCannotRepopulateReclaimedRoute(t *testing.T) {
 	var posts atomic.Int32
 	var releaseOnce sync.Once
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
-	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	holder := httptest.NewServer(ignoreReclaimNotice(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			writeJSONResponse(w, 200, externalChatReadyResponse{Ready: true, HolderPeer: "holder"})
 			return
@@ -236,7 +249,7 @@ func TestHandoffCancelledAbortKeepsOwnershipFence(t *testing.T) {
 
 func TestHandoffLateFinalizeIsNotSentAfterReclaim(t *testing.T) {
 	var calls atomic.Int32
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(200) }))
+	target := httptest.NewServer(ignoreReclaimNotice(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(200) }))
 	t.Cleanup(target.Close)
 	srv, _, id := prepareRemoteExternalChat(t, target.URL)
 	v, err := srv.agents.Store().GetAgentLockVersion(context.Background(), id)
@@ -309,7 +322,7 @@ func TestIncomingDelegationCannotOverrideLocalReclaim(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
-	delegated := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	delegated := httptest.NewServer(ignoreReclaimNotice(func(w http.ResponseWriter, r *http.Request) {
 		close(entered)
 		<-release
 		writeJSONResponse(w, 200, externalChatReadyResponse{HolderPeer: "source-C"})

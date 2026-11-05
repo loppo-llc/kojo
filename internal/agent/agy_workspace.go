@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,22 +20,27 @@ import (
 // cwd, which for a kojo turn is the agent directory:
 //
 //   - <dir>/.agents/mcp_config.json  MCP servers ({"mcpServers": {...}})
+//   - <dir>/.agents/rules/kojo-system-NN.md  always_on prompt rules. agy
+//     reads them again for a resumed conversation, so they carry kojo's
+//     shared system prompt (persona, memory, ...), which changes between
+//     the turns of one conversation.
 //   - <dir>/.agents/agents/<name>/agent.md  a custom agent, selected with
-//     --agent <name>; its body is the agent's system instructions
+//     --agent <name>. It sets the tool policy and carries the per-call
+//     SystemPromptExtra (thread / Slack context). agy freezes its body
+//     when a conversation is created (see agyResumeExtraNotice).
 //
-// kojo owns both files and rewrites them before every turn. One agent can
+// kojo owns these files and rewrites them before every turn. One agent can
 // run several agy turns at once (its own chat plus thread / external
-// sessions). The system prompt differs between them (a thread appends its
-// own context), so every distinct prompt gets its own custom agent,
-// kojo-<hash of the prompt>, and turns never wait on each other for it.
-// mcp_config.json has a single fixed path; it is the same for every turn
-// of an agent, and a turn that needs it to say something else (an
-// extension was toggled meanwhile) waits until the turns started against
-// the current content have exited (the same scheme as holdGrokMCPConfig).
+// sessions). Every distinct custom agent body gets its own agent,
+// kojo-<hash of the body>, so turns with different extras never wait on
+// each other for it. mcp_config.json and the rules have fixed paths shared
+// by every turn of the agent; a turn that needs them to say something else
+// waits until the turns started against the current content have exited
+// (the same scheme as holdGrokMCPConfig).
 
 const (
 	// agyKojoAgentPrefix starts the name of every custom agent kojo
-	// generates; agyAgentName appends the prompt hash.
+	// generates; agyAgentName appends the body hash.
 	agyKojoAgentPrefix = "kojo-"
 	// agyMCPTimeoutSeconds lifts agy's per-call MCP limit (3 minutes):
 	// kojo's own MCP tools (exec, long searches) can run far longer, and
@@ -50,11 +56,11 @@ func agyAgentsDir(agentDirPath string) string {
 	return filepath.Join(agentDirPath, ".agents", "agents")
 }
 
-// agyAgentName names the custom agent carrying systemPrompt. agy looks a
-// custom agent up by the name in its frontmatter; the directory is named
-// the same.
-func agyAgentName(systemPrompt string) string {
-	sum := sha256.Sum256([]byte(systemPrompt))
+// agyAgentName names the custom agent whose body (agyAgentDefBody) is
+// body. agy looks a custom agent up by the name in its frontmatter; the
+// directory is named the same.
+func agyAgentName(body string) string {
+	sum := sha256.Sum256([]byte(body))
 	return agyKojoAgentPrefix + hex.EncodeToString(sum[:8])
 }
 
@@ -135,23 +141,36 @@ var agyAgentTools = []string{
 	"send_message", "view_file", "wait", "write_to_file",
 }
 
-// renderAgyAgentDef renders the custom agent that carries kojo's system
-// prompt, or "" when there is none.
-func renderAgyAgentDef(name, systemPrompt string) string {
-	if systemPrompt == "" {
-		return ""
+// agyRulesPointer opens every generated agent body. The body is frozen
+// with the conversation, so it only points at the rules, which carry the
+// current shared prompt on every turn.
+const agyRulesPointer = "Follow the current kojo instructions in .agents/rules/kojo-system-*.md. " +
+	"Those rules are refreshed every turn; the latest version replaces earlier kojo rule snapshots in the conversation.\n"
+
+// agyAgentDefBody is the body of the custom agent for a turn whose
+// per-call SystemPromptExtra is extra.
+func agyAgentDefBody(extra string) string {
+	if extra == "" {
+		return agyRulesPointer
 	}
+	return agyRulesPointer + "\n" + extra + "\n"
+}
+
+// renderAgyAgentDef renders the custom agent name with body: kojo's tool
+// policy, then the body.
+func renderAgyAgentDef(name, body string) string {
 	return "---\nname: " + name +
 		"\ndescription: " + agyGeneratedAgentDescription +
 		"\ntools: [" + strings.Join(agyAgentTools, ", ") + "]" +
-		"\n---\n" + systemPrompt + "\n"
+		"\n---\n" + body
 }
 
 // holdAgyWorkspace makes the managed files say exactly files (path →
 // content; "" removes the file) and keeps them that way until release is
 // called, which the caller does once its agy process has exited. A file
-// held with other content is waited for; files listed in ephemeral are
-// removed again once their last holder released them.
+// held with other content is waited for, and so is a held kojo rule file
+// that files no longer lists (it would be pruned); files listed in
+// ephemeral are removed again once their last holder released them.
 func holdAgyWorkspace(ctx context.Context, agentDirPath string, files map[string]string, ephemeral ...string) (release func(), err error) {
 	paths := make([]string, 0, len(files))
 	for p := range files {
@@ -160,14 +179,7 @@ func holdAgyWorkspace(ctx context.Context, agentDirPath string, files map[string
 	sort.Strings(paths)
 	for {
 		agyWorkspaceMu.Lock()
-		var conflict chan struct{}
-		for _, p := range paths {
-			if h := agyWorkspaceHolds[p]; h != nil && h.content != files[p] {
-				conflict = h.freed
-				break
-			}
-		}
-		if conflict != nil {
+		if conflict := agyWorkspaceConflictLocked(agentDirPath, files); conflict != nil {
 			agyWorkspaceMu.Unlock()
 			select {
 			case <-conflict:
@@ -179,6 +191,10 @@ func holdAgyWorkspace(ctx context.Context, agentDirPath string, files map[string
 		// Also under a hold of the same content: the files may have been
 		// edited since, and putting back what the running turns were
 		// started with takes nothing from them.
+		if err := prepareAgyManagedPaths(agentDirPath, files); err != nil {
+			agyWorkspaceMu.Unlock()
+			return nil, err
+		}
 		for _, p := range paths {
 			if err := syncAgyManagedFile(p, files[p]); err != nil {
 				agyWorkspaceMu.Unlock()
@@ -218,11 +234,35 @@ func holdAgyWorkspace(ctx context.Context, agentDirPath string, files map[string
 	}
 }
 
+// agyWorkspaceConflictLocked returns the hold a turn wanting files must
+// wait for, or nil. Caller holds agyWorkspaceMu.
+func agyWorkspaceConflictLocked(agentDirPath string, files map[string]string) chan struct{} {
+	for p, content := range files {
+		if h := agyWorkspaceHolds[p]; h != nil && h.content != content {
+			return h.freed
+		}
+	}
+	// prepareAgyManagedPaths prunes the numbered kojo rule files that
+	// files does not list; one a running turn was started with must stay
+	// (a shorter prompt has fewer chunks).
+	rules := agyRulesDir(agentDirPath)
+	for p, h := range agyWorkspaceHolds {
+		if filepath.Dir(p) != rules || !isAgyManagedRuleName(filepath.Base(p)) {
+			continue
+		}
+		if _, ok := files[p]; !ok {
+			return h.freed
+		}
+	}
+	return nil
+}
+
 // sweepAgyAgentDefsLocked removes the generated custom agents no running
 // turn holds: those of a kojo that exited mid-turn, and the shared "kojo"
 // one of earlier versions. agy reads its agent def at start-up (a run
 // whose def is deleted mid-turn keeps its prompt), so an agy outliving its
-// kojo loses nothing. Caller holds agyWorkspaceMu.
+// kojo loses nothing. Caller holds agyWorkspaceMu and has checked the
+// agents directory with prepareAgyManagedPaths.
 func sweepAgyAgentDefsLocked(agentDirPath string) {
 	entries, err := os.ReadDir(agyAgentsDir(agentDirPath))
 	if err != nil {
@@ -236,17 +276,60 @@ func sweepAgyAgentDefsLocked(agentDirPath string) {
 		if agyWorkspaceHolds[def] != nil {
 			continue
 		}
-		if b, err := os.ReadFile(def); err != nil || !strings.Contains(string(b), "\ndescription: "+agyGeneratedAgentDescription+"\n") {
+		if b, err := readAgyStateFile(def); err != nil || !strings.Contains(string(b), "\ndescription: "+agyGeneratedAgentDescription+"\n") {
 			continue
 		}
 		_ = os.RemoveAll(filepath.Join(agyAgentsDir(agentDirPath), e.Name()))
 	}
 }
 
+// Check every managed parent before writing or removing anything. A
+// symlink in the writable workspace must not redirect MCP tokens, rules
+// or the agent-def sweep outside the agent directory. Only kojo's
+// numbered rule files are pruned.
+func prepareAgyManagedPaths(dir string, files map[string]string) error {
+	paths := []string{filepath.Join(dir, ".agents"), agyRulesDir(dir), agyAgentsDir(dir)}
+	for path := range files {
+		rel, err := filepath.Rel(dir, path)
+		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+			return fmt.Errorf("agy managed path outside agent directory: %s", path)
+		}
+		for parent := filepath.Dir(path); parent != dir; parent = filepath.Dir(parent) {
+			paths = append(paths, parent)
+		}
+	}
+	if err := geminiRefuseSymlinks(paths...); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(agyRulesDir(dir))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !isAgyManagedRuleName(name) {
+			continue
+		}
+		path := filepath.Join(agyRulesDir(dir), name)
+		if _, keep := files[path]; !keep {
+			if err := os.Remove(path); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // syncAgyManagedFile writes content to path (0600: an HTTP MCP entry
 // carries the agent's kojo token) unless it already says that, or removes
 // path when content is "".
 func syncAgyManagedFile(path, content string) error {
+	if err := agyRefuseFileSymlink(path); err != nil {
+		return err
+	}
 	if content == "" {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return err

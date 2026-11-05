@@ -108,6 +108,18 @@ func (s *Server) handlePeerAgentSyncState(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// Another device force-reclaimed this agent while we still ran it:
+	// our rows diverged, so ask for a full snapshot (Known=false) rather
+	// than advertising high-water marks the source's history doesn't share.
+	if marked, err := s.agents.Store().HasAgentFullSyncMarker(r.Context(), req.AgentID); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal",
+			"full-sync marker lookup: "+err.Error())
+		return
+	} else if marked {
+		writeJSONResponse(w, http.StatusOK, store.AgentSyncState{})
+		return
+	}
+
 	state, err := s.agents.Store().GetAgentSyncState(r.Context(), req.AgentID)
 	if err != nil {
 		// ErrNotFound bubbles up as state.Known=false from the

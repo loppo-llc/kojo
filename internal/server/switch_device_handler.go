@@ -652,6 +652,14 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	//     hard-fail BEFORE begin so an auth/holder mismatch
 	//     surfaces here instead of getting re-rejected at
 	//     /agent-sync after handoff_pending is already set.
+	// A force-reclaim notice still pending for the target means it may
+	// still believe it holds the agent (wrong_holder below). Deliver it
+	// first; the switch-transaction lock is held. Best-effort: if it
+	// fails, the probe reports the real state.
+	if _, nerr := s.deliverReclaimNotice(ctx, agentID, req.TargetPeerID); nerr != nil {
+		s.logger.Warn("switch-device: pending force-reclaim notice delivery failed",
+			"agent", agentID, "target", req.TargetPeerID, "err", nerr)
+	}
 	var targetState *store.AgentSyncState
 	probed, perr := s.dispatchPeerAgentSyncState(ctx, targetAddr, req.TargetPeerID, agentID)
 	switch {

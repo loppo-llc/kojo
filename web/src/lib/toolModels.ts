@@ -15,6 +15,7 @@ export const toolModels: Record<string, ToolModelConfig> = {
     models: [
       "gpt-6.1-sol",
       "gpt-6-astra",
+      "gpt-6.1-terra",
       "gpt-6-sol",
       "gpt-6-luna",
       "gpt-5.6-sol",
@@ -95,20 +96,21 @@ export type EffortLevel = (typeof effortLevels)[number];
  */
 const xhighModels = new Set(["opus", "sonnet", "claude-sonnet-5-5", "claude-sonnet-5", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"]);
 const codexEffortModels = new Set(toolModels.codex.models);
-// codex CLI 0.159.2 models_cache.json: gpt-6.1-sol, the gpt-6 family (sol,
-// astra, luna) and the gpt-5.6 family advertise low/medium/high/xhigh/max
-// (gpt-6.1-sol, gpt-6-sol, gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra also
-// list "ultra", which
+// codex CLI 0.164.0 models_cache.json: the gpt-6.1 family (sol, terra), the
+// gpt-6 family (sol, astra, luna) and the gpt-5.6 family advertise
+// low/medium/high/xhigh/max (gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol,
+// gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra also list "ultra", which
 // kojo's effort scale doesn't model). Older gpt-5.x models stop at xhigh.
 // Keep in sync with agent.go codexMaxEffortModels.
-const codexMaxModels = new Set(["gpt-6.1-sol", "gpt-6-sol", "gpt-6-astra", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
-// codex CLI 0.159.2 models_cache.json default_reasoning_level: gpt-6-astra
-// is the only listed model that defaults to "low" (this has flipped between
-// gpt-6-astra and gpt-5.6-sol across CLI releases; re-check the cache on
-// each update). gpt-5.5 is the one codex model that defaults to "xhigh".
-// Every other codex model, including gpt-6.1-sol, defaults to "medium".
-// Models missing from the cache (gpt-5.4 and older) keep "medium".
-const codexLowDefaultModels = new Set(["gpt-6-astra"]);
+const codexMaxModels = new Set(["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-astra", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+// codex CLI 0.164.0 models_cache.json default_reasoning_level: gpt-6.1-sol,
+// gpt-6.1-terra and gpt-5.6-sol default to "low" (the low-default set has
+// shifted between gpt-6-astra, gpt-5.6-sol and the gpt-6.1 family across CLI
+// releases; re-check the cache on each update). gpt-5.5 (no longer in the
+// cache; last seen in 0.159.2) is the one codex model that defaults to
+// "xhigh". Every other codex model, including gpt-6-astra, defaults to
+// "medium". Models missing from the cache (gpt-5.4 and older) keep "medium".
+const codexLowDefaultModels = new Set(["gpt-6.1-sol", "gpt-6.1-terra", "gpt-5.6-sol"]);
 const codexXhighDefaultModels = new Set(["gpt-5.5"]);
 // Claude models whose API default effort is "medium" rather than "high":
 // https://platform.claude.com/docs/en/models/opus-5-5/overview (fetched
@@ -148,13 +150,13 @@ export function supportsEffort(tool: string): boolean {
   return tool === "claude" || tool === "grok" || tool === "codex" || tool === "gemini-api" || tool === "gemini-agy";
 }
 
-// codex CLI 0.159.2: gpt-6.1-sol, gpt-6-sol, gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra
+// codex CLI 0.164.0: gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra
 // additionally advertise the "ultra" reasoning level (multi-agent
 // orchestration mode); gpt-6-luna and gpt-5.6-luna stop at max. It is a different beast from the plain effort
 // ladder — long-running and expensive — so kojo's per-agent effort scale
 // intentionally stops at "max"; ultra is offered ONLY as a per-session
 // choice in NewSession.
-const codexUltraModels = new Set(["gpt-6.1-sol", "gpt-6-sol", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"]);
+const codexUltraModels = new Set(["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"]);
 
 /**
  * Effort levels offered when starting an ad-hoc session for the given

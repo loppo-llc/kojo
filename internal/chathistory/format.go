@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/backenddiag"
 )
 
 const (
@@ -221,7 +223,11 @@ func formatMessage(m HistoryMessage, botUserID string) string {
 		label = fmt.Sprintf("%s (%s)", name, ts)
 	}
 
-	return label + ": " + m.Text
+	text := m.Text
+	if m.IsBot {
+		text = backenddiag.HistoryText(text)
+	}
+	return label + ": " + text
 }
 
 func sumLen(lines []string) int {

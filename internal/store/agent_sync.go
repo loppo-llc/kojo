@@ -181,6 +181,15 @@ func (s *Store) SyncAgentFromPeer(ctx context.Context, payload AgentSyncPayload)
 	if err := syncAgentTasksTx(ctx, tx, agentID, payload.Tasks); err != nil {
 		return err
 	}
+	// A full snapshot replaced every diverged row, so the post-reclaim
+	// "next switch must be full" marker has served its purpose.
+	if !payload.IncrementalMessages && !payload.IncrementalMemoryEntries {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM kv WHERE namespace = 'handoff' AND key = ?`,
+			AgentFullSyncMarkerKey(agentID)); err != nil {
+			return fmt.Errorf("store.SyncAgentFromPeer: clear full-sync marker: %w", err)
+		}
+	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store.SyncAgentFromPeer: commit: %w", err)

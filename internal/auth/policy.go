@@ -225,6 +225,13 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			// successful complete; drop rolls back on abort.
 			return true
 		}
+		if method == http.MethodPost && path == "/api/v1/peers/agent-sync/reclaimed" {
+			// Force-reclaim notice: the reclaiming device tells the
+			// old holder to release its runtime. signer-equals-
+			// reclaimer and the "do we still claim it" check run
+			// inside the handler.
+			return true
+		}
 		if method == http.MethodPost && path == "/api/v1/peers/agent-sync/state" {
 			// Incremental device-switch preflight (§3.7): source
 			// peer asks target for its high-water marks so the

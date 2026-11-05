@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"time"
@@ -32,6 +33,9 @@ const forceReclaimLeaseDuration = 5 * time.Minute
 //  2. Fire onAgentForceReclaimed (cmd/kojo wires it to
 //     AgentLockGuard.AddAgent + Manager.ActivateAgentRuntime) so
 //     the local chat surface reattaches without a daemon restart.
+//  3. Notify every other peer (reclaim_notice.go) so the previous
+//     holder releases its runtime instead of running a second copy;
+//     unreachable peers keep a pending notice that is retried.
 //
 // Trade-off: any in-flight write from the previous holder racing
 // the reclaim WILL fail CheckFencing on the new token. That's the
@@ -69,6 +73,25 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusInternalServerError, "internal", "agent lookup: "+err.Error())
 		return
 	}
+	// Outbox first: persist the notice for the previous holder BEFORE the
+	// reclaim commits, so a crash or hang-up right after the commit can't
+	// leave the old runtime running with nothing queued to tell it. If
+	// the reclaim below fails, the notice is left in place: it addresses
+	// every peer (a superset of any notice it replaced) and the delivery
+	// pass discards it unless this device holds the agent. Detached from
+	// the request and bounded so the switch lock is not held indefinitely.
+	noticeCtx, cancelNotice := context.WithTimeout(context.WithoutCancel(r.Context()), 2*reclaimNoticeTimeout)
+	defer cancelNotice()
+	// One timestamp orders this reclaim against a concurrent one elsewhere:
+	// it rides on the notice and is stamped (bound to the new fencing
+	// token) inside the reclaim tx below.
+	reclaimedAt := store.NowMillis()
+	if err := s.recordReclaimNotice(noticeCtx, id, reclaimedAt); err != nil {
+		s.logger.Error("force-reclaim: could not record notice for the previous holder", "agent", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"force-reclaim: record notice for the previous holder: "+err.Error())
+		return
+	}
 	// One-shot atomic restore of every device-switch artefact
 	// (agent_locks, blob_refs, kv handoff markers) back to "local
 	// owns the runtime". Without this all-in-one tx the operator
@@ -77,9 +100,9 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 	// agent_locks was rewritten but blob_refs.home_peer kept
 	// pointing at the dead peer and the next device-switch
 	// surfaced wrong_source.
-	rec, err := s.agents.Store().ForceReclaimAgentToLocal(
+	rec, err := s.agents.Store().ForceReclaimAgentToLocalStamped(
 		r.Context(), id, s.peerID.DeviceID,
-		store.NowMillis(), forceReclaimLeaseDuration.Milliseconds(),
+		reclaimedAt, forceReclaimLeaseDuration.Milliseconds(), reclaimedAt,
 	)
 	if err != nil {
 		s.logger.Error("force-reclaim: atomic state restore failed", "agent", id, "err", err)
@@ -96,11 +119,21 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 	s.logger.Info("force-reclaim: agent runtime reclaimed",
 		"agent", id, "fencing_token", rec.FencingToken,
 		"lease_expires_at", rec.LeaseExpiresAt)
+	// Tell the previous holder (and any other peer that still claims the
+	// agent) to let go. Best-effort: peers we can't reach now keep the
+	// pending notice, which the retry loop delivers once they come back.
+	// Still under the switch lock, so no switch can move the agent away
+	// mid-delivery.
+	notice, err := s.deliverReclaimNotice(noticeCtx, id, "")
+	if err != nil {
+		s.logger.Warn("force-reclaim: notice delivery failed; will retry", "agent", id, "err", err)
+	}
 	writeJSONResponse(w, http.StatusOK, map[string]any{
 		"agentId":        id,
 		"holderPeer":     rec.HolderPeer,
 		"fencingToken":   rec.FencingToken,
 		"leaseExpiresAt": rec.LeaseExpiresAt,
+		"reclaimNotice":  notice,
 	})
 }
 

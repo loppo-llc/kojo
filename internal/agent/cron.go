@@ -203,8 +203,9 @@ func (cs *cronScheduler) Stop() {
 
 // Schedule adds or updates a cron schedule for an agent.
 // If cronExpr is empty, any existing schedule is removed.
-// cronExpr must be a 5-field standard cron expression — shortcuts like @every
-// or 6-field forms (with seconds) are rejected via cronStdParser.
+// cronExpr must be one or more newline-separated 5-field standard cron
+// expressions — shortcuts like @every or 6-field forms (with seconds) are
+// rejected via cronStdParser. Multiple lines fire on the union of their ticks.
 func (cs *cronScheduler) Schedule(agentID string, cronExpr string) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()

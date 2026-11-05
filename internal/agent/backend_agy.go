@@ -13,8 +13,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/proctree"
 )
 
 // AgyBackend implements ChatBackend for the "gemini-agy" tool: the
@@ -79,109 +81,8 @@ var agyEffortModels = map[string]bool{
 // reaches argv.
 var agyConversationIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
-func agyStateDir(agentDirPath string) string { return filepath.Join(agentDirPath, ".agy") }
-
-// agyConversationRefPath maps a SessionKey to the file holding its
-// conversation id. The key is hashed: it is caller-supplied and must not
-// steer the join out of the directory.
-func agyConversationRefPath(agentDirPath, sessionKey string) string {
-	if sessionKey == "" {
-		return filepath.Join(agyStateDir(agentDirPath), "conversation_id")
-	}
-	return filepath.Join(agyStateDir(agentDirPath), "threads", "key-"+agentIDToUUID(sessionKey))
-}
-
-// readAgyConversationID returns the stored id for sessionKey, or "". A
-// malformed value is deleted so it cannot keep failing turns.
-func readAgyConversationID(agentDirPath, sessionKey string) string {
-	path := agyConversationRefPath(agentDirPath, sessionKey)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	id := strings.TrimSpace(string(data))
-	if !agyConversationIDPattern.MatchString(id) {
-		_ = os.Remove(path)
-		return ""
-	}
-	return id
-}
-
-// agyConversationExists reports whether agy still has the conversation.
-// agy keeps each one as ~/.gemini/antigravity-cli/conversations/<id>.db
-// and silently starts a new conversation for an id it does not know, so
-// the check is what lets a lost conversation get the recent-messages
-// bootstrap of a fresh one. When the store cannot be located the id is
-// trusted.
-func agyConversationExists(id string) bool {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return true
-	}
-	dir := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
-	if _, err := os.Stat(dir); err != nil {
-		return true
-	}
-	_, err = os.Stat(filepath.Join(dir, id+".db"))
-	return err == nil
-}
-
-func writeAgyConversationID(agentDirPath, sessionKey, id string, logger *slog.Logger) {
-	if !agyConversationIDPattern.MatchString(id) {
-		logger.Warn("agy: refusing to persist malformed conversation id", "value", id)
-		return
-	}
-	path := agyConversationRefPath(agentDirPath, sessionKey)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		logger.Warn("agy: mkdir for conversation id failed", "path", path, "err", err)
-		return
-	}
-	if err := os.WriteFile(path, []byte(id), 0o644); err != nil {
-		logger.Warn("agy: write conversation id failed", "path", path, "err", err)
-	}
-}
-
-// deleteAgyThreadRefStrict makes the next keyed turn start a fresh
-// conversation.
-func deleteAgyThreadRefStrict(agentID, sessionKey string) error {
-	err := os.Remove(agyConversationRefPath(agentDir(agentID), sessionKey))
-	if os.IsNotExist(err) {
-		return nil
-	}
-	return err
-}
-
-// agyCanResumeSession reports whether a keyed conversation ref exists.
-// agy keeps no per-conversation file kojo can probe, so a ref whose
-// conversation agy lost is only found out (and dropped) by the turn that
-// tries to resume it.
-func agyCanResumeSession(agentID, sessionKey string) bool {
-	if sessionKey == "" {
-		return false
-	}
-	id := readAgyConversationID(agentDir(agentID), sessionKey)
-	return id != "" && agyConversationExists(id)
-}
-
-// clearAgySessionCounted removes every conversation ref of the agent, so
-// the next turn of every key starts a fresh conversation.
-func clearAgySessionCounted(agentID string) (int, error) {
-	dir := agyStateDir(agentDir(agentID))
-	n := 0
-	_ = filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
-		if err == nil && !d.IsDir() {
-			n++
-		}
-		return nil
-	})
-	if err := os.RemoveAll(dir); err != nil {
-		return 0, err
-	}
-	return n, nil
-}
-
 // agyEnvStrip lists the inherited variables a turn must not see.
-var agyEnvStrip = []string{"AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}
+var agyEnvStrip = []string{"AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR", "ANTIGRAVITY_CONVERSATION_ID"}
 
 // agyPrintTimeout disables agy's own print-mode deadline; kojo's turn
 // timeout bounds the run.
@@ -263,6 +164,10 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 	if !opts.OneShot && resumeID == "" && opts.FreshSessionContext == "" && opts.RecentMessagesContext != "" {
 		userMessage = injectRecentMessagesContext(userMessage, opts.RecentMessagesContext)
 	}
+	sharedPrompt, extra := splitAgySystemPrompt(systemPrompt, opts.SystemPromptExtraApplied)
+	if resumeID != "" && agyResumeExtraChanged(readAgyConversationExtra(dir, resumeID), extra) {
+		userMessage = agyResumeExtraNotice(extra) + userMessage
+	}
 	input, err := agyUserMessageLine(userMessage)
 	if err != nil {
 		return nil, fmt.Errorf("encode prompt: %w", err)
@@ -272,20 +177,26 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 	if err != nil {
 		return nil, fmt.Errorf("render agy MCP config: %w", err)
 	}
-	// The custom agent is named after its prompt: a thread's prompt differs
-	// from the main chat's, and a shared name would make one wait for the
-	// other's agy to exit. (agy fixes the prompt when it creates a
-	// conversation; a resumed one keeps its own whatever --agent says.)
-	files := map[string]string{agyMCPConfigPath(dir): mcpConfig}
+	// The shared prompt goes to the always_on rules, which agy reads again
+	// for a resumed conversation; every turn of the agent shares them. The
+	// per-call extra (thread / Slack context) goes to a custom agent named
+	// after its body, so a thread turn never waits for a main-chat agy to
+	// exit because of it. agy freezes that body with the conversation; a
+	// changed extra reaches a resumed one through agyResumeExtraNotice.
+	managed := map[string]string{agyMCPConfigPath(dir): mcpConfig}
+	for name, body := range renderAgyRules(sharedPrompt) {
+		managed[filepath.Join(agyRulesDir(dir), name)] = body
+	}
 	var agentName string
 	var ephemeral []string
-	if systemPrompt != "" {
-		agentName = agyAgentName(systemPrompt)
+	if sharedPrompt != "" || extra != "" {
+		body := agyAgentDefBody(extra)
+		agentName = agyAgentName(body)
 		defPath := agyAgentDefPath(dir, agentName)
-		files[defPath] = renderAgyAgentDef(agentName, systemPrompt)
+		managed[defPath] = renderAgyAgentDef(agentName, body)
 		ephemeral = append(ephemeral, defPath)
 	}
-	release, err := holdAgyWorkspace(ctx, dir, files, ephemeral...)
+	release, err := holdAgyWorkspace(ctx, dir, managed, ephemeral...)
 	if err != nil {
 		return nil, fmt.Errorf("prepare agy workspace: %w", err)
 	}
@@ -294,7 +205,53 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 	cmd.Env = appendKojoTurnEnv(filterEnv(agyEnvStrip, agent.ID, dir), opts)
 	cmd.Dir = dir
 	cmd.Stdin = bytes.NewReader(input)
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	// agy runs run_command children in their own session (a pty), so
+	// neither a SIGTERM to agy nor one to its process group reaches them:
+	// a cancelled `sleep 60` would outlive the turn. Kill the whole
+	// descendant tree instead, identified at start so a reused pid is
+	// never signalled.
+	// The ctx watcher can fire before Identify runs below, so Cancel
+	// waits for the identity first. Without a known identity the tree
+	// snapshot could run after Wait reaped agy and hit a reused pid, so
+	// it falls back to os.Process.Kill, which cannot signal a stranger.
+	// The kill runs off the Cancel callback (exec holds Wait on it) and
+	// closes agyKilled when done; the cancel path waits for that, as
+	// OpenCode's awaitKill does, so no descendant outlives the turn.
+	var (
+		agyIdentMu sync.Mutex
+		killOnce   sync.Once
+		agyIdent   proctree.Ident
+		agyKilled  chan struct{}
+	)
+	identReady := make(chan struct{})
+	cmd.Cancel = func() error {
+		<-identReady
+		killOnce.Do(func() {
+			agyIdentMu.Lock()
+			id := agyIdent
+			killed := make(chan struct{})
+			agyKilled = killed
+			agyIdentMu.Unlock()
+			proc := cmd.Process
+			go func() {
+				defer close(killed)
+				if id == (proctree.Ident{}) {
+					_ = proc.Kill()
+					return
+				}
+				proctree.KillTreeIdent(proc.Pid, id, 5*time.Second)
+			}()
+		})
+		return nil
+	}
+	awaitKill := func() {
+		agyIdentMu.Lock()
+		killed := agyKilled
+		agyIdentMu.Unlock()
+		if killed != nil {
+			<-killed
+		}
+	}
 	cmd.WaitDelay = 10 * time.Second
 
 	var stderrBuf bytes.Buffer
@@ -309,6 +266,12 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 		return nil, fmt.Errorf("start agy: %w", err)
 	}
 
+	ident := proctree.Identify(cmd.Process.Pid)
+	agyIdentMu.Lock()
+	agyIdent = ident
+	agyIdentMu.Unlock()
+	close(identReady)
+
 	ch := make(chan ChatEvent, 64)
 	go func() {
 		defer close(ch)
@@ -317,10 +280,13 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 		send := func(e ChatEvent) bool { return ctxSend(ctx, ch, e) }
 
 		var exitTimer *time.Timer
+		var timerDone chan struct{}
 		onResult := func() {
+			timerDone = make(chan struct{})
 			exitTimer = time.AfterFunc(agyExitGrace, func() {
+				defer close(timerDone)
 				b.logger.Warn("agy: still running after its result event, terminating", "agent", agent.ID)
-				_ = cmd.Process.Signal(syscall.SIGTERM)
+				_ = cmd.Cancel()
 			})
 		}
 		thoughts := newAgyThoughtReader(b.logger)
@@ -330,10 +296,24 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 		killedAfterResult := false
 		if exitTimer != nil {
 			killedAfterResult = !exitTimer.Stop()
+			if killedAfterResult {
+				<-timerDone
+			}
+		}
+		awaitKill()
+		if result.conversationID != "" {
+			if opts.OneShot && !agyConversationIDPersisted(dir, result.conversationID) {
+				if _, err := removeAgyConversation(result.conversationID); err != nil {
+					b.logger.Warn("agy: OneShot cleanup failed", "agent", agent.ID, "err", err)
+					recordAgyConversation(dir, result.conversationID, b.logger)
+				}
+			} else {
+				recordAgyConversation(dir, result.conversationID, b.logger)
+			}
 		}
 
 		if result.cancelled || ctx.Err() != nil {
-			emitCancelDone(ctx, ch, result.text, result.thinking, result.toolUses, result.usage)
+			emitCancelDone(ctx, ch, cleanAgyContent(result.text), result.thinking, result.toolUses, result.usage)
 			return
 		}
 
@@ -341,6 +321,12 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 			waitErr = nil
 		}
 		processError := classifyAgyError(result, waitErr, stderrBuf.String())
+		// A turn that still produced text does not surface denials as an
+		// error, but keep them in the log so a partial answer is traceable.
+		if len(result.deniedActions) > 0 {
+			b.logger.Warn("agy: tool permission denied",
+				"agent", agent.ID, "actions", result.deniedActions, "status", result.status)
+		}
 		if processError != "" {
 			b.logger.Warn("agy turn failed", "agent", agent.ID, "err", processError,
 				"waitErr", waitErr, "stderr", stderrBuf.String())
@@ -360,23 +346,70 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 			return
 		}
 
-		if !opts.OneShot && result.conversationID != "" && result.conversationID != resumeID {
-			writeAgyConversationID(dir, persistKey, result.conversationID, b.logger)
+		if !opts.OneShot && result.conversationID != "" {
+			if result.conversationID != resumeID {
+				writeAgyConversationID(dir, persistKey, result.conversationID, b.logger)
+			}
+			writeAgyConversationExtra(dir, result.conversationID, extra, b.logger)
 		}
 
-		msg := assembleAssistantMessage(result.text, result.thinking, result.toolUses, result.usage)
+		msg := assembleAssistantMessage(cleanAgyContent(result.text), result.thinking, result.toolUses, result.usage)
 		send(ChatEvent{Type: "done", Message: msg, Usage: result.usage, ErrorMessage: processError})
 	}()
 	return ch, nil
 }
 
+// splitAgySystemPrompt separates the per-call extra the manager appended
+// to systemPrompt (ChatOptions.SystemPromptExtraApplied) from the prompt
+// shared by every turn of the agent.
+func splitAgySystemPrompt(systemPrompt, applied string) (shared, extra string) {
+	if applied == "" || !strings.HasSuffix(systemPrompt, applied) {
+		return systemPrompt, ""
+	}
+	shared = strings.TrimSuffix(systemPrompt, applied)
+	return strings.TrimSuffix(shared, "\n\n"), applied
+}
+
+// agyResumeExtraChanged reports whether a resumed conversation last given
+// the extra recorded as stored (a digest, "" when unrecorded) needs to be
+// told about extra. An unrecorded conversation with no extra needs nothing.
+func agyResumeExtraChanged(stored, extra string) bool {
+	if stored == "" {
+		return extra != ""
+	}
+	return stored != agyExtraDigest(extra)
+}
+
+// agyResumeExtraNotice carries a per-call extra to a resumed conversation
+// that has not been given it yet: agy keeps the custom agent body the
+// conversation was created with, so a Slack thread's poster or a legacy
+// conversation (whose extra used to live in the rules) would otherwise
+// run on stale or missing instructions. An empty extra withdraws the
+// earlier ones.
+func agyResumeExtraNotice(extra string) string {
+	if extra == "" {
+		return "<kojo-conversation-instructions>\n" +
+			"Earlier instructions specific to this conversation (including those in your agent definition) no longer apply; keep following the kojo rules.\n" +
+			"</kojo-conversation-instructions>\n\n"
+	}
+	return "<kojo-conversation-instructions>\n" +
+		"These instructions for this conversation replace any earlier ones (including those in your agent definition):\n\n" +
+		extra + "\n</kojo-conversation-instructions>\n\n"
+}
+
 // classifyAgyError turns the outcome of one agy run into the message the
 // user sees, or "" for a successful turn.
 func classifyAgyError(res *agyStreamResult, waitErr error, stderr string) string {
+	if res.streamError != "" {
+		return agyHintAuth(res.streamError, stderr)
+	}
 	if res.gotResult && res.status != "SUCCESS" {
 		msg := res.errorMessage
 		if msg == "" {
 			msg = "agy run ended with status " + res.status
+		}
+		if len(res.deniedActions) > 0 {
+			msg += " (denied tool permission: " + strings.Join(res.deniedActions, ", ") + ")"
 		}
 		return agyHintAuth(msg, stderr)
 	}
@@ -393,6 +426,9 @@ func classifyAgyError(res *agyStreamResult, waitErr error, stderr string) string
 			msg += ": " + s
 		}
 		return msg
+	}
+	if res.text == "" && len(res.deniedActions) > 0 {
+		return "agy denied tool permission: " + strings.Join(res.deniedActions, ", ")
 	}
 	return ""
 }
@@ -430,6 +466,8 @@ type agyStreamResult struct {
 	status         string
 	errorMessage   string
 	response       string
+	deniedActions  []string
+	streamError    string
 	gotResult      bool
 	cancelled      bool
 }
@@ -464,12 +502,18 @@ type agyStreamEvent struct {
 		ThinkingDelta  string       `json:"thinking_delta"`
 		ToolInfo       *agyToolInfo `json:"tool_info"`
 	} `json:"step_update"`
+	Status string `json:"status"`
+	Error  string `json:"error"`
 	Result *struct {
 		ConversationID string    `json:"conversation_id"`
 		Status         string    `json:"status"`
 		Response       string    `json:"response"`
 		Error          string    `json:"error"`
 		Usage          *agyUsage `json:"usage"`
+		DeniedActions  []struct {
+			Action      string `json:"action"`
+			DisplayName string `json:"display_name"`
+		} `json:"denied_actions"`
 	} `json:"result"`
 }
 
@@ -494,6 +538,8 @@ func parseAgyStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool,
 	scanner := newSkippingLineScanner(r)
 	loggedSkips := 0
 	var textBuf, thinkBuf strings.Builder
+	lastTextStep := -1
+	var lastFatalLine string
 	var toolUses []ToolUse
 	toolStarted := map[int]bool{}
 	toolDone := map[int]bool{}
@@ -510,6 +556,9 @@ func parseAgyStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool,
 		res.text = textBuf.String()
 		res.thinking = thinkBuf.String()
 		res.toolUses = toolUses
+		if !res.gotResult && res.streamError == "" {
+			res.streamError = lastFatalLine
+		}
 		res.cancelled = cancelled
 		if !cancelled && res.text == "" && res.response != "" {
 			res.text = res.response
@@ -523,7 +572,14 @@ func parseAgyStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool,
 			loggedSkips = n
 		}
 		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 || line[0] != '{' {
+		if len(line) == 0 {
+			continue
+		}
+		if line[0] != '{' {
+			text := string(line)
+			if strings.HasPrefix(text, "error:") || strings.HasPrefix(text, "AGY_ERROR:") {
+				lastFatalLine = text
+			}
 			continue
 		}
 		var ev agyStreamEvent
@@ -569,8 +625,20 @@ func parseAgyStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool,
 					}
 				}
 				if su.TextDelta != "" {
-					textBuf.WriteString(su.TextDelta)
-					if !send(ChatEvent{Type: "text", Delta: su.TextDelta}) {
+					delta := su.TextDelta
+					if lastTextStep != su.StepIndex && textBuf.Len() > 0 {
+						current := textBuf.String()
+						if !strings.HasSuffix(current, "\n\n") {
+							if strings.HasSuffix(current, "\n") {
+								delta = "\n" + delta
+							} else {
+								delta = "\n\n" + delta
+							}
+						}
+					}
+					lastTextStep = su.StepIndex
+					textBuf.WriteString(delta)
+					if !send(ChatEvent{Type: "text", Delta: delta}) {
 						return finish(true)
 					}
 				}
@@ -597,16 +665,30 @@ func parseAgyStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool,
 						}
 					}
 				}
-				if su.State == "DONE" && !toolDone[su.StepIndex] {
+				if (su.State == "DONE" || su.State == "ERROR") && !toolDone[su.StepIndex] {
 					toolDone[su.StepIndex] = true
 					output := ""
 					if su.ToolInfo != nil {
 						output = agyToolOutput(su.ToolInfo)
 					}
+					if output == "" && su.State == "ERROR" {
+						output = "Error"
+					}
 					matchToolOutput(toolUses, id, name, output)
 					if !send(ChatEvent{Type: "tool_result", ToolUseID: id, ToolName: name, ToolOutput: output}) {
 						return finish(true)
 					}
+				}
+			}
+		case "":
+			// Some early fatal errors are emitted as bare result objects.
+			if ev.Status != "" {
+				res.gotResult = true
+				res.status = ev.Status
+				res.errorMessage = ev.Error
+				if onResult != nil {
+					onResult()
+					onResult = nil
 				}
 			}
 		case "result":
@@ -628,6 +710,13 @@ func parseAgyStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool,
 			thoughtPending = nil
 			res.status = r.Status
 			res.errorMessage = r.Error
+			for _, action := range r.DeniedActions {
+				name := action.DisplayName
+				if name == "" {
+					name = action.Action
+				}
+				res.deniedActions = append(res.deniedActions, name)
+			}
 			res.response = r.Response
 			if r.ConversationID != "" {
 				res.conversationID = r.ConversationID
@@ -671,3 +760,8 @@ func agyToolOutput(ti *agyToolInfo) string {
 	}
 	return out
 }
+
+// file:// links are IDE-local; preserve the label for Slack and the WebUI.
+var agyFileLinkPattern = regexp.MustCompile(`\[([^\]\n]+)\]\(file://[^)\s]*\)`)
+
+func cleanAgyContent(s string) string { return agyFileLinkPattern.ReplaceAllString(s, "$1") }

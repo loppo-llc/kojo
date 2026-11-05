@@ -8,10 +8,12 @@ import {
   DEFAULT_TIMEOUT_MINUTES,
 } from "../../lib/agentApi";
 import {
+  CRON_MAX_LINES,
   cronFromInterval,
   detectInterval,
   humanizeCron,
   isCronExprSyntaxValid,
+  normalizeCronExpr,
   type IntervalSpec,
   type IntervalUnit,
 } from "../../lib/cronExpr";
@@ -72,7 +74,8 @@ function MinutesField({
 }
 
 interface Props {
-  // 5-field standard cron expression. "" = scheduling disabled.
+  // One or more newline-separated 5-field cron expressions (OR'd).
+  // "" = scheduling disabled.
   cronExpr: string;
   onCronExprChange: (v: string) => void;
   timeoutMinutes: number;
@@ -635,29 +638,37 @@ function CronEditor({
   onCommit: (v: string) => void;
 }) {
   const t = useT();
-  const valid = isCronExprSyntaxValid(value);
+  // Validate the form that will actually be saved (blank lines and padding
+  // stripped) so the error state matches what the server will see.
+  const normalized = normalizeCronExpr(value);
+  const valid = isCronExprSyntaxValid(normalized);
+  // Multiple lines are OR'd (fires when any line matches), so Enter inserts
+  // a newline and the draft commits on blur or Cmd/Ctrl+Enter.
+  const commit = () => {
+    if (valid) onCommit(normalized);
+  };
+  const rows = Math.min(Math.max(value.split("\n").length, 2), CRON_MAX_LINES);
   return (
     <Field
       help={t("sched.advancedHelp")}
       error={!valid ? t("sched.advancedInvalid") : undefined}
     >
-      <Input
+      <Textarea
         mono
         invalid={!valid}
+        rows={rows}
         value={value}
         onChange={(e) => {
           onLocalChange(e.target.value);
         }}
-        onBlur={() => {
-          if (valid) onCommit(value.trim());
-        }}
+        onBlur={commit}
         onKeyDown={(e) => {
-          if (e.key === "Enter") {
+          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
             e.preventDefault();
-            if (valid) onCommit(value.trim());
+            commit();
           }
         }}
-        placeholder="*/15 * * * *"
+        placeholder={"*/30 * * * 1-5\n0 */3 * * 0,6"}
       />
     </Field>
   );

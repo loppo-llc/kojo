@@ -96,15 +96,50 @@ export function parseCronExpr(expr: string): CronStruct | null {
 export function isCronExprSyntaxValid(expr: string): boolean {
   if (expr === "") return true;
   if (parseCronPresetSentinel(expr) !== null) return true;
-  const c = parseCronExpr(expr);
-  if (!c) return false;
-  // A trailing "/0" (e.g. the splat-form "*/0" or any other Step=0
-  // construct) parses as "every zero units" — robfig/cron would error out
-  // and the UI shouldn't pretend it's valid.
-  for (const f of [c.minute, c.hour, c.dom, c.month, c.dow]) {
-    if (/\/0+$/.test(f)) return false;
+  // Byte length, matching the Go-side check (\s also admits non-ASCII
+  // whitespace, so UTF-16 length isn't enough).
+  if (new TextEncoder().encode(expr).length > CRON_MAX_LEN) return false;
+  const lines = splitCronLines(expr);
+  if (lines.length === 0 || lines.length > CRON_MAX_LINES) return false;
+  for (const line of lines) {
+    const c = parseCronExpr(line);
+    if (!c) return false;
+    // A trailing "/0" (e.g. the splat-form "*/0" or any other Step=0
+    // construct) parses as "every zero units" — robfig/cron would error out
+    // and the UI shouldn't pretend it's valid.
+    for (const f of [c.minute, c.hour, c.dom, c.month, c.dow]) {
+      if (/\/0+$/.test(f)) return false;
+    }
   }
   return true;
+}
+
+// CRON_MAX_LINES / CRON_MAX_LEN mirror backend cron_expr.go's
+// MaxCronExprLines / MaxCronExprLen.
+export const CRON_MAX_LINES = 16;
+const CRON_MAX_LEN = 1024;
+
+/**
+ * Split a (possibly multi-line) cron expression into its non-blank,
+ * trimmed lines. Multiple lines are OR'd together server-side: the agent
+ * fires whenever any line matches (e.g. a weekday cadence plus a weekend
+ * cadence). The "@preset:N" sentinel is only valid as a whole expression,
+ * so callers check it before splitting.
+ */
+export function splitCronLines(expr: string): string[] {
+  return expr
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l !== "");
+}
+
+/**
+ * Canonical persisted form of an editor draft: blank lines and per-line
+ * padding removed, lines joined with "\n". The backend rejects blank lines,
+ * so the editor must normalise before committing.
+ */
+export function normalizeCronExpr(expr: string): string {
+  return splitCronLines(expr).join("\n");
 }
 
 const DOW_LABELS_JA = ["日", "月", "火", "水", "木", "金", "土"];
@@ -123,6 +158,10 @@ export function humanizeCron(expr: string): string {
     (ja ? `${n} 時間おき` : n === 1 ? "every hour" : `every ${n} hours`) +
     (offset ? " (per-agent offset)" : "");
   if (!expr) return ja ? "スケジュールなし" : "No schedule";
+  const lines = splitCronLines(expr);
+  if (lines.length > 1) {
+    return lines.map((l) => humanizeCron(l)).join(ja ? " ／ " : " / ");
+  }
   const presetN = parseCronPresetSentinel(expr);
   if (presetN !== null) {
     if (presetN < 60) return everyNMin(presetN, true);

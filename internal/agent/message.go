@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"sync/atomic"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/backenddiag"
 )
 
 // MessageAttachment represents a file attached to a chat message.
@@ -111,6 +113,9 @@ type ChatEvent struct {
 	ErrorMessage     string `json:"errorMessage,omitempty"`
 	// ErrorCode preserves the backend classification separately from human-readable text.
 	ErrorCode string `json:"errorCode,omitempty"`
+	// Provider diagnostics are transport metadata, not generated assistant text.
+	// The original CLI transcript and structured log retain them durably.
+	BackendDiagnostic *backenddiag.Diagnostic `json:"backendDiagnostic,omitempty"`
 	// ParentToolUseID is set when this event originates from a subagent
 	// spawned by a Task tool call rather than the main assistant turn.
 	// Its value is the tool_use ID of the parent Task invocation (or, for

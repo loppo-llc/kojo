@@ -1283,12 +1283,12 @@ const messages = {
   "sched.resumeDefault": { ja: "30分", en: "30 min" },
   "sched.timeoutNone": { ja: "なし", en: "none" },
   "sched.advancedHelp": {
-    ja: "5 フィールドの cron (分 時 日 月 曜日)。空 = 無効。Enter かフォーカスを外すと適用。",
-    en: "5-field cron (minute hour day-of-month month day-of-week). Empty = off. Press Enter or tab away to apply.",
+    ja: "5 フィールドの cron (分 時 日 月 曜日)。複数行で書くといずれかの行に一致した時刻に起動 (曜日ごとに頻度を変えるなど、最大 16 行)。空 = 無効。フォーカスを外すか ⌘/Ctrl+Enter で適用。",
+    en: "5-field cron (minute hour day-of-month month day-of-week). Multiple lines fire whenever any line matches (e.g. a different cadence per weekday; up to 16 lines). Empty = off. Tab away or press ⌘/Ctrl+Enter to apply.",
   },
   "sched.advancedInvalid": {
-    ja: "構文が不正 — 空白区切りの 5 フィールドが必要。",
-    en: "Invalid syntax — must be 5 whitespace-separated fields.",
+    ja: "構文が不正 — 各行に空白区切りの 5 フィールドが必要 (最大 16 行)。",
+    en: "Invalid syntax — each line must have 5 whitespace-separated fields (up to 16 lines).",
   },
 
   // ── AgentCreate ──

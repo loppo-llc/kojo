@@ -1102,6 +1102,10 @@ func TestAgent_ResumeIdleDuration_Default(t *testing.T) {
 func TestPrepareClaudeSettings_BashCaptureHook(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	capBase := t.TempDir()
+	origBase := bashCaptureBaseDir
+	bashCaptureBaseDir = func() string { return capBase }
+	t.Cleanup(func() { bashCaptureBaseDir = origBase })
 	agentID := "ag_bash_capture_test"
 	if err := os.MkdirAll(agentDir(agentID), 0o755); err != nil {
 		t.Fatal(err)
@@ -1115,19 +1119,32 @@ func TestPrepareClaudeSettings_BashCaptureHook(t *testing.T) {
 		claudeDir := filepath.Join(agentDir(agentID), ".claude")
 		settingsPath := filepath.Join(claudeDir, "settings.local.json")
 		hookPath := filepath.Join(claudeDir, "hooks", "bash-capture.sh")
-		captureDir := filepath.Join(claudeDir, "captures")
+		runPath := filepath.Join(claudeDir, "hooks", "bash-capture-run.sh")
+		captureDir := bashCaptureDir(agentID)
 
-		// Hook script must exist and be executable.
-		st, err := os.Stat(hookPath)
-		if err != nil {
-			t.Fatalf("hook script not written: %v", err)
+		// Hook script and runner must exist and be executable.
+		for _, p := range []string{hookPath, runPath} {
+			st, err := os.Stat(p)
+			if err != nil {
+				t.Fatalf("script not written: %v", err)
+			}
+			if st.Mode().Perm()&0o111 == 0 {
+				t.Errorf("%s not executable: mode=%v", p, st.Mode())
+			}
 		}
-		if st.Mode().Perm()&0o111 == 0 {
-			t.Errorf("hook script not executable: mode=%v", st.Mode())
-		}
-		// Captures dir must exist.
+		// Captures dir must exist, private, and OUTSIDE the agent dir:
+		// the agent's cwd is its agent dir, and a capture log inside it
+		// feeds `grep -r` its own output.
 		if st, err := os.Stat(captureDir); err != nil || !st.IsDir() {
 			t.Errorf("captures dir missing: %v", err)
+		} else if st.Mode().Perm() != 0o700 {
+			t.Errorf("captures dir mode = %v, want 0700", st.Mode().Perm())
+		}
+		if rel, err := filepath.Rel(agentDir(agentID), captureDir); err == nil && !strings.HasPrefix(rel, "..") {
+			t.Errorf("captures dir %q must not be inside agent dir", captureDir)
+		}
+		if _, err := os.Stat(filepath.Join(claudeDir, "captures")); !os.IsNotExist(err) {
+			t.Errorf("legacy .claude/captures must not be created: stat err=%v", err)
 		}
 
 		// Settings JSON must contain PreToolUse pointing at hook script,
@@ -1156,8 +1173,13 @@ func TestPrepareClaudeSettings_BashCaptureHook(t *testing.T) {
 		if !strings.Contains(string(hookSrc), captureDir) {
 			t.Errorf("capture dir not baked into hook script")
 		}
-		if strings.Contains(string(hookSrc), "__CAP_DIR__") {
-			t.Errorf("template placeholder __CAP_DIR__ left unreplaced")
+		for _, ph := range []string{"__CAP_DIR__", "__RUN_SCRIPT__", "__MAX_BYTES__"} {
+			if strings.Contains(string(hookSrc), ph) {
+				t.Errorf("template placeholder %s left unreplaced", ph)
+			}
+		}
+		if !strings.Contains(string(hookSrc), runPath) {
+			t.Errorf("runner path not baked into hook script")
 		}
 	})
 

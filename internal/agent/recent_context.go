@@ -6,6 +6,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/loppo-llc/kojo/internal/backenddiag"
 	"github.com/loppo-llc/kojo/internal/chathistory"
 )
 
@@ -200,6 +201,9 @@ func formatRecentMessagesContext(msgs []*Message) string {
 			continue
 		}
 		content := strings.TrimSpace(msg.Content)
+		if msg.Role == "assistant" {
+			content = backenddiag.HistoryText(content)
+		}
 		tools := formatRecentToolUses(msg.ToolUses)
 		// A turn that produced nothing but tool calls (no prose) still
 		// carries the information we care about here, so it is only

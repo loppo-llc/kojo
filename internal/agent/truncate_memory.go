@@ -322,19 +322,48 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 		m.logger.Info("truncate: gemini sessions cleared", "agent", agentID, "files", geminiFilesRm)
 	}
 
-	// 2e. agy (gemini-agy) main conversation. Cut at a turn boundary:
-	//     the turns that produced the surviving transcript stay, so the
-	//     boundary is the last surviving message rather than `since`
-	//     (see findAgyCut). No-op for agents without an agy conversation.
+	// 2e. agy (gemini-agy). The main conversation is cut at a turn
+	//     boundary: the turns that produced the surviving transcript stay,
+	//     so the boundary is the last surviving message rather than
+	//     `since` (see findAgyCut). When that cannot be done cleanly it is
+	//     dropped instead, so the next turn bootstraps from the
+	//     already-truncated kojo history rather than resuming turns the
+	//     transcript no longer has. Thread / keyed conversations are
+	//     dropped like codex's: their context may rest on the memory the
+	//     truncate just removed. No-op for agents without agy state.
+	agyTrimmed := false
+	agyMain := readAgyConversationID(agentDir(agentID), "")
+	agyHadMain := agyMain != ""
 	if agyCutoff, agyHasSurvivor, lerr := lastSurvivingMessageTime(ctx, agentID); lerr != nil {
-		m.logger.Warn("truncate: agy conversation skipped", "agent", agentID, "err", lerr)
+		m.logger.Warn("truncate: agy conversation not trimmed, dropping it", "agent", agentID, "err", lerr)
 	} else {
 		ar, aerr := truncateAgyMainConversation(agentID, agyCutoff, agyHasSurvivor)
-		if aerr != nil {
-			m.logger.Warn("truncate: agy conversation partial failure", "agent", agentID, "err", aerr)
-		}
 		res.AgyStepsRemoved = ar.stepsRemoved
 		res.AgyConversationCleared = ar.cleared
+		switch {
+		case aerr != nil:
+			m.logger.Warn("truncate: agy conversation trim failed, dropping it", "agent", agentID, "err", aerr)
+		case ar.cleared:
+			// The trim dropped only the main ref; list the conversation
+			// so the clear below deletes its native data too.
+			recordAgyConversation(agentDir(agentID), agyMain, m.logger)
+		default:
+			agyTrimmed = true
+		}
+	}
+	clearAgy := clearAgySessionCounted
+	if agyTrimmed {
+		clearAgy = clearAgyKeyedSessionsCounted
+	}
+	agyFiles, err := clearAgy(agentID)
+	if err != nil {
+		return nil, fmt.Errorf("truncate: clear agy sessions (transcript already truncated): %w", err)
+	}
+	if !agyTrimmed && agyHadMain {
+		res.AgyConversationCleared = true
+	}
+	if agyFiles > 0 {
+		m.logger.Info("truncate: agy sessions cleared", "agent", agentID, "files", agyFiles, "mainTrimmed", agyTrimmed)
 	}
 
 	// 3. Daily diary (per-day .md files plus their pre-compaction summary

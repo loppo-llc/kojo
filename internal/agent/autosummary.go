@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/loppo-llc/kojo/internal/backenddiag"
 	"github.com/loppo-llc/kojo/internal/chathistory"
 	"github.com/loppo-llc/kojo/internal/store"
 )
@@ -1361,8 +1362,10 @@ func loadSessionMessages(agentID, tool string, transcriptPath string, limit int,
 	// cannot pull the read past the cap.
 	if err := chathistory.ScanJSONLLines(io.LimitReader(f, transcriptMaxBytes), func(line []byte) {
 		var raw struct {
-			Type    string          `json:"type"`
-			Message json.RawMessage `json:"message"`
+			Type                    string          `json:"type"`
+			Message                 json.RawMessage `json:"message"`
+			IsAPIErrorMessage       bool            `json:"isApiErrorMessage"`
+			IsStreamAPIErrorMessage bool            `json:"is_api_error_message"`
 		}
 		if json.Unmarshal(line, &raw) != nil {
 			return
@@ -1383,6 +1386,10 @@ func loadSessionMessages(agentID, tool string, transcriptPath string, limit int,
 			}
 
 		case "assistant":
+			if raw.IsAPIErrorMessage || raw.IsStreamAPIErrorMessage {
+				msgs = append(msgs, &Message{Role: "assistant", Content: backenddiag.HistoryNotice})
+				return
+			}
 			var msg struct {
 				Content []struct {
 					Type string `json:"type"`
@@ -1461,6 +1468,9 @@ func buildSummaryPrompt(messages []*Message, prevSummary string) string {
 			continue
 		}
 		content := m.Content
+		if m.Role == "assistant" {
+			content = backenddiag.HistoryText(content)
+		}
 		// Redact potential secrets from content before summarization
 		content = redactSecrets(content)
 		// Truncate very long messages

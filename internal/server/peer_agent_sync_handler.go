@@ -836,7 +836,20 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	// dead-end early-draft cursor that would silently miss
 	// in-place mutations. A client that sets it is buggy and we
 	// fail loud rather than corrupt target's state.
-	if req.SinceMemoryEntrySeq > 0 {
+	//
+	// A pending full-sync marker (written when another device
+	// force-reclaimed this agent away from us) means our rows diverged
+	// from the source's history; a delta merge would drop rows or
+	// collide on the memory natural-key index. The state probe already
+	// answers Known=false in that case, so an incremental payload here
+	// means the marker landed after the probe — refuse it (fail closed
+	// on lookup errors) and let the orchestrator retry with a full sync.
+	fullSyncRequired := false
+	if req.SinceMessageSeq > 0 || req.SinceMemoryEntryUpdatedAt > 0 {
+		marked, merr := s.agents.Store().HasAgentFullSyncMarker(r.Context(), req.Agent.ID)
+		fullSyncRequired = merr != nil || marked
+	}
+	if req.SinceMemoryEntrySeq > 0 || fullSyncRequired {
 		if sessionRollback != nil {
 			sessionRollback()
 		}
@@ -848,6 +861,11 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		}
 		if geminiRollback != nil {
 			geminiRollback()
+		}
+		if fullSyncRequired {
+			writeError(w, http.StatusConflict, "full_sync_required",
+				"target history diverged after a force-reclaim; retry the switch so it ships a full snapshot")
+			return
 		}
 		writeError(w, http.StatusBadRequest, "unsupported",
 			"since_memory_entry_seq is not a valid delta cursor; use since_memory_entry_updated_at")

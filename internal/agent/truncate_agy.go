@@ -214,13 +214,14 @@ func truncateAgyMainConversation(agentID string, cutoff time.Time, hasSurvivor b
 	}
 	convDir := agyConversationsDir()
 	if convDir == "" {
-		return res, nil
+		return res, errors.New("agy conversation store not found")
 	}
 	dbPath := filepath.Join(convDir, convID+".db")
 	if _, err := os.Stat(dbPath); err != nil {
 		if os.IsNotExist(err) {
-			// agy lost it; the next turn notices and starts fresh.
-			return res, nil
+			// agy lost it: drop the ref so the caller clears whatever
+			// else of it is left rather than keeping it as trimmed.
+			return clear()
 		}
 		return res, err
 	}

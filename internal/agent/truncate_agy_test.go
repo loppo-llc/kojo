@@ -359,7 +359,7 @@ func TestRewindToMessage_TrimsAgyConversation(t *testing.T) {
 	}{
 		{"reply of turn 1", 3, 2},
 		{"user message of turn 2", 4, 4},
-		{"first user message", 0, 6}, // conversation cleared, db kept
+		{"first user message", 0, -1}, // conversation cleared and deleted
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
@@ -395,7 +395,11 @@ func TestRewindToMessage_TrimsAgyConversation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if s, _, _ := agyFixtureCounts(t, agyIDA); s != tc.wantSteps {
+			if tc.wantSteps < 0 {
+				if _, err := os.Stat(filepath.Join(agyConversationsDir(), agyIDA+".db")); !os.IsNotExist(err) {
+					t.Errorf("cleared conversation kept: %v", err)
+				}
+			} else if s, _, _ := agyFixtureCounts(t, agyIDA); s != tc.wantSteps {
 				t.Errorf("steps = %d, want %d (res %+v)", s, tc.wantSteps, res)
 			}
 			wantCleared := tc.pivot == 0
