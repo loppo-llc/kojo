@@ -148,6 +148,13 @@ type ChatOptions struct {
 	// would invalidate the cache for every Slack message.
 	SystemPromptExtra string
 
+	// SystemPromptExtraApplied is the per-call suffix the manager already
+	// appended to the systemPrompt argument (after a "\n\n" separator).
+	// Backends must not append it again; it only lets a backend that
+	// stores the prompt somewhere shared between concurrent turns (agy's
+	// workspace rules) keep the per-call part apart.
+	SystemPromptExtraApplied string
+
 	// OnSteerReady, if set, is invoked once by a backend that supports
 	// mid-turn steering (claude: extra user-message line on stdin; codex:
 	// turn/steer JSON-RPC) as soon as the turn can accept input. The callback

@@ -140,6 +140,12 @@ type notifyState struct {
 
 // GroupDMManager manages group DM CRUD, message posting, and notifications.
 type GroupDMManager struct {
+	// OnThreadReply is called when a thread turn finishes on its own and its
+	// reply has been posted (not on operator stop or failure). Wired by
+	// server.go to push an "agent_chat_done" web-push carrying the thread ID.
+	// Set once at startup before any thread turn runs.
+	OnThreadReply func(agentID, groupID string, msg *GroupMessage)
+
 	external externalBridgeHolder
 	mu       sync.Mutex
 	groups   map[string]*GroupDM
@@ -2205,9 +2211,28 @@ func (m *GroupDMManager) consumeThreadTurn(ctx context.Context, events <-chan Ch
 		m.agentMgr.deleteIngestedAttachments(replyAttachments)
 		return
 	}
-	if _, err := m.postThreadReplyWithAttachments(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, stopped, replyMessageID, replyAttachments, func() { finishAttachmentClaims(true) }); err != nil {
+	posted, err := m.postThreadReplyWithAttachments(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, stopped, replyMessageID, replyAttachments, func() { finishAttachmentClaims(true) })
+	if err != nil {
 		m.logger.Warn("failed to post thread reply", "group", groupID, "agent", agentID, "err", err)
+		return
 	}
+	// An operator stop is a deliberate action on a screen they are looking
+	// at; only a turn that finished on its own pages them.
+	if !stopped {
+		m.notifyThreadReply(agentID, groupID, posted)
+	}
+}
+
+// notifyThreadReply fires OnThreadReply (web-push) for a completed thread
+// turn, mirroring Manager.OnChatDone for the main conversation. Runs in its
+// own goroutine so a slow push provider never delays the thread's next turn.
+func (m *GroupDMManager) notifyThreadReply(agentID, groupID string, msg *GroupMessage) {
+	hook := m.OnThreadReply
+	if hook == nil || msg == nil {
+		return
+	}
+	msgCopy := *msg
+	go hook(agentID, groupID, &msgCopy)
 }
 
 // renderThreadPayload builds the one-shot payload for a thread turn from the

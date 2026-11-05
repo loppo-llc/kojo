@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -43,12 +45,69 @@ func agyKnownFile(agentDirPath string) string {
 	return filepath.Join(agyStateDir(agentDirPath), "conversations")
 }
 
-// agyRefuseStateSymlinks refuses a symlinked .agy or
-// threads directory. The agent can write its own workspace, so a link
-// there would otherwise redirect kojo's ref writes and cleanup to a path
-// outside the agent dir. Same guard as the Gemini/OpenCode state dirs.
+// agyExtrasDir holds, per conversation, the digest of the last
+// per-call SystemPromptExtra the conversation was given (see
+// agyResumeExtraNotice).
+func agyExtrasDir(agentDirPath string) string {
+	return filepath.Join(agyStateDir(agentDirPath), "extras")
+}
+
+func agyExtraFile(agentDirPath, convID string) string {
+	return filepath.Join(agyExtrasDir(agentDirPath), convID)
+}
+
+func agyExtraDigest(extra string) string {
+	sum := sha256.Sum256([]byte(extra))
+	return hex.EncodeToString(sum[:])
+}
+
+// readAgyConversationExtra returns the digest recorded for convID, or ""
+// when there is none (a conversation older than the record, or one whose
+// record was lost).
+func readAgyConversationExtra(agentDirPath, convID string) string {
+	if !isAgyConversationID(convID) || agyRefuseStateSymlinks(agentDirPath) != nil {
+		return ""
+	}
+	b, err := readAgyStateFile(agyExtraFile(agentDirPath, convID))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// writeAgyConversationExtra records that convID has been given extra.
+func writeAgyConversationExtra(agentDirPath, convID, extra string, logger *slog.Logger) {
+	if !isAgyConversationID(convID) {
+		return
+	}
+	digest := agyExtraDigest(extra)
+	if readAgyConversationExtra(agentDirPath, convID) == digest {
+		return
+	}
+	if err := agyRefuseStateSymlinks(agentDirPath); err != nil {
+		logger.Warn("agy: refusing to write extra record", "err", err)
+		return
+	}
+	path := agyExtraFile(agentDirPath, convID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		logger.Warn("agy: mkdir for extra record failed", "path", path, "err", err)
+		return
+	}
+	if err := agyRefuseFileSymlink(path); err != nil {
+		logger.Warn("agy: refusing to write extra record", "err", err)
+		return
+	}
+	if err := os.WriteFile(path, []byte(digest), 0o644); err != nil {
+		logger.Warn("agy: write extra record failed", "path", path, "err", err)
+	}
+}
+
+// agyRefuseStateSymlinks refuses a symlinked .agy, threads or extras
+// directory. The agent can write its own workspace, so a link there would
+// otherwise redirect kojo's ref writes and cleanup to a path outside the
+// agent dir. Same guard as the Gemini/OpenCode state dirs.
 func agyRefuseStateSymlinks(agentDirPath string) error {
-	return geminiRefuseSymlinks(agyStateDir(agentDirPath), agyThreadRefDir(agentDirPath))
+	return geminiRefuseSymlinks(agyStateDir(agentDirPath), agyThreadRefDir(agentDirPath), agyExtrasDir(agentDirPath))
 }
 
 // agyRefuseFileSymlink refuses a ref or ledger file that is a
@@ -278,11 +337,34 @@ func removeAgyConversation(id string) (removed int, err error) {
 
 // clearAgySessionCounted drops every conversation this agent
 // created, along with the refs and the ledger. It is used by the CLI
-// session reset, by ResetData and by TruncateMemory.
+// session reset, by ResetData and by TruncateMemory (when the main
+// conversation could not be trimmed).
 func clearAgySessionCounted(agentID string) (filesRemoved int, err error) {
+	return clearAgySessionsCounted(agentID, false)
+}
+
+// clearAgyKeyedSessionsCounted is clearAgySessionCounted except for the
+// main conversation, which stays resumable along with its ref, its extra
+// record and its ledger entry. TruncateMemory uses it after trimming the
+// main conversation at a turn boundary.
+func clearAgyKeyedSessionsCounted(agentID string) (filesRemoved int, err error) {
+	return clearAgySessionsCounted(agentID, true)
+}
+
+func clearAgySessionsCounted(agentID string, keepMain bool) (filesRemoved int, err error) {
 	dir := agentDir(agentID)
 	if err := agyRefuseStateSymlinks(dir); err != nil {
 		return 0, err
+	}
+	keep := ""
+	if keepMain {
+		body, rerr := readAgyStateFile(agySessionIDFile(dir))
+		if rerr != nil && !os.IsNotExist(rerr) {
+			return 0, rerr
+		}
+		if id := strings.TrimSpace(string(body)); isAgyConversationID(id) {
+			keep = id
+		}
 	}
 	// Any ref or ledger that exists but cannot be read may be the only
 	// record of a conversation; fail before removing anything.
@@ -326,6 +408,7 @@ func clearAgySessionCounted(agentID string) (filesRemoved int, err error) {
 			ids[id] = true
 		}
 	}
+	delete(ids, keep)
 	var failed []string
 	for id := range ids {
 		n, rerr := removeAgyConversation(id)
@@ -337,18 +420,33 @@ func clearAgySessionCounted(agentID string) (filesRemoved int, err error) {
 			}
 		}
 	}
-	for _, p := range []string{agySessionIDFile(dir), agyThreadRefDir(dir), agyKnownFile(dir)} {
+	drop := []string{agyThreadRefDir(dir), agyKnownFile(dir)}
+	if keep == "" {
+		drop = append(drop, agySessionIDFile(dir), agyExtrasDir(dir))
+	} else if entries, rerr := os.ReadDir(agyExtrasDir(dir)); rerr == nil {
+		for _, e := range entries {
+			if e.Name() != keep {
+				drop = append(drop, filepath.Join(agyExtrasDir(dir), e.Name()))
+			}
+		}
+	}
+	for _, p := range drop {
 		if rerr := os.RemoveAll(p); rerr != nil && !os.IsNotExist(rerr) && err == nil {
 			err = rerr
 		}
 	}
 	// Keep the ids whose state could not be removed in the ledger so the
 	// next reset retries them; the refs are still dropped so no turn
-	// resumes a half-deleted conversation.
-	if len(failed) > 0 {
-		sort.Strings(failed)
+	// resumes a half-deleted conversation. A kept main conversation stays
+	// listed so a later reset removes it.
+	ledger := failed
+	if keep != "" {
+		ledger = append(ledger, keep)
+	}
+	if len(ledger) > 0 {
+		sort.Strings(ledger)
 		if merr := os.MkdirAll(agyStateDir(dir), 0o755); merr == nil {
-			if werr := os.WriteFile(agyKnownFile(dir), []byte(strings.Join(failed, "\n")+"\n"), 0o644); werr != nil && err == nil {
+			if werr := os.WriteFile(agyKnownFile(dir), []byte(strings.Join(ledger, "\n")+"\n"), 0o644); werr != nil && err == nil {
 				err = werr
 			}
 		}

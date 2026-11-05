@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { memo, useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router";
 import {
   groupdmApi,
@@ -17,6 +17,7 @@ import {
 } from "../../lib/groupdmApi";
 import { useEnterSends } from "../../lib/preferences";
 import { formatTime } from "../../lib/utils";
+import { reuseUnchangedMessages } from "../../lib/reuseUnchanged";
 import { useFileUpload } from "../../hooks/useFileUpload";
 import { useDraftInput } from "../../hooks/useDraftInput";
 import { useAutoGrowTextarea } from "../../hooks/useAutoGrowTextarea";
@@ -309,10 +310,10 @@ export function GroupDMChat() {
             .catch(() => {});
         }
         setMessages((prev) => {
-          if (!r.hasMore) return r.messages;
+          if (!r.hasMore) return reuseUnchangedMessages(prev, r.messages);
           const newIds = new Set(r.messages.map((m) => m.id));
           const older = prev.filter((m) => !newIds.has(m.id));
-          return [...older, ...r.messages];
+          return reuseUnchangedMessages(prev, [...older, ...r.messages]);
         });
         // The room is open, so everything fetched counts as read. The
         // room list uses this marker for its unread badges.
@@ -927,103 +928,16 @@ export function GroupDMChat() {
           </div>
         )}
 
-        {messages.map((msg) => {
-          const isUser = msg.agentId === USER_SENDER_ID;
-          if (isUser) {
-            return (
-              <div key={msg.id} className="flex justify-end">
-                <div className="min-w-0 max-w-[85%] rounded-2xl rounded-br-md border border-copper/25 bg-raised px-3.5 py-2.5 text-[14px] text-ink lg:max-w-[70%]">
-                  {msg.attachments && msg.attachments.length > 0 && (
-                    <AttachmentList attachments={msg.attachments} isUser />
-                  )}
-                  <MessageContent
-                    messageId={msg.id}
-                    content={msg.content}
-                    isUser
-                    timestamp={msg.timestamp}
-                  />
-                </div>
-              </div>
-            );
-          }
-          // Subtle highlight when the agent @mentions the human operator.
-          const mentionsUser = msg.mentions?.includes(USER_SENDER_ID) ?? false;
-          return (
-            <div
-              key={msg.id}
-              className={`flex gap-3${mentionsUser ? " -mx-2 rounded-xl border-l-2 border-copper/60 bg-copper/5 px-2 py-1.5" : ""}`}
-            >
-              <AgentAvatar
-                agentId={msg.agentId}
-                name={msg.agentName}
-                size="xs"
-                className="mt-0.5 shrink-0"
-              />
-              <div className="min-w-0 flex-1">
-                <div className="mb-1 flex items-baseline gap-2">
-                  <span className={`text-[13px] font-semibold ${agentColors.get(msg.agentId) ?? "text-ink"}`}>
-                    {msg.agentName}
-                  </span>
-                  {isExternalId(msg.agentId) && (
-                    <span className="rounded-full border border-copper/40 px-1.5 font-mono text-[10px] text-copper">
-                      {t("xa.badge")}
-                    </span>
-                  )}
-                  <span className="font-mono text-[11px] text-ink-faint">{formatTime(msg.timestamp)}</span>
-                  {msg.model && (
-                    <span className="font-mono text-[10px] text-ink-faint">
-                      {msg.model}
-                      {msg.effort ? ` · ${msg.effort}` : ""}
-                    </span>
-                  )}
-                  {msg.interrupted && (
-                    <span
-                      className="rounded-full border border-hairline px-1.5 font-mono text-[10px] text-ink-faint"
-                      title={t("gdm.interruptedTitle")}
-                    >
-                      {t("gdm.interrupted")}
-                    </span>
-                  )}
-                  {mentionsUser && (
-                    <span
-                      className="rounded-full bg-copper/15 px-1.5 font-mono text-[10px] text-copper"
-                      title={t("dash.mentionsYou")}
-                    >
-                      @you
-                    </span>
-                  )}
-                </div>
-                {msg.thinking && <ThinkingBlock text={msg.thinking} />}
-                {msg.attachments && msg.attachments.length > 0 && (
-                  <AttachmentList attachments={msg.attachments} isUser={false} />
-                )}
-                {/* An interrupted reply can have empty content (only thinking
-                    or toolUses were produced before the stop) — skip the
-                    empty text block instead of rendering a hollow row. */}
-                {msg.content && (
-                  <div className="text-[14px] text-ink">
-                    <MessageContent
-                      messageId={msg.id}
-                      content={msg.content}
-                      isUser={false}
-                      timestamp={msg.timestamp}
-                      showTime={false}
-                    />
-                  </div>
-                )}
-                {msg.toolUses && msg.toolUses.length > 0 && (
-                  <CollapsedToolUses toolUses={msg.toolUses} />
-                )}
-                {/* Prefer the model persisted on the message — the agent's
-                    CURRENT model may differ from the one that actually
-                    produced (and prices) this past reply. */}
-                {msg.usage && msg.usage.inputTokens != null && (
-                  <ThreadUsageLine usage={msg.usage} model={msg.model || threadAgentModel} />
-                )}
-              </div>
-            </div>
-          );
-        })}
+        {messages.map((msg) => (
+          <GroupMessageRow
+            key={msg.id}
+            msg={msg}
+            color={agentColors.get(msg.agentId)}
+            // Only rows that actually price via the fallback depend on it,
+            // so a late model fetch does not invalidate every memoized row.
+            fallbackModel={msg.usage && !msg.model ? threadAgentModel : undefined}
+          />
+        ))}
         {awaitingReply && (() => {
           const live = threadLive?.active ? threadLive : null;
           const hasProgress =
@@ -1302,6 +1216,117 @@ export function GroupDMChat() {
     </div>
   );
 }
+
+// GroupMessageRow renders one persisted transcript row. It is memoized (and
+// the poll reuses unchanged message objects, see reuseUnchangedMessages) so a
+// keystroke in the composer, a 1s live-progress tick, or a no-op 3s poll does
+// not re-parse every row's markdown — that full re-render made long threads
+// progressively sluggish.
+const GroupMessageRow = memo(function GroupMessageRow({
+  msg,
+  color,
+  fallbackModel,
+}: {
+  msg: GroupMessage;
+  color?: string;
+  fallbackModel?: string;
+}) {
+  const t = useT();
+  const isUser = msg.agentId === USER_SENDER_ID;
+  if (isUser) {
+    return (
+      <div className="flex justify-end">
+        <div className="min-w-0 max-w-[85%] rounded-2xl rounded-br-md border border-copper/25 bg-raised px-3.5 py-2.5 text-[14px] text-ink lg:max-w-[70%]">
+          {msg.attachments && msg.attachments.length > 0 && (
+            <AttachmentList attachments={msg.attachments} isUser />
+          )}
+          <MessageContent
+            messageId={msg.id}
+            content={msg.content}
+            isUser
+            timestamp={msg.timestamp}
+          />
+        </div>
+      </div>
+    );
+  }
+  // Subtle highlight when the agent @mentions the human operator.
+  const mentionsUser = msg.mentions?.includes(USER_SENDER_ID) ?? false;
+  return (
+    <div
+      className={`flex gap-3${mentionsUser ? " -mx-2 rounded-xl border-l-2 border-copper/60 bg-copper/5 px-2 py-1.5" : ""}`}
+    >
+      <AgentAvatar
+        agentId={msg.agentId}
+        name={msg.agentName}
+        size="xs"
+        className="mt-0.5 shrink-0"
+      />
+      <div className="min-w-0 flex-1">
+        <div className="mb-1 flex items-baseline gap-2">
+          <span className={`text-[13px] font-semibold ${color ?? "text-ink"}`}>
+            {msg.agentName}
+          </span>
+          {isExternalId(msg.agentId) && (
+            <span className="rounded-full border border-copper/40 px-1.5 font-mono text-[10px] text-copper">
+              {t("xa.badge")}
+            </span>
+          )}
+          <span className="font-mono text-[11px] text-ink-faint">{formatTime(msg.timestamp)}</span>
+          {msg.model && (
+            <span className="font-mono text-[10px] text-ink-faint">
+              {msg.model}
+              {msg.effort ? ` · ${msg.effort}` : ""}
+            </span>
+          )}
+          {msg.interrupted && (
+            <span
+              className="rounded-full border border-hairline px-1.5 font-mono text-[10px] text-ink-faint"
+              title={t("gdm.interruptedTitle")}
+            >
+              {t("gdm.interrupted")}
+            </span>
+          )}
+          {mentionsUser && (
+            <span
+              className="rounded-full bg-copper/15 px-1.5 font-mono text-[10px] text-copper"
+              title={t("dash.mentionsYou")}
+            >
+              @you
+            </span>
+          )}
+        </div>
+        {msg.thinking && <ThinkingBlock text={msg.thinking} />}
+        {msg.attachments && msg.attachments.length > 0 && (
+          <AttachmentList attachments={msg.attachments} isUser={false} />
+        )}
+        {/* An interrupted reply can have empty content (only thinking
+            or toolUses were produced before the stop) — skip the
+            empty text block instead of rendering a hollow row. */}
+        {msg.content && (
+          <div className="text-[14px] text-ink">
+            <MessageContent
+              messageId={msg.id}
+              content={msg.content}
+              isUser={false}
+              timestamp={msg.timestamp}
+              showTime={false}
+            />
+          </div>
+        )}
+        {msg.toolUses && msg.toolUses.length > 0 && (
+          <CollapsedToolUses toolUses={msg.toolUses} />
+        )}
+        {/* Prefer the model persisted on the message — the agent's
+            CURRENT model may differ from the one that actually
+            produced (and prices) this past reply. */}
+        {msg.usage && msg.usage.inputTokens != null && (
+          <ThreadUsageLine usage={msg.usage} model={msg.model || fallbackModel} />
+        )}
+      </div>
+    </div>
+  );
+});
 
 // ThreadUsageLine renders per-reply token counts (input→output, cache read/
 // write when present) and an approximate USD cost when the thread agent's

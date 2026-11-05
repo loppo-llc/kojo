@@ -94,7 +94,9 @@ const agyPrintTimeout = "0s"
 // turn does not hang.
 var agyExitGrace = 30 * time.Second
 
-func buildAgyArgs(resumeID string, agent *Agent, withAgent bool) []string {
+// buildAgyArgs renders the argv of one run; agentName is the custom agent
+// to select, or "" for none.
+func buildAgyArgs(resumeID string, agent *Agent, agentName string) []string {
 	args := []string{
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
@@ -108,8 +110,8 @@ func buildAgyArgs(resumeID string, agent *Agent, withAgent bool) []string {
 	if resumeID != "" {
 		args = append(args, "--conversation", resumeID)
 	}
-	if withAgent {
-		args = append(args, "--agent", agyKojoAgentName)
+	if agentName != "" {
+		args = append(args, "--agent", agentName)
 	}
 	if agent.Model != "" {
 		args = append(args, "--model", agent.Model)
@@ -162,6 +164,10 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 	if !opts.OneShot && resumeID == "" && opts.FreshSessionContext == "" && opts.RecentMessagesContext != "" {
 		userMessage = injectRecentMessagesContext(userMessage, opts.RecentMessagesContext)
 	}
+	sharedPrompt, extra := splitAgySystemPrompt(systemPrompt, opts.SystemPromptExtraApplied)
+	if resumeID != "" && agyResumeExtraChanged(readAgyConversationExtra(dir, resumeID), extra) {
+		userMessage = agyResumeExtraNotice(extra) + userMessage
+	}
 	input, err := agyUserMessageLine(userMessage)
 	if err != nil {
 		return nil, fmt.Errorf("encode prompt: %w", err)
@@ -171,20 +177,31 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 	if err != nil {
 		return nil, fmt.Errorf("render agy MCP config: %w", err)
 	}
-	agentDef := renderAgyAgentDef(systemPrompt)
-	managed := map[string]string{
-		agyMCPConfigPath(dir): mcpConfig,
-		agyAgentDefPath(dir):  agentDef,
-	}
-	for name, body := range renderAgyRules(systemPrompt) {
+	// The shared prompt goes to the always_on rules, which agy reads again
+	// for a resumed conversation; every turn of the agent shares them. The
+	// per-call extra (thread / Slack context) goes to a custom agent named
+	// after its body, so a thread turn never waits for a main-chat agy to
+	// exit because of it. agy freezes that body with the conversation; a
+	// changed extra reaches a resumed one through agyResumeExtraNotice.
+	managed := map[string]string{agyMCPConfigPath(dir): mcpConfig}
+	for name, body := range renderAgyRules(sharedPrompt) {
 		managed[filepath.Join(agyRulesDir(dir), name)] = body
 	}
-	release, err := holdAgyWorkspace(ctx, dir, managed)
+	var agentName string
+	var ephemeral []string
+	if sharedPrompt != "" || extra != "" {
+		body := agyAgentDefBody(extra)
+		agentName = agyAgentName(body)
+		defPath := agyAgentDefPath(dir, agentName)
+		managed[defPath] = renderAgyAgentDef(agentName, body)
+		ephemeral = append(ephemeral, defPath)
+	}
+	release, err := holdAgyWorkspace(ctx, dir, managed, ephemeral...)
 	if err != nil {
 		return nil, fmt.Errorf("prepare agy workspace: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, bin, buildAgyArgs(resumeID, agent, agentDef != "")...)
+	cmd := exec.CommandContext(ctx, bin, buildAgyArgs(resumeID, agent, agentName)...)
 	cmd.Env = appendKojoTurnEnv(filterEnv(agyEnvStrip, agent.ID, dir), opts)
 	cmd.Dir = dir
 	cmd.Stdin = bytes.NewReader(input)
@@ -329,14 +346,55 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 			return
 		}
 
-		if !opts.OneShot && result.conversationID != "" && result.conversationID != resumeID {
-			writeAgyConversationID(dir, persistKey, result.conversationID, b.logger)
+		if !opts.OneShot && result.conversationID != "" {
+			if result.conversationID != resumeID {
+				writeAgyConversationID(dir, persistKey, result.conversationID, b.logger)
+			}
+			writeAgyConversationExtra(dir, result.conversationID, extra, b.logger)
 		}
 
 		msg := assembleAssistantMessage(cleanAgyContent(result.text), result.thinking, result.toolUses, result.usage)
 		send(ChatEvent{Type: "done", Message: msg, Usage: result.usage, ErrorMessage: processError})
 	}()
 	return ch, nil
+}
+
+// splitAgySystemPrompt separates the per-call extra the manager appended
+// to systemPrompt (ChatOptions.SystemPromptExtraApplied) from the prompt
+// shared by every turn of the agent.
+func splitAgySystemPrompt(systemPrompt, applied string) (shared, extra string) {
+	if applied == "" || !strings.HasSuffix(systemPrompt, applied) {
+		return systemPrompt, ""
+	}
+	shared = strings.TrimSuffix(systemPrompt, applied)
+	return strings.TrimSuffix(shared, "\n\n"), applied
+}
+
+// agyResumeExtraChanged reports whether a resumed conversation last given
+// the extra recorded as stored (a digest, "" when unrecorded) needs to be
+// told about extra. An unrecorded conversation with no extra needs nothing.
+func agyResumeExtraChanged(stored, extra string) bool {
+	if stored == "" {
+		return extra != ""
+	}
+	return stored != agyExtraDigest(extra)
+}
+
+// agyResumeExtraNotice carries a per-call extra to a resumed conversation
+// that has not been given it yet: agy keeps the custom agent body the
+// conversation was created with, so a Slack thread's poster or a legacy
+// conversation (whose extra used to live in the rules) would otherwise
+// run on stale or missing instructions. An empty extra withdraws the
+// earlier ones.
+func agyResumeExtraNotice(extra string) string {
+	if extra == "" {
+		return "<kojo-conversation-instructions>\n" +
+			"Earlier instructions specific to this conversation (including those in your agent definition) no longer apply; keep following the kojo rules.\n" +
+			"</kojo-conversation-instructions>\n\n"
+	}
+	return "<kojo-conversation-instructions>\n" +
+		"These instructions for this conversation replace any earlier ones (including those in your agent definition):\n\n" +
+		extra + "\n</kojo-conversation-instructions>\n\n"
 }
 
 // classifyAgyError turns the outcome of one agy run into the message the

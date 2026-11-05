@@ -236,9 +236,11 @@ func TestAgyPromptRulesRefreshAndPruneOnlyManagedFiles(t *testing.T) {
 	if err := os.WriteFile(prefixedUserRule, []byte("user rule"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	body := agyAgentDefBody("")
+	defPath := agyAgentDefPath(dir, agyAgentName(body))
 	hold := func(prompt string) func() {
 		t.Helper()
-		files := map[string]string{agyAgentDefPath(dir): renderAgyAgentDef(prompt)}
+		files := map[string]string{defPath: renderAgyAgentDef(agyAgentName(body), body)}
 		for name, body := range renderAgyRules(prompt) {
 			files[filepath.Join(agyRulesDir(dir), name)] = body
 		}
@@ -249,9 +251,9 @@ func TestAgyPromptRulesRefreshAndPruneOnlyManagedFiles(t *testing.T) {
 		return release
 	}
 	hold(strings.Repeat("old prompt\n", 5000))()
-	firstAgent, _ := os.ReadFile(agyAgentDefPath(dir))
+	firstAgent, _ := os.ReadFile(defPath)
 	hold("new prompt")()
-	secondAgent, _ := os.ReadFile(agyAgentDefPath(dir))
+	secondAgent, _ := os.ReadFile(defPath)
 	if string(firstAgent) != string(secondAgent) {
 		t.Fatal("custom agent body should remain stable across resumed turns")
 	}

@@ -2954,7 +2954,8 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	// so it is intentionally NOT forwarded via ChatOptions — that would
 	// cause a backend to append it a second time. The field stays on
 	// ChatOptions for future backends that want to inject it at a custom
-	// offset rather than the end of the system prompt.
+	// offset rather than the end of the system prompt. The merged suffix
+	// is reported in SystemPromptExtraApplied instead.
 	chatOpts := ChatOptions{
 		ResumeGoalOnReply:    resumeGoalOnReply,
 		Goal:                 opts.Goal,
@@ -2967,6 +2968,9 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		SessionStartContext:  prep.sessionStartContext,
 		SessionKey:           sessionKey,
 		ConversationKey:      opts.SessionKey,
+		// Informational only (already part of prep.sysPrompt): agy keeps
+		// it out of the workspace rules it shares with other turns.
+		SystemPromptExtraApplied: opts.SystemPromptExtra,
 		LingerBackgroundTasks: opts.LingerBackgroundTasks && sessionKey != "" &&
 			prep.backend.Name() == ToolClaude &&
 			(opts.KeyedSurface != nil || m.hasKeyedBackgroundHandler(agentID, sessionKey)),

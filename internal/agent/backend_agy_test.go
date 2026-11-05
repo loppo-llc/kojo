@@ -57,7 +57,7 @@ func TestAgyConversationRef_RejectsMalformed(t *testing.T) {
 
 func TestBuildAgyArgs(t *testing.T) {
 	a := &Agent{Model: "gemini-3.8-flash", Effort: "high"}
-	args := buildAgyArgs(agyIDA, a, true)
+	args := buildAgyArgs(agyIDA, a, "kojo-0123456789abcdef")
 	want := []string{
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
@@ -65,14 +65,14 @@ func TestBuildAgyArgs(t *testing.T) {
 		"--dangerously-skip-permissions",
 		"--disable-slash-commands",
 		"--conversation", agyIDA,
-		"--agent", agyKojoAgentName,
+		"--agent", "kojo-0123456789abcdef",
 		"--model", "gemini-3.8-flash",
 		"--effort", "high",
 	}
 	if !slices.Equal(args, want) {
 		t.Errorf("args =\n%q\nwant\n%q", args, want)
 	}
-	args = buildAgyArgs("", &Agent{}, false)
+	args = buildAgyArgs("", &Agent{}, "")
 	for _, f := range []string{"--conversation", "--continue", "-c", "--agent", "--model", "--effort"} {
 		if slices.Contains(args, f) {
 			t.Errorf("fresh args carry %s: %q", f, args)
@@ -220,7 +220,7 @@ func TestRenderAgyMCPConfig(t *testing.T) {
 
 func TestHoldAgyWorkspace(t *testing.T) {
 	dir := t.TempDir()
-	path := agyAgentDefPath(dir)
+	path := agyMCPConfigPath(dir)
 	rel1, err := holdAgyWorkspace(context.Background(), dir, map[string]string{path: "one"})
 	if err != nil {
 		t.Fatal(err)
@@ -282,6 +282,102 @@ func TestHoldAgyWorkspace(t *testing.T) {
 	}
 }
 
+// Turns with different system prompts (main chat vs a thread) must not wait
+// for each other; a generated agent def goes away with its last holder,
+// and stale generated defs are swept.
+func TestHoldAgyWorkspace_PerPromptAgents(t *testing.T) {
+	dir := t.TempDir()
+	mcp := agyMCPConfigPath(dir)
+	defA := agyAgentDefPath(dir, agyAgentName("main"))
+	defB := agyAgentDefPath(dir, agyAgentName("thread"))
+
+	stale := agyAgentDefPath(dir, "kojo")
+	own := agyAgentDefPath(dir, "kojo-mine")
+	ownHex := agyAgentDefPath(dir, "kojo-0123456789abcdef")
+	for p, body := range map[string]string{
+		stale:  renderAgyAgentDef("kojo", "old prompt"),
+		own:    renderAgyAgentDef("kojo-mine", "x"),
+		ownHex: "---\nname: kojo-0123456789abcdef\ndescription: hand-made\n---\nx\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	relA, err := holdAgyWorkspace(context.Background(), dir, map[string]string{mcp: "m", defA: "A"}, defA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	relB, err := holdAgyWorkspace(ctx, dir, map[string]string{mcp: "m", defB: "B"}, defB)
+	if err != nil {
+		t.Fatalf("second prompt waited for the first: %v", err)
+	}
+	for p, want := range map[string]string{defA: "A", defB: "B", mcp: "m"} {
+		if b, _ := os.ReadFile(p); string(b) != want {
+			t.Errorf("%s = %q, want %q", p, b, want)
+		}
+	}
+	if _, err := os.Stat(filepath.Dir(stale)); !os.IsNotExist(err) {
+		t.Errorf("legacy kojo agent not swept")
+	}
+	for _, p := range []string{own, ownHex} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("a non-generated agent was swept: %v", err)
+		}
+	}
+
+	// Another prompt under a changed MCP config waits for both holders of
+	// the old config, then takes its own def without touching theirs.
+	defC := agyAgentDefPath(dir, agyAgentName("other"))
+	got := make(chan error, 1)
+	var relC func()
+	go func() {
+		var err error
+		relC, err = holdAgyWorkspace(context.Background(), dir, map[string]string{mcp: "m2", defC: "C"}, defC)
+		got <- err
+	}()
+	select {
+	case <-got:
+		t.Fatal("conflicting MCP config did not wait")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	relA()
+	if _, err := os.Stat(filepath.Dir(defA)); !os.IsNotExist(err) {
+		t.Errorf("released agent def not removed")
+	}
+	if _, err := os.Stat(defB); err != nil {
+		t.Errorf("held agent def removed: %v", err)
+	}
+	select {
+	case <-got:
+		t.Fatal("conflicting MCP config did not wait for the second holder")
+	case <-time.After(50 * time.Millisecond):
+	}
+	relB()
+	if err := <-got; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Dir(defB)); !os.IsNotExist(err) {
+		t.Errorf("released agent def not removed")
+	}
+	if b, _ := os.ReadFile(mcp); string(b) != "m2" {
+		t.Errorf("mcp = %q, want m2", b)
+	}
+	if b, _ := os.ReadFile(defC); string(b) != "C" {
+		t.Errorf("defC = %q", b)
+	}
+	relC()
+	if _, err := os.Stat(mcp); err != nil {
+		t.Errorf("non-ephemeral file removed: %v", err)
+	}
+}
+
 // TestAgyChat_FakeBinary runs Chat against a stand-in agy that records
 // its argv and stdin and replays a canned stream.
 func TestAgyChat_FakeBinary(t *testing.T) {
@@ -294,7 +390,9 @@ func TestAgyChat_FakeBinary(t *testing.T) {
 	if err := os.WriteFile(stream, []byte(agyTestStream), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argvLog + "\ncat > " + stdinLog + "\ncat " + stream + "\n"
+	defLog := filepath.Join(bin, "agentdef")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argvLog + "\ncat > " + stdinLog +
+		"\ncat .agents/agents/*/agent.md > " + defLog + "\ncat " + stream + "\n"
 	if err := os.WriteFile(filepath.Join(bin, "agy"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -326,11 +424,15 @@ func TestAgyChat_FakeBinary(t *testing.T) {
 	if b, _ := os.ReadFile(filepath.Join(agyRulesDir(dir), "kojo-system-01.md")); !strings.Contains(string(b), "SYSTEM PROMPT") {
 		t.Errorf("prompt rules = %q", b)
 	}
-	if b, _ := os.ReadFile(agyAgentDefPath(dir)); strings.Contains(string(b), "SYSTEM PROMPT") || !strings.Contains(string(b), "tools:") {
-		t.Errorf("custom agent must carry only static instructions and tool policy: %q", b)
+	name := agyAgentName(agyAgentDefBody(""))
+	if b, _ := os.ReadFile(defLog); strings.Contains(string(b), "SYSTEM PROMPT") || !strings.Contains(string(b), "tools:") || !strings.Contains(string(b), "name: "+name+"\n") {
+		t.Errorf("custom agent must carry only the rules pointer and tool policy: %q", b)
+	}
+	if _, err := os.Stat(filepath.Dir(agyAgentDefPath(dir, name))); !os.IsNotExist(err) {
+		t.Errorf("agent def left behind after the turn: %v", err)
 	}
 	argv, _ := os.ReadFile(argvLog)
-	if strings.Contains(string(argv), "--conversation") || !strings.Contains(string(argv), "--agent\nkojo\n") {
+	if strings.Contains(string(argv), "--conversation") || !strings.Contains(string(argv), "--agent\n"+name+"\n") {
 		t.Errorf("first turn argv = %q", argv)
 	}
 	in, _ := os.ReadFile(stdinLog)
@@ -368,11 +470,11 @@ func TestAgyChat_FakeBinary(t *testing.T) {
 // must not reach argv for them.
 func TestBuildAgyArgs_DropsUnsupportedEffort(t *testing.T) {
 	for _, m := range []string{"gpt-oss-120b-medium", "gemini-4-argon-high"} {
-		if args := buildAgyArgs("", &Agent{Model: m, Effort: "high"}, false); slices.Contains(args, "--effort") {
+		if args := buildAgyArgs("", &Agent{Model: m, Effort: "high"}, ""); slices.Contains(args, "--effort") {
 			t.Errorf("%s: args carry --effort: %q", m, args)
 		}
 	}
-	if args := buildAgyArgs("", &Agent{Effort: "max"}, false); slices.Contains(args, "--effort") {
+	if args := buildAgyArgs("", &Agent{Effort: "max"}, ""); slices.Contains(args, "--effort") {
 		t.Errorf("max reached argv: %q", args)
 	}
 }
