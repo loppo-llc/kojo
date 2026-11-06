@@ -775,13 +775,13 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                             )}
                             {open && <RelTime value={ts} className="ml-auto" />}
                           </div>
+                          {agent.attention && agent.attentionReason && (
+                            <div className="mt-0.5 line-clamp-3 break-words text-[13px] text-copper" title={agent.attentionReason}>
+                              {agent.attentionReason}
+                            </div>
+                          )}
                           {open && (
                             <>
-                              {agent.attention && agent.attentionReason && (
-                                <div className="mt-0.5 line-clamp-3 break-words text-[13px] text-copper" title={agent.attentionReason}>
-                                  {agent.attentionReason}
-                                </div>
-                              )}
                               <div className={`mt-0.5 truncate text-[13px] ${errored ? "text-lamp-err/90" : "text-ink-dim"}`}>{preview}</div>
                               <div className="mt-1 flex min-w-0 items-center gap-1.5 overflow-hidden">
                                 <Chip className="shrink-0">{agent.tool}</Chip>
