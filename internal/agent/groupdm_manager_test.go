@@ -2074,3 +2074,29 @@ func TestRenameRecipients_ThreadRoomNotifiesNobody(t *testing.T) {
 		t.Errorf("group rename recipients = %+v, want [ag_bob]", got)
 	}
 }
+
+// TestThreadBusy_LiveOrQueued covers the room-list busy flag: a running turn
+// (threadLive) and a human turn still waiting on its FIFO ticket
+// (threadQueued) both count, so the dot does not blink off between turns.
+func TestThreadBusy_LiveOrQueued(t *testing.T) {
+	gdm := &GroupDMManager{threadLive: map[string]*threadLiveState{}}
+	if gdm.ThreadBusy("gd_x") {
+		t.Fatal("idle room reported busy")
+	}
+	gdm.startThreadLive("gd_x", "", "")
+	if !gdm.ThreadBusy("gd_x") {
+		t.Fatal("running turn not busy")
+	}
+	gdm.registerThreadQueued("gd_x", "m2")
+	gdm.endThreadLive("gd_x")
+	if !gdm.ThreadBusy("gd_x") {
+		t.Fatal("queued turn between FIFO turns not busy")
+	}
+	if gdm.ThreadBusy("gd_y") {
+		t.Fatal("unrelated room reported busy")
+	}
+	gdm.unregisterThreadQueued("gd_x", "m2")
+	if gdm.ThreadBusy("gd_x") {
+		t.Fatal("room still busy after queue drained")
+	}
+}

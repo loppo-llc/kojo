@@ -393,6 +393,22 @@ func (m *GroupDMManager) sealThreadSteer(groupID string) error {
 	return nil
 }
 
+// ThreadBusy reports whether groupID has a thread turn running or queued
+// behind one — the room list's busy indicator. threadLive alone would blink
+// off between back-to-back FIFO turns and while a queued human turn waits
+// for its ticket, so pending human-turn tickets (threadQueued) count too.
+func (m *GroupDMManager) ThreadBusy(groupID string) bool {
+	m.threadLiveMu.Lock()
+	_, live := m.threadLive[groupID]
+	m.threadLiveMu.Unlock()
+	if live {
+		return true
+	}
+	m.threadQueueMu.Lock()
+	defer m.threadQueueMu.Unlock()
+	return len(m.threadQueued[groupID]) > 0
+}
+
 func (m *GroupDMManager) ThreadLive(groupID string) (active bool, snapshot ThreadLiveSnapshot) {
 	m.threadLiveMu.Lock()
 	defer m.threadLiveMu.Unlock()

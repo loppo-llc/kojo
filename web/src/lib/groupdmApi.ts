@@ -69,6 +69,8 @@ export interface GroupDMInfo {
   externalTrust?: ExternalTrust;
   createdAt: string;
   updatedAt: string;
+  /** Thread room with a turn in flight (list endpoint only). */
+  busy?: boolean;
 }
 
 export type ExternalTrust = "untrusted" | "peer";

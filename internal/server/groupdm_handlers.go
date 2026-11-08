@@ -125,7 +125,17 @@ func (s *Server) handleListGroupDMs(w http.ResponseWriter, r *http.Request) {
 	if groups == nil {
 		groups = []*agent.GroupDM{}
 	}
-	writeJSONResponse(w, http.StatusOK, map[string]any{"groups": groups})
+	// Busy marks thread rooms with a turn in flight (replying / thinking) so
+	// the dashboard can show the same processing dot as an agent's main chat.
+	type groupDMListItem struct {
+		*agent.GroupDM
+		Busy bool `json:"busy,omitempty"`
+	}
+	items := make([]groupDMListItem, len(groups))
+	for i, g := range groups {
+		items[i] = groupDMListItem{GroupDM: g, Busy: s.groupdms.ThreadBusy(g.ID)}
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"groups": items})
 }
 
 func (s *Server) handleCreateGroupDM(w http.ResponseWriter, r *http.Request) {

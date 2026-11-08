@@ -609,6 +609,70 @@ func TestHandleGetGroupDMLive_ActiveSnapshotThenClears(t *testing.T) {
 	t.Fatalf("live snapshot still active after turn completed")
 }
 
+// TestHandleListGroupDMs_ThreadBusy verifies the room list flags a thread
+// room as busy while its turn is in flight (the dashboard's processing dot)
+// and drops the flag once the turn completes; idle rooms omit it.
+func TestHandleListGroupDMs_ThreadBusy(t *testing.T) {
+	srv, gdm, group, _ := newGroupDMHandlerTestServer(t)
+	aliceID := group.Members[0].AgentID
+
+	stub := &liveThreadStub{release: make(chan struct{})}
+	gdm.SetOneShotForTesting(stub.fn)
+
+	thread, err := gdm.CreateThread(aliceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	list := func() map[string]map[string]any {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/groupdms", nil)
+		rr := httptest.NewRecorder()
+		srv.handleListGroupDMs(rr, authedRequest(req, auth.Principal{Role: auth.RoleOwner}))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+		var resp struct {
+			Groups []map[string]any `json:"groups"`
+		}
+		readJSONResponse(t, rr, &resp)
+		out := map[string]map[string]any{}
+		for _, g := range resp.Groups {
+			id, _ := g["id"].(string)
+			out[id] = g
+		}
+		return out
+	}
+
+	before := list()
+	if _, has := before[thread.ID]["busy"]; has {
+		t.Fatalf("idle thread should omit busy, got %+v", before[thread.ID])
+	}
+	if before[thread.ID]["name"] == nil || before[thread.ID]["members"] == nil {
+		t.Fatalf("list item lost GroupDM fields: %+v", before[thread.ID])
+	}
+
+	if _, err := gdm.PostUserMessage(context.Background(), thread.ID, "ping", nil, true); err != nil {
+		t.Fatal(err)
+	}
+	waitBusy := func(want bool) {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			got, _ := list()[thread.ID]["busy"].(bool)
+			if got == want {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("thread busy never became %v", want)
+	}
+	waitBusy(true)
+	if busy, _ := list()[group.ID]["busy"].(bool); busy {
+		t.Errorf("unrelated group room reported busy")
+	}
+	close(stub.release)
+	waitBusy(false)
+}
+
 // TestHandleCreateThread_RemoteHeldAgent verifies the Hub can open a thread
 // with an agent whose runtime was device-switched to another peer: the agent
 // is gone from the local Manager map but agent_locks names a holder, and the
