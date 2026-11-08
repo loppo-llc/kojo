@@ -2015,6 +2015,13 @@ type chatPrep struct {
 	recentMessagesContext string
 	history               []HistoryTurn
 	mcpServers            map[string]mcpServerEntry
+	// agyAttachmentOptOut is set when a gemini-agy turn asked to hide
+	// kojo's attachment staging contract: the shared prompt keeps it (see
+	// agyKeepsSharedAttachmentSection) and the caller appends
+	// agyAttachmentOptOutPrompt to the per-call extra instead.
+	agyAttachmentOptOut bool
+	// promptGeneration orders sysPrompt (see ChatOptions.PromptGeneration).
+	promptGeneration uint64
 }
 
 // prepareChatOptions describes response-surface capabilities that can differ
@@ -2028,6 +2035,26 @@ type prepareChatOptions struct {
 	// the only surface that consumes a pending post-compaction diary
 	// re-injection.
 	mainSession bool
+}
+
+// agyKeepsSharedAttachmentSection reports whether a turn asking to hide the
+// attachment staging contract must keep it in the system prompt and opt
+// out through its per-call extra instead. gemini-agy puts the shared
+// system prompt in rule files every concurrent turn of the agent reads
+// (again before each model step), so a thread / external turn dropping a
+// section would rewrite the rules under a running main-chat turn — or, as
+// before, wait for it to exit.
+func agyKeepsSharedAttachmentSection(a *Agent, opts prepareChatOptions) bool {
+	return opts.disableKojoAttachmentInstructions && a.Tool == ToolGeminiAgy &&
+		toolHasAgenticTools(a.Tool) && !a.InjectionDisabled(InjectionAttachments)
+}
+
+// agyAttachmentOptOutPrompt withdraws the shared attachment staging
+// contract for one gemini-agy conversation (see
+// agyKeepsSharedAttachmentSection).
+func agyAttachmentOptOutPrompt(agentID string) string {
+	return fmt.Sprintf("The \"Sending file attachments to the user\" section of the kojo rules does not apply to this conversation: never stage files under `%s` here — that directory delivers them to a different conversation.",
+		filepath.Join(agentDir(agentID), attachStagingSubpath))
 }
 
 func applyPrepareChatOptions(a *Agent, opts prepareChatOptions) {
@@ -2121,6 +2148,9 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		return nil, fmt.Errorf("%w: %s", ErrAgentArchived, agentID)
 	}
 	agentCopy := *a
+	// Drawn with the settings snapshot, before any prompt input (persona,
+	// memory, groups) is read, so it orders every input of sysPrompt.
+	promptGeneration := nextAgyPromptGeneration()
 	// prepareChatOptions may append a turn-local disabled injection below.
 	// Detach the slice while holding m.mu so the snapshot never writes through
 	// Agent's shared backing array or races a concurrent settings update.
@@ -2130,6 +2160,10 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 	// External transports such as Slack deliver the assistant's text through
 	// their own API and do not consume Kojo's MessageAttachment events. Hide
 	// the staging contract for those turns without mutating the shared Agent.
+	agyAttachmentOptOut := agyKeepsSharedAttachmentSection(&agentCopy, opts)
+	if agyAttachmentOptOut {
+		opts.disableKojoAttachmentInstructions = false
+	}
 	applyPrepareChatOptions(&agentCopy, opts)
 
 	backend, err := m.resolveBackend(&agentCopy)
@@ -2262,6 +2296,8 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		recentMessagesContext: recentMessagesContext,
 		history:               history,
 		mcpServers:            mcpServers,
+		agyAttachmentOptOut:   agyAttachmentOptOut,
+		promptGeneration:      promptGeneration,
 	}, nil
 }
 
@@ -2503,6 +2539,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		Goal:                  goal,
 		PreserveGoalOnCancel:  func() bool { return m.IsSwitching(agentID) || m.NativeGoalsShuttingDown() },
 		MCPServers:            prep.mcpServers,
+		PromptGeneration:      prep.promptGeneration,
 		AutomatedTrigger:      role == "system" && goal == nil,
 		RetryOverload:         src == BusySourceCron && role == "system" && goal == nil,
 		SessionStartContext:   prep.sessionStartContext,
@@ -2824,6 +2861,9 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		return nil, err
 	}
 	m.applyTurnEffort(agentID, prep, effortCh)
+	if prep.agyAttachmentOptOut {
+		opts.SystemPromptExtra = strings.TrimSpace(agyAttachmentOptOutPrompt(agentID) + "\n\n" + opts.SystemPromptExtra)
+	}
 
 	chatCtx, cancelCause := context.WithCancelCause(ctx)
 	cancel := func() { cancelCause(nil) }
@@ -2971,6 +3011,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		// Informational only (already part of prep.sysPrompt): agy keeps
 		// it out of the workspace rules it shares with other turns.
 		SystemPromptExtraApplied: opts.SystemPromptExtra,
+		PromptGeneration:         prep.promptGeneration,
 		LingerBackgroundTasks: opts.LingerBackgroundTasks && sessionKey != "" &&
 			prep.backend.Name() == ToolClaude &&
 			(opts.KeyedSurface != nil || m.hasKeyedBackgroundHandler(agentID, sessionKey)),
@@ -4864,6 +4905,7 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 		defer cancel()
 
 		backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
+			PromptGeneration:    prep.promptGeneration,
 			SessionStartContext: prep.sessionStartContext,
 			FreshSessionContext: prep.freshSessionContext,
 			// Session-less backends replay the transcript; here it has

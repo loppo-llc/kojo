@@ -196,7 +196,7 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 		managed[defPath] = renderAgyAgentDef(agentName, body)
 		ephemeral = append(ephemeral, defPath)
 	}
-	release, err := holdAgyWorkspace(ctx, dir, managed, ephemeral...)
+	release, err := holdAgyWorkspace(ctx, dir, opts.PromptGeneration, managed, ephemeral...)
 	if err != nil {
 		return nil, fmt.Errorf("prepare agy workspace: %w", err)
 	}

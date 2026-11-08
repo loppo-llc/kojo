@@ -27,9 +27,10 @@ func TestSplitAgySystemPrompt(t *testing.T) {
 	}
 }
 
-// Turns sharing the rules but carrying different extras run side by side;
-// a turn whose shorter prompt would prune a rule chunk another running
-// turn was started with waits for it.
+// Turns carrying different extras run side by side, and so do turns whose
+// rules differ (the agent edited its memory in between): the newest rules
+// win, stale chunks are pruned, and nothing waits on a running turn.
+// Only a differing held file such as mcp_config.json is waited for.
 func TestHoldAgyWorkspace_RulesAndExtras(t *testing.T) {
 	dir := t.TempDir()
 	rule := func(n int) string {
@@ -40,43 +41,93 @@ func TestHoldAgyWorkspace_RulesAndExtras(t *testing.T) {
 		name := agyAgentName(body)
 		return agyAgentDefPath(dir, name), renderAgyAgentDef(name, body)
 	}
+	mcp := agyMCPConfigPath(dir)
 	defA, bodyA := def("thread A")
 	defB, bodyB := def("thread B")
-	relA, err := holdAgyWorkspace(context.Background(), dir, map[string]string{rule(1): "r1", rule(2): "r2", defA: bodyA}, defA)
+	relA, err := holdAgyWorkspace(context.Background(), dir, 0, map[string]string{mcp: "m", rule(1): "r1", rule(2): "r2", defA: bodyA}, defA)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	relB, err := holdAgyWorkspace(ctx, dir, map[string]string{rule(1): "r1", rule(2): "r2", defB: bodyB}, defB)
+	relB, err := holdAgyWorkspace(ctx, dir, 0, map[string]string{mcp: "m", rule(1): "r1", rule(2): "r2", defB: bodyB}, defB)
 	if err != nil {
 		t.Fatalf("same rules, other extra waited: %v", err)
 	}
 	relB()
 
-	got := make(chan error, 1)
-	var relC func()
-	go func() {
-		var err error
-		relC, err = holdAgyWorkspace(context.Background(), dir, map[string]string{rule(1): "r1"})
-		got <- err
-	}()
-	select {
-	case <-got:
-		t.Fatal("pruning a held rule chunk did not wait")
-	case <-time.After(50 * time.Millisecond):
+	// Shorter, newer prompt while A still runs: written at once.
+	relC, err := holdAgyWorkspace(ctx, dir, 0, map[string]string{mcp: "m", rule(1): "r1 new"})
+	if err != nil {
+		t.Fatalf("changed rules waited for a running turn: %v", err)
 	}
-	if b, _ := os.ReadFile(rule(2)); string(b) != "r2" {
-		t.Errorf("held rule chunk changed: %q", b)
-	}
-	relA()
-	if err := <-got; err != nil {
-		t.Fatal(err)
+	if b, _ := os.ReadFile(rule(1)); string(b) != "r1 new" {
+		t.Errorf("newest rules not written: %q", b)
 	}
 	if _, err := os.Stat(rule(2)); !os.IsNotExist(err) {
 		t.Errorf("stale rule chunk survived: %v", err)
 	}
+	// Releasing must not undo or remove the newer rules.
+	relA()
 	relC()
+	if b, _ := os.ReadFile(rule(1)); string(b) != "r1 new" {
+		t.Errorf("rules changed on release: %q", b)
+	}
+	if _, err := os.Stat(defA); !os.IsNotExist(err) {
+		t.Errorf("released agent def survived: %v", err)
+	}
+
+	// A held mcp_config.json is still waited for.
+	relD, err := holdAgyWorkspace(context.Background(), dir, 0, map[string]string{mcp: "m", rule(1): "r1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan error, 1)
+	var relE func()
+	go func() {
+		var err error
+		relE, err = holdAgyWorkspace(context.Background(), dir, 0, map[string]string{mcp: "m2", rule(1): "r1 stale"})
+		got <- err
+	}()
+	select {
+	case <-got:
+		t.Fatal("a differing mcp_config.json did not wait")
+	case <-time.After(50 * time.Millisecond):
+	}
+	// A newer turn writes its rules while the waiting one is blocked; the
+	// waiter must not put its older rules back once it gets through.
+	relF, err := holdAgyWorkspace(context.Background(), dir, 0, map[string]string{mcp: "m", rule(1): "r1 newest"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	relD()
+	relF()
+	if err := <-got; err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(rule(1)); string(b) != "r1 newest" {
+		t.Errorf("a turn that waited restored older rules: %q", b)
+	}
+	if b, _ := os.ReadFile(mcp); string(b) != "m2" {
+		t.Errorf("waiter's mcp_config.json not written: %q", b)
+	}
+	relE()
+
+	// Ordered by the generation the prompt was built under, not arrival.
+	newer := nextAgyPromptGeneration() + 10
+	relG, err := holdAgyWorkspace(context.Background(), dir, newer, map[string]string{mcp: "m2", rule(1): "built later"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	relG()
+	relH, err := holdAgyWorkspace(context.Background(), dir, newer-5, map[string]string{mcp: "m2", rule(1): "built earlier"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	relH()
+	if b, _ := os.ReadFile(rule(1)); string(b) != "built later" {
+		t.Errorf("an earlier-built prompt arriving late overwrote a newer one: %q", b)
+	}
 }
 
 // A keyed (thread / Slack) conversation gets its extra in the custom

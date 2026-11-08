@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // The Antigravity CLI (agy) has no per-invocation flag for MCP servers or
@@ -21,9 +22,9 @@ import (
 //
 //   - <dir>/.agents/mcp_config.json  MCP servers ({"mcpServers": {...}})
 //   - <dir>/.agents/rules/kojo-system-NN.md  always_on prompt rules. agy
-//     reads them again for a resumed conversation, so they carry kojo's
-//     shared system prompt (persona, memory, ...), which changes between
-//     the turns of one conversation.
+//     reads them again before every model step (not only at start-up), so
+//     they carry kojo's shared system prompt (persona, memory, ...), which
+//     changes between the turns of one conversation.
 //   - <dir>/.agents/agents/<name>/agent.md  a custom agent, selected with
 //     --agent <name>. It sets the tool policy and carries the per-call
 //     SystemPromptExtra (thread / Slack context). agy freezes its body
@@ -33,10 +34,16 @@ import (
 // run several agy turns at once (its own chat plus thread / external
 // sessions). Every distinct custom agent body gets its own agent,
 // kojo-<hash of the body>, so turns with different extras never wait on
-// each other for it. mcp_config.json and the rules have fixed paths shared
-// by every turn of the agent; a turn that needs them to say something else
-// waits until the turns started against the current content have exited
-// (the same scheme as holdGrokMCPConfig).
+// each other for it. mcp_config.json has a fixed path shared by every turn
+// of the agent; a turn that needs it to say something else waits until the
+// turns started against the current content have exited (the same scheme
+// as holdGrokMCPConfig). The rules are shared too but never waited for:
+// every turn of an agent builds the same shared prompt (prepareChat keeps
+// per-surface differences in the extra for agy), so two turns' rules
+// differ only when the agent's persona / memory files changed in between.
+// The newest write wins; a running turn, which re-reads the rules every
+// step, just picks up the fresher prompt. Waiting instead would hold a
+// thread turn until a main-chat turn that edited MEMORY.md had exited.
 
 const (
 	// agyKojoAgentPrefix starts the name of every custom agent kojo
@@ -88,6 +95,20 @@ type agyWorkspaceHold struct {
 // agyWorkspaceHolds maps a managed file path to the content the running
 // turns were started against.
 var agyWorkspaceHolds = map[string]*agyWorkspaceHold{}
+
+// agyPromptGeneration numbers system prompts in the order they were
+// built (prepareChat draws one just before reading the persona / memory
+// files). agyRulesWritten records, per agent directory, the generation of
+// the rules on disk, so a turn that reaches holdAgyWorkspace late (slow
+// effort resolution, waiting for mcp_config.json) never puts an older
+// prompt back over a newer turn's. agyRulesWritten is guarded by
+// agyWorkspaceMu.
+var (
+	agyPromptGeneration atomic.Uint64
+	agyRulesWritten     = map[string]uint64{}
+)
+
+func nextAgyPromptGeneration() uint64 { return agyPromptGeneration.Add(1) }
 
 // renderAgyMCPConfig renders mcp_config.json, or "" when there is nothing
 // to declare (the file is then removed).
@@ -168,10 +189,17 @@ func renderAgyAgentDef(name, body string) string {
 // holdAgyWorkspace makes the managed files say exactly files (path →
 // content; "" removes the file) and keeps them that way until release is
 // called, which the caller does once its agy process has exited. A file
-// held with other content is waited for, and so is a held kojo rule file
-// that files no longer lists (it would be pruned); files listed in
-// ephemeral are removed again once their last holder released them.
-func holdAgyWorkspace(ctx context.Context, agentDirPath string, files map[string]string, ephemeral ...string) (release func(), err error) {
+// held with other content is waited for; files listed in ephemeral are
+// removed again once their last holder released them. kojo rule chunks
+// are written (and stale ones pruned) without a hold: the newest turn's
+// rules win (see the package comment above).
+//
+// gen is the generation of the prompt the rules in files carry (0: draw
+// one now).
+func holdAgyWorkspace(ctx context.Context, agentDirPath string, gen uint64, files map[string]string, ephemeral ...string) (release func(), err error) {
+	if gen == 0 {
+		gen = nextAgyPromptGeneration()
+	}
 	paths := make([]string, 0, len(files))
 	for p := range files {
 		paths = append(paths, p)
@@ -188,14 +216,23 @@ func holdAgyWorkspace(ctx context.Context, agentDirPath string, files map[string
 				return nil, ctx.Err()
 			}
 		}
+		// A newer turn's rules are already on disk: leave them (and their
+		// chunk set) alone and run on them.
+		writeRules := agyRulesWritten[agentDirPath] < gen
+		if writeRules {
+			agyRulesWritten[agentDirPath] = gen
+		}
 		// Also under a hold of the same content: the files may have been
 		// edited since, and putting back what the running turns were
 		// started with takes nothing from them.
-		if err := prepareAgyManagedPaths(agentDirPath, files); err != nil {
+		if err := prepareAgyManagedPaths(agentDirPath, files, writeRules); err != nil {
 			agyWorkspaceMu.Unlock()
 			return nil, err
 		}
 		for _, p := range paths {
+			if !writeRules && isAgyRuleChunkPath(agentDirPath, p) {
+				continue
+			}
 			if err := syncAgyManagedFile(p, files[p]); err != nil {
 				agyWorkspaceMu.Unlock()
 				return nil, err
@@ -203,6 +240,9 @@ func holdAgyWorkspace(ctx context.Context, agentDirPath string, files map[string
 		}
 		holds := make(map[string]*agyWorkspaceHold, len(paths))
 		for _, p := range paths {
+			if isAgyRuleChunkPath(agentDirPath, p) {
+				continue
+			}
 			h := agyWorkspaceHolds[p]
 			if h == nil {
 				h = &agyWorkspaceHold{content: files[p], freed: make(chan struct{})}
@@ -238,23 +278,20 @@ func holdAgyWorkspace(ctx context.Context, agentDirPath string, files map[string
 // wait for, or nil. Caller holds agyWorkspaceMu.
 func agyWorkspaceConflictLocked(agentDirPath string, files map[string]string) chan struct{} {
 	for p, content := range files {
+		if isAgyRuleChunkPath(agentDirPath, p) {
+			continue
+		}
 		if h := agyWorkspaceHolds[p]; h != nil && h.content != content {
 			return h.freed
 		}
 	}
-	// prepareAgyManagedPaths prunes the numbered kojo rule files that
-	// files does not list; one a running turn was started with must stay
-	// (a shorter prompt has fewer chunks).
-	rules := agyRulesDir(agentDirPath)
-	for p, h := range agyWorkspaceHolds {
-		if filepath.Dir(p) != rules || !isAgyManagedRuleName(filepath.Base(p)) {
-			continue
-		}
-		if _, ok := files[p]; !ok {
-			return h.freed
-		}
-	}
 	return nil
+}
+
+// isAgyRuleChunkPath reports whether p is one of kojo's numbered rule
+// chunks, which holdAgyWorkspace writes without holding them.
+func isAgyRuleChunkPath(agentDirPath, p string) bool {
+	return filepath.Dir(p) == agyRulesDir(agentDirPath) && isAgyManagedRuleName(filepath.Base(p))
 }
 
 // sweepAgyAgentDefsLocked removes the generated custom agents no running
@@ -285,9 +322,10 @@ func sweepAgyAgentDefsLocked(agentDirPath string) {
 
 // Check every managed parent before writing or removing anything. A
 // symlink in the writable workspace must not redirect MCP tokens, rules
-// or the agent-def sweep outside the agent directory. Only kojo's
-// numbered rule files are pruned.
-func prepareAgyManagedPaths(dir string, files map[string]string) error {
+// or the agent-def sweep outside the agent directory. With pruneRules,
+// kojo's numbered rule files that files does not list are removed; no
+// other file is.
+func prepareAgyManagedPaths(dir string, files map[string]string, pruneRules bool) error {
 	paths := []string{filepath.Join(dir, ".agents"), agyRulesDir(dir), agyAgentsDir(dir)}
 	for path := range files {
 		rel, err := filepath.Rel(dir, path)
@@ -300,6 +338,9 @@ func prepareAgyManagedPaths(dir string, files map[string]string) error {
 	}
 	if err := geminiRefuseSymlinks(paths...); err != nil {
 		return err
+	}
+	if !pruneRules {
+		return nil
 	}
 	entries, err := os.ReadDir(agyRulesDir(dir))
 	if os.IsNotExist(err) {

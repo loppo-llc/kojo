@@ -244,7 +244,7 @@ func TestAgyPromptRulesRefreshAndPruneOnlyManagedFiles(t *testing.T) {
 		for name, body := range renderAgyRules(prompt) {
 			files[filepath.Join(agyRulesDir(dir), name)] = body
 		}
-		release, err := holdAgyWorkspace(context.Background(), dir, files)
+		release, err := holdAgyWorkspace(context.Background(), dir, 0, files)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -18,7 +18,7 @@ func writeAgyRulesForTest(dir string, files map[string]string) error {
 	for name, content := range files {
 		managed[filepath.Join(dir, name)] = content
 	}
-	release, err := holdAgyWorkspace(context.Background(), agentDir, managed)
+	release, err := holdAgyWorkspace(context.Background(), agentDir, 0, managed)
 	if err == nil {
 		release()
 	}

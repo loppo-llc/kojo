@@ -221,7 +221,7 @@ func TestRenderAgyMCPConfig(t *testing.T) {
 func TestHoldAgyWorkspace(t *testing.T) {
 	dir := t.TempDir()
 	path := agyMCPConfigPath(dir)
-	rel1, err := holdAgyWorkspace(context.Background(), dir, map[string]string{path: "one"})
+	rel1, err := holdAgyWorkspace(context.Background(), dir, 0, map[string]string{path: "one"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,7 @@ func TestHoldAgyWorkspace(t *testing.T) {
 	if err := os.WriteFile(path, []byte("edited"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	rel2, err := holdAgyWorkspace(context.Background(), dir, map[string]string{path: "one"})
+	rel2, err := holdAgyWorkspace(context.Background(), dir, 0, map[string]string{path: "one"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +248,7 @@ func TestHoldAgyWorkspace(t *testing.T) {
 	var rel3 func()
 	go func() {
 		var err error
-		rel3, err = holdAgyWorkspace(context.Background(), dir, map[string]string{path: ""})
+		rel3, err = holdAgyWorkspace(context.Background(), dir, 0, map[string]string{path: ""})
 		got <- err
 	}()
 	select {
@@ -273,11 +273,11 @@ func TestHoldAgyWorkspace(t *testing.T) {
 	rel3()
 
 	// A cancelled context gives up waiting.
-	relA, _ := holdAgyWorkspace(context.Background(), dir, map[string]string{path: "a"})
+	relA, _ := holdAgyWorkspace(context.Background(), dir, 0, map[string]string{path: "a"})
 	defer relA()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if _, err := holdAgyWorkspace(ctx, dir, map[string]string{path: "b"}); err == nil {
+	if _, err := holdAgyWorkspace(ctx, dir, 0, map[string]string{path: "b"}); err == nil {
 		t.Errorf("cancelled wait returned no error")
 	}
 }
@@ -307,13 +307,13 @@ func TestHoldAgyWorkspace_PerPromptAgents(t *testing.T) {
 		}
 	}
 
-	relA, err := holdAgyWorkspace(context.Background(), dir, map[string]string{mcp: "m", defA: "A"}, defA)
+	relA, err := holdAgyWorkspace(context.Background(), dir, 0, map[string]string{mcp: "m", defA: "A"}, defA)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	relB, err := holdAgyWorkspace(ctx, dir, map[string]string{mcp: "m", defB: "B"}, defB)
+	relB, err := holdAgyWorkspace(ctx, dir, 0, map[string]string{mcp: "m", defB: "B"}, defB)
 	if err != nil {
 		t.Fatalf("second prompt waited for the first: %v", err)
 	}
@@ -338,7 +338,7 @@ func TestHoldAgyWorkspace_PerPromptAgents(t *testing.T) {
 	var relC func()
 	go func() {
 		var err error
-		relC, err = holdAgyWorkspace(context.Background(), dir, map[string]string{mcp: "m2", defC: "C"}, defC)
+		relC, err = holdAgyWorkspace(context.Background(), dir, 0, map[string]string{mcp: "m2", defC: "C"}, defC)
 		got <- err
 	}()
 	select {

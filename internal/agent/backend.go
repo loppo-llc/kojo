@@ -155,6 +155,12 @@ type ChatOptions struct {
 	// workspace rules) keep the per-call part apart.
 	SystemPromptExtraApplied string
 
+	// PromptGeneration orders this call's system prompt against those of
+	// the agent's other turns (agy shares one copy of it between them and
+	// keeps the newest; see holdAgyWorkspace). 0 = unknown, ordered at the
+	// backend call.
+	PromptGeneration uint64
+
 	// OnSteerReady, if set, is invoked once by a backend that supports
 	// mid-turn steering (claude: extra user-message line on stdin; codex:
 	// turn/steer JSON-RPC) as soon as the turn can accept input. The callback
