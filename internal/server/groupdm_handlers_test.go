@@ -715,3 +715,93 @@ func TestHandleCreateThread_RemoteHeldAgent(t *testing.T) {
 		t.Fatalf("thread = %+v", th)
 	}
 }
+
+func rewindGroupMessageRequest(groupID, msgID string, p auth.Principal) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/groupdms/"+groupID+"/messages/"+msgID+"/rewind", nil)
+	req.SetPathValue("id", groupID)
+	req.SetPathValue("msgId", msgID)
+	return authedRequest(req, p)
+}
+
+func TestHandleRewindGroupDMMessage(t *testing.T) {
+	srv, gdm, group, outsider := newGroupDMHandlerTestServer(t)
+	owner := auth.Principal{Role: auth.RoleOwner}
+	gdm.SetOneShotForTesting(func(ctx context.Context, agentID, userMessage string, opts agent.OneShotOpts) (<-chan agent.ChatEvent, error) {
+		ch := make(chan agent.ChatEvent, 1)
+		ch <- agent.ChatEvent{Type: "done", Message: &agent.Message{Content: "ok"}}
+		close(ch)
+		return ch, nil
+	})
+	thread, err := gdm.CreateThread(group.Members[0].AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	waitIdle := func() {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for gdm.ThreadBusy(thread.ID) {
+			if time.Now().After(deadline) {
+				t.Fatal("thread never went idle")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	// Each post gets an "ok" reply, so the room reads one/ok/two/ok/three/ok.
+	var ids []string
+	for _, text := range []string{"one", "two", "three"} {
+		m, err := gdm.PostUserMessage(ctx, thread.ID, text, nil, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, m.ID)
+		waitIdle()
+	}
+
+	rr := httptest.NewRecorder()
+	srv.handleRewindGroupDMMessage(rr, rewindGroupMessageRequest(thread.ID, ids[1], auth.Principal{Role: auth.RoleAgent, AgentID: outsider.ID}))
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("non-member status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	srv.handleRewindGroupDMMessage(rr, rewindGroupMessageRequest(thread.ID, ids[1], owner))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var resp agent.ThreadRewindResult
+	readJSONResponse(t, rr, &resp)
+	if resp.MessagesRemoved != 4 {
+		t.Fatalf("messagesRemoved = %d, want 4", resp.MessagesRemoved)
+	}
+	msgs, _, latest, err := gdm.Messages(thread.ID, 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 || msgs[0].ID != ids[0] || msgs[1].Content != "ok" || latest != msgs[1].ID {
+		t.Fatalf("after rewind: %d msgs, latest %q", len(msgs), latest)
+	}
+
+	// The removed message is gone now.
+	rr = httptest.NewRecorder()
+	srv.handleRewindGroupDMMessage(rr, rewindGroupMessageRequest(thread.ID, ids[2], owner))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("removed-message status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	gm, err := gdm.PostUserMessage(ctx, group.ID, "hi", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr = httptest.NewRecorder()
+	srv.handleRewindGroupDMMessage(rr, rewindGroupMessageRequest(group.ID, gm.ID, owner))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("group-room status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	srv.handleRewindGroupDMMessage(rr, rewindGroupMessageRequest("gd_missing", ids[0], owner))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("missing-group status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+}

@@ -287,7 +287,9 @@ export function GroupDMChat() {
         // auto-title/rename that lands between renders. Piggybacks on the
         // message poll so it costs one extra GET only when something changed.
         const head = r.messages.length > 0 ? r.messages[r.messages.length - 1].id : "";
-        if (head && head !== lastHeadRef.current) {
+        // An emptied transcript (rewind/clear elsewhere) counts as a change
+        // too: a thread rewound to empty may have reset its auto-title.
+        if (head !== lastHeadRef.current) {
           groupdmApi.get(id).then((g) => {
             if (generation !== pollGenerationRef.current) return;
             // Advance only on success so a failed GET is retried on the
@@ -311,8 +313,15 @@ export function GroupDMChat() {
         }
         setMessages((prev) => {
           if (!r.hasMore) return reuseUnchangedMessages(prev, r.messages);
+          // Keep paged-in history only up to where the fresh page overlaps
+          // it: later rows the page no longer has were removed server-side
+          // (a thread rewind), not merely scrolled out of the page.
+          const prevIndex = new Map(prev.map((m, i) => [m.id, i]));
+          const overlap = r.messages.find((m) => prevIndex.has(m.id));
           const newIds = new Set(r.messages.map((m) => m.id));
-          const older = prev.filter((m) => !newIds.has(m.id));
+          const older = overlap
+            ? prev.slice(0, prevIndex.get(overlap.id))
+            : prev.filter((m) => !newIds.has(m.id));
           return reuseUnchangedMessages(prev, [...older, ...r.messages]);
         });
         // The room is open, so everything fetched counts as read. The
@@ -360,6 +369,82 @@ export function GroupDMChat() {
   // Null when no reply is being awaited.
   const awaitingHeadRef = useRef<string | null>(null);
   awaitingHeadRef.current = awaitingReply && lastMsg ? lastMsg.id : null;
+
+  // Rewind ("undo send") for thread rooms, mirroring the main agent chat.
+  // Reads messages/input through refs so the callback stays stable and the
+  // memoized rows are not re-rendered on every keystroke or poll.
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  const inputRef = useRef(input);
+  inputRef.current = input;
+  const handleRewind = useCallback(
+    async (msgId: string) => {
+      if (!id) return;
+      const roomId = id;
+      const snapshot = messagesRef.current;
+      const idx = snapshot.findIndex((m) => m.id === msgId);
+      if (idx < 0) return;
+      // Put the prompt back in the composer so it can be edited and re-sent,
+      // but never clobber a draft the user already started.
+      const restored = snapshot[idx].content ?? "";
+      const didRestore = !!restored && !inputRef.current.trim();
+      if (didRestore) {
+        inputRef.current = restored;
+        setInput(restored);
+      }
+      // Discard in-flight polls that may still carry the rewound rows.
+      pollGenerationRef.current += 1;
+      const startGeneration = pollGenerationRef.current;
+      setMessages(snapshot.slice(0, idx));
+      let failure: unknown;
+      try {
+        await groupdmApi.rewindToMessage(roomId, msgId);
+      } catch (e) {
+        failure = e;
+      }
+      // A room switch while waiting bumped the generation: leave the new
+      // room alone (its own poll owns the view now).
+      if (startGeneration !== pollGenerationRef.current) {
+        if (failure) throw failure;
+        return;
+      }
+      // Polls issued while the rewind was in flight may predate it too.
+      pollGenerationRef.current += 1;
+      const generation = pollGenerationRef.current;
+      // Always resync: a failed/timed-out request says nothing about whether
+      // the truncate landed, so the server transcript is the only truth.
+      try {
+        const [fresh, freshGroup] = await Promise.all([
+          groupdmApi.messages(roomId, PAGE_SIZE),
+          // Emptying a thread can reset its auto-title.
+          groupdmApi.get(roomId).catch(() => null),
+        ]);
+        if (generation === pollGenerationRef.current) {
+          if (freshGroup) setGroup(freshGroup);
+          setMessages((prev) => reuseUnchangedMessages(prev, fresh.messages));
+          // The refetch replaced the list with the newest page; mirror
+          // hasMore exactly instead of the poll's never-shrink rule.
+          setHasMore(fresh.hasMore);
+          // Rewind did not happen: undo the composer restore so the text is
+          // not there twice, unless the user has since edited it.
+          if (
+            didRestore &&
+            fresh.messages.some((m) => m.id === msgId) &&
+            inputRef.current === restored
+          ) {
+            inputRef.current = "";
+            setInput("");
+          }
+        }
+      } catch (e) {
+        if (!failure) failure = e;
+        else console.error(e);
+      }
+      if (failure) throw failure;
+    },
+    [id, setInput],
+  );
+  const canRewind = isThread && !isDraft && !awaitingReply && !sending;
 
   // Live progress for the in-flight turn: polled while awaitingReply so
   // thinking / tool calls / partial text render in place of a static
@@ -936,6 +1021,7 @@ export function GroupDMChat() {
             // Only rows that actually price via the fallback depend on it,
             // so a late model fetch does not invalidate every memoized row.
             fallbackModel={msg.usage && !msg.model ? threadAgentModel : undefined}
+            onRewind={canRewind && msg.agentId === USER_SENDER_ID && msg.id ? handleRewind : undefined}
           />
         ))}
         {awaitingReply && (() => {
@@ -1226,10 +1312,12 @@ const GroupMessageRow = memo(function GroupMessageRow({
   msg,
   color,
   fallbackModel,
+  onRewind,
 }: {
   msg: GroupMessage;
   color?: string;
   fallbackModel?: string;
+  onRewind?: (msgId: string) => Promise<void>;
 }) {
   const t = useT();
   const isUser = msg.agentId === USER_SENDER_ID;
@@ -1245,6 +1333,7 @@ const GroupMessageRow = memo(function GroupMessageRow({
             content={msg.content}
             isUser
             timestamp={msg.timestamp}
+            onRewind={onRewind}
           />
         </div>
       </div>

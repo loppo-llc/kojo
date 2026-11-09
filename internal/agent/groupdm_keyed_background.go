@@ -107,11 +107,21 @@ func (m *GroupDMManager) deliverRemoteKeyedBackgroundTurn(agentID, sessionKey st
 // turn's result. holderCapture: response attachments are captured by the
 // remote holder, so no local stage-dir watcher runs.
 func (m *GroupDMManager) runKeyedBackgroundTurn(parent context.Context, agentID, groupID string, events <-chan ChatEvent, abort context.CancelCauseFunc, replyMessageID string, holderCapture bool) {
+	// Sampled before queueing too: a stale completion that queues behind the
+	// first fresh turn would otherwise find the marker already consumed.
+	staleAtArrival := m.threadFreshSessionPending(groupID)
 	reservation := m.threadTurns.Reserve(groupID)
 	defer reservation.Release()
 	reservation.Wait()
 	if !m.liveAgentThread(groupID, agentID) {
 		abort(KojoStop(keyedThreadDeletedReason))
+		return
+	}
+	// Until a turn has started on the fresh session a rewind demands, any
+	// background turn comes from the pre-rewind session (e.g. a remote
+	// holder's lingering process) and would answer from removed context.
+	if staleAtArrival || m.threadFreshSessionPending(groupID) {
+		abort(KojoStop(keyedThreadRewoundReason))
 		return
 	}
 

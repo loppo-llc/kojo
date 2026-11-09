@@ -42,6 +42,18 @@ func (q *keyedFIFO) ReservePair(id string) (*fifoReservation, *fifoReservation) 
 	return q.reserveLocked(id), q.reserveLocked(id)
 }
 
+// TryReserve takes a ticket only when id has no outstanding reservation —
+// nothing running and nothing queued — and reports whether it did. The ticket
+// is ready immediately; holding it keeps every later Reserve waiting.
+func (q *keyedFIFO) TryReserve(id string) (*fifoReservation, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.tails[id] != nil {
+		return nil, false
+	}
+	return q.reserveLocked(id), true
+}
+
 func (q *keyedFIFO) reserveLocked(id string) *fifoReservation {
 	if q.tails == nil {
 		q.tails = make(map[string]chan struct{})

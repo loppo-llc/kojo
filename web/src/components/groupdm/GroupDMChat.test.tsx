@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   steer: vi.fn(),
   threadLive: vi.fn(),
   stopThread: vi.fn(),
+  rewindToMessage: vi.fn(),
 }));
 
 vi.mock("../../lib/agentApi", () => ({
@@ -50,6 +51,7 @@ vi.mock("../../lib/groupdmApi", async (importOriginal) => ({
     steer: mocks.steer,
     threadLive: mocks.threadLive,
     stopThread: mocks.stopThread,
+    rewindToMessage: mocks.rewindToMessage,
   },
 }));
 
@@ -598,5 +600,117 @@ describe("GroupDMChat mention highlight", () => {
     const mentioned = screen.getByText("hey @user look at this").closest(".border-copper\\/60");
     expect(mentioned).not.toBeNull();
     expect(screen.getByText("just chatting").closest(".border-copper\\/60")).toBeNull();
+  });
+});
+
+describe("GroupDMChat thread rewind", () => {
+  const threadGroup = {
+    id: "g1",
+    name: "Alice",
+    kind: "thread" as const,
+    members: [{ agentId: "ag_alice", agentName: "Alice", status: "online" as const }],
+    cooldown: 0,
+    style: "efficient" as const,
+    venue: "chatroom" as const,
+    createdAt: "2026-06-15T00:00:00Z",
+    updatedAt: "2026-06-15T00:00:00Z",
+  };
+  const u1 = { id: "u1", agentId: "user", agentName: "User", content: "first ask", timestamp: "2026-06-15T00:00:01Z" };
+  const a1 = { id: "a1", agentId: "ag_alice", agentName: "Alice", content: "first answer", timestamp: "2026-06-15T00:00:02Z" };
+  const u2 = { id: "u2", agentId: "user", agentName: "User", content: "second ask", timestamp: "2026-06-15T00:00:03Z" };
+  const a2 = { id: "a2", agentId: "ag_alice", agentName: "Alice", content: "second answer", timestamp: "2026-06-15T00:00:04Z" };
+
+  beforeEach(() => {
+    // The composer draft persists in sessionStorage; a restored prompt from
+    // one case would otherwise block the restore in the next.
+    sessionStorage.clear();
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    sessionStorage.clear();
+  });
+
+  it("rewinds to a user message and puts its text back in the composer", async () => {
+    mocks.groupGet.mockResolvedValue(threadGroup);
+    let rewound = false;
+    mocks.groupMessages.mockImplementation(() =>
+      Promise.resolve({ messages: rewound ? [u1, a1] : [u1, a1, u2, a2], hasMore: false }),
+    );
+    mocks.rewindToMessage.mockImplementation(() => {
+      rewound = true;
+      return Promise.resolve({ messagesRemoved: 2 });
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderGroup();
+
+    expect(await screen.findByText("second answer")).toBeInTheDocument();
+    const buttons = screen.getAllByTitle(/^(Undo sending|この発言を送る前に戻す)/);
+    expect(buttons).toHaveLength(2); // one per user message
+    fireEvent.click(buttons[1]);
+
+    await waitFor(() => expect(mocks.rewindToMessage).toHaveBeenCalledWith("g1", "u2"));
+    await waitFor(() => expect(screen.queryByText("second answer")).not.toBeInTheDocument());
+    expect(screen.getByText("first answer")).toBeInTheDocument();
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("second ask");
+  });
+
+  it("restores the transcript and clears the composer when the rewind fails", async () => {
+    mocks.groupGet.mockResolvedValue(threadGroup);
+    mocks.groupMessages.mockResolvedValue({ messages: [u1, a1, u2, a2], hasMore: false });
+    mocks.rewindToMessage.mockRejectedValue(new Error("busy"));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const alertSpy = vi.spyOn(window, "alert").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    renderGroup();
+
+    expect(await screen.findByText("second answer")).toBeInTheDocument();
+    fireEvent.click(screen.getAllByTitle(/^(Undo sending|この発言を送る前に戻す)/)[1]);
+
+    await waitFor(() => expect(alertSpy).toHaveBeenCalled());
+    expect(screen.getByText("second answer")).toBeInTheDocument();
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("offers no rewind while a reply is pending or in a group room", async () => {
+    mocks.groupGet.mockResolvedValue(threadGroup);
+    mocks.groupMessages.mockResolvedValue({ messages: [u1, a1, u2], hasMore: false });
+    mocks.threadLive.mockResolvedValue({ active: true });
+    renderGroup();
+    expect(await screen.findByText("second ask")).toBeInTheDocument();
+    expect(screen.queryAllByTitle(/^(Undo sending|この発言を送る前に戻す)/)).toHaveLength(0);
+    cleanup();
+
+    mocks.groupGet.mockResolvedValue({ ...threadGroup, kind: "group" as const, members: [
+      { agentId: "ag_alice", agentName: "Alice", status: "online" as const },
+      { agentId: "ag_bob", agentName: "Bob", status: "online" as const },
+    ] });
+    mocks.groupMessages.mockResolvedValue({ messages: [u1, a1], hasMore: false });
+    renderGroup();
+    expect(await screen.findByText("first answer")).toBeInTheDocument();
+    expect(screen.queryAllByTitle(/^(Undo sending|この発言を送る前に戻す)/)).toHaveLength(0);
+  });
+
+  it("drops rows another client rewound while the page reports more history", async () => {
+    mocks.groupGet.mockResolvedValue(threadGroup);
+    const old = Array.from({ length: 3 }, (_, i) => ({
+      id: `o${i}`, agentId: "ag_alice", agentName: "Alice", content: `old ${i}`, timestamp: "2026-06-15T00:00:00Z",
+    }));
+    let page = { messages: [u1, a1, u2, a2], hasMore: true };
+    mocks.groupMessages.mockImplementation((_id: string, _limit: number, before?: string) =>
+      Promise.resolve(before ? { messages: old, hasMore: false } : page),
+    );
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      renderGroup();
+      expect(await screen.findByText("second answer")).toBeInTheDocument();
+      // Simulate a rewind from elsewhere; the newest page now starts earlier.
+      page = { messages: [old[2], u1, a1], hasMore: true };
+      await vi.advanceTimersByTimeAsync(3100);
+      await waitFor(() => expect(screen.queryByText("second answer")).not.toBeInTheDocument());
+      expect(screen.queryByText("second ask")).not.toBeInTheDocument();
+      expect(screen.getByText("first answer")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -1279,6 +1279,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("DELETE /api/v1/groupdms/{id}/messages", s.handleClearGroupMessages)
 		mux.HandleFunc("POST /api/v1/groupdms/{id}/messages", s.handlePostGroupMessage)
 		mux.HandleFunc("POST /api/v1/groupdms/{id}/user-messages", s.handlePostGroupUserMessage)
+		mux.HandleFunc("POST /api/v1/groupdms/{id}/messages/{msgId}/rewind", s.handleRewindGroupDMMessage)
 		mux.HandleFunc("POST /api/v1/groupdms/{id}/steer", s.handleSteerGroupDM)
 		mux.HandleFunc("POST /api/v1/groupdms/{id}/stop", s.handleStopGroupDMTurn)
 		mux.HandleFunc("GET /api/v1/groupdms/{id}/unread", s.handleGetGroupUnread)

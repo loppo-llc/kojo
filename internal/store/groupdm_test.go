@@ -463,3 +463,72 @@ func TestGroupDMUpdateAllowsDeadMembers(t *testing.T) {
 		t.Fatalf("expected ErrNotFound on adding dead member, got %v", err)
 	}
 }
+
+func TestTruncateGroupDMMessagesFrom(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	seedAgent(t, s, "a1")
+	for _, g := range []string{"g", "other"} {
+		if _, err := s.InsertGroupDM(ctx, &GroupDMRecord{
+			ID: g, Name: "n", Members: []GroupDMMember{{AgentID: "a1"}},
+		}, GroupDMInsertOptions{}); err != nil {
+			t.Fatalf("insert %s: %v", g, err)
+		}
+	}
+	for _, id := range []string{"m1", "m2", "m3", "m4"} {
+		if _, err := s.AppendGroupDMMessage(ctx, &GroupDMMessageRecord{
+			ID: id, GroupDMID: "g", AgentID: "a1", Content: id,
+		}, GroupDMMessageInsertOptions{}); err != nil {
+			t.Fatalf("append %s: %v", id, err)
+		}
+	}
+	if _, err := s.AppendGroupDMMessage(ctx, &GroupDMMessageRecord{
+		ID: "o1", GroupDMID: "other", AgentID: "a1", Content: "o1",
+	}, GroupDMMessageInsertOptions{}); err != nil {
+		t.Fatalf("append o1: %v", err)
+	}
+
+	// A message of another group is not a valid boundary.
+	if _, err := s.TruncateGroupDMMessagesFrom(ctx, "g", "o1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-group boundary: err = %v, want ErrNotFound", err)
+	}
+
+	res, err := s.TruncateGroupDMMessagesFrom(ctx, "g", "m3")
+	if err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if res.Removed != 2 || res.HeadID != "m2" || res.BoundaryContent != "m3" {
+		t.Fatalf("truncate = %+v, want (2, m2, m3)", res)
+	}
+	list, err := s.ListGroupDMMessages(ctx, "g", GroupDMMessageListOptions{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 2 || list[0].ID != "m1" || list[1].ID != "m2" {
+		t.Fatalf("survivors = %v, want [m1 m2]", list)
+	}
+	if other, _ := s.ListGroupDMMessages(ctx, "other", GroupDMMessageListOptions{}); len(other) != 1 {
+		t.Fatalf("other group touched: %d messages", len(other))
+	}
+
+	// Already-tombstoned boundary is gone.
+	if _, err := s.TruncateGroupDMMessagesFrom(ctx, "g", "m3"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("tombstoned boundary: err = %v, want ErrNotFound", err)
+	}
+
+	// Truncating from the first message leaves an empty transcript, and a
+	// later append still gets a fresh (higher) seq.
+	res, err = s.TruncateGroupDMMessagesFrom(ctx, "g", "m1")
+	if err != nil || res.Removed != 2 || res.HeadID != "" {
+		t.Fatalf("truncate all = (%+v, %v), want (2, \"\", nil)", res, err)
+	}
+	rec, err := s.AppendGroupDMMessage(ctx, &GroupDMMessageRecord{
+		ID: "m5", GroupDMID: "g", AgentID: "a1", Content: "m5",
+	}, GroupDMMessageInsertOptions{})
+	if err != nil {
+		t.Fatalf("append after truncate: %v", err)
+	}
+	if rec.Seq <= 4 {
+		t.Fatalf("seq after truncate = %d, want > 4", rec.Seq)
+	}
+}

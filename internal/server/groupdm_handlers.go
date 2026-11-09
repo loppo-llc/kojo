@@ -639,6 +639,35 @@ func (s *Server) handleStopGroupDMTurn(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, map[string]any{"stopped": true})
 }
 
+// handleRewindGroupDMMessage rolls a thread room back to just before the
+// given user message (the message and everything after it are removed). The
+// thread's next turn starts on a fresh native session seeded with the shorter
+// transcript. Thread rooms only.
+func (s *Server) handleRewindGroupDMMessage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.requireMemberOrOwner(w, r, id) {
+		return
+	}
+	res, err := s.groupdms.RewindThread(id, r.PathValue("msgId"))
+	if err != nil {
+		switch {
+		case errors.Is(err, agent.ErrGroupNotFound), errors.Is(err, agent.ErrMessageNotFound):
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		case errors.Is(err, agent.ErrNotThreadRoom):
+			writeError(w, http.StatusBadRequest, "bad_request", "rewind is only supported in thread rooms")
+		case errors.Is(err, agent.ErrAgentBusy):
+			writeError(w, http.StatusConflict, "busy", "thread is busy; stop the current turn first")
+		case errors.Is(err, agent.ErrThreadGoalBound):
+			writeError(w, http.StatusConflict, "goal_bound", "clear the Codex goal before rewinding this thread")
+		default:
+			s.logger.Error("rewind thread failed", "id", id, "err", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+		}
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, res)
+}
+
 func (s *Server) handleAddGroupMember(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req struct {

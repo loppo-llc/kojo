@@ -1148,6 +1148,71 @@ SELECT id FROM groupdm_messages
 	return head, nil
 }
 
+// GroupDMTruncateResult reports what TruncateGroupDMMessagesFrom removed.
+type GroupDMTruncateResult struct {
+	Removed         int64  // rows tombstoned
+	HeadID          string // remaining live head ("" when nothing survives)
+	BoundaryContent string // content of the boundary message itself
+}
+
+// TruncateGroupDMMessagesFrom tombstones messageID and every later live
+// message in groupID (by seq). ErrNotFound when the group is not live or
+// messageID is not a live message of that group. The boundary lookup,
+// tombstone and head lookup share one transaction so a concurrent append
+// cannot land between them unseen.
+func (s *Store) TruncateGroupDMMessagesFrom(ctx context.Context, groupID, messageID string) (*GroupDMTruncateResult, error) {
+	if groupID == "" || messageID == "" {
+		return nil, errors.New("store.TruncateGroupDMMessagesFrom: groupdm_id and message_id required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var (
+		seq     int64
+		content string
+	)
+	if err := tx.QueryRowContext(ctx, `
+SELECT m.seq, COALESCE(m.content, '') FROM groupdm_messages m
+  JOIN groupdms g ON g.id = m.groupdm_id
+ WHERE m.id = ? AND m.groupdm_id = ? AND m.deleted_at IS NULL AND g.deleted_at IS NULL`,
+		messageID, groupID).Scan(&seq, &content); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	now := NowMillis()
+	res, err := tx.ExecContext(ctx, `
+UPDATE groupdm_messages
+   SET deleted_at = ?, updated_at = ?, version = version + 1
+ WHERE groupdm_id = ? AND seq >= ? AND deleted_at IS NULL`, now, now, groupID, seq)
+	if err != nil {
+		return nil, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	var head string
+	err = tx.QueryRowContext(ctx, `
+SELECT id FROM groupdm_messages
+ WHERE groupdm_id = ? AND deleted_at IS NULL
+ ORDER BY seq DESC LIMIT 1`, groupID).Scan(&head)
+	if errors.Is(err, sql.ErrNoRows) {
+		head, err = "", nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &GroupDMTruncateResult{Removed: n, HeadID: head, BoundaryContent: content}, nil
+}
+
 func scanGroupDMMessageRow(r rowScanner) (*GroupDMMessageRecord, error) {
 	var (
 		rec         GroupDMMessageRecord
