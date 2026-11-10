@@ -3,7 +3,8 @@ import { priceModel, estimateTurnCost } from "./pricing";
 
 describe("priceModel", () => {
   it("resolves aliases to canonical pricing", () => {
-    expect(priceModel("opus")).toEqual(priceModel("claude-opus-5"));
+    expect(priceModel("opus")).toEqual(priceModel("claude-opus-5-5"));
+    expect(priceModel("fable")).toEqual(priceModel("claude-fable-5-2"));
     expect(priceModel("sonnet")).toEqual(priceModel("claude-sonnet-5"));
     expect(priceModel("haiku")).toEqual(priceModel("claude-haiku-4-5"));
   });
@@ -53,8 +54,21 @@ describe("priceModel", () => {
       cacheRead: 0.2,
       cacheWrite: 5,
     });
-    // The opus alias stays on Opus 5 until the claude CLI resolves it to 5.5.
-    expect(priceModel("opus")).not.toEqual(priceModel("claude-opus-5-5"));
+    // claude CLI 2.1.321 resolves the opus alias to Opus 5.5.
+    expect(priceModel("opus")).toEqual(priceModel("claude-opus-5-5"));
+  });
+
+  it("prices Fable 5.2 at $8/$40 with a 0.025x cache read", () => {
+    // https://platform.claude.com/docs/en/models/fable-5-2/overview: input $8,
+    // output $40, 5m cache write $10, cache read $0.20.
+    for (const m of ["claude-fable-5-2", "fable"]) {
+      expect(priceModel(m)).toEqual({
+        input: 8,
+        output: 40,
+        cacheRead: 0.2,
+        cacheWrite: 10,
+      });
+    }
   });
 
   it("reads cache at 0.025x for Fable 5.1, 0.1x for Fable 5", () => {

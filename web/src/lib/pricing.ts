@@ -7,6 +7,7 @@
 //   - cache write 5m  = 1.25x the base input rate
 //
 // Anthropic base input/output rates (USD / 1M tokens):
+//   claude-fable-5-2 :  8 / 40   (cache read 0.025x, not 0.1x — see below)
 //   claude-fable-5-1 : 10 / 50   (cache read 0.025x, not 0.1x — see below)
 //   claude-fable-5   : 10 / 50
 //   claude-opus-5-5  :  4 / 20   (cache read 0.05x, not 0.1x — see below)
@@ -40,8 +41,11 @@
 // The whole request bills at the long-context tier. kojo prices the short-
 // context tier only, so estimates understate very large turns by up to 2x.
 //
-// claude-fable-5-1 and claude-opus-5-5 are the two ids in this table that
-// depart from the 0.1x cache-read rule:
+// claude-fable-5-2, claude-fable-5-1 and claude-opus-5-5 are the ids in this
+// table that depart from the 0.1x cache-read rule:
+//   - https://platform.claude.com/docs/en/models/fable-5-2/overview (fetched
+//     2026-11-10) lists Fable 5.2 at $8 input / $40 output, 5m cache write
+//     $10 (the usual 1.25x) and cache read $0.20, i.e. still 0.025x.
 //   - https://platform.claude.com/docs/en/about-claude/pricing (fetched
 //     2026-09-02) prices Fable 5.1's cache hits and refreshes at 0.025x the
 //     base input rate, i.e. $0.25/1M against Fable 5's $1/1M. Everything else
@@ -50,11 +54,11 @@
 //   - https://platform.claude.com/docs/en/models/opus-5-5/overview (fetched
 //     2026-09-23) lists Opus 5.5 at $4 input / $20 output, 5m cache write
 //     $5 (the usual 1.25x) but cache read $0.20, i.e. 0.05x.
-// (Mythos 5.1 carries the same exception, but kojo does not offer it: the
-// model is gated behind Anthropic's trusted access, so it never reaches
+// (Mythos 5.1 / 5.2 carry the same exception, but kojo does not offer them: the
+// models are gated behind Anthropic's trusted access, so it never reaches
 // toolModels.ts and has no row here.)
 //
-// Models not in the table (fable-5 bare alias, gpt-*, custom-* endpoints, "")
+// Models not in the table (fable-5 bare id, gpt-*, custom-* endpoints, "")
 // return undefined from priceModel → no cost is shown.
 
 export interface ModelPricing {
@@ -72,7 +76,7 @@ export interface ModelPricing {
  * Anthropic: cache read 0.1x, cache write 5m 1.25x base input.
  *
  * The cache-read multiplier is an option rather than a constant because Fable
- * 5.1 reads cache at 0.025x and Opus 5.5 at 0.05x. It is named at the call site on purpose: the
+ * 5.1 / 5.2 read cache at 0.025x and Opus 5.5 at 0.05x. It is named at the call site on purpose: the
  * third positional argument of pricedXai below is a dollar rate, and two
  * neighbouring helpers whose third argument means different things is exactly
  * the mix-up that would misprice a model by 10x.
@@ -109,6 +113,7 @@ function pricedXai(
 
 // Keyed by the canonical (full) model id.
 const CANONICAL_PRICING: Record<string, ModelPricing> = {
+  "claude-fable-5-2": pricedAnthropic(8, 40, { cacheReadRate: 0.025 }),
   "claude-fable-5-1": pricedAnthropic(10, 50, { cacheReadRate: 0.025 }),
   "claude-fable-5": pricedAnthropic(10, 50),
   "claude-opus-5-5": pricedAnthropic(4, 20, { cacheReadRate: 0.05 }),
@@ -130,15 +135,17 @@ const CANONICAL_PRICING: Record<string, ModelPricing> = {
 };
 
 // kojo agent.model aliases (see web/src/lib/toolModels.ts) mapped to a
-// canonical id. "opus" → Opus 5, "sonnet" → Sonnet 5, "haiku" → Haiku 4.5.
-// The "opus" alias follows what the installed claude CLI resolves it to:
-// 2.1.276 still maps it to claude-opus-5 (its binary carries no opus-5-5
-// id at all), so it stays on Opus 5 pricing until the CLI moves.
-// "sonnet" resolves to claude-sonnet-5 up to CLI 2.1.282 and to
+// canonical id. "opus" → Opus 5.5, "sonnet" → Sonnet 5, "haiku" → Haiku 4.5,
+// "fable" → Fable 5.2.
+// The "opus" and "fable" aliases follow what the installed claude CLI
+// resolves them to: 2.1.276 mapped "opus" to claude-opus-5; 2.1.321's model
+// catalog maps it to claude-opus-5-5 and adds "fable" → claude-fable-5-2
+// (Anthropic API). "sonnet" resolves to claude-sonnet-5 up to CLI 2.1.282 and to
 // claude-sonnet-5-5 from 2.1.284 (Anthropic API); both bill $2/$10, so the
 // estimate is right on either side of that update.
 const ALIASES: Record<string, string> = {
-  opus: "claude-opus-5",
+  opus: "claude-opus-5-5",
+  fable: "claude-fable-5-2",
   sonnet: "claude-sonnet-5",
   haiku: "claude-haiku-4-5",
 };

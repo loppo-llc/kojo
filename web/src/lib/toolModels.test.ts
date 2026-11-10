@@ -16,8 +16,9 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(modelsForTool("claude")).toContain("claude-opus-4-8");
   });
 
-  it("lists both Fable models, newest first, as claude models", () => {
+  it("lists the Fable models, newest first, as claude models", () => {
     const models = modelsForTool("claude");
+    expect(models).toContain("claude-fable-5-2");
     expect(models).toContain("claude-fable-5-1");
     expect(models).toContain("claude-fable-5");
     // The list is the dropdown order, and every other family in it runs
@@ -26,10 +27,16 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(models.indexOf("claude-fable-5-1")).toBe(
       models.indexOf("claude-fable-5") - 1,
     );
+    expect(models.indexOf("claude-fable-5-2")).toBe(
+      models.indexOf("claude-fable-5-1") - 1,
+    );
+    // The fable alias sits directly above the family it resolves into,
+    // like opus and sonnet.
+    expect(models.indexOf("fable")).toBe(models.indexOf("claude-fable-5-2") - 1);
   });
 
-  it("Fable 5 and 5.1 support xhigh and max but default to high", () => {
-    for (const m of ["claude-fable-5-1", "claude-fable-5"]) {
+  it("Fable 5, 5.1 and 5.2 support xhigh and max but default to high", () => {
+    for (const m of ["fable", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5"]) {
       expect(effortLevelsForModel(m)).toContain("xhigh");
       expect(effortLevelsForModel(m)).toContain("max");
       expect(defaultEffortForModel(m)).toBe("high");
@@ -72,9 +79,10 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(defaultEffortForModel("claude-opus-4-6")).toBe("high");
   });
 
-  it("opus alias is treated as Opus 5: supports xhigh, defaults to high", () => {
+  it("opus alias is treated as Opus 5.5: supports xhigh, defaults to medium", () => {
+    // claude CLI 2.1.321 resolves "opus" to claude-opus-5-5.
     expect(effortLevelsForModel("opus")).toContain("xhigh");
-    expect(defaultEffortForModel("opus")).toBe("high");
+    expect(defaultEffortForModel("opus")).toBe("medium");
   });
 
   it("sonnet supports xhigh and defaults to high", () => {
@@ -231,6 +239,7 @@ describe("sessionEffortLevelsForModel — ultra is session-only", () => {
     expect(sessionEffortLevelsForModel("gpt-6-luna")).not.toContain("ultra");
     expect(sessionEffortLevelsForModel("gpt-5.6-luna")).not.toContain("ultra");
     expect(sessionEffortLevelsForModel("gpt-5.5")).not.toContain("ultra");
+    expect(sessionEffortLevelsForModel("claude-fable-5-2")).not.toContain("ultra");
     expect(sessionEffortLevelsForModel("claude-fable-5-1")).not.toContain("ultra");
     expect(sessionEffortLevelsForModel("claude-fable-5")).not.toContain("ultra");
   });

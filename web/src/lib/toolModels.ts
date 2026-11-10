@@ -8,7 +8,7 @@ export interface ToolModelConfig {
 export const toolModels: Record<string, ToolModelConfig> = {
   claude: {
     default: "sonnet",
-    models: ["sonnet", "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "opus", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "haiku"],
+    models: ["sonnet", "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "opus", "claude-opus-5-5", "claude-opus-5", "fable", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "haiku"],
   },
   codex: {
     default: "gpt-6-astra",
@@ -90,11 +90,12 @@ export type EffortLevel = (typeof effortLevels)[number];
  * Models that support the xhigh effort level. Anthropic's effort doc
  * (https://platform.claude.com/docs/en/build-with-claude/effort, fetched
  * 2026-09-29) lists xhigh for Fable 5.1 / Fable 5 / Opus 5.5 / Opus 5 /
- * Opus 4.8 / Opus 4.7 / Sonnet 5.5 / Sonnet 5. The "sonnet" alias resolves
- * to Sonnet 5 (claude CLI up to 2.1.282) or Sonnet 5.5 (2.1.284+) on the
- * Anthropic API; both support xhigh.
+ * Opus 4.8 / Opus 4.7 / Sonnet 5.5 / Sonnet 5, and Fable 5.2 (2026-11-09)
+ * keeps the full ladder. The "sonnet" alias resolves to Sonnet 5 (claude CLI
+ * up to 2.1.282) or Sonnet 5.5 (2.1.284+) on the Anthropic API; both support
+ * xhigh. "fable" is claude CLI 2.1.321's alias for claude-fable-5-2.
  */
-const xhighModels = new Set(["opus", "sonnet", "claude-sonnet-5-5", "claude-sonnet-5", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"]);
+const xhighModels = new Set(["opus", "sonnet", "fable", "claude-sonnet-5-5", "claude-sonnet-5", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"]);
 const codexEffortModels = new Set(toolModels.codex.models);
 // codex CLI 0.164.0 models_cache.json: the gpt-6.1 family (sol, terra), the
 // gpt-6 family (sol, astra, luna) and the gpt-5.6 family advertise
@@ -115,7 +116,8 @@ const codexXhighDefaultModels = new Set(["gpt-5.5"]);
 // Claude models whose API default effort is "medium" rather than "high":
 // https://platform.claude.com/docs/en/models/opus-5-5/overview (fetched
 // 2026-09-23) — Opus 5.5 is the first Claude model to default to medium.
-const claudeMediumDefaultModels = new Set(["claude-opus-5-5"]);
+// The "opus" alias resolves to claude-opus-5-5 from claude CLI 2.1.321.
+const claudeMediumDefaultModels = new Set(["opus", "claude-opus-5-5"]);
 // grok CLI 1.0.40 models_cache.json: grok-4.7, grok-4.7-build-fast and
 // grok-4.6 list efforts [xhigh,high,medium,low]; grok-4.5 lists
 // [high,medium,low]. None advertises "max". Keep in sync with agent.go
@@ -131,10 +133,10 @@ const grokXhighModels = new Set(["grok-4.7", "grok-4.7-build-fast", "grok-4.6"])
 
 /**
  * Models whose default effort is xhigh (rather than high).
- * Opus 5 / 4.8 and both Fable models support xhigh and max but default to
- * high; only Opus 4.7 defaults to xhigh (and Opus 5.5 to medium, see
- * claudeMediumDefaultModels). The "opus" alias is treated as
- * Opus 5, so it defaults to high. grok-4.7 / grok-4.7-build-fast / grok-4.6
+ * Opus 5 / 4.8 and the Fable models (5, 5.1, 5.2) support xhigh and max but
+ * default to high; only Opus 4.7 defaults to xhigh (and Opus 5.5, with the
+ * "opus" alias that now resolves to it, to medium, see
+ * claudeMediumDefaultModels). grok-4.7 / grok-4.7-build-fast / grok-4.6
  * advertise low/medium/high/xhigh and grok-4.5 low/medium/high; all carry
  * reasoning_effort "high" as the CLI default, so none is listed here.
  */
