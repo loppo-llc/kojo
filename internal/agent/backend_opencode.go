@@ -40,6 +40,7 @@ const GeminiDefaultModel = "gemini-4-argon"
 // "flash" is the legacy gemini-cli alias kept for agents created before
 // the switch; OpenCode has no aliases, so it is resolved here.
 var geminiEffortModels = map[string]string{
+	"gemini-4-carbon":  "gemini-4-carbon",
 	"gemini-4-argon":   "gemini-4-argon",
 	"gemini-3.8-flash": "gemini-3.8-flash",
 	"flash":            "gemini-3.8-flash",
@@ -48,6 +49,7 @@ var geminiEffortModels = map[string]string{
 // geminiModelNames are the display names written into the provider config
 // for the models kojo fully describes.
 var geminiModelNames = map[string]string{
+	"gemini-4-carbon":  "Gemini 4 Carbon",
 	"gemini-4-argon":   "Gemini 4 Argon",
 	"gemini-3.8-flash": "Gemini 3.8 Flash",
 }

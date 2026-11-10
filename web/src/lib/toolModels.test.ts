@@ -222,10 +222,10 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(defaultEffortForModel("grok-4.5")).toBe("high");
   });
 
-  it("gemini lists argon (default) and flash with low/medium/high, default medium", () => {
-    expect(modelsForTool("gemini-api")).toEqual(["gemini-4-argon", "gemini-3.8-flash"]);
+  it("gemini lists carbon, argon (default) and flash with low/medium/high, default medium", () => {
+    expect(modelsForTool("gemini-api")).toEqual(["gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash"]);
     expect(defaultModelForTool("gemini-api")).toBe("gemini-4-argon");
-    for (const m of ["gemini-4-argon", "gemini-3.8-flash"]) {
+    for (const m of ["gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash"]) {
       expect(effortLevelsForModel(m)).toEqual(["low", "medium", "high"]);
       expect(defaultEffortForModel(m)).toBe("medium");
     }
@@ -279,7 +279,7 @@ describe("toolModels — custom backends", () => {
 
 describe("gemini-agy", () => {
   it("offers low/medium/high only for bare family ids", () => {
-    for (const m of ["", "gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5"]) {
+    for (const m of ["", "gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5"]) {
       expect(effortLevelsForModel(m, "gemini-agy")).toEqual(["low", "medium", "high"]);
     }
     expect(effortLevelsForModel("gpt-oss-120b-medium", "gemini-agy")).toEqual([]);

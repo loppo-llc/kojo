@@ -161,7 +161,7 @@ func TestBuildGeminiArgs(t *testing.T) {
 }
 
 func TestGeminiModelAndVariant(t *testing.T) {
-	for in, want := range map[string]string{"": GeminiDefaultModel, "flash": "gemini-3.8-flash", "gemini-3.8-flash": "gemini-3.8-flash", "gemini-4-argon": "gemini-4-argon", "custom-x": "custom-x"} {
+	for in, want := range map[string]string{"": GeminiDefaultModel, "flash": "gemini-3.8-flash", "gemini-3.8-flash": "gemini-3.8-flash", "gemini-4-argon": "gemini-4-argon", "gemini-4-carbon": "gemini-4-carbon", "custom-x": "custom-x"} {
 		if got := resolveGeminiModel(in); got != want {
 			t.Errorf("resolveGeminiModel(%q) = %q, want %q", in, got, want)
 		}
@@ -171,6 +171,8 @@ func TestGeminiModelAndVariant(t *testing.T) {
 		{"gemini-4-argon", "low", "low"},
 		{"gemini-4-argon", "medium", "medium"},
 		{"gemini-4-argon", "high", "high"},
+		{"gemini-4-carbon", "low", "low"},
+		{"gemini-4-carbon", "", "medium"},
 		{"gemini-4-argon", "max", "medium"},
 		{"flash", "low", "low"},
 		{"", "high", "high"},

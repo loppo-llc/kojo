@@ -7,12 +7,16 @@ import "time"
 // Source: https://ai.google.dev/gemini-api/docs/pricing (last updated
 // 2026-10-14), plus the model pages
 // https://ai.google.dev/gemini-api/docs/generate-content/latest-model
-// (Gemini 4 Argon) and
+// (Gemini 4 Argon),
+// https://aistudio.google.com/docs/whats-new-gemini-4-carbon (Gemini 4
+// Carbon, 2026-11-10: same rates and step-up date as Argon; paid tier
+// only, implicit caching only) and
 // https://ai.google.dev/gemini-api/docs/generate-content/whats-new-gemini-3.8
-// (gemini-3.8-flash). Output rates include thinking tokens. Neither model
-// has a long-context tier on the Standard tab, so one rate applies to the
-// whole request.
+// (gemini-3.8-flash). Output rates include thinking tokens. None of the
+// models has a long-context tier on the Standard tab, so one rate applies
+// to the whole request.
 //
+//	gemini-4-carbon,
 //	gemini-4-argon   until 2026-11-30: in $2.00 / out $10.00 / cached $0.10
 //	                 from  2026-12-01: in $4.00 / out $20.00 / cached $0.20
 //	gemini-3.8-flash until 2026-12-31: in $0.75 / out $3.75  / cached $0.075
@@ -28,6 +32,10 @@ type geminiPriceStep struct {
 }
 
 var geminiPriceTable = map[string][]geminiPriceStep{
+	"gemini-4-carbon": {
+		{input: 2.00, output: 10.00, cacheRead: 0.10},
+		{from: time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC), input: 4.00, output: 20.00, cacheRead: 0.20},
+	},
 	"gemini-4-argon": {
 		{input: 2.00, output: 10.00, cacheRead: 0.10},
 		{from: time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC), input: 4.00, output: 20.00, cacheRead: 0.20},
