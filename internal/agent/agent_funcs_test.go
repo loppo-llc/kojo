@@ -193,8 +193,17 @@ func TestValidModelEffort(t *testing.T) {
 			t.Errorf("expected max to be valid for %q", m)
 		}
 	}
+	// Haiku 5.5 (and the "haiku" alias, which resolves to it) takes the
+	// full ladder.
+	for _, m := range []string{"haiku", "claude-haiku-5-5"} {
+		for _, e := range []string{"xhigh", "max"} {
+			if !ValidModelEffort(m, e) {
+				t.Errorf("expected %s to be valid for %q", e, m)
+			}
+		}
+	}
 	// xhigh is invalid for non-opus/non-codex models
-	for _, m := range []string{"claude-sonnet-4-6", "claude-opus-4-6", "haiku", ""} {
+	for _, m := range []string{"claude-sonnet-4-6", "claude-opus-4-6", ""} {
 		if ValidModelEffort(m, "xhigh") {
 			t.Errorf("expected xhigh to be invalid for %q", m)
 		}

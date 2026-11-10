@@ -8,7 +8,7 @@ export interface ToolModelConfig {
 export const toolModels: Record<string, ToolModelConfig> = {
   claude: {
     default: "sonnet",
-    models: ["sonnet", "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "opus", "claude-opus-5-5", "claude-opus-5", "fable", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "haiku"],
+    models: ["sonnet", "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "opus", "claude-opus-5-5", "claude-opus-5", "fable", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "haiku", "claude-haiku-5-5"],
   },
   codex: {
     default: "gpt-6-astra",
@@ -93,9 +93,10 @@ export type EffortLevel = (typeof effortLevels)[number];
  * Opus 4.8 / Opus 4.7 / Sonnet 5.5 / Sonnet 5, and Fable 5.2 (2026-11-09)
  * keeps the full ladder. The "sonnet" alias resolves to Sonnet 5 (claude CLI
  * up to 2.1.282) or Sonnet 5.5 (2.1.284+) on the Anthropic API; both support
- * xhigh. "fable" is claude CLI 2.1.321's alias for claude-fable-5-2.
+ * xhigh. "fable" is claude CLI 2.1.321's alias for claude-fable-5-2. Haiku
+ * 5.5 takes low through max, and 2.1.321 resolves "haiku" to it.
  */
-const xhighModels = new Set(["opus", "sonnet", "fable", "claude-sonnet-5-5", "claude-sonnet-5", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"]);
+const xhighModels = new Set(["opus", "sonnet", "fable", "haiku", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-sonnet-5", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"]);
 const codexEffortModels = new Set(toolModels.codex.models);
 // codex CLI 0.164.0 models_cache.json: the gpt-6.1 family (sol, terra), the
 // gpt-6 family (sol, astra, luna) and the gpt-5.6 family advertise
@@ -117,7 +118,9 @@ const codexXhighDefaultModels = new Set(["gpt-5.5"]);
 // https://platform.claude.com/docs/en/models/opus-5-5/overview (fetched
 // 2026-09-23) — Opus 5.5 is the first Claude model to default to medium.
 // The "opus" alias resolves to claude-opus-5-5 from claude CLI 2.1.321.
-const claudeMediumDefaultModels = new Set(["opus", "claude-opus-5-5"]);
+// Haiku 5.5 also defaults to medium (claude-api skill models.md, CLI
+// 2.1.321), and the same CLI resolves "haiku" to claude-haiku-5-5.
+const claudeMediumDefaultModels = new Set(["opus", "claude-opus-5-5", "haiku", "claude-haiku-5-5"]);
 // grok CLI 1.0.40 models_cache.json: grok-4.7, grok-4.7-build-fast and
 // grok-4.6 list efforts [xhigh,high,medium,low]; grok-4.5 lists
 // [high,medium,low]. None advertises "max". Keep in sync with agent.go

@@ -22,6 +22,8 @@
 //                                 the increase was cancelled and $2/$10 is
 //                                 now the standard rate)
 //   claude-sonnet-4-6:  3 / 15
+//   claude-haiku-5-5 :  0.10 / 0.50 (prompts of 100K tokens or fewer; longer
+//                                 prompts bill $0.50 / $2.50 — see below)
 //   claude-haiku-4-5 :  1 /  5
 //
 // xAI source: https://docs.x.ai/developers/pricing plus the per-model pages
@@ -126,6 +128,12 @@ const CANONICAL_PRICING: Record<string, ModelPricing> = {
   "claude-sonnet-5-5": pricedAnthropic(2, 10),
   "claude-sonnet-5": pricedAnthropic(2, 10),
   "claude-sonnet-4-6": pricedAnthropic(3, 15),
+  // Haiku 5.5 has two rate cards chosen per request by prompt length: $0.10 /
+  // $0.50 up to 100K prompt tokens, $0.50 / $2.50 above (standard cache
+  // multipliers on both). A turn's usage sums every request in it, so the
+  // per-request prompt length is unknowable here; the estimate uses the
+  // short-prompt card. The claude CLI's exact costUSD is preferred anyway.
+  "claude-haiku-5-5": pricedAnthropic(0.1, 0.5),
   "claude-haiku-4-5": pricedAnthropic(1, 5),
   // xAI — https://docs.x.ai/developers/pricing (grok-4.7 2026-09-22, rest 2026-08-13)
   "grok-4.7": pricedXai(2, 6, 0.5),
@@ -135,19 +143,19 @@ const CANONICAL_PRICING: Record<string, ModelPricing> = {
 };
 
 // kojo agent.model aliases (see web/src/lib/toolModels.ts) mapped to a
-// canonical id. "opus" → Opus 5.5, "sonnet" → Sonnet 5, "haiku" → Haiku 4.5,
+// canonical id. "opus" → Opus 5.5, "sonnet" → Sonnet 5, "haiku" → Haiku 5.5,
 // "fable" → Fable 5.2.
 // The "opus" and "fable" aliases follow what the installed claude CLI
 // resolves them to: 2.1.276 mapped "opus" to claude-opus-5; 2.1.321's model
-// catalog maps it to claude-opus-5-5 and adds "fable" → claude-fable-5-2
-// (Anthropic API). "sonnet" resolves to claude-sonnet-5 up to CLI 2.1.282 and to
+// catalog maps it to claude-opus-5-5, "haiku" to claude-haiku-5-5 and adds
+// "fable" → claude-fable-5-2 (Anthropic API). "sonnet" resolves to claude-sonnet-5 up to CLI 2.1.282 and to
 // claude-sonnet-5-5 from 2.1.284 (Anthropic API); both bill $2/$10, so the
 // estimate is right on either side of that update.
 const ALIASES: Record<string, string> = {
   opus: "claude-opus-5-5",
   fable: "claude-fable-5-2",
   sonnet: "claude-sonnet-5",
-  haiku: "claude-haiku-4-5",
+  haiku: "claude-haiku-5-5",
 };
 
 /**

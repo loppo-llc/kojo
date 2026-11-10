@@ -6,10 +6,15 @@ describe("priceModel", () => {
     expect(priceModel("opus")).toEqual(priceModel("claude-opus-5-5"));
     expect(priceModel("fable")).toEqual(priceModel("claude-fable-5-2"));
     expect(priceModel("sonnet")).toEqual(priceModel("claude-sonnet-5"));
-    expect(priceModel("haiku")).toEqual(priceModel("claude-haiku-4-5"));
+    expect(priceModel("haiku")).toEqual(priceModel("claude-haiku-5-5"));
   });
 
   it("prices canonical claude ids", () => {
+    const haiku = priceModel("claude-haiku-5-5")!;
+    expect(haiku.input).toBe(0.1);
+    expect(haiku.output).toBe(0.5);
+    expect(haiku.cacheRead).toBeCloseTo(0.01, 10);
+    expect(haiku.cacheWrite).toBeCloseTo(0.125, 10);
     expect(priceModel("claude-opus-5")).toEqual({
       input: 5,
       output: 25,

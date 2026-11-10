@@ -168,9 +168,11 @@ func NormalizeThinkingMode(mode string) string {
 // Fable 5.1's five-level ladder. The "sonnet" alias resolves to Sonnet 5
 // (claude CLI up to 2.1.282) or Sonnet 5.5 (2.1.284+) on the Anthropic API,
 // both xhigh-capable; "fable" is claude CLI 2.1.321's alias for the newest
-// Fable (claude-fable-5-2).
+// Fable (claude-fable-5-2). Haiku 5.5 takes effort low through max (default
+// medium), and 2.1.321 resolves the "haiku" alias to it (Haiku 4.5 had no
+// effort parameter at all).
 var xhighModels = map[string]bool{
-	"opus": true, "sonnet": true, "fable": true, "claude-sonnet-5-5": true, "claude-sonnet-5": true, "claude-opus-5-5": true, "claude-opus-5": true, "claude-fable-5-2": true, "claude-fable-5-1": true, "claude-fable-5": true, "claude-opus-4-8": true, "claude-opus-4-7": true,
+	"opus": true, "sonnet": true, "fable": true, "haiku": true, "claude-haiku-5-5": true, "claude-sonnet-5-5": true, "claude-sonnet-5": true, "claude-opus-5-5": true, "claude-opus-5": true, "claude-fable-5-2": true, "claude-fable-5-1": true, "claude-fable-5": true, "claude-opus-4-8": true, "claude-opus-4-7": true,
 	// grok CLI 1.0.40's models_cache.json advertises xhigh for grok-4.7,
 	// grok-4.7-build-fast and grok-4.6 but only low/medium/high for
 	// grok-4.5; none offers max. Keep this in sync with

@@ -85,6 +85,16 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(defaultEffortForModel("opus")).toBe("medium");
   });
 
+  it("haiku alias is treated as Haiku 5.5: full ladder, defaults to medium", () => {
+    // claude CLI 2.1.321 resolves "haiku" to claude-haiku-5-5.
+    for (const m of ["haiku", "claude-haiku-5-5"]) {
+      expect(effortLevelsForModel(m)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+      expect(defaultEffortForModel(m)).toBe("medium");
+    }
+    const models = modelsForTool("claude");
+    expect(models.indexOf("claude-haiku-5-5")).toBe(models.indexOf("haiku") + 1);
+  });
+
   it("sonnet supports xhigh and defaults to high", () => {
     // The alias resolves to Sonnet 5 / Sonnet 5.5, both xhigh-capable.
     expect(effortLevelsForModel("sonnet")).toContain("xhigh");
