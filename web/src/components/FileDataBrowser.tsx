@@ -804,7 +804,7 @@ function FileViewer({
 
   return (
     <div className="absolute inset-0 z-10 flex flex-col bg-app">
-      <header className="flex shrink-0 items-center gap-2 border-b border-hairline px-4 py-3">
+      <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-hairline px-4 py-3">
         <button
           onClick={handleClose}
           className="-ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] text-ink-dim transition-colors hover:bg-hover hover:text-ink"
@@ -814,7 +814,7 @@ function FileViewer({
             <path d="M12.5 15l-5-5 5-5" />
           </svg>
         </button>
-        <div className="min-w-0 flex-1">
+        <div className="min-w-[10rem] flex-1">
           <div className="truncate text-sm text-ink">{name}</div>
           {view && (
             <div className="font-mono text-[11px] text-ink-faint">
@@ -871,6 +871,11 @@ function FileViewer({
             </button>
           </div>
         )}
+        {canEdit && (
+          <button onClick={startEdit} className={btn}>
+            {t("fdb.edit")}
+          </button>
+        )}
         <button
           onClick={onCopyPath}
           className="rounded-lg border border-hairline bg-raised px-2 py-1 font-mono text-[11px] text-ink-dim transition-colors hover:bg-hover hover:text-ink"
@@ -884,11 +889,6 @@ function FileViewer({
         >
           {t("fdb.downloadLower")}
         </a>
-        {canEdit && (
-          <button onClick={startEdit} className={btn}>
-            {t("fdb.edit")}
-          </button>
-        )}
         </>)}
       </header>
       {editing && (conflict || saveError) && (
