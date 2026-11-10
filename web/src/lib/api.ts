@@ -1,4 +1,4 @@
-import { get, post, del, patch, upload } from "./httpClient";
+import { get, post, del, patch, upload, putWithIfMatch } from "./httpClient";
 import { appendTokenQuery } from "./auth";
 
 export interface SessionInfo {
@@ -58,6 +58,8 @@ export interface FileView {
   size: number;
   url?: string;
   absPath?: string; // present on agent-scoped view responses
+  // Content etag for text views; the editor sends it back as If-Match.
+  etag?: string;
 }
 
 export interface Attachment {
@@ -173,6 +175,14 @@ export const api = {
     },
     view: (path: string, peerId?: string) =>
       get<FileView>(withPeer(`/api/v1/files/view?path=${encodeURIComponent(path)}`, peerId)),
+    // save overwrites an existing text file. `etag` is the one from the
+    // view response; a stale etag throws PreconditionFailedError.
+    save: (path: string, content: string, etag: string, peerId?: string) =>
+      putWithIfMatch<FileView>(
+        withPeer(`/api/v1/files/content?path=${encodeURIComponent(path)}`, peerId),
+        { content },
+        etag,
+      ).then((r) => r.value),
     // rawUrl returns the URL of the raw file with the Owner token
     // appended when one is stored. Use this for `<img src>` /
     // anchor-driven downloads. Fetch-driven callers should prefer

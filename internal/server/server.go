@@ -835,6 +835,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	mux.HandleFunc("GET /api/v1/files/view", s.handleViewFile)
 	mux.HandleFunc("GET /api/v1/files/raw", s.handleRawFile)
 	mux.HandleFunc("GET /api/v1/files/thumb", s.handleThumbFile)
+	mux.HandleFunc("PUT /api/v1/files/content", s.handleWriteFile)
 
 	// File upload
 	mux.HandleFunc("POST /api/v1/upload", s.handleUpload)
@@ -1128,6 +1129,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents/{id}/files/view", s.handleViewAgentFile)
 	mux.HandleFunc("GET /api/v1/agents/{id}/files/raw", s.handleRawAgentFile)
 	mux.HandleFunc("GET /api/v1/agents/{id}/files/thumb", s.handleThumbAgentFile)
+	mux.HandleFunc("PUT /api/v1/agents/{id}/files/content", s.handleWriteAgentFile)
 	mux.HandleFunc("PATCH /api/v1/agents/{id}", s.handleUpdateAgent)
 	mux.HandleFunc("POST /api/v1/agents/{id}/transfer-skips/dismiss", s.handleDismissTransferSkips)
 	mux.HandleFunc("POST /api/v1/agents/{id}/reset", s.handleResetAgentData)

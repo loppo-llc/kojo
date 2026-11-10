@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router";
 import { isThumbSupported, type DirEntry, type FileView } from "../lib/api";
+import { PreconditionFailedError } from "../lib/httpClient";
 import { errMsg, formatSize, timeAgo } from "../lib/utils";
 import {
   basename,
@@ -28,6 +29,10 @@ interface FileDataSource {
   // Sources that don't implement it fall back to rawUrl. `v` is an
   // optional cache-busting string (typically the source's modTime).
   thumbUrl?: (path: string, size?: number, v?: string) => string;
+  // Optional text save. When present, text files get an "edit" button.
+  // `etag` is the one from the view response; a stale one must reject
+  // with PreconditionFailedError.
+  save?: (path: string, content: string, etag: string) => Promise<FileView>;
 }
 
 interface FileDataBrowserProps {
@@ -108,6 +113,10 @@ export function FileDataBrowser({
   const [filter, setFilter] = useState("");
   const [viewer, setViewer] = useState<ViewerState | null>(null);
   const [copied, setCopied] = useState(false);
+  // Bumped after a save (list sizes/mtimes change) and on "load latest"
+  // after a save conflict.
+  const [listReload, setListReload] = useState(0);
+  const [viewReload, setViewReload] = useState(0);
 
   const activePath = useMemo(() => {
     const raw = searchParams.get(pathParam);
@@ -202,7 +211,7 @@ export function FileDataBrowser({
     return () => {
       cancelled = true;
     };
-  }, [activePath, dataSource, ready, showHidden]);
+  }, [activePath, dataSource, ready, showHidden, listReload]);
 
   useEffect(() => {
     if (!ready || !viewPath) {
@@ -230,7 +239,7 @@ export function FileDataBrowser({
     return () => {
       cancelled = true;
     };
-  }, [dataSource, ready, viewPath]);
+  }, [dataSource, ready, viewPath, viewReload]);
 
   const canGoUp = useMemo(() => {
     if (!browserPath) return false;
@@ -443,6 +452,16 @@ export function FileDataBrowser({
           dataSource={dataSource}
           state={viewer}
           onClose={closeViewer}
+          onSaved={(v) => {
+            setViewer((prev) =>
+              prev && prev.path === viewer.path
+                ? { ...prev, view: { ...prev.view, ...v, path: prev.view?.path ?? v.path } }
+                : prev,
+            );
+            setListReload((n) => n + 1);
+          }}
+          onReload={() => setViewReload((n) => n + 1)}
+          draftKey={`${location.pathname}\n${viewer.path}`}
           onCopyPath={() => {
             const copyPath = viewer.view?.absPath ?? viewer.view?.path;
             if (copyPath) copyText(copyPath);
@@ -561,40 +580,233 @@ function EntryRow({
   );
 }
 
+// Editor drafts are parked in sessionStorage (per tab) keyed by route +
+// file path, so they never outlive the browser tab.
+const DRAFT_PREFIX = "kojo.fdb.draft:";
+type StoredDraft = { etag: string; content: string };
+
+function readDraft(key: string): StoredDraft | null {
+  try {
+    const raw = sessionStorage.getItem(DRAFT_PREFIX + key);
+    if (!raw) return null;
+    const v = JSON.parse(raw) as Partial<StoredDraft>;
+    return typeof v.etag === "string" && typeof v.content === "string" ? { etag: v.etag, content: v.content } : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeDraft(key: string, draft: StoredDraft) {
+  try {
+    sessionStorage.setItem(DRAFT_PREFIX + key, JSON.stringify(draft));
+  } catch {
+    // Quota / private mode: the draft just isn't preserved.
+  }
+}
+
+function clearDraft(key: string) {
+  try {
+    sessionStorage.removeItem(DRAFT_PREFIX + key);
+  } catch {
+    // ignore
+  }
+}
+
 function FileViewer({
   dataSource,
   state,
   onClose,
+  onSaved,
+  onReload,
   onCopyPath,
   copied,
+  draftKey,
 }: {
   dataSource: FileDataSource;
   state: ViewerState;
+  draftKey: string;
   onClose: () => void;
+  onSaved: (view: FileView) => void;
+  onReload: () => void;
   onCopyPath: () => void;
   copied: boolean;
 }) {
   const t = useT();
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
   const { view, error, loading, name, path } = state;
   const isMarkdown = view?.type === "text" && view.language === "markdown";
   const [mdView, setMdView] = useState<"rendered" | "raw">("rendered");
+
+  // ── editor ──
+  // `baseEtag` is the version the draft was started from; saves assert it
+  // via If-Match so a newer on-disk write is never clobbered silently.
+  const canEdit = view?.type === "text" && !!view.etag && !!dataSource.save;
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [baseEtag, setBaseEtag] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [conflict, setConflict] = useState(false);
+  const [savedFlash, setSavedFlash] = useState(false);
+  const dirty = editing && draft !== (view?.content ?? "");
+
   useEffect(() => {
     setMdView("rendered");
+    setEditing(false);
+    setSaveError(null);
+    setConflict(false);
   }, [path]);
+
+  // Unsaved drafts survive leaving the viewer through browser history
+  // (swipe-back can't be intercepted with BrowserRouter): reopening the
+  // file drops straight back into the editor with the draft.
+  const restoredFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!view?.etag || restoredFor.current === draftKey) return;
+    restoredFor.current = draftKey;
+    const stored = readDraft(draftKey);
+    if (!stored) return;
+    setDraft(stored.content);
+    setBaseEtag(stored.etag);
+    setEditing(true);
+  }, [draftKey, view?.etag]);
+
+  // Debounced write; anything still pending is flushed on unmount so a
+  // back-swipe right after typing keeps the last keystrokes.
+  const pendingDraft = useRef<{ key: string; draft: StoredDraft } | null>(null);
+  useEffect(() => {
+    if (!editing) return;
+    if (!dirty) {
+      pendingDraft.current = null;
+      clearDraft(draftKey);
+      return;
+    }
+    pendingDraft.current = { key: draftKey, draft: { etag: baseEtag, content: draft } };
+    const timer = setTimeout(() => {
+      writeDraft(draftKey, { etag: baseEtag, content: draft });
+      pendingDraft.current = null;
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [baseEtag, draft, draftKey, dirty, editing]);
+  useEffect(() => () => {
+    const p = pendingDraft.current;
+    if (p) writeDraft(p.key, p.draft);
+  }, []);
+
+  const startEdit = () => {
+    if (!view?.etag) return;
+    setDraft(view.content ?? "");
+    setBaseEtag(view.etag);
+    setSaveError(null);
+    setConflict(false);
+    setEditing(true);
+  };
+
+  const confirmDiscard = useCallback(
+    () => !dirty || window.confirm(t("fdb.discardConfirm")),
+    [dirty, t],
+  );
+
+  const endEdit = useCallback(() => {
+    pendingDraft.current = null;
+    clearDraft(draftKey);
+    setEditing(false);
+    setSaveError(null);
+    setConflict(false);
+  }, [draftKey]);
+
+  const stopEdit = useCallback(() => {
+    if (confirmDiscard()) endEdit();
+  }, [confirmDiscard, endEdit]);
+
+  const doSave = useCallback(async (etag: string) => {
+    if (!dataSource.save) return;
+    setSaving(true);
+    setSaveError(null);
+    setConflict(false);
+    try {
+      const saved = await dataSource.save(path, draft, etag);
+      pendingDraft.current = null;
+      clearDraft(draftKey);
+      setBaseEtag(saved.etag ?? "");
+      onSaved(saved);
+      setSavedFlash(true);
+      setTimeout(() => setSavedFlash(false), 1400);
+    } catch (e) {
+      if (e instanceof PreconditionFailedError) setConflict(true);
+      else setSaveError(errMsg(e));
+    } finally {
+      setSaving(false);
+    }
+  }, [dataSource, draft, draftKey, onSaved, path]);
+
+  const save = useCallback(() => {
+    if (saving || !baseEtag || !dirty) return;
+    void doSave(baseEtag);
+  }, [baseEtag, dirty, doSave, saving]);
+
+  // Conflict resolution: fetch the current etag and write over it.
+  const overwrite = async () => {
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const latest = await dataSource.view(path);
+      if (latest.type !== "text" || !latest.etag) throw new Error(t("fdb.notEditable"));
+      setSaving(false);
+      await doSave(latest.etag);
+    } catch (e) {
+      setSaving(false);
+      setSaveError(errMsg(e));
+    }
+  };
+
+  const loadLatest = () => {
+    if (!confirmDiscard()) return;
+    endEdit();
+    onReload();
+  };
+
+  const handleClose = useCallback(() => {
+    if (editing) {
+      if (!confirmDiscard()) return;
+      pendingDraft.current = null;
+      clearDraft(draftKey);
+    }
+    onClose();
+  }, [confirmDiscard, draftKey, editing, onClose]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (editing) stopEdit();
+        else onClose();
+        return;
+      }
+      if (editing && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        save();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [editing, onClose, save, stopEdit]);
+
+  useEffect(() => {
+    if (!dirty) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [dirty]);
+
+  const btn =
+    "shrink-0 rounded-lg border border-hairline bg-raised px-2 py-1 font-mono text-[11px] text-ink-dim transition-colors hover:bg-hover hover:text-ink disabled:opacity-40";
 
   return (
     <div className="absolute inset-0 z-10 flex flex-col bg-app">
       <header className="flex shrink-0 items-center gap-2 border-b border-hairline px-4 py-3">
         <button
-          onClick={onClose}
+          onClick={handleClose}
           className="-ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] text-ink-dim transition-colors hover:bg-hover hover:text-ink"
           aria-label={t("common.back")}
         >
@@ -606,11 +818,33 @@ function FileViewer({
           <div className="truncate text-sm text-ink">{name}</div>
           {view && (
             <div className="font-mono text-[11px] text-ink-faint">
-              {formatSize(view.size)}
-              {view.language ? ` · ${view.language}` : view.mime ? ` · ${view.mime}` : ""}
+              {editing
+                ? dirty
+                  ? t("fdb.unsaved")
+                  : savedFlash
+                    ? t("fdb.saved")
+                    : t("fdb.editing")
+                : <>
+                    {formatSize(view.size)}
+                    {view.language ? ` · ${view.language}` : view.mime ? ` · ${view.mime}` : ""}
+                  </>}
             </div>
           )}
         </div>
+        {editing ? (
+          <>
+            <button onClick={stopEdit} disabled={saving} className={btn}>
+              {dirty ? t("fdb.cancelEdit") : t("fdb.doneEdit")}
+            </button>
+            <button
+              onClick={save}
+              disabled={saving || !dirty}
+              className="shrink-0 rounded-lg border border-copper/40 bg-copper/10 px-2 py-1 font-mono text-[11px] text-copper transition-colors hover:bg-copper/20 disabled:opacity-40"
+            >
+              {saving ? t("fdb.saving") : t("fdb.save")}
+            </button>
+          </>
+        ) : (<>
         {isMarkdown && (
           <div className="flex shrink-0 items-center overflow-hidden rounded-lg border border-hairline">
             <button
@@ -650,7 +884,44 @@ function FileViewer({
         >
           {t("fdb.downloadLower")}
         </a>
+        {canEdit && (
+          <button onClick={startEdit} className={btn}>
+            {t("fdb.edit")}
+          </button>
+        )}
+        </>)}
       </header>
+      {editing && (conflict || saveError) && (
+        <div className="shrink-0 space-y-2 border-b border-hairline bg-raised px-4 py-2 text-xs text-ink-dim">
+          {saveError && <div className="break-words">{saveError}</div>}
+          {conflict && (
+            <>
+              <div>{t("fdb.conflict")}</div>
+              <div className="flex gap-2">
+                <button onClick={loadLatest} disabled={saving} className={btn}>
+                  {t("fdb.loadLatest")}
+                </button>
+                <button onClick={overwrite} disabled={saving} className={btn}>
+                  {t("fdb.overwrite")}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+      {editing ? (
+        <textarea
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          spellCheck={false}
+          autoCapitalize="off"
+          autoCorrect="off"
+          autoComplete="off"
+          autoFocus
+          aria-label={name}
+          className="min-h-0 w-full flex-1 resize-none bg-app p-4 font-mono text-base leading-relaxed text-ink outline-none sm:text-[13px]"
+        />
+      ) : (
       <div className="flex-1 overflow-auto">
         {loading ? (
           <div className="px-4 py-16 text-center text-sm text-ink-faint">{t("fdb.loading")}</div>
@@ -682,6 +953,7 @@ function FileViewer({
           </div>
         ) : null}
       </div>
+      )}
     </div>
   );
 }

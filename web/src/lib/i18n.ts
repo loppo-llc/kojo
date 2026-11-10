@@ -1944,6 +1944,25 @@ const messages = {
   "fdb.showRawSource": { ja: "ソースを表示", en: "Show raw source" },
   "fdb.downloadLower": { ja: "ダウンロード", en: "download" },
   "fdb.downloadInstead": { ja: "代わりにダウンロード", en: "Download instead" },
+  "fdb.edit": { ja: "編集", en: "edit" },
+  "fdb.save": { ja: "保存", en: "save" },
+  "fdb.saving": { ja: "保存中…", en: "saving…" },
+  "fdb.saved": { ja: "保存した", en: "saved" },
+  "fdb.editing": { ja: "編集中", en: "editing" },
+  "fdb.unsaved": { ja: "未保存の変更あり", en: "unsaved changes" },
+  "fdb.cancelEdit": { ja: "キャンセル", en: "cancel" },
+  "fdb.doneEdit": { ja: "完了", en: "done" },
+  "fdb.discardConfirm": {
+    ja: "保存していない変更を破棄する？",
+    en: "Discard unsaved changes?",
+  },
+  "fdb.conflict": {
+    ja: "開いた後にファイルがディスク上で変更された。",
+    en: "The file changed on disk after you opened it.",
+  },
+  "fdb.loadLatest": { ja: "最新を読み込む（編集を破棄）", en: "Load latest (discard edits)" },
+  "fdb.overwrite": { ja: "上書き保存", en: "Overwrite" },
+  "fdb.notEditable": { ja: "このファイルは編集できない", en: "This file can't be edited" },
 
   // ── SessionPage ──
   "sess.tabCli": { ja: "CLI", en: "CLI" },

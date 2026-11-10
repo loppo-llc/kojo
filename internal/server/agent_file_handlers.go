@@ -146,6 +146,7 @@ func (s *Server) handleViewAgentFile(w http.ResponseWriter, r *http.Request) {
 		"mime":     view.Mime,
 		"size":     view.Size,
 		"url":      view.URL,
+		"etag":     view.ETag,
 		"absPath":  abs,
 	})
 }
@@ -176,6 +177,55 @@ func (s *Server) handleRawAgentFile(w http.ResponseWriter, r *http.Request) {
 	if err := s.files.ServeRaw(w, r, abs); err != nil {
 		writeServeErr(w, err)
 	}
+}
+
+// handleWriteAgentFile saves an edited text file inside the agent's data
+// directory. Writing straight to disk is the same thing the agent's own
+// Edit tool does: DB-canonical files (MEMORY.md, memory/, persona.md,
+// user.md, checkin.md, status.json) are reconciled disk→DB by the file
+// watcher / next prepareChat sync. The mutation slot keeps the save out
+// of a device-switch snapshot or restart drain window.
+func (s *Server) handleWriteAgentFile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	rel := r.URL.Query().Get("path")
+	_, abs, err := resolveAgentPath(id, rel)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if abs == agent.AgentDir(id) {
+		writeError(w, http.StatusBadRequest, "bad_request", "path is a directory")
+		return
+	}
+	ifMatch, content, ok := s.readFileWrite(w, r)
+	if !ok {
+		return
+	}
+	releaseMut, err := s.agents.AcquireMutation(id)
+	if err != nil {
+		writeError(w, http.StatusConflict, "agent_busy", err.Error())
+		return
+	}
+	defer releaseMut()
+	view, err := s.files.WriteText(abs, content, ifMatch)
+	if err != nil {
+		writeFileSaveError(w, err)
+		return
+	}
+	w.Header().Set("ETag", quoteETag(view.ETag))
+	writeJSONResponse(w, http.StatusOK, map[string]any{
+		"path":     rel,
+		"type":     view.Type,
+		"content":  view.Content,
+		"language": view.Language,
+		"size":     view.Size,
+		"etag":     view.ETag,
+		"absPath":  abs,
+	})
 }
 
 // handleThumbAgentFile serves a JPEG thumbnail for an agent-scoped image.

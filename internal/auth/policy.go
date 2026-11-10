@@ -296,6 +296,10 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		if method == http.MethodPost && path == "/api/v1/upload" {
 			return true
 		}
+		// Text-file save from the File tab's editor.
+		if method == http.MethodPut && path == "/api/v1/files/content" {
+			return true
+		}
 		// Git surface used by the Git tab. Read-only routes admit
 		// GET; the exec endpoint runs whitelisted operations
 		// inside handler-side guards.

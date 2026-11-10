@@ -587,6 +587,12 @@ export const agentApi = {
       get<FileView>(
         `/api/v1/agents/${agentId}/files/view?path=${encodeURIComponent(relPath)}`,
       ),
+    save: (agentId: string, relPath: string, content: string, etag: string) =>
+      putWithIfMatch<FileView>(
+        `/api/v1/agents/${agentId}/files/content?path=${encodeURIComponent(relPath)}`,
+        { content },
+        etag,
+      ).then((r) => r.value),
     rawUrl: (agentId: string, relPath: string, download = false) => {
       const base = `/api/v1/agents/${agentId}/files/raw?path=${encodeURIComponent(relPath)}`;
       return appendTokenQuery(download ? `${base}&download=1` : base);
