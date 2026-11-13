@@ -97,7 +97,7 @@ export function AgentChat() {
     fileInputRef,
     handleFileSelect,
     removePendingFile,
-  } = useFileUpload(agent?.holderPeer);
+  } = useFileUpload(agent?.holderPeer, id);
   const { textareaRef, resize: handleTextareaInput } = useAutoGrowTextarea(input);
   // Canonical auto-scroll + pagination shared with GroupDMChat. The suppress /
   // restore refs are owned by useChatScroll; the holder-peer refetch effect
@@ -794,6 +794,11 @@ export function AgentChat() {
       if (text) handleSteer(text, command !== undefined);
       return;
     }
+    // Files still uploading would miss this message (they land in
+    // pendingFiles afterwards). SendButton shows a spinner meanwhile; this
+    // also covers the Enter-key path. Steer above is text-only, so it isn't
+    // gated.
+    if (uploading && command === undefined) return;
     // Holder peer offline → the WS frame would dead-end at the Hub
     // proxy. Route through the queue-and-forward HTTP endpoint instead:
     // the server delivers immediately if it can, or queues the message
@@ -1448,8 +1453,7 @@ export function AgentChat() {
           />
           <AttachButton
             onClick={() => fileInputRef.current?.click()}
-            uploading={uploading}
-            disabled={uploading || streaming || holderOffline}
+            disabled={streaming || holderOffline}
             title={holderOffline ? t("chat.holderPeerOffline") : t("composer.attachFiles")}
           />
           {agent?.tool === "codex" && id && <GoalControls agentId={id} enabled={goalMode} onToggle={setGoalMode} budget={goalBudget} onBudget={setGoalBudget} running={streaming} onCommand={handleSend} />}
@@ -1495,6 +1499,7 @@ export function AgentChat() {
           ) : (
             <SendButton
               onClick={() => handleSend()}
+              busy={uploading}
               disabled={
                 holderOffline
                   // Attachments-only stays clickable so handleSend can

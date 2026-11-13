@@ -269,6 +269,7 @@ const messages = {
   // ── Composer (shared by AgentChat + GroupDMChat) ──
   "composer.olderMessages": { ja: "過去のメッセージ", en: "older messages" },
   "composer.attachFiles": { ja: "ファイルを添付", en: "Attach files" },
+  "composer.uploading": { ja: "アップロード中…", en: "Uploading…" },
   "composer.voiceInput": { ja: "音声入力", en: "Voice input" },
   "composer.stopVoice": { ja: "音声入力を停止", en: "Stop voice input" },
   "composer.send": { ja: "送信", en: "Send" },
