@@ -127,16 +127,17 @@ const claudeMediumDefaultModels = new Set(["opus", "claude-opus-5-5", "haiku", "
 // grokEffortModels / xhighModels.
 const grokEffortModels = new Set(toolModels.grok.models);
 // Gemini thinkingLevel ladder: low/medium/high, API default medium;
-// gemini-4-hydrogen adds xhigh and defaults to high (agy 1.5.7 likewise
-// lists gemini-4-hydrogen-xhigh). Keep in sync with backend_opencode.go
-// geminiXhighModels / geminiHighDefaultModels and backend_agy.go
-// agyXhighModels.
+// gemini-4-hydrogen defaults to high. Its xhigh is offered only on agy
+// (agy 1.5.7 lists gemini-4-hydrogen-xhigh): OpenCode, behind gemini-api,
+// rejects thinkingLevel xhigh. Keep in sync with backend_opencode.go
+// geminiHighDefaultModels and backend_agy.go agyXhighModels.
 // "flash" is the legacy gemini-cli alias for gemini-3.8-flash; the backend
 // resolves it before picking the variant. Keep in sync with
 // internal/agent/backend_opencode.go geminiEffortModels.
 const agyEffortModels = new Set(["", "gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5"]);
 const geminiEffortModels = new Set([...toolModels["gemini-api"].models, "flash"]);
-const geminiXhighModels = new Set(["gemini-4-hydrogen"]);
+const geminiHighDefaultModels = new Set(["gemini-4-hydrogen"]);
+const agyXhighModels = new Set(["gemini-4-hydrogen"]);
 const grokXhighModels = new Set(["grok-4.7", "grok-4.7-build-fast", "grok-4.6"]);
 
 /**
@@ -187,7 +188,7 @@ export function effortLevelsForModel(model: string, tool?: string): readonly Eff
   // agyEffortModels.
   if (tool === "gemini-agy") {
     if (!agyEffortModels.has(model)) return [];
-    return geminiXhighModels.has(model) ? (["low", "medium", "high", "xhigh"] as const) : (["low", "medium", "high"] as const);
+    return agyXhighModels.has(model) ? (["low", "medium", "high", "xhigh"] as const) : (["low", "medium", "high"] as const);
   }
   // With the CLI-default model, the concrete model (and therefore support
   // for xhigh/max) is not known. Offer only the common safe ladder; in
@@ -197,7 +198,6 @@ export function effortLevelsForModel(model: string, tool?: string): readonly Eff
   if (codexEffortModels.has(model)) return ["low", "medium", "high", "xhigh"] as const;
   if (grokXhighModels.has(model)) return ["low", "medium", "high", "xhigh"] as const;
   if (grokEffortModels.has(model)) return ["low", "medium", "high"] as const;
-  if (geminiXhighModels.has(model)) return ["low", "medium", "high", "xhigh"] as const;
   if (geminiEffortModels.has(model)) return ["low", "medium", "high"] as const;
   if (xhighModels.has(model)) return effortLevels;
   return effortLevels.filter((e) => e !== "xhigh");
@@ -209,7 +209,7 @@ export function defaultEffortForModel(model: string, tool?: string): string {
   if (codexLowDefaultModels.has(model)) return "low";
   if (codexXhighDefaultModels.has(model)) return "xhigh";
   if (codexEffortModels.has(model)) return "medium";
-  if (geminiXhighModels.has(model)) return "high";
+  if (geminiHighDefaultModels.has(model)) return "high";
   if (geminiEffortModels.has(model)) return "medium";
   if (claudeMediumDefaultModels.has(model)) return "medium";
   return defaultXhighModels.has(model) ? "xhigh" : "high";

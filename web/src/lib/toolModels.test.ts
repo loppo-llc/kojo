@@ -232,8 +232,8 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(effortLevelsForModel("flash")).toEqual(["low", "medium", "high"]);
   });
 
-  it("gemini-4-hydrogen adds xhigh and defaults to high", () => {
-    expect(effortLevelsForModel("gemini-4-hydrogen", "gemini-api")).toEqual(["low", "medium", "high", "xhigh"]);
+  it("gemini-4-hydrogen defaults to high; no xhigh on gemini-api (OpenCode rejects it)", () => {
+    expect(effortLevelsForModel("gemini-4-hydrogen", "gemini-api")).toEqual(["low", "medium", "high"]);
     expect(defaultEffortForModel("gemini-4-hydrogen", "gemini-api")).toBe("high");
   });
 });

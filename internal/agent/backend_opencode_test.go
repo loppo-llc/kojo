@@ -176,7 +176,7 @@ func TestGeminiModelAndVariant(t *testing.T) {
 		{"gemini-4-carbon", "xhigh", "medium"},
 		{"gemini-4-hydrogen", "", "high"},
 		{"gemini-4-hydrogen", "low", "low"},
-		{"gemini-4-hydrogen", "xhigh", "xhigh"},
+		{"gemini-4-hydrogen", "xhigh", "high"},
 		{"gemini-4-hydrogen", "max", "high"},
 		{"gemini-4-argon", "max", "medium"},
 		{"flash", "low", "low"},
@@ -223,7 +223,7 @@ func TestValidToolModelEffort_Gemini(t *testing.T) {
 		{"pro", "low", false},
 		{"auto", "medium", false},
 		{"flash", "", true},
-		{"gemini-4-hydrogen", "xhigh", true},
+		{"gemini-4-hydrogen", "xhigh", false},
 		{"gemini-4-hydrogen", "high", true},
 		{"gemini-4-hydrogen", "max", false},
 		{"gemini-4-carbon", "xhigh", false},
@@ -357,19 +357,10 @@ func TestBuildOpenCodeTurnConfig(t *testing.T) {
 		}
 	}
 
-	// gemini-4-hydrogen also gets the xhigh variant; the others stop at high.
-	if jsonPath(model, "variants", "xhigh") != nil {
-		t.Fatalf("gemini-4-argon has an xhigh variant")
-	}
-	_, out = decodeOCConfig(t, buildOpenCodeTurnConfig(openCodeTurnConfig{model: "gemini-4-hydrogen", variant: "xhigh"}))
-	model = jsonPath(out, "provider", "google", "models", "gemini-4-hydrogen")
-	for _, lvl := range []string{"low", "medium", "high", "xhigh"} {
-		if tc := jsonPath(model, "variants", lvl, "thinkingConfig"); jsonPath(tc, "thinkingLevel") != lvl {
-			t.Fatalf("hydrogen variant %s = %v", lvl, tc)
-		}
-	}
-	if got := jsonPath(out, "agent", "build", "variant"); got != "xhigh" {
-		t.Fatalf("hydrogen variant = %v", got)
+	// OpenCode rejects thinkingLevel xhigh, so no model gets that variant.
+	_, out = decodeOCConfig(t, buildOpenCodeTurnConfig(openCodeTurnConfig{model: "gemini-4-hydrogen", variant: "high"}))
+	if model = jsonPath(out, "provider", "google", "models", "gemini-4-hydrogen"); jsonPath(model, "variants", "xhigh") != nil || jsonPath(model, "variants", "high") == nil {
+		t.Fatalf("hydrogen variants = %v", jsonPath(model, "variants"))
 	}
 
 	// Custom maxOutputTokens and an undescribed model: no variants, no prompt.
