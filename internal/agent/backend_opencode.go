@@ -35,23 +35,45 @@ import (
 const GeminiDefaultModel = "gemini-4-argon"
 
 // geminiEffortModels maps the Gemini models whose thinking level kojo can
-// drive through agent.Effort (low/medium/high → OpenCode variant →
+// drive through agent.Effort (low/medium/high, plus xhigh where
+// geminiXhighModels says so → OpenCode variant →
 // thinkingConfig.thinkingLevel) to the concrete id OpenCode is given.
 // "flash" is the legacy gemini-cli alias kept for agents created before
 // the switch; OpenCode has no aliases, so it is resolved here.
 var geminiEffortModels = map[string]string{
-	"gemini-4-carbon":  "gemini-4-carbon",
-	"gemini-4-argon":   "gemini-4-argon",
-	"gemini-3.8-flash": "gemini-3.8-flash",
-	"flash":            "gemini-3.8-flash",
+	"gemini-4-hydrogen": "gemini-4-hydrogen",
+	"gemini-4-carbon":   "gemini-4-carbon",
+	"gemini-4-argon":    "gemini-4-argon",
+	"gemini-3.8-flash":  "gemini-3.8-flash",
+	"flash":             "gemini-3.8-flash",
 }
 
 // geminiModelNames are the display names written into the provider config
 // for the models kojo fully describes.
 var geminiModelNames = map[string]string{
-	"gemini-4-carbon":  "Gemini 4 Carbon",
-	"gemini-4-argon":   "Gemini 4 Argon",
-	"gemini-3.8-flash": "Gemini 3.8 Flash",
+	"gemini-4-hydrogen": "Gemini 4 Hydrogen",
+	"gemini-4-carbon":   "Gemini 4 Carbon",
+	"gemini-4-argon":    "Gemini 4 Argon",
+	"gemini-3.8-flash":  "Gemini 3.8 Flash",
+}
+
+// geminiXhighModels are the concrete ids whose thinkingLevel ladder adds
+// xhigh above high, and geminiHighDefaultModels those whose API default
+// is high instead of medium (gemini-4-hydrogen: low/medium/high/xhigh,
+// default high; https://aistudio.google.com/docs/whats-new-gemini-4-hydrogen).
+// Keep in sync with web toolModels.ts.
+var (
+	geminiXhighModels       = map[string]bool{"gemini-4-hydrogen": true}
+	geminiHighDefaultModels = map[string]bool{"gemini-4-hydrogen": true}
+)
+
+// geminiThinkingLevels returns the thinkingLevel ladder kojo defines as
+// OpenCode variants for a concrete model it describes.
+func geminiThinkingLevels(model string) []string {
+	if geminiXhighModels[model] {
+		return []string{"low", "medium", "high", "xhigh"}
+	}
+	return []string{"low", "medium", "high"}
 }
 
 // geminiSessionIDPattern matches OpenCode session ids ("ses_" + 12 hex
@@ -413,16 +435,22 @@ func EffectiveGeminiMaxOutputTokens(v int) int {
 }
 
 // geminiVariant maps kojo's effort onto the OpenCode variant kojo defines
-// for the model. An empty effort still selects "medium" (the API default)
+// for the model. An empty (or unsupported) effort still selects the
+// model's API default (medium, or high for geminiHighDefaultModels)
 // explicitly, so the request always carries a thinking config kojo chose.
 // Returns "" for models kojo does not describe (no variants defined).
 func geminiVariant(model, effort string) string {
-	if geminiModelNames[resolveGeminiModel(model)] == "" {
+	concrete := resolveGeminiModel(model)
+	if geminiModelNames[concrete] == "" {
 		return ""
 	}
-	switch effort {
-	case "low", "medium", "high":
-		return effort
+	for _, lvl := range geminiThinkingLevels(concrete) {
+		if effort == lvl {
+			return effort
+		}
+	}
+	if geminiHighDefaultModels[concrete] {
+		return "high"
 	}
 	return "medium"
 }
@@ -744,7 +772,8 @@ type openCodeTurnConfig struct {
 //     OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX || 32000), so the env var is
 //     set to the same value (verified by capturing the generateContent
 //     request: generationConfig.maxOutputTokens equals the setting);
-//   - variants spell out thinkingConfig for low/medium/high with
+//   - variants spell out thinkingConfig for low/medium/high (+ xhigh on
+//     geminiXhighModels) with
 //     includeThoughts so the reasoning parts reach the stream;
 //   - mcp: stdio servers become "local" (their environment restores the
 //     operator's XDG dirs and blanks the isolation vars and the key),
@@ -776,7 +805,7 @@ func buildOpenCodeTurnConfig(t openCodeTurnConfig) map[string]any {
 		modelDef["attachment"] = true
 		modelDef["temperature"] = true
 		variants := map[string]any{}
-		for _, lvl := range []string{"low", "medium", "high"} {
+		for _, lvl := range geminiThinkingLevels(t.model) {
 			variants[lvl] = map[string]any{
 				"thinkingConfig": map[string]any{"includeThoughts": true, "thinkingLevel": lvl},
 			}

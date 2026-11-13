@@ -161,7 +161,7 @@ func TestBuildGeminiArgs(t *testing.T) {
 }
 
 func TestGeminiModelAndVariant(t *testing.T) {
-	for in, want := range map[string]string{"": GeminiDefaultModel, "flash": "gemini-3.8-flash", "gemini-3.8-flash": "gemini-3.8-flash", "gemini-4-argon": "gemini-4-argon", "gemini-4-carbon": "gemini-4-carbon", "custom-x": "custom-x"} {
+	for in, want := range map[string]string{"": GeminiDefaultModel, "flash": "gemini-3.8-flash", "gemini-3.8-flash": "gemini-3.8-flash", "gemini-4-argon": "gemini-4-argon", "gemini-4-carbon": "gemini-4-carbon", "gemini-4-hydrogen": "gemini-4-hydrogen", "custom-x": "custom-x"} {
 		if got := resolveGeminiModel(in); got != want {
 			t.Errorf("resolveGeminiModel(%q) = %q, want %q", in, got, want)
 		}
@@ -173,6 +173,11 @@ func TestGeminiModelAndVariant(t *testing.T) {
 		{"gemini-4-argon", "high", "high"},
 		{"gemini-4-carbon", "low", "low"},
 		{"gemini-4-carbon", "", "medium"},
+		{"gemini-4-carbon", "xhigh", "medium"},
+		{"gemini-4-hydrogen", "", "high"},
+		{"gemini-4-hydrogen", "low", "low"},
+		{"gemini-4-hydrogen", "xhigh", "xhigh"},
+		{"gemini-4-hydrogen", "max", "high"},
 		{"gemini-4-argon", "max", "medium"},
 		{"flash", "low", "low"},
 		{"", "high", "high"},
@@ -218,10 +223,37 @@ func TestValidToolModelEffort_Gemini(t *testing.T) {
 		{"pro", "low", false},
 		{"auto", "medium", false},
 		{"flash", "", true},
+		{"gemini-4-hydrogen", "xhigh", true},
+		{"gemini-4-hydrogen", "high", true},
+		{"gemini-4-hydrogen", "max", false},
+		{"gemini-4-carbon", "xhigh", false},
+		{"", "xhigh", false},
 	}
 	for _, c := range cases {
 		if got := ValidToolModelEffort(ToolGeminiAPI, c.model, c.effort); got != c.ok {
 			t.Errorf("ValidToolModelEffort(gemini, %q, %q) = %v, want %v", c.model, c.effort, got, c.ok)
+		}
+	}
+}
+
+func TestValidToolModelEffort_Agy(t *testing.T) {
+	cases := []struct {
+		model, effort string
+		ok            bool
+	}{
+		{"", "", true},
+		{"", "high", true},
+		{"", "xhigh", false},
+		{"gemini-4-hydrogen", "low", true},
+		{"gemini-4-hydrogen", "xhigh", true},
+		{"gemini-4-hydrogen", "max", false},
+		{"gemini-4-carbon", "xhigh", false},
+		{"gpt-oss-120b-medium", "low", false},
+		{"gpt-oss-120b-medium", "", true},
+	}
+	for _, c := range cases {
+		if got := ValidToolModelEffort(ToolGeminiAgy, c.model, c.effort); got != c.ok {
+			t.Errorf("ValidToolModelEffort(agy, %q, %q) = %v, want %v", c.model, c.effort, got, c.ok)
 		}
 	}
 }
@@ -323,6 +355,21 @@ func TestBuildOpenCodeTurnConfig(t *testing.T) {
 		if v, ok := env[k]; !ok || v != "" {
 			t.Errorf("local mcp env %s = %v (present %v), want blank", k, v, ok)
 		}
+	}
+
+	// gemini-4-hydrogen also gets the xhigh variant; the others stop at high.
+	if jsonPath(model, "variants", "xhigh") != nil {
+		t.Fatalf("gemini-4-argon has an xhigh variant")
+	}
+	_, out = decodeOCConfig(t, buildOpenCodeTurnConfig(openCodeTurnConfig{model: "gemini-4-hydrogen", variant: "xhigh"}))
+	model = jsonPath(out, "provider", "google", "models", "gemini-4-hydrogen")
+	for _, lvl := range []string{"low", "medium", "high", "xhigh"} {
+		if tc := jsonPath(model, "variants", lvl, "thinkingConfig"); jsonPath(tc, "thinkingLevel") != lvl {
+			t.Fatalf("hydrogen variant %s = %v", lvl, tc)
+		}
+	}
+	if got := jsonPath(out, "agent", "build", "variant"); got != "xhigh" {
+		t.Fatalf("hydrogen variant = %v", got)
 	}
 
 	// Custom maxOutputTokens and an undescribed model: no variants, no prompt.

@@ -64,17 +64,25 @@ func agyPath() string {
 
 // agyEffortModels lists the models agy takes --effort (low/medium/high)
 // for: the bare ids of the families `agy models` lists per effort level
-// (agy 1.5.5, paid tier). "" is agy's default model (gemini-4-argon on the
+// (agy 1.5.7, paid tier). "" is agy's default model (gemini-4-argon on the
 // paid tier, gemini-3.8-flash on the free one; both take the ladder).
 // Suffixed ids (gemini-4-argon-high, gpt-oss-120b-medium) conflict with
 // --effort. Keep in sync with web toolModels.ts.
 var agyEffortModels = map[string]bool{
 	"":                  true,
+	"gemini-4-hydrogen": true,
 	"gemini-4-carbon":   true,
 	"gemini-4-argon":    true,
 	"gemini-3.8-flash":  true,
 	"claude-opus-5-5":   true,
 	"claude-sonnet-5-5": true,
+}
+
+// agyXhighModels are the agyEffortModels whose family `agy models` also
+// lists at xhigh (gemini-4-hydrogen-xhigh, agy 1.5.7). Keep in sync with
+// web toolModels.ts.
+var agyXhighModels = map[string]bool{
+	"gemini-4-hydrogen": true,
 }
 
 // agyConversationIDPattern matches agy conversation ids (UUIDs). Every

@@ -223,13 +223,18 @@ describe("toolModels — Opus 5 / effort defaults", () => {
   });
 
   it("gemini lists carbon, argon (default) and flash with low/medium/high, default medium", () => {
-    expect(modelsForTool("gemini-api")).toEqual(["gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash"]);
+    expect(modelsForTool("gemini-api")).toEqual(["gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash"]);
     expect(defaultModelForTool("gemini-api")).toBe("gemini-4-argon");
     for (const m of ["gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash"]) {
       expect(effortLevelsForModel(m)).toEqual(["low", "medium", "high"]);
       expect(defaultEffortForModel(m)).toBe("medium");
     }
     expect(effortLevelsForModel("flash")).toEqual(["low", "medium", "high"]);
+  });
+
+  it("gemini-4-hydrogen adds xhigh and defaults to high", () => {
+    expect(effortLevelsForModel("gemini-4-hydrogen", "gemini-api")).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(defaultEffortForModel("gemini-4-hydrogen", "gemini-api")).toBe("high");
   });
 });
 
@@ -283,6 +288,7 @@ describe("gemini-agy", () => {
       expect(effortLevelsForModel(m, "gemini-agy")).toEqual(["low", "medium", "high"]);
     }
     expect(effortLevelsForModel("gpt-oss-120b-medium", "gemini-agy")).toEqual([]);
+    expect(effortLevelsForModel("gemini-4-hydrogen", "gemini-agy")).toEqual(["low", "medium", "high", "xhigh"]);
     // the claude backend's ladder is unaffected by the shared id
     expect(effortLevelsForModel("claude-opus-5-5")).toContain("max");
   });

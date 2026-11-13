@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -264,29 +265,33 @@ func ValidModelEffort(model, effort string) bool {
 func ValidToolModelEffort(tool, model, effort string) bool {
 	switch NormalizeToolName(tool) {
 	case ToolGeminiAPI:
-		// Gemini's thinkingLevel ladder is low/medium/high, and kojo can
-		// only set it (as an OpenCode variant) for the models in
-		// geminiEffortModels (an empty model means GeminiDefaultModel).
-		// Unknown ids accept no effort rather than one that would
-		// silently not apply.
-		switch effort {
-		case "":
+		// Gemini's thinkingLevel ladder is low/medium/high (gemini-4-hydrogen
+		// adds xhigh), and kojo can only set it (as an OpenCode variant)
+		// for the models in geminiEffortModels (an empty model means
+		// GeminiDefaultModel). Unknown ids accept no effort rather than
+		// one that would silently not apply.
+		if effort == "" {
 			return true
-		case "low", "medium", "high":
-			if model == "" {
-				model = GeminiDefaultModel
-			}
-			return geminiEffortModels[model] != ""
 		}
-		return false
+		if model == "" {
+			model = GeminiDefaultModel
+		}
+		concrete := geminiEffortModels[model]
+		if concrete == "" {
+			return false
+		}
+		return slices.Contains(geminiThinkingLevels(concrete), effort)
 	case ToolGeminiAgy:
-		// agy (1.4.8) takes --effort low/medium/high only for the bare
-		// model ids in agyEffortModels.
+		// agy (1.5.7) takes --effort only for the bare model ids in
+		// agyEffortModels, on the ladder `agy models` lists for the
+		// family: low/medium/high, plus xhigh for agyXhighModels.
 		switch effort {
 		case "":
 			return true
 		case "low", "medium", "high":
 			return agyEffortModels[model]
+		case "xhigh":
+			return agyXhighModels[model]
 		}
 		return false
 	case ToolCustomClaude, ToolCustomCodex, ToolCustomBare, ToolCustomOpenCode:
