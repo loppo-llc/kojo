@@ -165,6 +165,10 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 			_ = os.Remove(agyConversationRefPath(dir, persistKey))
 			resumeID = ""
 		}
+		if resumeID != "" && agyConversationResetDue(resumeID, persistKey, opts.AutomatedTrigger, agent.ID, agent.ResumeIdleDuration(), b.logger) &&
+			dropAgyConversation(dir, persistKey, resumeID, b.logger) {
+			resumeID = ""
+		}
 	}
 
 	userMessage = injectSessionContexts(userMessage, opts, resumeID != "")

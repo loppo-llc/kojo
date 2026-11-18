@@ -552,7 +552,21 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		var existingRef *codexThreadRef
 		resumed := false
 		if !opts.OneShot {
-			if ref, rerr := readCodexThreadRef(agent.ID, opts.SessionKey); rerr == nil && ref != nil && ref.ThreadID != "" {
+			ref, rerr := readCodexThreadRef(agent.ID, opts.SessionKey)
+			if rerr == nil && ref != nil && ref.ThreadID != "" && opts.Goal == nil && opts.GoalRunID == "" &&
+				codexThreadResetDue(ref, opts.SessionKey, opts.AutomatedTrigger, agent.ID, agent.ResumeIdleDuration(), b.logger) {
+				if dropped, err := dropCodexThreadRefForReset(agent.ID, opts.SessionKey, ref.ThreadID); err != nil {
+					b.logger.Warn("codex reset: remove thread ref failed, resuming",
+						"agent", agent.ID, "thread_id", ref.ThreadID, "err", err)
+				} else if dropped {
+					ref = nil
+				} else {
+					// The ref changed under the lock (a goal got bound):
+					// resume what it points at now.
+					ref, rerr = readCodexThreadRef(agent.ID, opts.SessionKey)
+				}
+			}
+			if rerr == nil && ref != nil && ref.ThreadID != "" {
 				existingRef = ref
 				resumeParams := buildCodexResumeParams(threadParams, ref.ThreadID)
 				threadStartID = sendRPC("thread/resume", resumeParams)
@@ -644,6 +658,12 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		// backend knows whether thread/resume actually succeeded or
 		// thread/start was used.
 		userMessage = injectSessionContexts(userMessage, opts, resumed)
+		// A fresh thread (first turn, failed resume or kojo's idle-aware
+		// reset) has no history of its own: bootstrap it with the bounded
+		// transcript excerpt, as the claude / agy backends do.
+		if !opts.OneShot && !resumed && opts.FreshSessionContext == "" && opts.RecentMessagesContext != "" {
+			userMessage = injectRecentMessagesContext(userMessage, opts.RecentMessagesContext)
+		}
 
 		// Step 4: Start turn with user message.
 		// System prompt is NOT prepended here — it flows through
