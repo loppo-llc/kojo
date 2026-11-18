@@ -305,6 +305,15 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 		thoughts := newAgyThoughtReader(b.logger)
 		result := parseAgyStream(stdout, b.logger, send, onResult, thoughts.Lookup)
 		thoughts.Close()
+		// The stream is not known to carry every error step; the
+		// transcript does. An error logged after the last response is
+		// this turn's failure, and so is one the transcript cannot rule
+		// out.
+		if result.errorSuperseded {
+			if found, ok := agyTranscriptHasErrorAfter(agyTranscriptPath(result.conversationID), result.lastResponseDone); found || !ok {
+				result.errorSuperseded = false
+			}
+		}
 		waitErr := cmd.Wait()
 		killedAfterResult := false
 		if exitTimer != nil {
@@ -334,6 +343,10 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 			waitErr = nil
 		}
 		processError := classifyAgyError(result, waitErr, stderrBuf.String())
+		if result.errorSuperseded && processError == "" {
+			b.logger.Info("agy: ignored error status superseded by a later response",
+				"agent", agent.ID, "err", result.errorMessage)
+		}
 		// A turn that still produced text does not surface denials as an
 		// error, but keep them in the log so a partial answer is traceable.
 		if len(result.deniedActions) > 0 {
@@ -412,11 +425,18 @@ func agyResumeExtraNotice(extra string) string {
 
 // classifyAgyError turns the outcome of one agy run into the message the
 // user sees, or "" for a successful turn.
+//
+// agy (1.5.11) derives a resumed conversation's result status from its
+// whole trajectory: once any turn logged an ERROR_MESSAGE step (e.g. a
+// retried 503), every later result of that conversation reports
+// status=ERROR with that old error, even though the run finished normally.
+// An ERROR whose run ended with a finished agent_response and streamed no
+// error_message step after it is therefore not this turn's failure.
 func classifyAgyError(res *agyStreamResult, waitErr error, stderr string) string {
 	if res.streamError != "" {
 		return agyHintAuth(res.streamError, stderr)
 	}
-	if res.gotResult && res.status != "SUCCESS" {
+	if res.gotResult && res.status != "SUCCESS" && !res.errorSuperseded {
 		msg := res.errorMessage
 		if msg == "" {
 			msg = "agy run ended with status " + res.status
@@ -483,6 +503,12 @@ type agyStreamResult struct {
 	streamError    string
 	gotResult      bool
 	cancelled      bool
+	// errorSuperseded marks an ERROR result whose error no streamed step
+	// of this run left standing: no error_message step came after the
+	// run's last finished agent_response (step lastResponseDone). See
+	// classifyAgyError.
+	errorSuperseded  bool
+	lastResponseDone int
 }
 
 type agyUsage struct {
@@ -557,6 +583,7 @@ func parseAgyStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool,
 	toolStarted := map[int]bool{}
 	toolDone := map[int]bool{}
 	thoughtDone := map[int]bool{}
+	lastResponseDone, lastErrorStep := -1, -1
 	var thoughtPending []int // agent_response steps whose thought was not readable by DONE
 	emitThought := func(t string) bool {
 		if thinkBuf.Len() > 0 {
@@ -573,6 +600,9 @@ func parseAgyStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool,
 			res.streamError = lastFatalLine
 		}
 		res.cancelled = cancelled
+		res.lastResponseDone = lastResponseDone
+		res.errorSuperseded = res.gotResult && res.status == "ERROR" &&
+			lastResponseDone >= 0 && lastErrorStep < lastResponseDone
 		if !cancelled && res.text == "" && res.response != "" {
 			res.text = res.response
 		}
@@ -620,7 +650,12 @@ func parseAgyStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool,
 				}
 			}
 			switch su.StepType {
+			case "error_message":
+				lastErrorStep = max(lastErrorStep, su.StepIndex)
 			case "agent_response":
+				if su.State == "DONE" {
+					lastResponseDone = max(lastResponseDone, su.StepIndex)
+				}
 				if thought != nil && !thoughtDone[su.StepIndex] && su.ThinkingDelta == "" {
 					convID := su.ConversationID
 					if convID == "" {

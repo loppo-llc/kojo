@@ -151,3 +151,52 @@ func dropAgyConversation(agentDirPath, sessionKey, convID string, logger *slog.L
 	}
 	return true
 }
+
+// agyTranscriptHasErrorAfter reports whether an agy transcript holds an
+// ERROR_MESSAGE step with an index above afterStep. ok=false means the
+// read was inconclusive: the file could not be read, or the tail window
+// did not reach back to afterStep.
+func agyTranscriptHasErrorAfter(path string, afterStep int) (found, ok bool) {
+	if path == "" {
+		return false, false
+	}
+	f, info, err := openStagedAttachment(path)
+	if err != nil {
+		return false, false
+	}
+	defer f.Close()
+	var start int64
+	if info.Size() > agyTranscriptTailReadBytes {
+		start = info.Size() - agyTranscriptTailReadBytes
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return false, false
+	}
+	first := start > 0
+	reached := start == 0
+	err = chathistory.ScanJSONLLines(io.LimitReader(f, agyTranscriptTailReadBytes), func(line []byte) {
+		if first {
+			first = false
+			return
+		}
+		var rec struct {
+			StepIndex int    `json:"step_index"`
+			Type      string `json:"type"`
+		}
+		if json.Unmarshal(line, &rec) != nil {
+			return
+		}
+		if rec.StepIndex <= afterStep {
+			reached = true
+		} else if rec.Type == "ERROR_MESSAGE" {
+			found = true
+		}
+	})
+	if err != nil {
+		return false, false
+	}
+	if found {
+		return true, true
+	}
+	return false, reached
+}
