@@ -269,8 +269,8 @@ func ValidToolModelEffort(tool, model, effort string) bool {
 	switch NormalizeToolName(tool) {
 	case ToolGeminiAPI:
 		// Gemini's thinkingLevel ladder is low/medium/high (see
-		// geminiThinkingLevels for why gemini-4-hydrogen's xhigh is not
-		// on it), and kojo can only set it (as an OpenCode variant) for
+		// geminiThinkingLevels for why gemini-4-neon's and
+		// gemini-4-hydrogen's xhigh is not on it), and kojo can only set it (as an OpenCode variant) for
 		// the models in geminiEffortModels (an empty model means
 		// GeminiDefaultModel). Unknown ids accept no effort rather than
 		// one that would silently not apply.
@@ -282,7 +282,7 @@ func ValidToolModelEffort(tool, model, effort string) bool {
 		}
 		return geminiEffortModels[model] != "" && slices.Contains(geminiThinkingLevels, effort)
 	case ToolGeminiAgy:
-		// agy (1.5.7) takes --effort only for the bare model ids in
+		// agy (1.5.12) takes --effort only for the bare model ids in
 		// agyEffortModels, on the ladder `agy models` lists for the
 		// family: low/medium/high, plus xhigh for agyXhighModels.
 		switch effort {

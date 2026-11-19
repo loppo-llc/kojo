@@ -39,10 +39,10 @@ export const toolModels: Record<string, ToolModelConfig> = {
   // defines for the concrete id (see geminiEffortModels below).
   "gemini-api": {
     default: "gemini-4-argon",
-    models: ["gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash"],
+    models: ["gemini-4-neon", "gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash"],
   },
   // gemini-agy runs the Antigravity CLI (agy) signed in with the operator's
-  // Google account. Ids are agy model slugs (`agy models`, agy 1.5.7);
+  // Google account. Ids are agy model slugs (`agy models`, agy 1.5.12);
   // "" leaves the choice to agy's default (gemini-4-argon on a paid
   // account). agy lists each family per effort level (gemini-4-argon-high,
   // ...); kojo offers the bare id plus the effort selector instead. The list
@@ -50,7 +50,7 @@ export const toolModels: Record<string, ToolModelConfig> = {
   // gpt-oss-120b-medium.
   "gemini-agy": {
     default: "",
-    models: ["gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5", "gpt-oss-120b-medium"],
+    models: ["gemini-4-neon", "gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5", "gpt-oss-120b-medium"],
   },
   // The custom-* backends have no fixed model list: the operator supplies
   // the endpoint and useCustomModels fetches whatever it advertises.
@@ -129,17 +129,18 @@ const claudeMediumDefaultModels = new Set(["opus", "claude-opus-5-5", "haiku", "
 // grokEffortModels / xhighModels.
 const grokEffortModels = new Set(toolModels.grok.models);
 // Gemini thinkingLevel ladder: low/medium/high, API default medium;
-// gemini-4-hydrogen defaults to high. Its xhigh is offered only on agy
-// (agy 1.5.7 lists gemini-4-hydrogen-xhigh): OpenCode, behind gemini-api,
+// gemini-4-neon and gemini-4-hydrogen default to high. Their xhigh is
+// offered only on agy (agy 1.5.12 lists gemini-4-neon-xhigh and
+// gemini-4-hydrogen-xhigh): OpenCode, behind gemini-api,
 // rejects thinkingLevel xhigh. Keep in sync with backend_opencode.go
 // geminiHighDefaultModels and backend_agy.go agyXhighModels.
 // "flash" is the legacy gemini-cli alias for gemini-3.8-flash; the backend
 // resolves it before picking the variant. Keep in sync with
 // internal/agent/backend_opencode.go geminiEffortModels.
-const agyEffortModels = new Set(["", "gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5"]);
+const agyEffortModels = new Set(["", "gemini-4-neon", "gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5"]);
 const geminiEffortModels = new Set([...toolModels["gemini-api"].models, "flash"]);
-const geminiHighDefaultModels = new Set(["gemini-4-hydrogen"]);
-const agyXhighModels = new Set(["gemini-4-hydrogen"]);
+const geminiHighDefaultModels = new Set(["gemini-4-neon", "gemini-4-hydrogen"]);
+const agyXhighModels = new Set(["gemini-4-neon", "gemini-4-hydrogen"]);
 const grokXhighModels = new Set(["grok-4.7", "grok-4.7-build-fast", "grok-4.6"]);
 
 /**

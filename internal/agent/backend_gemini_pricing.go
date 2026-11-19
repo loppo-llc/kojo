@@ -13,12 +13,16 @@ import "time"
 // only, implicit caching only),
 // https://aistudio.google.com/docs/whats-new-gemini-4-hydrogen (Gemini 4
 // Hydrogen, 2026-11-12: flat paid-tier rate with no step-up; also on the
-// free tier, which kojo does not distinguish; implicit caching only) and
+// free tier, which kojo does not distinguish; implicit caching only),
+// https://aistudio.google.com/docs/whats-new-gemini-4-neon (Gemini 4 Neon,
+// 2026-11-18: flat paid-tier rate across the full 1M window with no
+// step-up; paid tier only, implicit caching only) and
 // https://ai.google.dev/gemini-api/docs/generate-content/whats-new-gemini-3.8
 // (gemini-3.8-flash). Output rates include thinking tokens. None of the
 // models has a long-context tier on the Standard tab, so one rate applies
 // to the whole request.
 //
+//	gemini-4-neon                        in $3.00 / out $15.00 / cached $0.15
 //	gemini-4-hydrogen                    in $1.50 / out $7.50  / cached $0.075
 //	gemini-4-carbon,
 //	gemini-4-argon   until 2026-11-30: in $2.00 / out $10.00 / cached $0.10
@@ -36,6 +40,9 @@ type geminiPriceStep struct {
 }
 
 var geminiPriceTable = map[string][]geminiPriceStep{
+	"gemini-4-neon": {
+		{input: 3.00, output: 15.00, cacheRead: 0.15},
+	},
 	"gemini-4-hydrogen": {
 		{input: 1.50, output: 7.50, cacheRead: 0.075},
 	},

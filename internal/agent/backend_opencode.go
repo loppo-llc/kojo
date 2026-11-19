@@ -41,6 +41,7 @@ const GeminiDefaultModel = "gemini-4-argon"
 // "flash" is the legacy gemini-cli alias kept for agents created before
 // the switch; OpenCode has no aliases, so it is resolved here.
 var geminiEffortModels = map[string]string{
+	"gemini-4-neon":     "gemini-4-neon",
 	"gemini-4-hydrogen": "gemini-4-hydrogen",
 	"gemini-4-carbon":   "gemini-4-carbon",
 	"gemini-4-argon":    "gemini-4-argon",
@@ -51,6 +52,7 @@ var geminiEffortModels = map[string]string{
 // geminiModelNames are the display names written into the provider config
 // for the models kojo fully describes.
 var geminiModelNames = map[string]string{
+	"gemini-4-neon":     "Gemini 4 Neon",
 	"gemini-4-hydrogen": "Gemini 4 Hydrogen",
 	"gemini-4-carbon":   "Gemini 4 Carbon",
 	"gemini-4-argon":    "Gemini 4 Argon",
@@ -58,14 +60,16 @@ var geminiModelNames = map[string]string{
 }
 
 // geminiHighDefaultModels are the concrete ids whose API thinkingLevel
-// default is high instead of medium (gemini-4-hydrogen;
+// default is high instead of medium (gemini-4-neon, gemini-4-hydrogen;
+// https://aistudio.google.com/docs/whats-new-gemini-4-neon,
 // https://aistudio.google.com/docs/whats-new-gemini-4-hydrogen). Keep in
 // sync with web toolModels.ts.
-var geminiHighDefaultModels = map[string]bool{"gemini-4-hydrogen": true}
+var geminiHighDefaultModels = map[string]bool{"gemini-4-neon": true, "gemini-4-hydrogen": true}
 
 // geminiThinkingLevels is the thinkingLevel ladder kojo defines as
-// OpenCode variants. gemini-4-hydrogen also takes xhigh on the API, but
-// OpenCode 1.19.3 (the version kojo is verified against) validates
+// OpenCode variants. gemini-4-neon and gemini-4-hydrogen also take xhigh
+// on the API, but OpenCode 1.19.3 (the version kojo is verified against)
+// validates
 // providerOptions.google.thinkingConfig.thinkingLevel against
 // minimal/low/medium/high and fails the turn with "invalid google
 // provider options", so xhigh is not offered here (gemini-agy has it).

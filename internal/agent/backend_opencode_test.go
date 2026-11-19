@@ -161,7 +161,7 @@ func TestBuildGeminiArgs(t *testing.T) {
 }
 
 func TestGeminiModelAndVariant(t *testing.T) {
-	for in, want := range map[string]string{"": GeminiDefaultModel, "flash": "gemini-3.8-flash", "gemini-3.8-flash": "gemini-3.8-flash", "gemini-4-argon": "gemini-4-argon", "gemini-4-carbon": "gemini-4-carbon", "gemini-4-hydrogen": "gemini-4-hydrogen", "custom-x": "custom-x"} {
+	for in, want := range map[string]string{"": GeminiDefaultModel, "flash": "gemini-3.8-flash", "gemini-3.8-flash": "gemini-3.8-flash", "gemini-4-argon": "gemini-4-argon", "gemini-4-carbon": "gemini-4-carbon", "gemini-4-hydrogen": "gemini-4-hydrogen", "gemini-4-neon": "gemini-4-neon", "custom-x": "custom-x"} {
 		if got := resolveGeminiModel(in); got != want {
 			t.Errorf("resolveGeminiModel(%q) = %q, want %q", in, got, want)
 		}
@@ -178,6 +178,9 @@ func TestGeminiModelAndVariant(t *testing.T) {
 		{"gemini-4-hydrogen", "low", "low"},
 		{"gemini-4-hydrogen", "xhigh", "high"},
 		{"gemini-4-hydrogen", "max", "high"},
+		{"gemini-4-neon", "", "high"},
+		{"gemini-4-neon", "medium", "medium"},
+		{"gemini-4-neon", "xhigh", "high"},
 		{"gemini-4-argon", "max", "medium"},
 		{"flash", "low", "low"},
 		{"", "high", "high"},
@@ -226,6 +229,9 @@ func TestValidToolModelEffort_Gemini(t *testing.T) {
 		{"gemini-4-hydrogen", "xhigh", false},
 		{"gemini-4-hydrogen", "high", true},
 		{"gemini-4-hydrogen", "max", false},
+		{"gemini-4-neon", "low", true},
+		{"gemini-4-neon", "high", true},
+		{"gemini-4-neon", "xhigh", false},
 		{"gemini-4-carbon", "xhigh", false},
 		{"", "xhigh", false},
 	}
@@ -247,6 +253,9 @@ func TestValidToolModelEffort_Agy(t *testing.T) {
 		{"gemini-4-hydrogen", "low", true},
 		{"gemini-4-hydrogen", "xhigh", true},
 		{"gemini-4-hydrogen", "max", false},
+		{"gemini-4-neon", "low", true},
+		{"gemini-4-neon", "xhigh", true},
+		{"gemini-4-neon", "max", false},
 		{"gemini-4-carbon", "xhigh", false},
 		{"gpt-oss-120b-medium", "low", false},
 		{"gpt-oss-120b-medium", "", true},
@@ -361,6 +370,10 @@ func TestBuildOpenCodeTurnConfig(t *testing.T) {
 	_, out = decodeOCConfig(t, buildOpenCodeTurnConfig(openCodeTurnConfig{model: "gemini-4-hydrogen", variant: "high"}))
 	if model = jsonPath(out, "provider", "google", "models", "gemini-4-hydrogen"); jsonPath(model, "variants", "xhigh") != nil || jsonPath(model, "variants", "high") == nil {
 		t.Fatalf("hydrogen variants = %v", jsonPath(model, "variants"))
+	}
+	_, out = decodeOCConfig(t, buildOpenCodeTurnConfig(openCodeTurnConfig{model: "gemini-4-neon", variant: "high"}))
+	if model = jsonPath(out, "provider", "google", "models", "gemini-4-neon"); jsonPath(model, "variants", "xhigh") != nil || jsonPath(model, "variants", "high") == nil || jsonPath(model, "name") != "Gemini 4 Neon" {
+		t.Fatalf("neon model = %v", model)
 	}
 
 	// Custom maxOutputTokens and an undescribed model: no variants, no prompt.
