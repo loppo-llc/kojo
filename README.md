@@ -303,7 +303,8 @@ From source: see [Build](#build).
 - `kojo update` — downloads the latest release for this platform, verifies checksums, and swaps the binary in place. Restart the daemon to run the new code.
 - Web UI update banner — applies via `POST /api/v1/system/update` (download, swap, graceful restart).
 - Peer auto-update — a peer that connects to a newer Hub of the same OS/arch downloads that Hub's binary, swaps, and restarts itself.
-- Opt-outs: `--no-update-check` / `KOJO_NO_UPDATE_CHECK=1` (periodic GitHub check), `--no-peer-autoupdate` / `KOJO_NO_PEER_AUTOUPDATE=1` (peer binary pull).
+- Extension packages — checked against their remotes every 6 h (`git ls-remote`); Settings → Extensions shows an "Update available" badge and a per-package **Auto-update** toggle (off by default). Auto-update follows the installed tag/branch and never applies a commit that changes the requested capabilities or needs a newer kojo.
+- Opt-outs: `--no-update-check` / `KOJO_NO_UPDATE_CHECK=1` (periodic GitHub check), `--no-peer-autoupdate` / `KOJO_NO_PEER_AUTOUPDATE=1` (peer binary pull), `KOJO_NO_EXT_UPDATE_CHECK=1` (periodic extension check and auto-update).
 
 Details: [docs/self-update.md](docs/self-update.md).
 
