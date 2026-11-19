@@ -22,7 +22,7 @@ import (
 //   - /api/v1/sessions, /api/v1/sessions/{id}/...    session lifecycle
 //   - /api/v1/info, /api/v1/dirs                     peer info + dir completion
 //   - /api/v1/files, /api/v1/files/view,
-//     /api/v1/files/raw                              file browser tab
+//     /api/v1/files/raw, /api/v1/files/content       file browser tab
 //   - /api/v1/upload                                 file attach
 //   - /api/v1/git/status, /api/v1/git/log,
 //     /api/v1/git/diff, /api/v1/git/exec             git tab
@@ -60,6 +60,7 @@ func isPeerProxyPath(p string) bool {
 	switch p {
 	case "/api/v1/info", "/api/v1/dirs", "/api/v1/upload",
 		"/api/v1/files", "/api/v1/files/view", "/api/v1/files/raw", "/api/v1/files/thumb",
+		"/api/v1/files/content",
 		"/api/v1/git/status", "/api/v1/git/log", "/api/v1/git/diff", "/api/v1/git/exec":
 		return true
 	}

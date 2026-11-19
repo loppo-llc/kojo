@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -40,17 +41,41 @@ const GeminiDefaultModel = "gemini-4-argon"
 // "flash" is the legacy gemini-cli alias kept for agents created before
 // the switch; OpenCode has no aliases, so it is resolved here.
 var geminiEffortModels = map[string]string{
-	"gemini-4-argon":   "gemini-4-argon",
-	"gemini-3.8-flash": "gemini-3.8-flash",
-	"flash":            "gemini-3.8-flash",
+	"gemini-4-neon":     "gemini-4-neon",
+	"gemini-4-hydrogen": "gemini-4-hydrogen",
+	"gemini-4-carbon":   "gemini-4-carbon",
+	"gemini-4-argon":    "gemini-4-argon",
+	"gemini-3.8-flash":  "gemini-3.8-flash",
+	"flash":             "gemini-3.8-flash",
 }
 
 // geminiModelNames are the display names written into the provider config
 // for the models kojo fully describes.
 var geminiModelNames = map[string]string{
-	"gemini-4-argon":   "Gemini 4 Argon",
-	"gemini-3.8-flash": "Gemini 3.8 Flash",
+	"gemini-4-neon":     "Gemini 4 Neon",
+	"gemini-4-hydrogen": "Gemini 4 Hydrogen",
+	"gemini-4-carbon":   "Gemini 4 Carbon",
+	"gemini-4-argon":    "Gemini 4 Argon",
+	"gemini-3.8-flash":  "Gemini 3.8 Flash",
 }
+
+// geminiHighDefaultModels are the concrete ids whose API thinkingLevel
+// default is high instead of medium (gemini-4-neon, gemini-4-hydrogen;
+// https://aistudio.google.com/docs/whats-new-gemini-4-neon,
+// https://aistudio.google.com/docs/whats-new-gemini-4-hydrogen). Keep in
+// sync with web toolModels.ts.
+var geminiHighDefaultModels = map[string]bool{"gemini-4-neon": true, "gemini-4-hydrogen": true}
+
+// geminiThinkingLevels is the thinkingLevel ladder kojo defines as
+// OpenCode variants. gemini-4-neon and gemini-4-hydrogen also take xhigh
+// on the API, but OpenCode 1.19.3 (the version kojo is verified against)
+// validates
+// providerOptions.google.thinkingConfig.thinkingLevel against
+// minimal/low/medium/high and fails the turn with "invalid google
+// provider options", so xhigh is not offered here (gemini-agy has it).
+// Revisit when kojo moves to an OpenCode release whose google provider
+// accepts xhigh.
+var geminiThinkingLevels = []string{"low", "medium", "high"}
 
 // geminiSessionIDPattern matches OpenCode session ids ("ses_" + 12 hex
 // timestamp digits + 14 base62 characters). Every value read back from a
@@ -411,16 +436,20 @@ func EffectiveGeminiMaxOutputTokens(v int) int {
 }
 
 // geminiVariant maps kojo's effort onto the OpenCode variant kojo defines
-// for the model. An empty effort still selects "medium" (the API default)
+// for the model. An empty (or unsupported) effort still selects the
+// model's API default (medium, or high for geminiHighDefaultModels)
 // explicitly, so the request always carries a thinking config kojo chose.
 // Returns "" for models kojo does not describe (no variants defined).
 func geminiVariant(model, effort string) string {
-	if geminiModelNames[resolveGeminiModel(model)] == "" {
+	concrete := resolveGeminiModel(model)
+	if geminiModelNames[concrete] == "" {
 		return ""
 	}
-	switch effort {
-	case "low", "medium", "high":
+	if slices.Contains(geminiThinkingLevels, effort) {
 		return effort
+	}
+	if geminiHighDefaultModels[concrete] {
+		return "high"
 	}
 	return "medium"
 }
@@ -774,7 +803,7 @@ func buildOpenCodeTurnConfig(t openCodeTurnConfig) map[string]any {
 		modelDef["attachment"] = true
 		modelDef["temperature"] = true
 		variants := map[string]any{}
-		for _, lvl := range []string{"low", "medium", "high"} {
+		for _, lvl := range geminiThinkingLevels {
 			variants[lvl] = map[string]any{
 				"thinkingConfig": map[string]any{"includeThoughts": true, "thinkingLevel": lvl},
 			}

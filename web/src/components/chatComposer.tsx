@@ -144,15 +144,17 @@ export function LoadMoreButton({
   );
 }
 
-/** Quiet icon button that opens the file picker; shows a spinner while uploading. */
+/**
+ * Quiet icon button that opens the file picker. It deliberately has no
+ * upload state: the picker stays usable while earlier files are still
+ * uploading, and SendButton's `busy` spinner carries the progress instead.
+ */
 export function AttachButton({
   onClick,
-  uploading,
   disabled,
   title,
 }: {
   onClick: () => void;
-  uploading: boolean;
   disabled?: boolean;
   title?: string;
 }) {
@@ -165,17 +167,20 @@ export function AttachButton({
       title={title ?? t("composer.attachFiles")}
       aria-label={t("composer.attachFiles")}
     >
-      {uploading ? (
-        <svg className="h-5 w-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-        </svg>
-      ) : (
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5">
-          <path fillRule="evenodd" d="M15.621 4.379a3 3 0 00-4.242 0l-7 7a3 3 0 004.241 4.243h.001l.497-.5a.75.75 0 011.064 1.057l-.498.501-.002.002a4.5 4.5 0 01-6.364-6.364l7-7a4.5 4.5 0 016.368 6.36l-3.455 3.553A2.625 2.625 0 119.52 9.52l3.45-3.451a.75.75 0 111.061 1.06l-3.45 3.451a1.125 1.125 0 001.587 1.595l3.454-3.553a3 3 0 000-4.242z" clipRule="evenodd" />
-        </svg>
-      )}
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5">
+        <path fillRule="evenodd" d="M15.621 4.379a3 3 0 00-4.242 0l-7 7a3 3 0 004.241 4.243h.001l.497-.5a.75.75 0 011.064 1.057l-.498.501-.002.002a4.5 4.5 0 01-6.364-6.364l7-7a4.5 4.5 0 016.368 6.36l-3.455 3.553A2.625 2.625 0 119.52 9.52l3.45-3.451a.75.75 0 111.061 1.06l-3.45 3.451a1.125 1.125 0 001.587 1.595l3.454-3.553a3 3 0 000-4.242z" clipRule="evenodd" />
+      </svg>
     </button>
+  );
+}
+
+/** The shared 20px spinner glyph. */
+function Spinner() {
+  return (
+    <svg className="h-5 w-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+    </svg>
   );
 }
 
@@ -212,10 +217,7 @@ export function MicButton({
       }
     >
       {connecting ? (
-        <svg className="h-5 w-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-        </svg>
+        <Spinner />
       ) : (
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5">
           <path d="M10 2a3 3 0 00-3 3v5a3 3 0 006 0V5a3 3 0 00-3-3z" />
@@ -226,28 +228,46 @@ export function MicButton({
   );
 }
 
-/** 36px copper circular send button (arrow-up). Quiet/faint when disabled. */
+/**
+ * 36px copper circular send button (arrow-up). Quiet/faint when disabled.
+ * `busy` (attachments still uploading) swaps the arrow for a copper spinner
+ * on a tinted ring and blocks the click — sending then would drop the
+ * in-flight files.
+ */
 export function SendButton({
   onClick,
   disabled,
+  busy,
   title,
 }: {
   onClick: () => void;
   disabled?: boolean;
+  busy?: boolean;
   title?: string;
 }) {
   const t = useT();
+  const label = busy ? t("composer.uploading") : t("composer.send");
   return (
     <button
       onClick={onClick}
-      disabled={disabled}
-      title={title ?? t("composer.send")}
-      aria-label={t("composer.send")}
-      className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-copper text-[#14100b] transition-colors hover:bg-copper-bright disabled:cursor-not-allowed disabled:bg-raised disabled:text-ink-faint"
+      disabled={disabled || busy}
+      title={busy ? label : title ?? label}
+      aria-label={label}
+      aria-busy={busy || undefined}
+      className={
+        "flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors " +
+        (busy
+          ? "cursor-wait bg-copper/15 text-copper ring-1 ring-copper/40"
+          : "bg-copper text-[#14100b] hover:bg-copper-bright disabled:cursor-not-allowed disabled:bg-raised disabled:text-ink-faint")
+      }
     >
-      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
-        <path d="M10 16V4M5 9l5-5 5 5" />
-      </svg>
+      {busy ? (
+        <Spinner />
+      ) : (
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
+          <path d="M10 16V4M5 9l5-5 5 5" />
+        </svg>
+      )}
     </button>
   );
 }

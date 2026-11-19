@@ -24,6 +24,7 @@ export function FileBrowser({ embedded, initialPath, peerId }: FileBrowserProps 
         entries: result.entries,
       })),
     view: (path: string) => api.files.view(path, peerId),
+    save: (path: string, content: string, etag: string) => api.files.save(path, content, etag, peerId),
     rawUrl: (path: string, download?: boolean) => api.files.rawUrl(path, download, peerId),
     thumbUrl: (path: string, size?: number, v?: string) => api.files.thumbUrl(path, size, v, peerId),
   }), [peerId]);

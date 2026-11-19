@@ -85,6 +85,64 @@ func (s *Server) handleViewFile(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, result)
 }
 
+// fileWriteBodyCap bounds the JSON body of a text-file save. The file
+// itself is capped at 1 MiB by filebrowser; JSON escaping can inflate
+// that up to ~6x (\uXXXX for control characters), so allow headroom.
+const fileWriteBodyCap = 8 << 20
+
+type fileWriteRequest struct {
+	Content string `json:"content"`
+}
+
+// readFileWrite parses the shared preamble of the global and agent-scoped
+// text-save endpoints: a mandatory, non-wildcard If-Match carrying the
+// etag the viewer loaded, and the JSON body. On failure it has already
+// written the response.
+func (s *Server) readFileWrite(w http.ResponseWriter, r *http.Request) (ifMatch, content string, ok bool) {
+	ifMatch, present, ok := s.parseIfMatchStrict(w, r, "If-Match wildcard is not supported for file saves")
+	if !ok {
+		return "", "", false
+	}
+	if !present {
+		writeError(w, http.StatusPreconditionRequired, "precondition_required",
+			"If-Match with the etag from the view response is required")
+		return "", "", false
+	}
+	var req fileWriteRequest
+	if !readCappedJSON(w, r, fileWriteBodyCap, "request body too large", "invalid JSON body", &req) {
+		return "", "", false
+	}
+	return ifMatch, req.Content, true
+}
+
+// writeFileSaveError maps a filebrowser.WriteText error: etag mismatch →
+// 412, everything else follows the view endpoint's ladder.
+func writeFileSaveError(w http.ResponseWriter, err error) {
+	if errors.Is(err, filebrowser.ErrETagMismatch) {
+		writeError(w, http.StatusPreconditionFailed, "precondition_failed", err.Error())
+		return
+	}
+	writeFileViewError(w, err)
+}
+
+// handleWriteFile saves an edited text file (the file viewer's editor).
+// Owner (and trusted peer, for the remote session file tab) only — see
+// auth policy.
+func (s *Server) handleWriteFile(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	ifMatch, content, ok := s.readFileWrite(w, r)
+	if !ok {
+		return
+	}
+	view, err := s.files.WriteText(path, content, ifMatch)
+	if err != nil {
+		writeFileSaveError(w, err)
+		return
+	}
+	w.Header().Set("ETag", quoteETag(view.ETag))
+	writeJSONResponse(w, http.StatusOK, view)
+}
+
 func (s *Server) handleRawFile(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	if r.URL.Query().Get("download") == "1" {

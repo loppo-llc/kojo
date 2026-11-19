@@ -149,7 +149,7 @@ export function GroupDMChat() {
     fileInputRef,
     handleFileSelect,
     removePendingFile,
-  } = useFileUpload();
+  } = useFileUpload(undefined, id ?? `draft:${draftAgentId ?? ""}`);
 
   // Reset send-error + textarea height when id changes. The draft text
   // itself is restored by useDraftInput.
@@ -503,6 +503,9 @@ export function GroupDMChat() {
     const files = command === undefined ? pendingFiles : [];
     const text = command ?? (goalMode && !awaitingReply && input.trim() ? "!goal " + (goalBudget ? "--tokens " + goalBudget + " " : "") + input.trim() : input.trim());
     if ((!text && files.length === 0) || sending) return;
+    // Files still uploading would miss this message; SendButton shows a
+    // spinner meanwhile and this covers the Enter-key path too.
+    if (uploading && command === undefined) return;
     if (!id && !isDraft) return;
     if (isDraft && !draftAgentId) return;
     setSending(true);
@@ -613,7 +616,7 @@ export function GroupDMChat() {
     } finally {
       setSending(false);
     }
-  }, [goalBudget, goalMode, id, isDraft, draftAgentId, navigate, input, pendingFiles, sending, awaitingReply, clearDraft, setPendingFiles, setUploadError, textareaRef]);
+  }, [goalBudget, goalMode, id, isDraft, draftAgentId, navigate, input, pendingFiles, sending, uploading, awaitingReply, clearDraft, setPendingFiles, setUploadError, textareaRef]);
 
   // Stop the in-flight thread turn. The partial reply lands through the
   // normal message poll (server persists it with interrupted=true), so no
@@ -1105,8 +1108,7 @@ export function GroupDMChat() {
           />
           <AttachButton
             onClick={() => fileInputRef.current?.click()}
-            uploading={uploading}
-            disabled={uploading || sending}
+            disabled={sending}
           />
           {isThread && threadAgentTool === "codex" && group?.members[0] && <GoalControls agentId={group.members[0].agentId} sessionKey={id ? "groupdm:"+id : null} enabled={goalMode} onToggle={setGoalMode} budget={goalBudget} onBudget={setGoalBudget} running={awaitingReply} onCommand={(command) => void handleSend(command)} />}
           <div className="min-w-0 flex-1 rounded-xl border border-hairline bg-raised px-1 focus-within:border-copper/50">
@@ -1130,6 +1132,7 @@ export function GroupDMChat() {
           {awaitingReply && !isDraft && <StopButton onClick={handleStop} />}
           <SendButton
             onClick={() => void handleSend()}
+            busy={uploading}
             disabled={(!input.trim() && pendingFiles.length === 0) || sending}
           />
         </div>
