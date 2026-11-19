@@ -5,6 +5,8 @@ import {
   installExtension,
   updateExtension,
   setExtensionEnabled,
+  setExtensionAutoUpdate,
+  checkExtensionUpdates,
   removeExtension,
   getExtensionSchema,
   setExtensionConfig,
@@ -14,6 +16,7 @@ import {
   type InstalledExtension,
   type ExtensionPreview,
   type ExtensionServiceStatus,
+  type ExtensionUpdateStatus,
   type JSONSchema,
 } from "../../lib/extensionsApi";
 import { agentApi, type AgentInfo } from "../../lib/agentApi";
@@ -25,6 +28,7 @@ import { Input } from "../ui/Input";
 import { Button } from "../ui/Button";
 import { Toggle } from "../ui/Toggle";
 import { Banner } from "../ui/Banner";
+import { RelTime } from "../ui/RelTime";
 import { SchemaForm } from "./SchemaForm";
 
 /**
@@ -50,6 +54,9 @@ export function ExtensionsSection({
   const t = useT();
   const [items, setItems] = useState<InstalledExtension[]>([]);
   const [services, setServices] = useState<ExtensionServiceStatus[]>([]);
+  const [updates, setUpdates] = useState<
+    Record<string, ExtensionUpdateStatus>
+  >({});
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [url, setUrl] = useState("");
   const [ref, setRef] = useState("");
@@ -62,6 +69,7 @@ export function ExtensionsSection({
       .then((res) => {
         setItems(res.extensions);
         setServices(res.services);
+        setUpdates(res.updates);
       })
       .catch((err) => setError(errMsg(err)));
     // Installing, enabling or removing a package can change which UI
@@ -72,6 +80,17 @@ export function ExtensionsSection({
 
   useEffect(() => {
     reload();
+  }, [reload]);
+
+  // The background update pass can swap a checkout while this page sits
+  // open in another tab. The web app does not subscribe to server events,
+  // so re-read the list when the tab comes back into view instead.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === "visible") reload();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
   }, [reload]);
 
   // The agent roster drives the per-agent enablement list. Loaded once:
@@ -233,9 +252,25 @@ export function ExtensionsSection({
         )}
 
         <div className="space-y-2">
-          <h4 className="text-[12px] font-medium text-ink-dim">
-            {t("gs.extInstalled")}
-          </h4>
+          <div className="flex items-center justify-between gap-2">
+            <h4 className="text-[12px] font-medium text-ink-dim">
+              {t("gs.extInstalled")}
+            </h4>
+            {items.length > 0 && (
+              <Button
+                onClick={() =>
+                  void withBusy(async () => {
+                    setUpdates(await checkExtensionUpdates());
+                    // Nothing was saved; a "saved" flash would mislead.
+                    return false;
+                  })
+                }
+                disabled={busy}
+              >
+                {t("gs.extCheckUpdates")}
+              </Button>
+            )}
+          </div>
           {items.length === 0 && (
             <p className="text-sm text-ink-faint">{t("gs.extNone")}</p>
           )}
@@ -245,6 +280,7 @@ export function ExtensionsSection({
               ext={ext}
               agents={agents}
               services={services}
+              update={updates[ext.id]}
               busy={busy}
               expanded={expanded === ext.id}
               onToggleExpand={() =>
@@ -252,6 +288,9 @@ export function ExtensionsSection({
               }
               onSetEnabled={(v) =>
                 void withBusy(() => setExtensionEnabled(ext.id, v))
+              }
+              onSetAutoUpdate={(v) =>
+                void withBusy(() => setExtensionAutoUpdate(ext.id, v))
               }
               onSetAgentBinding={(agentId, enabled) =>
                 void withBusy(() =>
@@ -366,10 +405,12 @@ function ExtensionRow({
   ext,
   agents,
   services,
+  update,
   busy,
   expanded,
   onToggleExpand,
   onSetEnabled,
+  onSetAutoUpdate,
   onSetAgentBinding,
   onUpdate,
   onRemove,
@@ -379,10 +420,12 @@ function ExtensionRow({
   ext: InstalledExtension;
   agents: AgentInfo[];
   services: ExtensionServiceStatus[];
+  update?: ExtensionUpdateStatus;
   busy: boolean;
   expanded: boolean;
   onToggleExpand: () => void;
   onSetEnabled: (v: boolean) => void;
+  onSetAutoUpdate: (v: boolean) => void;
   onSetAgentBinding: (agentId: string, enabled: boolean) => void;
   onUpdate: () => void;
   onRemove: () => void;
@@ -407,35 +450,58 @@ function ExtensionRow({
   return (
     <div className="rounded-[10px] border border-hairline bg-raised p-3">
       <div className="flex items-start justify-between gap-3">
+        {/* The whole header (not just the text) toggles the details, and
+            the chevron says there is something to open or close. */}
         <button
           type="button"
-          className="min-w-0 text-left"
+          className="group flex min-w-0 flex-1 items-start gap-2 text-left"
           onClick={onToggleExpand}
           aria-expanded={expanded}
+          title={expanded ? t("dash.collapse") : t("dash.expand")}
         >
-          <div className="text-sm font-medium text-ink">
-            {ext.manifest.name}{" "}
-            <span className="font-normal text-ink-dim">
-              {ext.manifest.version}
-            </span>
-          </div>
-          <div className="truncate font-mono text-[12px] text-ink-faint">
-            {ext.id} · {ext.commit.slice(0, 7)}
-            {ext.ref ? ` · ${ext.ref}` : ""}
-          </div>
-          {service && (
-            <div className="mt-1 flex items-center gap-1.5 text-[12px] text-ink-dim">
-              <span
-                aria-hidden
-                className={`inline-block h-1.5 w-1.5 rounded-full ${
-                  running.length > 0 ? "bg-emerald-500" : "bg-ink-faint"
-                }`}
-              />
-              {running.length > 0
-                ? `${t("gs.extServiceRunning")}${running.length > 1 ? ` (${running.length})` : ""}`
-                : t("gs.extServiceStopped")}
+          <svg
+            aria-hidden
+            className={`mt-1 h-3 w-3 shrink-0 text-ink-faint transition-transform group-hover:text-ink-dim motion-reduce:transition-none ${expanded ? "rotate-90" : ""}`}
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth={2}
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+          </svg>
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-medium text-ink">
+              {ext.manifest.name}{" "}
+              <span className="font-normal text-ink-dim">
+                {ext.manifest.version}
+              </span>
+              {update?.available && (
+                <span
+                  className="ml-1.5 inline-flex items-center whitespace-nowrap rounded-full border border-copper/50 px-1.5 align-middle text-[10.5px] font-normal text-copper"
+                  title={update.latest}
+                >
+                  {t("gs.extUpdateAvailable")}
+                </span>
+              )}
             </div>
-          )}
+            <div className="truncate font-mono text-[12px] text-ink-faint">
+              {ext.id} · {ext.commit.slice(0, 7)}
+              {ext.ref ? ` · ${ext.ref}` : ""}
+            </div>
+            {service && (
+              <div className="mt-1 flex items-center gap-1.5 text-[12px] text-ink-dim">
+                <span
+                  aria-hidden
+                  className={`inline-block h-1.5 w-1.5 rounded-full ${
+                    running.length > 0 ? "bg-emerald-500" : "bg-ink-faint"
+                  }`}
+                />
+                {running.length > 0
+                  ? `${t("gs.extServiceRunning")}${running.length > 1 ? ` (${running.length})` : ""}`
+                  : t("gs.extServiceStopped")}
+              </div>
+            )}
+          </div>
         </button>
         <Toggle
           checked={ext.enabled}
@@ -474,6 +540,12 @@ function ExtensionRow({
             />
           )}
           <ExtensionTokenPanel ext={ext} setError={setError} />
+          <ExtensionUpdatePanel
+            ext={ext}
+            update={update}
+            busy={busy}
+            onSetAutoUpdate={onSetAutoUpdate}
+          />
           <div className="flex gap-2">
             <Button onClick={onUpdate} disabled={busy}>
               {t("gs.extUpdate")}
@@ -483,6 +555,72 @@ function ExtensionRow({
             </Button>
           </div>
         </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Update status and the auto-update opt-in. Auto-update follows the
+ * package's ref (branch, tag, or the default branch); a ref pinned to
+ * a commit has nothing to follow.
+ */
+function ExtensionUpdatePanel({
+  ext,
+  update,
+  busy,
+  onSetAutoUpdate,
+}: {
+  ext: InstalledExtension;
+  update?: ExtensionUpdateStatus;
+  busy: boolean;
+  onSetAutoUpdate: (v: boolean) => void;
+}) {
+  const t = useT();
+  let state: string;
+  if (!update) state = t("gs.extUpdateNotChecked");
+  else if (update.error) state = t("gs.extUpdateCheckFailed");
+  else if (update.pinned) state = t("gs.extUpdatePinned");
+  else if (update.available)
+    state = t("gs.extUpdateAvailableCommit", {
+      commit: (update.latest ?? "").slice(0, 7),
+    });
+  else state = t("gs.extUpdateUpToDate");
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-[12px] font-medium text-ink-dim">
+            {t("gs.extAutoUpdate")}
+          </div>
+          <p className="text-[12px] text-ink-faint">
+            {t("gs.extAutoUpdateHelp")}
+          </p>
+        </div>
+        <Toggle
+          checked={ext.autoUpdate === true}
+          disabled={busy}
+          aria-label={t("gs.extAutoUpdate")}
+          onChange={onSetAutoUpdate}
+        />
+      </div>
+      <div className="flex items-center gap-2 text-[12px] text-ink-dim">
+        <span>{state}</span>
+        {update?.checkedAt && <RelTime value={update.checkedAt} />}
+      </div>
+      {update?.error && (
+        <p className="break-all font-mono text-[11px] text-ink-faint">
+          {update.error}
+        </p>
+      )}
+      {ext.autoUpdate && update?.needsConsent && (
+        <Banner tone="warn">{t("gs.extAutoUpdateNeedsConsent")}</Banner>
+      )}
+      {ext.autoUpdate && update?.autoError && !update.needsConsent && (
+        <Banner tone="warn">
+          {t("gs.extAutoUpdateFailed", { error: update.autoError })}
+        </Banner>
       )}
     </div>
   );

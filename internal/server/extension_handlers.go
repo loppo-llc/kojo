@@ -88,6 +88,38 @@ func (s *Server) handleListExtensions(w http.ResponseWriter, r *http.Request) {
 		// rows because it is runtime state, not registry state: a
 		// package can be enabled and still have a crashing service.
 		"services": services,
+		// What the last upstream check found per package (see
+		// extpkg/updatecheck.go). Absent IDs have not been checked.
+		"updates": mgr.UpdateStatuses(),
+	})
+}
+
+// extensionCheckTimeout bounds one package's ls-remote. Much shorter
+// than extensionGitTimeout: it moves no objects, and the manual check
+// runs every package inside one request.
+const extensionCheckTimeout = 30 * time.Second
+
+// handleCheckExtensionUpdates asks every package's remote whether its
+// ref has moved and returns the result. It only checks: applying is
+// the per-package update route, or the periodic pass for packages that
+// opted into auto-update.
+func (s *Server) handleCheckExtensionUpdates(w http.ResponseWriter, r *http.Request) {
+	mgr, ok := s.requireExtensions(w)
+	if !ok {
+		return
+	}
+	if err := mgr.CheckUpdates(r.Context(), extensionCheckTimeout); err != nil {
+		if errors.Is(err, extpkg.ErrCheckBusy) {
+			writeError(w, http.StatusServiceUnavailable, "busy", "an update check is already running; try again shortly")
+			return
+		}
+		// The client went away mid-pass; whatever was recorded stays.
+		writeError(w, http.StatusServiceUnavailable, "cancelled", err.Error())
+		return
+	}
+	s.PublishEvent(eventbus.Event{Table: "extensions", Op: "update"})
+	writeJSONResponse(w, http.StatusOK, map[string]any{
+		"updates": mgr.UpdateStatuses(),
 	})
 }
 
@@ -220,23 +252,25 @@ func (s *Server) handleUpdateExtension(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, row)
 }
 
-// handlePatchExtension toggles a package's global enablement.
+// handlePatchExtension toggles a package's global enablement and/or
+// its auto-update opt-in.
 func (s *Server) handlePatchExtension(w http.ResponseWriter, r *http.Request) {
 	mgr, ok := s.requireExtensions(w)
 	if !ok {
 		return
 	}
 	var req struct {
-		Enabled *bool `json:"enabled"`
+		Enabled    *bool `json:"enabled"`
+		AutoUpdate *bool `json:"autoUpdate"`
 	}
 	if !decodeJSONBody(w, r, &req) {
 		return
 	}
-	if req.Enabled == nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "enabled is required")
+	if req.Enabled == nil && req.AutoUpdate == nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "enabled or autoUpdate is required")
 		return
 	}
-	row, err := mgr.SetEnabled(r.PathValue("id"), *req.Enabled)
+	row, err := mgr.SetFlags(r.PathValue("id"), req.Enabled, req.AutoUpdate)
 	if err != nil {
 		writeExtensionError(w, err)
 		return

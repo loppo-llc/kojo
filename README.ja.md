@@ -303,7 +303,8 @@ curl -fsSL https://raw.githubusercontent.com/loppo-llc/kojo/main/scripts/install
 - `kojo update` — このプラットフォーム向けの最新リリースを取得し、チェックサム検証のうえバイナリをその場で差し替える。新コードを動かすにはデーモンの再起動が必要。
 - Web UI の更新バナー — `POST /api/v1/system/update` でダウンロード・差し替え・グレースフル再起動まで行う。
 - ピア自動更新 — 同 OS/arch の新しい Hub に接続したピアは、Hub のバイナリを取得して差し替え、自身を再起動する。
-- 無効化: `--no-update-check` / `KOJO_NO_UPDATE_CHECK=1`（定期 GitHub チェック）、`--no-peer-autoupdate` / `KOJO_NO_PEER_AUTOUPDATE=1`（ピアからのバイナリ取得）。
+- 拡張パッケージ — 6 時間ごとに各リモートを確認 (`git ls-remote`)。設定 → 拡張機能に「更新あり」表示と、パッケージごとの **自動更新** トグル（既定オフ）。自動更新は導入時のタグ / ブランチを追従し、要求権限が変わるコミットや新しい kojo が必要なコミットは自動では入れない。
+- 無効化: `--no-update-check` / `KOJO_NO_UPDATE_CHECK=1`（定期 GitHub チェック）、`--no-peer-autoupdate` / `KOJO_NO_PEER_AUTOUPDATE=1`（ピアからのバイナリ取得）、`KOJO_NO_EXT_UPDATE_CHECK=1`（拡張の定期確認と自動更新）。
 
 詳細: [docs/self-update.md](docs/self-update.md)（英語）。
 

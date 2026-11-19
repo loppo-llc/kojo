@@ -1670,6 +1670,32 @@ const messages = {
     ja: "このエージェント向けの設定",
     en: "Settings for this agent",
   },
+  "gs.extCheckUpdates": { ja: "更新を確認", en: "Check for updates" },
+  "gs.extUpdateAvailable": { ja: "更新あり", en: "Update available" },
+  "gs.extUpdateAvailableCommit": {
+    ja: "更新あり ({commit})",
+    en: "Update available ({commit})",
+  },
+  "gs.extUpdateUpToDate": { ja: "最新", en: "Up to date" },
+  "gs.extUpdateNotChecked": { ja: "未確認", en: "Not checked yet" },
+  "gs.extUpdateCheckFailed": { ja: "更新確認に失敗", en: "Update check failed" },
+  "gs.extUpdatePinned": {
+    ja: "コミット固定のため更新なし",
+    en: "Pinned to a commit; nothing to follow",
+  },
+  "gs.extAutoUpdate": { ja: "自動更新", en: "Auto-update" },
+  "gs.extAutoUpdateHelp": {
+    ja: "導入時のタグ / ブランチが進んだら自動で更新する (数時間ごとに確認)。権限が変わる更新は自動では入れない",
+    en: "Update automatically when the installed tag / branch moves (checked every few hours). Updates that change capabilities are never applied automatically",
+  },
+  "gs.extAutoUpdateNeedsConsent": {
+    ja: "この更新は権限の変更を含むため自動では入れていない。「更新」から内容を承認して",
+    en: "This update changes the requested capabilities, so it was not applied automatically. Use Update to approve it",
+  },
+  "gs.extAutoUpdateFailed": {
+    ja: "自動更新できなかった: {error}",
+    en: "Auto-update failed: {error}",
+  },
   "gs.extServiceRunning": { ja: "サービス稼働中", en: "Service running" },
   "gs.extServiceStopped": { ja: "サービス停止中", en: "Service not running" },
   "gs.extToken": { ja: "アクセストークン", en: "Access token" },
