@@ -450,43 +450,58 @@ function ExtensionRow({
   return (
     <div className="rounded-[10px] border border-hairline bg-raised p-3">
       <div className="flex items-start justify-between gap-3">
+        {/* The whole header (not just the text) toggles the details, and
+            the chevron says there is something to open or close. */}
         <button
           type="button"
-          className="min-w-0 text-left"
+          className="group flex min-w-0 flex-1 items-start gap-2 text-left"
           onClick={onToggleExpand}
           aria-expanded={expanded}
+          title={expanded ? t("dash.collapse") : t("dash.expand")}
         >
-          <div className="text-sm font-medium text-ink">
-            {ext.manifest.name}{" "}
-            <span className="font-normal text-ink-dim">
-              {ext.manifest.version}
-            </span>
-            {update?.available && (
-              <span
-                className="ml-1.5 inline-flex items-center whitespace-nowrap rounded-full border border-copper/50 px-1.5 align-middle text-[10.5px] font-normal text-copper"
-                title={update.latest}
-              >
-                {t("gs.extUpdateAvailable")}
+          <svg
+            aria-hidden
+            className={`mt-1 h-3 w-3 shrink-0 text-ink-faint transition-transform group-hover:text-ink-dim motion-reduce:transition-none ${expanded ? "rotate-90" : ""}`}
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth={2}
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+          </svg>
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-medium text-ink">
+              {ext.manifest.name}{" "}
+              <span className="font-normal text-ink-dim">
+                {ext.manifest.version}
               </span>
+              {update?.available && (
+                <span
+                  className="ml-1.5 inline-flex items-center whitespace-nowrap rounded-full border border-copper/50 px-1.5 align-middle text-[10.5px] font-normal text-copper"
+                  title={update.latest}
+                >
+                  {t("gs.extUpdateAvailable")}
+                </span>
+              )}
+            </div>
+            <div className="truncate font-mono text-[12px] text-ink-faint">
+              {ext.id} · {ext.commit.slice(0, 7)}
+              {ext.ref ? ` · ${ext.ref}` : ""}
+            </div>
+            {service && (
+              <div className="mt-1 flex items-center gap-1.5 text-[12px] text-ink-dim">
+                <span
+                  aria-hidden
+                  className={`inline-block h-1.5 w-1.5 rounded-full ${
+                    running.length > 0 ? "bg-emerald-500" : "bg-ink-faint"
+                  }`}
+                />
+                {running.length > 0
+                  ? `${t("gs.extServiceRunning")}${running.length > 1 ? ` (${running.length})` : ""}`
+                  : t("gs.extServiceStopped")}
+              </div>
             )}
           </div>
-          <div className="truncate font-mono text-[12px] text-ink-faint">
-            {ext.id} · {ext.commit.slice(0, 7)}
-            {ext.ref ? ` · ${ext.ref}` : ""}
-          </div>
-          {service && (
-            <div className="mt-1 flex items-center gap-1.5 text-[12px] text-ink-dim">
-              <span
-                aria-hidden
-                className={`inline-block h-1.5 w-1.5 rounded-full ${
-                  running.length > 0 ? "bg-emerald-500" : "bg-ink-faint"
-                }`}
-              />
-              {running.length > 0
-                ? `${t("gs.extServiceRunning")}${running.length > 1 ? ` (${running.length})` : ""}`
-                : t("gs.extServiceStopped")}
-            </div>
-          )}
         </button>
         <Toggle
           checked={ext.enabled}
