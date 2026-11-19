@@ -1,6 +1,8 @@
 package filebrowser
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,8 +12,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/atomicfile"
 	"github.com/loppo-llc/kojo/internal/thumbnail"
 )
 
@@ -19,6 +23,10 @@ import (
 var (
 	ErrUnsupportedFile = errors.New("unsupported file type")
 	ErrFileTooLarge    = errors.New("file too large")
+	// ErrETagMismatch is returned by WriteText when the file on disk no
+	// longer matches the etag the editor loaded (someone — typically the
+	// agent itself — wrote it in between).
+	ErrETagMismatch = errors.New("file changed on disk")
 )
 
 const maxFileSize = 1024 * 1024 // 1MB
@@ -64,6 +72,11 @@ var langExts = map[string]string{
 
 type Browser struct {
 	logger *slog.Logger
+	// writeMu serialises WriteText so two editor saves can't interleave
+	// their etag check and rename. Writers outside kojo (the agent CLI)
+	// are not covered; the etag check still catches them unless they land
+	// inside the check→rename window.
+	writeMu sync.Mutex
 }
 
 func New(logger *slog.Logger) *Browser {
@@ -159,6 +172,15 @@ type FileView struct {
 	Mime     string `json:"mime,omitempty"`
 	Size     int64  `json:"size"`
 	URL      string `json:"url,omitempty"`
+	// ETag identifies the text content the viewer loaded; the editor
+	// sends it back as If-Match so a save never clobbers a newer write.
+	ETag string `json:"etag,omitempty"`
+}
+
+// ContentETag returns the etag for a text file body.
+func ContentETag(content []byte) string {
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:16])
 }
 
 func (b *Browser) View(path string) (*FileView, error) {
@@ -212,6 +234,78 @@ func (b *Browser) View(path string) (*FileView, error) {
 		Content:  string(content),
 		Language: lang,
 		Size:     info.Size(),
+		ETag:     ContentETag(content),
+	}, nil
+}
+
+// WriteText overwrites an existing text file with content, but only when
+// the file still matches ifMatch (an etag from View). It is the editor's
+// save path, so it deliberately refuses anything the viewer would not
+// have shown as text: missing files, directories, non-regular files,
+// images, binaries and files over the size cap. Symlinks are followed and
+// the resolved target is replaced (atomically, keeping its permission
+// bits) so the link itself survives.
+func (b *Browser) WriteText(path, content, ifMatch string) (*FileView, error) {
+	if ifMatch == "" {
+		return nil, fmt.Errorf("etag is required")
+	}
+	if len(content) > maxFileSize {
+		return nil, fmt.Errorf("%w: %d bytes (max %d)", ErrFileTooLarge, len(content), maxFileSize)
+	}
+	data := []byte(content)
+	if isBinary(data) {
+		return nil, fmt.Errorf("%w: content contains NUL bytes", ErrUnsupportedFile)
+	}
+	absPath, err := b.resolveValidated(path)
+	if err != nil {
+		return nil, err
+	}
+	target, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("file not found: %w", err)
+	}
+	// Re-validate the resolved target: resolveValidated already does, but
+	// keep the check next to the write so a future refactor can't drop it.
+	if err := b.validatePath(target); err != nil {
+		return nil, err
+	}
+	if _, ok := imageExts[strings.ToLower(filepath.Ext(target))]; ok {
+		return nil, fmt.Errorf("%w: image", ErrUnsupportedFile)
+	}
+
+	b.writeMu.Lock()
+	defer b.writeMu.Unlock()
+
+	info, err := os.Stat(target)
+	if err != nil {
+		return nil, fmt.Errorf("file not found: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: not a regular file", ErrUnsupportedFile)
+	}
+	if info.Size() > maxFileSize {
+		return nil, fmt.Errorf("%w: %d bytes (max %d)", ErrFileTooLarge, info.Size(), maxFileSize)
+	}
+	current, err := os.ReadFile(target)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read file: %w", err)
+	}
+	if isBinary(current) {
+		return nil, fmt.Errorf("%w: binary", ErrUnsupportedFile)
+	}
+	if ContentETag(current) != ifMatch {
+		return nil, ErrETagMismatch
+	}
+	if err := atomicfile.WriteBytes(target, data, info.Mode().Perm()); err != nil {
+		return nil, fmt.Errorf("cannot write file: %w", err)
+	}
+	return &FileView{
+		Path:     absPath,
+		Type:     "text",
+		Content:  content,
+		Language: langExts[strings.ToLower(filepath.Ext(absPath))],
+		Size:     int64(len(data)),
+		ETag:     ContentETag(data),
 	}, nil
 }
 

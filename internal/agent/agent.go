@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -178,6 +179,7 @@ var xhighModels = map[string]bool{
 	// grok-4.5; none offers max. Keep this in sync with
 	// web/src/lib/toolModels.ts xhighModels / grokXhighModels.
 	"grok-4.7": true, "grok-4.7-build-fast": true, "grok-4.6": true,
+	"gpt-6.2-sol": true, "gpt-6.2-astra": true,
 	"gpt-6.1-sol": true, "gpt-6.1-terra": true, "gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 	"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true,
@@ -185,6 +187,7 @@ var xhighModels = map[string]bool{
 }
 
 var codexEffortModels = map[string]bool{
+	"gpt-6.2-sol": true, "gpt-6.2-astra": true,
 	"gpt-6.1-sol": true, "gpt-6.1-terra": true, "gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 	"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true,
@@ -192,14 +195,15 @@ var codexEffortModels = map[string]bool{
 }
 
 // codexMaxEffortModels lists codex models that support the "max" effort
-// level. codex CLI 0.164.0 models_cache.json advertises
-// low/medium/high/xhigh/max for the gpt-6.1 family (sol, terra), the gpt-6
-// family (sol, astra, luna) and the gpt-5.6 family (sol, terra, luna).
-// Within those, gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol and gpt-6-astra, plus
-// gpt-5.6-sol and gpt-5.6-terra, also list "ultra", which kojo's effort scale doesn't
+// level. codex CLI 0.167.0 models_cache.json advertises
+// low/medium/high/xhigh/max for the gpt-6.2 family (sol, astra), the gpt-6.1
+// family (sol, terra), the gpt-6 family (sol, astra, luna) and the gpt-5.6
+// family (sol, terra, luna). Within those, every model except gpt-6-luna and
+// gpt-5.6-luna also lists "ultra", which kojo's effort scale doesn't
 // model. Older gpt-5.x models stop at xhigh. Keep in sync with
 // web/src/lib/toolModels.ts codexMaxModels.
 var codexMaxEffortModels = map[string]bool{
+	"gpt-6.2-sol": true, "gpt-6.2-astra": true,
 	"gpt-6.1-sol": true, "gpt-6.1-terra": true, "gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 }
@@ -264,29 +268,30 @@ func ValidModelEffort(model, effort string) bool {
 func ValidToolModelEffort(tool, model, effort string) bool {
 	switch NormalizeToolName(tool) {
 	case ToolGeminiAPI:
-		// Gemini's thinkingLevel ladder is low/medium/high, and kojo can
-		// only set it (as an OpenCode variant) for the models in
-		// geminiEffortModels (an empty model means GeminiDefaultModel).
-		// Unknown ids accept no effort rather than one that would
-		// silently not apply.
-		switch effort {
-		case "":
+		// Gemini's thinkingLevel ladder is low/medium/high (see
+		// geminiThinkingLevels for why gemini-4-neon's and
+		// gemini-4-hydrogen's xhigh is not on it), and kojo can only set it (as an OpenCode variant) for
+		// the models in geminiEffortModels (an empty model means
+		// GeminiDefaultModel). Unknown ids accept no effort rather than
+		// one that would silently not apply.
+		if effort == "" {
 			return true
-		case "low", "medium", "high":
-			if model == "" {
-				model = GeminiDefaultModel
-			}
-			return geminiEffortModels[model] != ""
 		}
-		return false
+		if model == "" {
+			model = GeminiDefaultModel
+		}
+		return geminiEffortModels[model] != "" && slices.Contains(geminiThinkingLevels, effort)
 	case ToolGeminiAgy:
-		// agy (1.4.8) takes --effort low/medium/high only for the bare
-		// model ids in agyEffortModels.
+		// agy (1.5.12) takes --effort only for the bare model ids in
+		// agyEffortModels, on the ladder `agy models` lists for the
+		// family: low/medium/high, plus xhigh for agyXhighModels.
 		switch effort {
 		case "":
 			return true
 		case "low", "medium", "high":
 			return agyEffortModels[model]
+		case "xhigh":
+			return agyXhighModels[model]
 		}
 		return false
 	case ToolCustomClaude, ToolCustomCodex, ToolCustomBare, ToolCustomOpenCode:

@@ -145,16 +145,18 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(defaultEffortForModel("gpt-5.4")).toBe("medium");
   });
 
-  it("lists exactly the public codex models, newest first, and defaults to gpt-6-astra", () => {
-    // codex CLI 0.164.0 models_cache.json, visibility "list" only —
-    // gpt-6-chat-thinking, gpt-reserve and codex-auto-review are hidden and
-    // stay out. Order follows the cache's priority: gpt-6.1-sol, gpt-6-astra,
-    // gpt-6.1-terra, then gpt-6-sol and gpt-6-luna. The trailing gpt-5.5 and
-    // older are no longer in the cache and stay listed for existing agents.
+  it("lists exactly the public codex models, newest first, and defaults to gpt-6.2-astra", () => {
+    // codex CLI 0.167.0 models_cache.json, visibility "list" only —
+    // gpt-reserve and codex-auto-review are hidden and stay out. Order
+    // follows the cache's priority: gpt-6.2-sol, gpt-6.2-astra, gpt-6.1-sol,
+    // gpt-6.1-terra, gpt-6-astra, gpt-6-sol, gpt-6-luna. The trailing gpt-5.5
+    // and older are no longer in the cache and stay listed for existing agents.
     expect(modelsForTool("codex")).toEqual([
+      "gpt-6.2-sol",
+      "gpt-6.2-astra",
       "gpt-6.1-sol",
-      "gpt-6-astra",
       "gpt-6.1-terra",
+      "gpt-6-astra",
       "gpt-6-sol",
       "gpt-6-luna",
       "gpt-5.6-sol",
@@ -166,18 +168,20 @@ describe("toolModels — Opus 5 / effort defaults", () => {
       "gpt-5.3-codex",
       "gpt-5.2",
     ]);
-    expect(defaultModelForTool("codex")).toBe("gpt-6-astra");
+    expect(defaultModelForTool("codex")).toBe("gpt-6.2-astra");
   });
 
-  it("the gpt-6.1 and gpt-6 families support xhigh and max; gpt-6.1 defaults to low, gpt-6 to medium", () => {
-    // codex CLI 0.164.0 models_cache.json default_reasoning_level.
-    for (const m of ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-astra", "gpt-6-luna"]) {
+  it("the gpt-6.2, gpt-6.1 and gpt-6 families support xhigh and max; astra and 6.1-terra default to low", () => {
+    // codex CLI 0.167.0 models_cache.json default_reasoning_level.
+    for (const m of ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-astra", "gpt-6-luna"]) {
       expect(effortLevelsForModel(m)).toEqual(["low", "medium", "high", "xhigh", "max"]);
     }
-    expect(defaultEffortForModel("gpt-6.1-sol")).toBe("low");
+    expect(defaultEffortForModel("gpt-6.2-sol")).toBe("medium");
+    expect(defaultEffortForModel("gpt-6.2-astra")).toBe("low");
+    expect(defaultEffortForModel("gpt-6.1-sol")).toBe("medium");
     expect(defaultEffortForModel("gpt-6.1-terra")).toBe("low");
     expect(defaultEffortForModel("gpt-6-sol")).toBe("medium");
-    expect(defaultEffortForModel("gpt-6-astra")).toBe("medium");
+    expect(defaultEffortForModel("gpt-6-astra")).toBe("low");
     expect(defaultEffortForModel("gpt-6-luna")).toBe("medium");
   });
 
@@ -198,8 +202,8 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     }
   });
 
-  it("gpt-5.6-sol defaults to low, terra and luna to medium (codex CLI 0.164.0)", () => {
-    expect(defaultEffortForModel("gpt-5.6-sol")).toBe("low");
+  it("the gpt-5.6 family defaults to medium (codex CLI 0.167.0)", () => {
+    expect(defaultEffortForModel("gpt-5.6-sol")).toBe("medium");
     expect(defaultEffortForModel("gpt-5.6-terra")).toBe("medium");
     expect(defaultEffortForModel("gpt-5.6-luna")).toBe("medium");
   });
@@ -222,19 +226,31 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(defaultEffortForModel("grok-4.5")).toBe("high");
   });
 
-  it("gemini lists argon (default) and flash with low/medium/high, default medium", () => {
-    expect(modelsForTool("gemini-api")).toEqual(["gemini-4-argon", "gemini-3.8-flash"]);
+  it("gemini lists carbon, argon (default) and flash with low/medium/high, default medium", () => {
+    expect(modelsForTool("gemini-api")).toEqual(["gemini-4-neon", "gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash"]);
     expect(defaultModelForTool("gemini-api")).toBe("gemini-4-argon");
-    for (const m of ["gemini-4-argon", "gemini-3.8-flash"]) {
+    for (const m of ["gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash"]) {
       expect(effortLevelsForModel(m)).toEqual(["low", "medium", "high"]);
       expect(defaultEffortForModel(m)).toBe("medium");
     }
     expect(effortLevelsForModel("flash")).toEqual(["low", "medium", "high"]);
   });
+
+  it("gemini-4-hydrogen defaults to high; no xhigh on gemini-api (OpenCode rejects it)", () => {
+    expect(effortLevelsForModel("gemini-4-hydrogen", "gemini-api")).toEqual(["low", "medium", "high"]);
+    expect(defaultEffortForModel("gemini-4-hydrogen", "gemini-api")).toBe("high");
+  });
+
+  it("gemini-4-neon defaults to high; no xhigh on gemini-api (OpenCode rejects it)", () => {
+    expect(effortLevelsForModel("gemini-4-neon", "gemini-api")).toEqual(["low", "medium", "high"]);
+    expect(defaultEffortForModel("gemini-4-neon", "gemini-api")).toBe("high");
+  });
 });
 
 describe("sessionEffortLevelsForModel — ultra is session-only", () => {
-  it("adds ultra for gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra", () => {
+  it("adds ultra for the gpt-6.2 family, gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra", () => {
+    expect(sessionEffortLevelsForModel("gpt-6.2-sol").slice(-2)).toEqual(["max", "ultra"]);
+    expect(sessionEffortLevelsForModel("gpt-6.2-astra").slice(-2)).toEqual(["max", "ultra"]);
     expect(sessionEffortLevelsForModel("gpt-6.1-sol").slice(-2)).toEqual(["max", "ultra"]);
     expect(sessionEffortLevelsForModel("gpt-6.1-terra").slice(-2)).toEqual(["max", "ultra"]);
     expect(sessionEffortLevelsForModel("gpt-6-sol")).toContain("ultra");
@@ -255,7 +271,7 @@ describe("sessionEffortLevelsForModel — ultra is session-only", () => {
   });
 
   it("agent-facing effortLevelsForModel never offers ultra", () => {
-    for (const m of ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"]) {
+    for (const m of ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"]) {
       expect(effortLevelsForModel(m)).not.toContain("ultra" as never);
     }
   });
@@ -279,10 +295,12 @@ describe("toolModels — custom backends", () => {
 
 describe("gemini-agy", () => {
   it("offers low/medium/high only for bare family ids", () => {
-    for (const m of ["", "gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5"]) {
+    for (const m of ["", "gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5"]) {
       expect(effortLevelsForModel(m, "gemini-agy")).toEqual(["low", "medium", "high"]);
     }
     expect(effortLevelsForModel("gpt-oss-120b-medium", "gemini-agy")).toEqual([]);
+    expect(effortLevelsForModel("gemini-4-hydrogen", "gemini-agy")).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(effortLevelsForModel("gemini-4-neon", "gemini-agy")).toEqual(["low", "medium", "high", "xhigh"]);
     // the claude backend's ladder is unaffected by the shared id
     expect(effortLevelsForModel("claude-opus-5-5")).toContain("max");
   });

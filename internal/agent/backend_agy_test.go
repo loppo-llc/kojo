@@ -477,6 +477,14 @@ func TestBuildAgyArgs_DropsUnsupportedEffort(t *testing.T) {
 	if args := buildAgyArgs("", &Agent{Effort: "max"}, ""); slices.Contains(args, "--effort") {
 		t.Errorf("max reached argv: %q", args)
 	}
+	// xhigh only for the families agy lists at xhigh.
+	if args := buildAgyArgs("", &Agent{Model: "gemini-4-carbon", Effort: "xhigh"}, ""); slices.Contains(args, "--effort") {
+		t.Errorf("carbon xhigh reached argv: %q", args)
+	}
+	args := buildAgyArgs("", &Agent{Model: "gemini-4-hydrogen", Effort: "xhigh"}, "")
+	if i := slices.Index(args, "--effort"); i < 0 || i+1 >= len(args) || args[i+1] != "xhigh" {
+		t.Errorf("hydrogen xhigh missing from argv: %q", args)
+	}
 }
 
 func TestAgyConversationExists(t *testing.T) {

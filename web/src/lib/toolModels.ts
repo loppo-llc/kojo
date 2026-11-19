@@ -11,11 +11,13 @@ export const toolModels: Record<string, ToolModelConfig> = {
     models: ["sonnet", "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "opus", "claude-opus-5-5", "claude-opus-5", "fable", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "haiku", "claude-haiku-5-5"],
   },
   codex: {
-    default: "gpt-6-astra",
+    default: "gpt-6.2-astra",
     models: [
+      "gpt-6.2-sol",
+      "gpt-6.2-astra",
       "gpt-6.1-sol",
-      "gpt-6-astra",
       "gpt-6.1-terra",
+      "gpt-6-astra",
       "gpt-6-sol",
       "gpt-6-luna",
       "gpt-5.6-sol",
@@ -37,10 +39,10 @@ export const toolModels: Record<string, ToolModelConfig> = {
   // defines for the concrete id (see geminiEffortModels below).
   "gemini-api": {
     default: "gemini-4-argon",
-    models: ["gemini-4-argon", "gemini-3.8-flash"],
+    models: ["gemini-4-neon", "gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash"],
   },
   // gemini-agy runs the Antigravity CLI (agy) signed in with the operator's
-  // Google account. Ids are agy model slugs (`agy models`, agy 1.4.8);
+  // Google account. Ids are agy model slugs (`agy models`, agy 1.5.12);
   // "" leaves the choice to agy's default (gemini-4-argon on a paid
   // account). agy lists each family per effort level (gemini-4-argon-high,
   // ...); kojo offers the bare id plus the effort selector instead. The list
@@ -48,7 +50,7 @@ export const toolModels: Record<string, ToolModelConfig> = {
   // gpt-oss-120b-medium.
   "gemini-agy": {
     default: "",
-    models: ["gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5", "gpt-oss-120b-medium"],
+    models: ["gemini-4-neon", "gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5", "gpt-oss-120b-medium"],
   },
   // The custom-* backends have no fixed model list: the operator supplies
   // the endpoint and useCustomModels fetches whatever it advertises.
@@ -98,21 +100,21 @@ export type EffortLevel = (typeof effortLevels)[number];
  */
 const xhighModels = new Set(["opus", "sonnet", "fable", "haiku", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-sonnet-5", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"]);
 const codexEffortModels = new Set(toolModels.codex.models);
-// codex CLI 0.164.0 models_cache.json: the gpt-6.1 family (sol, terra), the
-// gpt-6 family (sol, astra, luna) and the gpt-5.6 family advertise
-// low/medium/high/xhigh/max (gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol,
-// gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra also list "ultra", which
-// kojo's effort scale doesn't model). Older gpt-5.x models stop at xhigh.
+// codex CLI 0.167.0 models_cache.json: the gpt-6.2 family (sol, astra), the
+// gpt-6.1 family (sol, terra), the gpt-6 family (sol, astra, luna) and the
+// gpt-5.6 family advertise low/medium/high/xhigh/max (all of them except
+// gpt-6-luna and gpt-5.6-luna also list "ultra", which kojo's effort scale
+// doesn't model). Older gpt-5.x models stop at xhigh.
 // Keep in sync with agent.go codexMaxEffortModels.
-const codexMaxModels = new Set(["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-astra", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
-// codex CLI 0.164.0 models_cache.json default_reasoning_level: gpt-6.1-sol,
-// gpt-6.1-terra and gpt-5.6-sol default to "low" (the low-default set has
-// shifted between gpt-6-astra, gpt-5.6-sol and the gpt-6.1 family across CLI
-// releases; re-check the cache on each update). gpt-5.5 (no longer in the
+const codexMaxModels = new Set(["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-astra", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+// codex CLI 0.167.0 models_cache.json default_reasoning_level: gpt-6.2-astra,
+// gpt-6.1-terra and gpt-6-astra default to "low" (the low-default set has
+// shifted between the astra models, gpt-5.6-sol and the gpt-6.1 family across
+// CLI releases; re-check the cache on each update). gpt-5.5 (no longer in the
 // cache; last seen in 0.159.2) is the one codex model that defaults to
-// "xhigh". Every other codex model, including gpt-6-astra, defaults to
-// "medium". Models missing from the cache (gpt-5.4 and older) keep "medium".
-const codexLowDefaultModels = new Set(["gpt-6.1-sol", "gpt-6.1-terra", "gpt-5.6-sol"]);
+// "xhigh". Every other codex model, including gpt-6.2-sol and gpt-6.1-sol,
+// defaults to "medium". Models missing from the cache (gpt-5.4 and older) keep "medium".
+const codexLowDefaultModels = new Set(["gpt-6.2-astra", "gpt-6.1-terra", "gpt-6-astra"]);
 const codexXhighDefaultModels = new Set(["gpt-5.5"]);
 // Claude models whose API default effort is "medium" rather than "high":
 // https://platform.claude.com/docs/en/models/opus-5-5/overview (fetched
@@ -126,12 +128,19 @@ const claudeMediumDefaultModels = new Set(["opus", "claude-opus-5-5", "haiku", "
 // [high,medium,low]. None advertises "max". Keep in sync with agent.go
 // grokEffortModels / xhighModels.
 const grokEffortModels = new Set(toolModels.grok.models);
-// Gemini thinkingLevel ladder: low/medium/high, API default medium.
+// Gemini thinkingLevel ladder: low/medium/high, API default medium;
+// gemini-4-neon and gemini-4-hydrogen default to high. Their xhigh is
+// offered only on agy (agy 1.5.12 lists gemini-4-neon-xhigh and
+// gemini-4-hydrogen-xhigh): OpenCode, behind gemini-api,
+// rejects thinkingLevel xhigh. Keep in sync with backend_opencode.go
+// geminiHighDefaultModels and backend_agy.go agyXhighModels.
 // "flash" is the legacy gemini-cli alias for gemini-3.8-flash; the backend
 // resolves it before picking the variant. Keep in sync with
 // internal/agent/backend_opencode.go geminiEffortModels.
-const agyEffortModels = new Set(["", "gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5"]);
+const agyEffortModels = new Set(["", "gemini-4-neon", "gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5"]);
 const geminiEffortModels = new Set([...toolModels["gemini-api"].models, "flash"]);
+const geminiHighDefaultModels = new Set(["gemini-4-neon", "gemini-4-hydrogen"]);
+const agyXhighModels = new Set(["gemini-4-neon", "gemini-4-hydrogen"]);
 const grokXhighModels = new Set(["grok-4.7", "grok-4.7-build-fast", "grok-4.6"]);
 
 /**
@@ -155,13 +164,13 @@ export function supportsEffort(tool: string): boolean {
   return tool === "claude" || tool === "grok" || tool === "codex" || tool === "gemini-api" || tool === "gemini-agy";
 }
 
-// codex CLI 0.164.0: gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra
+// codex CLI 0.167.0: gpt-6.2-sol, gpt-6.2-astra, gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra
 // additionally advertise the "ultra" reasoning level (multi-agent
 // orchestration mode); gpt-6-luna and gpt-5.6-luna stop at max. It is a different beast from the plain effort
 // ladder — long-running and expensive — so kojo's per-agent effort scale
 // intentionally stops at "max"; ultra is offered ONLY as a per-session
 // choice in NewSession.
-const codexUltraModels = new Set(["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"]);
+const codexUltraModels = new Set(["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"]);
 
 /**
  * Effort levels offered when starting an ad-hoc session for the given
@@ -181,7 +190,8 @@ export function effortLevelsForModel(model: string, tool?: string): readonly Eff
   // whose ladder is low/medium/high. Keep in sync with agent.go
   // agyEffortModels.
   if (tool === "gemini-agy") {
-    return agyEffortModels.has(model) ? (["low", "medium", "high"] as const) : [];
+    if (!agyEffortModels.has(model)) return [];
+    return agyXhighModels.has(model) ? (["low", "medium", "high", "xhigh"] as const) : (["low", "medium", "high"] as const);
   }
   // With the CLI-default model, the concrete model (and therefore support
   // for xhigh/max) is not known. Offer only the common safe ladder; in
@@ -202,6 +212,7 @@ export function defaultEffortForModel(model: string, tool?: string): string {
   if (codexLowDefaultModels.has(model)) return "low";
   if (codexXhighDefaultModels.has(model)) return "xhigh";
   if (codexEffortModels.has(model)) return "medium";
+  if (geminiHighDefaultModels.has(model)) return "high";
   if (geminiEffortModels.has(model)) return "medium";
   if (claudeMediumDefaultModels.has(model)) return "medium";
   return defaultXhighModels.has(model) ? "xhigh" : "high";

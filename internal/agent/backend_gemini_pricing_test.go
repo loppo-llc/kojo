@@ -12,6 +12,12 @@ func TestGeminiPriceAt_DateSwitch(t *testing.T) {
 		at               time.Time
 		in, out, cacheRd float64
 	}{
+		{"gemini-4-neon", time.Date(2026, 11, 18, 0, 0, 0, 0, time.UTC), 3.00, 15.00, 0.15},
+		{"gemini-4-neon", time.Date(2027, 6, 1, 0, 0, 0, 0, time.UTC), 3.00, 15.00, 0.15},
+		{"gemini-4-hydrogen", time.Date(2026, 11, 12, 0, 0, 0, 0, time.UTC), 1.50, 7.50, 0.075},
+		{"gemini-4-hydrogen", time.Date(2027, 6, 1, 0, 0, 0, 0, time.UTC), 1.50, 7.50, 0.075},
+		{"gemini-4-carbon", time.Date(2026, 11, 30, 23, 59, 59, 0, time.UTC), 2, 10, 0.10},
+		{"gemini-4-carbon", time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC), 4, 20, 0.20},
 		{"gemini-4-argon", time.Date(2026, 11, 30, 23, 59, 59, 0, time.UTC), 2, 10, 0.10},
 		{"gemini-4-argon", time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC), 4, 20, 0.20},
 		{"gemini-3.8-flash", time.Date(2026, 12, 31, 23, 59, 59, 0, time.UTC), 0.75, 3.75, 0.075},
