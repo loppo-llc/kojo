@@ -1361,10 +1361,6 @@ func main() {
 	// when an agent was reclaimed (reclaim_notice.go).
 	srv.StartReclaimNoticeLoop(ctx)
 
-	// Periodic GitHub Releases check. Skipped for dev/unparseable
-	// stamps (never auto-notify against a dirty describe), operator
-	// opt-out, or env kill-switch. The checker itself is still on
-	// server.Config so the HTTP endpoints can CheckNow/Apply on demand.
 	// Periodic extension update check (and auto-update for packages
 	// that opted in). Separate kill-switch from the binary check: the
 	// remotes it talks to are the ones the operator installed from.
@@ -1374,6 +1370,10 @@ func main() {
 		srv.StartExtensionUpdateLoop(ctx)
 	}
 
+	// Periodic GitHub Releases check. Skipped for dev/unparseable
+	// stamps (never auto-notify against a dirty describe), operator
+	// opt-out, or env kill-switch. The checker itself is still on
+	// server.Config so the HTTP endpoints can CheckNow/Apply on demand.
 	if *noUpdateCheck || os.Getenv("KOJO_NO_UPDATE_CHECK") == "1" {
 		logger.Info("selfupdate: periodic check disabled by flag or KOJO_NO_UPDATE_CHECK")
 	} else if _, err := selfupdate.ParseVersion(version); err != nil {
