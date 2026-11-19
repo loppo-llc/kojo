@@ -50,7 +50,12 @@ type Installed struct {
 	UpdatedAt   string `json:"updatedAt"`
 	// Enabled gates the whole package. Per-agent contributions need
 	// both this and the agent's own binding.
-	Enabled       bool     `json:"enabled"`
+	Enabled bool `json:"enabled"`
+	// AutoUpdate opts the package into unattended updates: when the
+	// periodic check sees its ref move on the remote, kojo applies the
+	// new commit itself — unless it asks for a different scope set or
+	// a newer kojo, which still need the operator. Off by default.
+	AutoUpdate    bool     `json:"autoUpdate,omitempty"`
 	GrantedScopes []string `json:"grantedScopes,omitempty"`
 	// Token is the package's bearer token (see token.go). It is
 	// persisted but never leaves the process through clone(), so the

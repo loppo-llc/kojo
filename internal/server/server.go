@@ -874,6 +874,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	mux.HandleFunc("GET /api/v1/extensions", s.handleListExtensions)
 	mux.HandleFunc("POST /api/v1/extensions", s.handleInstallExtension)
 	mux.HandleFunc("POST /api/v1/extensions/preview", s.handlePreviewExtension)
+	mux.HandleFunc("POST /api/v1/extensions/check-updates", s.handleCheckExtensionUpdates)
 	mux.HandleFunc("GET /api/v1/extensions/{id}", s.handleGetExtension)
 	mux.HandleFunc("PATCH /api/v1/extensions/{id}", s.handlePatchExtension)
 	mux.HandleFunc("DELETE /api/v1/extensions/{id}", s.handleDeleteExtension)

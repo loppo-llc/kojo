@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -318,6 +319,63 @@ func TestExtensionLifecycleHandlers(t *testing.T) {
 	}
 }
 
+func TestExtensionAutoUpdateAndCheckHandlers(t *testing.T) {
+	srv := newExtTestServer(t)
+	repo := newExtTestRepo(t)
+	commit := extPreviewCommit(t, srv, repo)
+	rr := extCall(t, srv.handleInstallExtension, http.MethodPost, "/api/v1/extensions",
+		`{"url":`+jsonString(repo)+`,"commit":`+jsonString(commit)+`,"ackScopes":["chat:send"]}`, nil)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("install failed: %s", rr.Body)
+	}
+	if _, set := decodeExt(t, rr)["autoUpdate"]; set {
+		t.Fatalf("autoUpdate on by default: %s", rr.Body)
+	}
+	ids := map[string]string{"id": "demo"}
+
+	// autoUpdate alone is a valid PATCH and leaves enabled untouched.
+	rr = extCall(t, srv.handlePatchExtension, http.MethodPatch, "/api/v1/extensions/demo", `{"autoUpdate":true}`, ids)
+	row := decodeExt(t, rr)
+	if rr.Code != http.StatusOK || row["autoUpdate"] != true || row["enabled"] != true {
+		t.Fatalf("patch autoUpdate = %d %s", rr.Code, rr.Body)
+	}
+
+	// Not checked yet: the list carries an empty updates map.
+	rr = extCall(t, srv.handleListExtensions, http.MethodGet, "/api/v1/extensions", "", nil)
+	if updates, _ := decodeExt(t, rr)["updates"].(map[string]any); updates == nil || len(updates) != 0 {
+		t.Fatalf("updates before check = %s", rr.Body)
+	}
+
+	writeExtTestFiles(t, repo, map[string]string{"skills/demo/SKILL.md": "# demo v2\n"})
+	commitExtTestRepo(t, repo)
+	rr = extCall(t, srv.handleCheckExtensionUpdates, http.MethodPost, "/api/v1/extensions/check-updates", "", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("check = %d %s", rr.Code, rr.Body)
+	}
+	updates, _ := decodeExt(t, rr)["updates"].(map[string]any)
+	demo, _ := updates["demo"].(map[string]any)
+	if demo["available"] != true || demo["latest"] == "" || demo["checkedAt"] == "" {
+		t.Fatalf("check result = %s", rr.Body)
+	}
+	// The manual check never applies, even with autoUpdate on.
+	got, _ := srv.extensions.Get("demo")
+	if got.Commit != commit {
+		t.Fatalf("check moved the checkout to %s", got.Commit)
+	}
+
+	// The periodic pass does.
+	srv.runExtensionUpdatePass(context.Background())
+	got, _ = srv.extensions.Get("demo")
+	if got.Commit == commit {
+		t.Fatal("auto-update pass did not apply the new commit")
+	}
+	rr = extCall(t, srv.handleListExtensions, http.MethodGet, "/api/v1/extensions", "", nil)
+	updates, _ = decodeExt(t, rr)["updates"].(map[string]any)
+	if demo, _ := updates["demo"].(map[string]any); demo["available"] != false {
+		t.Fatalf("updates after pass = %s", rr.Body)
+	}
+}
+
 // TestExtensionRoutesAreOwnerOnly pins the security property the whole
 // design leans on: installing a package from a URL is reachable by the
 // Owner alone, never by an agent or a paired peer.
@@ -325,6 +383,7 @@ func TestExtensionRoutesAreOwnerOnly(t *testing.T) {
 	paths := []string{
 		"/api/v1/extensions",
 		"/api/v1/extensions/preview",
+		"/api/v1/extensions/check-updates",
 		"/api/v1/extensions/demo",
 		"/api/v1/extensions/demo/update",
 		"/api/v1/extensions/demo/config",

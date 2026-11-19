@@ -76,6 +76,12 @@ export interface InstalledExtension {
   installedAt: string;
   updatedAt: string;
   enabled: boolean;
+  /**
+   * Opted into unattended updates: the periodic check applies a new
+   * commit on the package's ref by itself, except one that changes the
+   * scope set or needs a newer kojo. Off (absent) by default.
+   */
+  autoUpdate?: boolean;
   grantedScopes?: string[];
   config?: Record<string, unknown>;
   /** Names of the global secret settings that are set. Values are never returned. */
@@ -109,14 +115,52 @@ export interface ExtensionServiceStatus {
   agentId?: string;
 }
 
+/**
+ * What the last upstream check found for one package. The daemon asks
+ * each package's remote (git ls-remote) every few hours; a package
+ * missing from the map has not been checked since kojo started.
+ */
+export interface ExtensionUpdateStatus {
+  /** Commit the package's ref points at on the remote. */
+  latest?: string;
+  /** latest differs from the installed commit. */
+  available: boolean;
+  /** The ref is a commit SHA, so there is nothing to follow. */
+  pinned?: boolean;
+  /** RFC 3339. */
+  checkedAt?: string;
+  /** Why the last check failed. */
+  error?: string;
+  /** Why auto-update did not apply `latest`. */
+  autoError?: string;
+  /** `latest` changes the scope set; update by hand to consent. */
+  needsConsent?: boolean;
+}
+
 export interface ExtensionList {
   extensions: InstalledExtension[];
   services: ExtensionServiceStatus[];
+  updates: Record<string, ExtensionUpdateStatus>;
 }
 
 export async function listExtensions(): Promise<ExtensionList> {
   const res = await get<Partial<ExtensionList>>("/api/v1/extensions");
-  return { extensions: res.extensions ?? [], services: res.services ?? [] };
+  return {
+    extensions: res.extensions ?? [],
+    services: res.services ?? [],
+    updates: res.updates ?? {},
+  };
+}
+
+/** Ask every package's remote now. Checks only; never applies. */
+export async function checkExtensionUpdates(): Promise<
+  Record<string, ExtensionUpdateStatus>
+> {
+  const res = await post<{ updates?: Record<string, ExtensionUpdateStatus> }>(
+    "/api/v1/extensions/check-updates",
+    {},
+  );
+  return res.updates ?? {};
 }
 
 export function previewExtension(
@@ -164,6 +208,16 @@ export function setExtensionEnabled(
   return patch<InstalledExtension>(
     `/api/v1/extensions/${encodeURIComponent(id)}`,
     { enabled },
+  );
+}
+
+export function setExtensionAutoUpdate(
+  id: string,
+  autoUpdate: boolean,
+): Promise<InstalledExtension> {
+  return patch<InstalledExtension>(
+    `/api/v1/extensions/${encodeURIComponent(id)}`,
+    { autoUpdate },
   );
 }
 

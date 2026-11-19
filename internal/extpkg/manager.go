@@ -35,6 +35,19 @@ func (e *ScopeMismatchError) Error() string {
 	return fmt.Sprintf("scope acknowledgement mismatch (missing: %v, unexpected: %v)", e.Missing, e.Extra)
 }
 
+// IncompatibleError reports a package whose manifest rules out the
+// running kojo version. Typed so the auto-updater can tell "this
+// commit will never install here" from a transient fetch failure.
+type IncompatibleError struct {
+	ID         string
+	Constraint string
+	Current    string
+}
+
+func (e *IncompatibleError) Error() string {
+	return fmt.Sprintf("extension %s requires kojo %s, this instance is %s", e.ID, e.Constraint, e.Current)
+}
+
 // Manager owns the on-disk extension registry. Every mutation is
 // serialised by mu and persisted before it is visible to readers, so a
 // crash mid-install leaves either the old state or the new one.
@@ -68,6 +81,16 @@ type Manager struct {
 	// undoSecrets is set by a mutate callback that wrote to the
 	// credential store; see mutate. Guarded by mu.
 	undoSecrets func()
+	// updates holds the result of the last upstream check per package
+	// (see updatecheck.go). In memory only, guarded by mu: it is a
+	// cache of remote state, refilled by the next check after a
+	// restart.
+	updates map[string]*updateState
+	// checkSem serialises whole check/auto-update passes so the
+	// periodic loop and an operator's "check now" never fetch the same
+	// package twice at once. A one-slot channel rather than a mutex so
+	// a waiter can give up when its context ends.
+	checkSem chan struct{}
 }
 
 // bumpGen stamps a package ID with a fresh serial, marking every
@@ -118,6 +141,7 @@ func NewManager(root, kojoVersion string, logger *slog.Logger) (*Manager, error)
 		logger:      logger.With("component", "extpkg"),
 		now:         time.Now,
 		st:          st,
+		checkSem:    make(chan struct{}, 1),
 	}
 	m.sweepTmp()
 	return m, nil
@@ -264,6 +288,9 @@ func (m *Manager) Install(ctx context.Context, req InstallRequest) (Installed, e
 		delete(m.gen, mf.ID)
 		return Installed{}, err
 	}
+	// A status left over from an earlier registration of this ID
+	// describes somebody else's source; start clean.
+	delete(m.updates, mf.ID)
 	m.logger.Info("extension installed", "id", mf.ID, "version", mf.Version, "commit", commit)
 	return row.clone(), nil
 }
@@ -280,6 +307,15 @@ type UpdateRequest struct {
 // Update re-fetches an installed package at the given ref and swaps
 // the checkout in place. Enablement and configuration survive.
 func (m *Manager) Update(ctx context.Context, id string, req UpdateRequest) (Installed, error) {
+	return m.updateIf(ctx, id, req, nil)
+}
+
+// updateIf is Update with a last-moment veto: accept runs under the
+// lock just before the new checkout is swapped in, against the row as
+// it is then, and a non-nil error aborts the swap. The auto-updater
+// uses it so an operator who turns auto-update off while a fetch is
+// running still wins.
+func (m *Manager) updateIf(ctx context.Context, id string, req UpdateRequest, accept func(row *Installed) error) (Installed, error) {
 	m.mu.Lock()
 	row, ok := m.st.Extensions[id]
 	if !ok {
@@ -326,6 +362,11 @@ func (m *Manager) Update(ctx context.Context, id string, req UpdateRequest) (Ins
 	if m.gen[id] != startGen {
 		return Installed{}, fmt.Errorf("update %s: the package changed while updating; try again", id)
 	}
+	if accept != nil {
+		if err := accept(row); err != nil {
+			return Installed{}, err
+		}
+	}
 	dst := pkgPath(m.root, id)
 	backup := dst + ".old"
 	_ = os.RemoveAll(backup)
@@ -364,6 +405,7 @@ func (m *Manager) Update(ctx context.Context, id string, req UpdateRequest) (Ins
 			m.logger.Warn("saving the registry after secret migration failed", "id", id, "error", err)
 		}
 	}
+	m.noteUpdatedLocked(id, ref, commit)
 	m.logger.Info("extension updated", "id", id, "version", mf.Version, "commit", commit)
 	return row.clone(), nil
 }
@@ -387,6 +429,7 @@ func (m *Manager) Remove(id string) error {
 		m.st.Extensions[id] = row
 		return err
 	}
+	delete(m.updates, id)
 	// The registry is the source of truth; a leftover directory is
 	// harmless debris, so a failure here is logged, not returned.
 	if err := os.RemoveAll(pkgPath(m.root, id)); err != nil {
@@ -407,6 +450,25 @@ func (m *Manager) Remove(id string) error {
 func (m *Manager) SetEnabled(id string, enabled bool) (Installed, error) {
 	return m.mutate(id, func(row *Installed) error {
 		row.Enabled = enabled
+		return nil
+	})
+}
+
+// SetAutoUpdate opts the package in or out of unattended updates.
+func (m *Manager) SetAutoUpdate(id string, on bool) (Installed, error) {
+	return m.SetFlags(id, nil, &on)
+}
+
+// SetFlags changes the package-wide switches in one write. A nil
+// pointer leaves that switch alone.
+func (m *Manager) SetFlags(id string, enabled, autoUpdate *bool) (Installed, error) {
+	return m.mutate(id, func(row *Installed) error {
+		if enabled != nil {
+			row.Enabled = *enabled
+		}
+		if autoUpdate != nil {
+			row.AutoUpdate = *autoUpdate
+		}
 		return nil
 	})
 }
@@ -621,7 +683,7 @@ func (m *Manager) stage(ctx context.Context, url, ref string) (string, *Manifest
 		return stage, nil, "", err
 	}
 	if !ok {
-		return stage, nil, "", fmt.Errorf("extension %s requires kojo %s, this instance is %s", mf.ID, mf.KojoVersion, m.kojoVersion)
+		return stage, nil, "", &IncompatibleError{ID: mf.ID, Constraint: mf.KojoVersion, Current: m.kojoVersion}
 	}
 	if err := verifyContributions(stage, mf); err != nil {
 		return stage, nil, "", err
