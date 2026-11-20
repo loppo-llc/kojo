@@ -1083,10 +1083,13 @@ export const agentApi = {
   },
 
   stt: {
-    // Mint a short-lived ephemeral token for the browser to open the xAI
-    // streaming Speech-to-Text WebSocket directly.
-    token: () =>
-      post<{ token: string; expiresAt: number; wsBaseUrl: string }>(`/api/v1/stt/token`, {}),
+    // Mint a short-lived ephemeral token for the browser to open the
+    // effective provider's streaming Speech-to-Text WebSocket directly.
+    // `language` (BCP-47) is locked into Gemini tokens; xAI ignores it.
+    token: (language?: string) =>
+      post<STTTokenResponse>(`/api/v1/stt/token`, language ? { language } : {}),
+    getConfig: () => get<STTConfig>(`/api/v1/stt/config`),
+    setConfig: (provider: STTProvider) => put<STTConfig>(`/api/v1/stt/config`, { provider }),
   },
 
   embeddingModel: {
@@ -1097,3 +1100,22 @@ export const agentApi = {
   },
 
 };
+
+export type STTProvider = "off" | "xai" | "gemini";
+
+/** Effective global voice-input provider and which providers have a key. */
+export interface STTConfig {
+  provider: STTProvider;
+  available: { xai: boolean; gemini: boolean };
+}
+
+export interface STTTokenResponse {
+  provider: Exclude<STTProvider, "off">;
+  token: string;
+  expiresAt: number;
+  wsBaseUrl: string;
+  /** Gemini only: Live API model for the setup message. */
+  model?: string;
+  /** Gemini only: language locked into the token ("" / absent = auto). */
+  language?: string;
+}

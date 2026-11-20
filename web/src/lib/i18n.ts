@@ -432,9 +432,9 @@ const messages = {
     ja: "このエージェントのキューが満杯 (最大100件) — キューを1件取り消すか、端末の復帰を待って。",
     en: "Queue is full for this agent (100 messages max) — cancel a queued message or wait for the device to reconnect.",
   },
-  "chat.xaiKeyMissing": {
-    ja: "xAI API キーが未設定。設定画面で登録して。",
-    en: "xAI API key is not set. Register it in Settings.",
+  "chat.sttKeyMissing": {
+    ja: "音声入力の API キーが未設定。設定画面で登録して。",
+    en: "No API key for voice input. Register one in Settings.",
   },
   "chat.holderPeerOffline": {
     ja: "ホストピアがオフライン",
@@ -1578,6 +1578,13 @@ const messages = {
   "gs.restore": { ja: "復元", en: "Restore" },
   "gs.chat": { ja: "チャット", en: "Chat" },
   "gs.sendWithEnter": { ja: "Enter で送信", en: "Send with Enter" },
+  "gs.voiceInput": { ja: "音声入力", en: "Voice input" },
+  "gs.voiceInputHelp": {
+    ja: "チャットのマイク入力に使う文字起こし API。無効にするとマイクボタンを表示しない。API キーを登録したものだけ選べる。",
+    en: "Speech-to-text API for the chat mic. Off hides the mic button. Only providers with an API key can be selected.",
+  },
+  "gs.voiceInputOff": { ja: "無効", en: "Off" },
+  "gs.voiceInputNoKey": { ja: "{name} (API キー未設定)", en: "{name} (no API key)" },
   "gs.enterSendsHelp": {
     ja: "Enter で送信、Shift+Enter で改行",
     en: "Enter to send, Shift+Enter for newline",

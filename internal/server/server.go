@@ -1234,9 +1234,12 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/tts/audio/{file}", s.handleTTSAudio)
 	mux.HandleFunc("HEAD /api/v1/tts/audio/{file}", s.handleTTSAudio)
 
-	// Speech-to-text: mint a short-lived ephemeral token for the browser
-	// to open the xAI streaming STT WebSocket directly (owner-only).
+	// Speech-to-text: global provider selection (off / xAI / Gemini) and a
+	// short-lived ephemeral token so the browser can open the provider's
+	// streaming STT WebSocket directly (owner-only).
 	mux.HandleFunc("POST /api/v1/stt/token", s.handleSTTToken)
+	mux.HandleFunc("GET /api/v1/stt/config", s.handleGetSTTConfig)
+	mux.HandleFunc("PUT /api/v1/stt/config", s.handleSetSTTConfig)
 
 	// Tasks
 	mux.HandleFunc("GET /api/v1/agents/{id}/tasks", s.handleListTasks)

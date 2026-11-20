@@ -69,7 +69,13 @@ export function GlobalSettings() {
           </Field>
         </SectionCard>
         <ApiKeysSection gemini={gemini} embedding={embedding} openai={openai} xai={xai} typesafe={typesafe} />
-        <ChatPreferencesSection enterSends={enterSends} setEnterSends={setEnterSends} />
+        <ChatPreferencesSection
+          enterSends={enterSends}
+          setEnterSends={setEnterSends}
+          sttKeyRevision={`${gemini.configured}:${gemini.saveToken}:${xai.configured}`}
+          setError={setError}
+          flashSuccess={flashSuccess}
+        />
         <PersonaTemplatesSection setError={setError} flashSuccess={flashSuccess} />
 
         <ExtensionsSection setError={setError} flashSuccess={flashSuccess} />

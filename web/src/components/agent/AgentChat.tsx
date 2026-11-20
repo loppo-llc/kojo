@@ -14,6 +14,7 @@ import { useAutoGrowTextarea } from "../../hooks/useAutoGrowTextarea";
 import { useChatScroll } from "../../hooks/useChatScroll";
 import { useChatPagination } from "../../hooks/useChatPagination";
 import { useSpeechInput } from "../../hooks/useSpeechInput";
+import { useSTTConfig } from "../../lib/sttConfig";
 import {
   DismissibleError,
   PendingAttachments,
@@ -909,6 +910,11 @@ export function AgentChat() {
     [setInput],
   );
   const speech = useSpeechInput({ onFinal: appendTranscript });
+  const sttConfig = useSTTConfig();
+  const speechActive = speech.state === "listening" || speech.state === "connecting";
+  // Mic shows only when Settings has a voice-input provider in effect (one
+  // with an API key). Keep it while a session is live so it can be stopped.
+  const showMic = speech.supported && ((sttConfig != null && sttConfig.provider !== "off") || speechActive);
   const toggleVoice = useCallback(() => {
     if (speech.state === "listening" || speech.state === "connecting") speech.stop();
     else void speech.start();
@@ -1430,12 +1436,12 @@ export function AgentChat() {
         {queueError && <DismissibleError message={queueError} onDismiss={() => setQueueError(null)} />}
         {/* Upload error */}
         {uploadError && <DismissibleError message={uploadError} onDismiss={() => setUploadError(null)} />}
-        {/* Voice input error (e.g. missing xAI key → hint to Settings) */}
+        {/* Voice input error (e.g. missing STT key → hint to Settings) */}
         {speech.state === "error" && speech.error && (
           <DismissibleError
             message={
               /api key|not configured/i.test(speech.error)
-                ? t("chat.xaiKeyMissing")
+                ? t("chat.sttKeyMissing")
                 : speech.error
             }
             onDismiss={() => speech.stop()}
@@ -1480,7 +1486,7 @@ export function AgentChat() {
           </div>
           {/* Mic sits on the opposite side of the textarea from Attach —
               the two were adjacent on the left and easy to mis-tap. */}
-          {speech.supported && (
+          {showMic && (
             <MicButton
               listening={speech.state === "listening"}
               connecting={speech.state === "connecting"}
