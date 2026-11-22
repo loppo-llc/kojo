@@ -1769,7 +1769,9 @@ func main() {
 	// every listener branch so agent.SetKojoAPIBase is already wired
 	// into the system prompt the woken turn will be built with. The
 	// timestamp fences the consumer to pre-boot markers only.
-	go agentMgr.ConsumeRestartWake(version, time.Now())
+	bootTime := time.Now()
+	go agentMgr.ConsumeRestartWake(version, bootTime)
+	go agentMgr.ConsumeModelSwitchWakes(bootTime)
 	go srv.RunNativeGoalRecovery(ctx)
 
 	<-ctx.Done()

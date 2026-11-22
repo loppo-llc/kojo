@@ -827,6 +827,7 @@ func (m *Manager) ActivateAgentRuntime(agentID string) {
 	// (no `!`exec`` substitution, `grok --resume` wording), codex
 	// installs a .codex/skills body, and custom-bare is no-op.
 	SyncDeviceSwitchSkillForTool(agentID, a.Tool, a.IsDeviceSwitchEnabled(), m.logger)
+	SyncModelSwitchSkillForTool(agentID, a.Tool, m.logger)
 }
 
 // arrivalNotified deduplicates NotifyDeviceSwitchArrival across

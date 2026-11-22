@@ -227,6 +227,7 @@ func (m *Manager) handleKeyedBackgroundTurn(agentID, sessionKey string, events <
 		defer close(out)
 		defer cancel()
 		end := m.processOneShotEvents(ctx, agentID, backendCh, out, true)
+		m.noteModelSwitchTurnEnd(agentID, sessionKey, osID, lifeCtx, end, nil)
 		if surface == nil {
 			m.recordKeyedTurnStop(agentID, sessionKey, ctx, end)
 		} else if !end.sent && lifeCtx.Err() != nil {

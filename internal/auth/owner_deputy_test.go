@@ -166,3 +166,25 @@ func TestResolver_StampsOwnerDeputy(t *testing.T) {
 		t.Errorf("plain agent resolved to %+v", p)
 	}
 }
+
+func TestModelSwitchRoute_SelfOnly(t *testing.T) {
+	const self = "/api/v1/agents/ag_x/model-switch"
+	const other = "/api/v1/agents/ag_y/model-switch"
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		if !AllowNonOwner(plainP, method, self) {
+			t.Errorf("%s: agent denied its own model switch", method)
+		}
+		if AllowNonOwner(plainP, method, other) {
+			t.Errorf("%s: agent reached another agent's model switch", method)
+		}
+	}
+	if AllowNonOwner(deputyP, http.MethodPost, other) {
+		t.Error("deputy reached another agent's model switch")
+	}
+	if !AllowNonOwner(deputyP, http.MethodPost, self) {
+		t.Error("deputy denied its own model switch")
+	}
+	if AllowNonOwner(plainP, http.MethodDelete, self) {
+		t.Error("DELETE allowed")
+	}
+}

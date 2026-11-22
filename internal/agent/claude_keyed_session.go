@@ -849,6 +849,40 @@ func (b *ClaudeBackend) CloseKeyedSessionSync(agentID, sessionKey, reason string
 	closeSessionsSync([]*claudeSession{sess})
 }
 
+// CloseKeyedSessionIfIdle ends the key's process unless it is running a turn
+// or holds background tasks, and reports whether the key is free of a live
+// process afterwards. The idle check and the closing flag are one critical
+// section, so a turn that arrives later gets a fresh process instead of being
+// killed. The entry stays pooled until onEOF evicts it, as the spawn path
+// expects for a closing session.
+func (b *ClaudeBackend) CloseKeyedSessionIfIdle(agentID, sessionKey, reason string) bool {
+	if sessionKey == "" {
+		return true
+	}
+	b.sessMu.Lock()
+	sess := b.sessions[keyedPoolKey(agentID, sessionKey)]
+	b.sessMu.Unlock()
+	if sess == nil {
+		return true
+	}
+	sess.mu.Lock()
+	if sess.closing || sess.state == sessDead {
+		sess.mu.Unlock()
+		return true
+	}
+	if sess.state != sessIdle || sess.pendingTasks > 0 {
+		sess.mu.Unlock()
+		return false
+	}
+	sess.setClosingLocked()
+	if sess.closeReason == "" {
+		sess.closeReason = reason
+	}
+	sess.mu.Unlock()
+	closeSessionsSync([]*claudeSession{sess})
+	return true
+}
+
 // HasKeyedSession reports whether a keyed lingering session is live for the key.
 func (b *ClaudeBackend) HasKeyedSession(agentID, sessionKey string) bool {
 	b.sessMu.Lock()

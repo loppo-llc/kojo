@@ -263,6 +263,7 @@ type mainStopNote struct {
 // recordMainTurnStop persists the main chat's stop note when the turn ended
 // by a stop.
 func (m *Manager) recordMainTurnStop(agentID string, ctx context.Context, end turnEnd) {
+	m.noteModelSwitchTurnEnd(agentID, "", 0, ctx, end, nil)
 	if c, ok := turnStopCause(ctx, end); ok {
 		m.putMainStopNote(agentID, stopNoteText(c))
 	}

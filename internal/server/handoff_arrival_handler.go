@@ -63,6 +63,28 @@ type handoffArrivalBindRequest struct {
 
 // Adapters use pointer receivers. A nil pointer inside the interface is not an
 // executable reservation and must never be advertised as a capability.
+// continueThreadAfterModelSwitch queues the next turn into the arrival slot
+// held behind the calling turn. Only a capability minted on this peer and
+// not bound to a device handoff qualifies; the caller falls back otherwise.
+func (s *Server) continueThreadAfterModelSwitch(ctx context.Context, agentID, sessionKey, capability, prompt string) error {
+	s.handoffArrivalMu.Lock()
+	entry := s.handoffArrivalCaps[capability]
+	if entry == nil || entry.AgentID != agentID || entry.SessionKey != sessionKey ||
+		entry.OpID != "" || entry.Accepted || entry.Admitting ||
+		time.Now().After(entry.ExpiresAt) || missingHandoffArrivalReservation(entry.Reservation) {
+		s.handoffArrivalMu.Unlock()
+		return errHandoffCapabilityInvalid
+	}
+	entry.Admitting = true
+	entry.AdmissionDone = make(chan struct{})
+	reservation := entry.Reservation
+	s.handoffArrivalMu.Unlock()
+
+	err := reservation.Activate(ctx, prompt, "")
+	s.completeHandoffArrivalAdmission(capability, entry, err == nil)
+	return err
+}
+
 func missingHandoffArrivalReservation(reservation agent.HandoffArrivalReservation) bool {
 	return reservation == nil || (reflect.ValueOf(reservation).Kind() == reflect.Pointer && reflect.ValueOf(reservation).IsNil())
 }

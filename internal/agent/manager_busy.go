@@ -631,8 +631,13 @@ func (m *Manager) waitChatIdle(ctx context.Context, agentID string, skipBusy boo
 // manager is a no-op.
 func (m *Manager) SetQuiescing(on bool) {
 	m.busyMu.Lock()
+	lifted := m.quiescing && !on
 	m.quiescing = on
 	m.busyMu.Unlock()
+	if lifted {
+		// The restart was aborted: nothing will consume what it deferred.
+		go m.ConsumeModelSwitchWakes(time.Now())
+	}
 }
 
 // blockerAge renders a coarse human-readable age for a drain blocker

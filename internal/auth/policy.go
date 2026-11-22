@@ -142,6 +142,13 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		return allowExtension(p, method, path)
 	}
 
+	// Agent-driven model switch: strictly the agent itself. Checked before
+	// the owner-deputy grant so a deputy cannot change another agent's model
+	// and start a turn on it (the regular PATCH stays for that).
+	if id, sub, ok := SplitAgentIDPath(path); ok && sub == "/model-switch" {
+		return (method == http.MethodGet || method == http.MethodPost) && p.IsAgent() && p.AgentID == id
+	}
+
 	// An owner-deputy holds the Owner's authority over the whole API —
 	// itself included — except the grant-management routes, so it can
 	// neither mint another deputy / privileged agent nor revoke its own

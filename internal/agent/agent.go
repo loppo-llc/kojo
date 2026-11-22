@@ -828,6 +828,10 @@ type AgentConfig struct {
 // AgentUpdateConfig is the request body for PATCH updates.
 // Pointer fields distinguish "not provided" (nil) from "set to zero".
 type AgentUpdateConfig struct {
+	// expectModel makes the write conditional on the current tool/model/
+	// effort (the agent-driven model switch). Never set from JSON.
+	expectModel *ModelSwitchTarget `json:"-"`
+
 	Name                  *string `json:"name"`
 	Persona               *string `json:"persona"`
 	PublicProfile         *string `json:"publicProfile"`
