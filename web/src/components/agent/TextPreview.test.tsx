@@ -118,6 +118,18 @@ describe("AttachmentList text preview", () => {
     expect(screen.getByRole("button", { name: "Rendered" })).toBeInTheDocument();
   });
 
+  it("navigates between text attachments from the viewer header", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("body"));
+    render(<AttachmentList attachments={[att("one.txt", "text/plain"), att("two.txt", "text/plain")]} isUser={false} />);
+    fireEvent.click(screen.getByRole("button", { name: /one\.txt/ }));
+    const viewer = await screen.findByTestId("text-preview");
+    expect(viewer).toHaveTextContent("one.txt");
+    fireEvent.click(screen.getByRole("button", { name: "Next preview" }));
+    await waitFor(() => expect(screen.getByTestId("text-preview")).toHaveTextContent("two.txt"));
+    // the floating overlay arrows are not rendered in text mode
+    expect(screen.getAllByRole("button", { name: "Next preview" })).toHaveLength(1);
+  });
+
   it("keeps non-text attachments as download links", () => {
     render(<AttachmentList attachments={[att("a.zip", "application/zip")]} isUser={false} />);
     expect(screen.getByRole("link", { name: /a\.zip/ })).toHaveAttribute("download", "a.zip");

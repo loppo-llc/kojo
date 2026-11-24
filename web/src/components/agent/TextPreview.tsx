@@ -190,11 +190,15 @@ export function TextPreview({
   downloadUrl,
   name,
   mime,
+  onNavigate,
 }: {
   url: string;
   downloadUrl: string;
   name: string;
   mime: string;
+  /** Prev/next between attachments; shown in the header so the
+   * overlay's floating arrows don't cover the text. */
+  onNavigate?: (dir: -1 | 1) => void;
 }) {
   const t = useT();
   const format = textFormat(name, mime);
@@ -298,7 +302,17 @@ export function TextPreview({
       data-testid="text-preview"
     >
       <div className="flex shrink-0 items-center gap-2 border-b border-hairline py-2 pl-3 pr-7">
+        {onNavigate && (
+          <button type="button" className={btn} onClick={() => onNavigate(-1)} aria-label={t("media.prevPreview")} title={t("media.prev")}>
+            ‹
+          </button>
+        )}
         <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink">{name}</span>
+        {onNavigate && (
+          <button type="button" className={btn} onClick={() => onNavigate(1)} aria-label={t("media.nextPreview")} title={t("media.next")}>
+            ›
+          </button>
+        )}
         {canToggle && (
           <button type="button" className={btn} onClick={() => setMode(mode === "rendered" ? "raw" : "rendered")}>
             {mode === "rendered" ? t("textPreview.raw") : t("textPreview.rendered")}

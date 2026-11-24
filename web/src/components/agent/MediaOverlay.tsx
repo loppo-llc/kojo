@@ -140,7 +140,7 @@ export function MediaOverlay({
           </div>
         )}
 
-        {canNavigate && (
+        {canNavigate && type !== "text" && (
           <>
             <button
               type="button"
@@ -180,6 +180,7 @@ export function MediaOverlay({
               downloadUrl={api.blob.urlFromKojoURI(path) ?? api.files.rawUrl(path, true, peerId)}
               name={fileName}
               mime={mime ?? ""}
+              onNavigate={canNavigate ? onNavigate : undefined}
             />
           ) : type === "image" ? (
             <img
