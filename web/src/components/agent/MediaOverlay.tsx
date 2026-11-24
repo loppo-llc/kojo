@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, isThumbSupported } from "../../lib/api";
 import { useT } from "../../lib/i18n";
+import { TextPreview } from "./TextPreview";
 
-export type MediaPreviewType = "image" | "video";
+export type MediaPreviewType = "image" | "video" | "text";
 
 // attachmentURL resolves an attachment's path to a downloadable
 // URL. kojo:// URIs (agent-generated attachments, hub-ingested peer
@@ -30,6 +31,8 @@ export function MediaOverlay({
   path,
   peerId,
   type,
+  name,
+  mime,
   currentIndex,
   total,
   onClose,
@@ -38,6 +41,9 @@ export function MediaOverlay({
   path: string;
   peerId?: string;
   type: MediaPreviewType;
+  /** Display name / MIME of the attachment; used by the text viewer. */
+  name?: string;
+  mime?: string;
   currentIndex?: number;
   total?: number;
   onClose: () => void;
@@ -50,7 +56,7 @@ export function MediaOverlay({
   const [videoError, setVideoError] = useState(false);
   const [mediaWidth, setMediaWidth] = useState<number | null>(null);
   const mediaFrameRef = useRef<HTMLDivElement>(null);
-  const fileName = path.split(/[/\\]/).pop() || path;
+  const fileName = name || path.split(/[/\\]/).pop() || path;
   const caption = path;
   const canNavigate = !!onNavigate && (total ?? 0) > 1;
 
@@ -73,7 +79,9 @@ export function MediaOverlay({
         onClose();
         return;
       }
-      if (!canNavigate) return;
+      // Arrow keys belong to the text viewer (caret/selection, horizontal
+      // table scroll); use the on-screen prev/next buttons there.
+      if (!canNavigate || type === "text") return;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
         onNavigate?.(-1);
@@ -84,7 +92,7 @@ export function MediaOverlay({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [canNavigate, onClose, onNavigate]);
+  }, [canNavigate, onClose, onNavigate, type]);
 
   useEffect(() => {
     const el = mediaFrameRef.current;
@@ -166,7 +174,14 @@ export function MediaOverlay({
         )}
 
         <div ref={mediaFrameRef} className="inline-flex max-w-[90vw] items-center justify-center">
-          {type === "image" ? (
+          {type === "text" ? (
+            <TextPreview
+              url={rawUrl}
+              downloadUrl={api.blob.urlFromKojoURI(path) ?? api.files.rawUrl(path, true, peerId)}
+              name={fileName}
+              mime={mime ?? ""}
+            />
+          ) : type === "image" ? (
             <img
               src={rawUrl}
               alt={caption}
@@ -201,12 +216,14 @@ export function MediaOverlay({
           )}
         </div>
 
+        {type !== "text" && (
         <div
           className="mt-2 max-w-[90vw] whitespace-pre-wrap text-center text-xs text-ink-dim font-mono wrap-anywhere"
           style={{ width: mediaWidth ? `${mediaWidth}px` : "min(90vw, 32rem)" }}
         >
           {caption}
         </div>
+        )}
       </div>
     </div>
   );

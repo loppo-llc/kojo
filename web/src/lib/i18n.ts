@@ -1035,6 +1035,21 @@ const messages = {
     en: "This video format cannot be played in the browser.",
   },
   "media.download": { ja: "ダウンロード", en: "Download" },
+  "textPreview.raw": { ja: "ソース", en: "Raw" },
+  "textPreview.rendered": { ja: "表示", en: "Rendered" },
+  "textPreview.binary": {
+    ja: "テキストとして表示できない。ダウンロードして開いて。",
+    en: "This file can't be shown as text. Download it instead.",
+  },
+  "textPreview.loadFailed": { ja: "読み込みに失敗した: {error}", en: "Failed to load: {error}" },
+  "textPreview.truncated": {
+    ja: "先頭 {size} だけ表示してる。全文はダウンロードして。",
+    en: "Showing the first {size} only. Download for the full file.",
+  },
+  "textPreview.tableTruncated": {
+    ja: "表が大きすぎるから一部だけ表示してる。全体はソース表示かダウンロードで。",
+    en: "Table is too large; showing part of it. Use Raw or download for the rest.",
+  },
 
   // ── StreamingMessage / ChatMessage ──
   "stream.thinking": { ja: "思考中…", en: "Thinking…" },
@@ -1197,6 +1212,10 @@ const messages = {
   "attach.imageUnavailable": {
     ja: "画像を取得できない",
     en: "image unavailable",
+  },
+  "attach.previewTitle": {
+    ja: "{name} をプレビュー",
+    en: "Preview {name}",
   },
   "attach.downloadTitle": {
     ja: "{name} をダウンロード",

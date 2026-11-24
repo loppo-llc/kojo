@@ -50,6 +50,22 @@ interface MarkdownRendererProps {
   content: string;
   /** Optional callback to transform plain-text segments (e.g. file-path chips). */
   processText?: (text: string) => React.ReactNode;
+  /**
+   * Render remote (http/https/protocol-relative) images as plain links
+   * instead of loading them, so opening an untrusted document doesn't
+   * beacon the viewer to third-party hosts.
+   */
+  blockRemoteImages?: boolean;
+}
+
+function isCrossOrigin(src: string): boolean {
+  try {
+    const u = new URL(src, window.location.href);
+    if (u.protocol === "data:" || u.protocol === "blob:") return false;
+    return u.origin !== window.location.origin;
+  } catch {
+    return true;
+  }
 }
 
 /** Skip text processing inside these intrinsic element types. */
@@ -98,7 +114,7 @@ function canReplaceInlineCodeWithProcessedText(result: React.ReactNode): boolean
   return hasProcessedNode;
 }
 
-export function MarkdownRenderer({ content, processText }: MarkdownRendererProps) {
+export function MarkdownRenderer({ content, processText, blockRemoteImages }: MarkdownRendererProps) {
   const components = useMemo(
     () => {
       const withText = (Tag: string) => {
@@ -181,9 +197,21 @@ export function MarkdownRenderer({ content, processText }: MarkdownRendererProps
             return <code className={className} {...props}>{children}</code>;
           },
         }),
+        ...(blockRemoteImages && {
+          img({ src, alt, node: _node, ...props }: React.ComponentProps<"img"> & { node?: unknown }) {
+            if (typeof src === "string" && isCrossOrigin(src)) {
+              return (
+                <a href={src} target="_blank" rel="noopener noreferrer">
+                  {alt || src}
+                </a>
+              );
+            }
+            return <img src={src} alt={alt} {...props} />;
+          },
+        }),
       };
     },
-    [processText],
+    [processText, blockRemoteImages],
   );
 
   const [katex, setKatex] = useState<PluginList | null>(katexPlugins);

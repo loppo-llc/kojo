@@ -8,6 +8,7 @@ import {
   type MediaPreviewType,
 } from "./MediaOverlay";
 import { useT } from "../../lib/i18n";
+import { isTextAttachment } from "./TextPreview";
 
 // File extension categories
 const IMAGE_EXTS = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
@@ -17,6 +18,8 @@ type MediaPreviewItem = {
   path: string;
   type: MediaPreviewType;
   peerId?: string;
+  name: string;
+  mime: string;
 };
 
 export function getFileType(path: string): "image" | "video" | "other" {
@@ -29,6 +32,7 @@ function attachmentPreviewType(att: AgentMessageAttachment): MediaPreviewType | 
   const extType = getFileType(att.name || att.path);
   if (att.mime.startsWith("image/") || extType === "image") return "image";
   if (att.mime.startsWith("video/") || extType === "video") return "video";
+  if (isTextAttachment(att.name || att.path, att.mime)) return "text";
   return null;
 }
 
@@ -118,7 +122,7 @@ export function AttachmentList({ attachments, isUser }: { attachments: AgentMess
     () =>
       attachments.flatMap((att) => {
         const type = attachmentPreviewType(att);
-        return type ? [{ path: att.path, type, peerId: att.peerId }] : [];
+        return type ? [{ path: att.path, type, peerId: att.peerId, name: att.name, mime: att.mime }] : [];
       }),
     [attachments],
   );
@@ -167,7 +171,25 @@ export function AttachmentList({ attachments, isUser }: { attachments: AgentMess
               </button>
             );
           }
-          // Non-image/non-video: render as a download anchor so the
+          if (previewType === "text") {
+            return (
+              <button
+                key={att.path}
+                onClick={() => setPreviewPath(att.path)}
+                className={`flex items-center gap-1.5 px-2 py-1 rounded-[10px] text-xs hover:opacity-80 transition-opacity ${
+                  isUser ? "bg-copper/20 text-ink" : "bg-surface text-ink-dim"
+                }`}
+                title={t("attach.previewTitle", { name: att.name })}
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 opacity-60">
+                  <path fillRule="evenodd" d="M4.5 2A1.5 1.5 0 003 3.5v13A1.5 1.5 0 004.5 18h11a1.5 1.5 0 001.5-1.5V7.621a1.5 1.5 0 00-.44-1.06l-4.12-4.122A1.5 1.5 0 0011.378 2H4.5zm2.25 8.5a.75.75 0 000 1.5h6.5a.75.75 0 000-1.5h-6.5zm0 3a.75.75 0 000 1.5h6.5a.75.75 0 000-1.5h-6.5z" clipRule="evenodd" />
+                </svg>
+                <span className="max-w-[150px] truncate">{att.name}</span>
+                <span className="opacity-50">{formatSize(att.size)}</span>
+              </button>
+            );
+          }
+          // Anything else: render as a download anchor so the
           // user can save the file. Anchor's `download` attribute
           // hints at save-as while still rendering inline-clickable.
           return (
@@ -194,6 +216,8 @@ export function AttachmentList({ attachments, isUser }: { attachments: AgentMess
           path={preview.path}
           peerId={preview.peerId}
           type={preview.type}
+          name={preview.name}
+          mime={preview.mime}
           currentIndex={previewIndex}
           total={previewable.length}
           onClose={() => setPreviewPath(null)}
