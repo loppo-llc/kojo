@@ -1652,6 +1652,20 @@ func (b *ClaudeBackend) CloseSessionSyncExceptKeyed(agentID, preserveKey string)
 // CloseAllSessions terminates every live persistent process. Used by the
 // restart drain so a device switch / restart doesn't strand a process.
 func (b *ClaudeBackend) CloseAllSessions() {
+	for _, s := range b.takeAllSessions() {
+		s.close()
+	}
+}
+
+// CloseAllSessionsSync is CloseAllSessions that also waits (bounded,
+// escalating to SIGKILL) for every process to exit.
+func (b *ClaudeBackend) CloseAllSessionsSync() {
+	closeSessionsSync(b.takeAllSessions())
+}
+
+// takeAllSessions empties the pool and returns its sessions, already
+// marked with the shutdown close reason.
+func (b *ClaudeBackend) takeAllSessions() []*claudeSession {
 	b.sessMu.Lock()
 	sessions := make([]*claudeSession, 0, len(b.sessions))
 	for id, s := range b.sessions {
@@ -1661,8 +1675,8 @@ func (b *ClaudeBackend) CloseAllSessions() {
 	b.sessMu.Unlock()
 	for _, s := range sessions {
 		s.markCloseReason("kojo shutting down")
-		s.close()
 	}
+	return sessions
 }
 
 // CloseClaudeSession terminates the agent's persistent claude process, if any.
@@ -1721,6 +1735,15 @@ func (m *Manager) CloseClaudeKeyedSessionIfSame(agentID, sessionKey string, hand
 func (m *Manager) CloseAllClaudeSessions() {
 	if cb, ok := m.backends["claude"].(*ClaudeBackend); ok {
 		cb.CloseAllSessions()
+	}
+}
+
+// CloseAllClaudeSessionsSync terminates all persistent claude processes
+// and waits (bounded) for them to exit, so nothing the CLI does after
+// its turn can race a caller that removes the data dir next.
+func (m *Manager) CloseAllClaudeSessionsSync() {
+	if cb, ok := m.backends["claude"].(*ClaudeBackend); ok {
+		cb.CloseAllSessionsSync()
 	}
 }
 

@@ -28,24 +28,26 @@ func pairedExternal(t *testing.T) (*Server, http.Handler, *agent.GroupDM, string
 		close(ch)
 		return ch, nil
 	})
-	// Member-change notifications to the kojo agents run async; let
-	// them settle before the temp config dir is removed.
+	// Member-change notifications to the kojo agents run async as real
+	// Manager.Chat turns (and post-turn summarize) that write into the
+	// temp config dir. Drain them the way a restart does before the dir
+	// is removed: quiescing refuses notification goroutines that have
+	// not reached Chat yet (the check and the preparing counter are one
+	// atomic step), and WaitAllChatsIdle covers preparing, busy and
+	// summarizing. The notification turns also leave a real persistent
+	// claude process behind when the CLI is installed; close those
+	// synchronously too. Registered after the Manager.Close cleanup, so
+	// it runs first.
 	t.Cleanup(func() {
-		idle := 0
-		for i := 0; i < 200 && idle < 20; i++ {
-			busy := false
-			for _, g := range srv.groupdms.List() {
-				for _, m := range g.Members {
-					busy = busy || srv.agents.IsBusy(m.AgentID)
-				}
-			}
-			if busy {
-				idle = 0
-			} else {
-				idle++
-			}
-			time.Sleep(50 * time.Millisecond)
+		srv.agents.SetQuiescing(true)
+		// Above the summarizer subprocess bound, so a slow summarize fails
+		// the test here instead of racing the TempDir removal.
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		if err := srv.agents.WaitAllChatsIdle(ctx); err != nil {
+			t.Errorf("drain async notification turns: %v", err)
 		}
+		srv.agents.CloseAllClaudeSessionsSync()
 	})
 	created := ownerCall(t, srv.handleCreateExternalAgent, "POST", `{"name":"Bot A","ratePerMin":3}`, nil)
 	id := created["id"].(string)
