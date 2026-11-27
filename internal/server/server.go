@@ -1258,9 +1258,6 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/v1/agents/{id}/background-sessions/{key}", s.handleStopBackgroundSession)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}/background-sessions/{key}/tasks/{taskId}", s.handleStopBackgroundTask)
 
-	// Pre-compaction summary (called by Claude Code's PreCompact hook)
-	mux.HandleFunc("POST /api/v1/agents/{id}/pre-compact", s.handlePreCompact)
-
 	// Session reset (CLI session only, keeps conversation history)
 	mux.HandleFunc("POST /api/v1/agents/{id}/reset-session", s.handleResetSession)
 

@@ -64,7 +64,6 @@ const (
 // mismatch. The validators MUST stay in lockstep with the runtime
 // reader (see internal/agent/store.go parseCronPausedRow,
 // internal/agent/cron_lock_kv.go acquireCronLockDB,
-// internal/agent/autosummary.go decodeMarkerKVRow,
 // internal/auth/store_kv.go parseAuthKVValue).
 func validateKVRow(kind legacyKind, rec *store.KVRecord) error {
 	if rec == nil {

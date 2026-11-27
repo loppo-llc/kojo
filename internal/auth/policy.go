@@ -108,7 +108,7 @@ func EnforceMiddleware(next http.Handler) http.Handler {
 //  1. Public reads — info, directory, agent list/get, avatar.
 //  2. Self-scoped reads/writes — files, messages, tasks, credentials,
 //     memory, notify sources, group memberships, avatar upload,
-//     persona / metadata patch, PreCompact hook.
+//     persona / metadata patch.
 //     Permitted only when the path's {id} matches the principal.
 //  3. Privileged-cross-agent — delete / reset / checkin / unarchive /
 //     reset-session. Permitted for self by Agent, or for any target by
@@ -549,9 +549,6 @@ func isSelfScopedRoute(method, sub string) bool {
 		return method == http.MethodGet || method == http.MethodPost
 	case "/groups":
 		return method == http.MethodGet
-	case "/pre-compact":
-		// PreCompact hook fired by claude-code on the agent's own session.
-		return method == http.MethodPost
 	case "/user-context":
 		// Agent reads/writes its own user.md workspace file. GET surfaces
 		// the in-memory DefaultUserContent template for new agents (no

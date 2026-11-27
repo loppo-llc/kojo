@@ -156,20 +156,6 @@ func TestCheckinManagerRetryScopeAndAbort(t *testing.T) {
 			if ctx.Err() != nil {
 				t.Fatalf("test relied on parent cancellation: %v", ctx.Err())
 			}
-			// Ensure post-turn summarization exits before the test store closes.
-			deadline := time.Now().Add(time.Second)
-			for {
-				m.busyMu.Lock()
-				active := m.summarizing
-				m.busyMu.Unlock()
-				if active == 0 {
-					break
-				}
-				if time.Now().After(deadline) {
-					t.Fatal("summary did not stop")
-				}
-				time.Sleep(time.Millisecond)
-			}
 		})
 	}
 }

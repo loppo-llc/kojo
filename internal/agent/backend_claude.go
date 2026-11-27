@@ -870,7 +870,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 // claudeProcessEnv is appended to the Claude CLI processes that run agent
 // turns (one-shot Chat in this file and the persistent claudeSession).
-// runCLIGenerate callers (autosummary, effort classifier) are prompt-only
+// runCLIGenerate callers (effort classifier, generate) are prompt-only
 // and never reach the conditions below, so they are left alone. The 1M /
 // autocompact settings are explained at the Chat call site.
 //
@@ -1981,10 +1981,9 @@ const sessionCacheColdIdle = 60 * time.Minute
 // Arithmetic behind the floor: a cold --resume writes the full transcript
 // at 2x base input (1-hour TTL) — on a $10/MTok model, 30k tokens is
 // $0.60 every time the agent wakes cold. A fresh session writes only the
-// system prompt and tool definitions, and the pre-reset summary is
-// incremental since the autosummary marker, so it reads a few thousand
-// new tokens at base input plus a short diary entry at output price —
-// tens of cents at most, and it has to be paid eventually anyway. Under
+// system prompt and tool definitions plus the recent-conversation excerpt,
+// a few thousand tokens at base input — and it has to be paid eventually
+// anyway. Under
 // ~30k the two are close enough that keeping the conversation intact
 // wins; the number is a judgement, not a measurement.
 const sessionColdResetFloorTokens = 30_000
@@ -1998,29 +1997,13 @@ const sessionColdResetFloorTokens = 30_000
 // the read as untrusted so the reset retries on the next chat.
 const sessionTailReadBytes = 1 * 1024 * 1024
 
-// preResetSummarize is the summarization hook invoked by sessionFileUsable
-// right before it deletes a session file. Defaults to PreCompactSummarize,
-// which writes a diary entry from the live session JSONL. Exposed as a
-// package variable so tests can substitute a deterministic fake instead of
-// spawning a real claude CLI process.
-var preResetSummarize = func(agentID, tool, transcriptPath string, logger *slog.Logger) error {
-	// Reset path doesn't have the PreCompact-hook stdin payload (claude
-	// isn't telling us about a compaction here — kojo is initiating a
-	// session wipe), but it does know exactly which JSONL it is about to
-	// delete, so that path is passed through rather than left to
-	// discovery — which picks the most recently modified file in the
-	// project dir and, with several keyed sessions live, can be a
-	// different conversation.
-	return PreCompactSummarize(agentID, tool, transcriptPath, logger)
-}
-
 // sessionResetMinIdleDuration is the package-default idle window used when
 // a caller doesn't supply a per-agent override (legacy callers and tests).
 // Per-agent override comes through Agent.ResumeIdleMinutes →
 // Agent.ResumeIdleDuration().
 //
 // Rationale for the 30-minute default: an active chat produces many short
-// turns that never reach the autosummary / MEMORY.md path, so resetting
+// turns the agent has not yet written to its diary / MEMORY.md, so resetting
 // mid-conversation would discard recent context the agent can't recover
 // from files — and every reset replays the full prompt, so keeping the
 // session across a typical interactive lull saves tokens. Agents that
@@ -2052,12 +2035,9 @@ const sessionResetMinIdleDuration = defaultResumeIdleDuration
 // idleThreshold is the per-agent active-chat protection window. Pass
 // agent.ResumeIdleDuration(); pass <=0 to fall back to sessionResetMinIdleDuration.
 //
-// agentID and logger are used to summarize the session into the agent's
-// diary (via PreCompactSummarize) just before a reset fires. This is kojo's
-// system-level guarantee that recent turns aren't lost simply because the
-// agent forgot to update MEMORY.md itself — production experience has shown
-// that persona / system-prompt instructions to "write to MEMORY.md" are not
-// reliable, so the reset path writes a summary regardless.
+// agentID is only used for logging. The reset does not summarize the
+// dropped session: the agent keeps its own diary / MEMORY.md, and the fresh
+// session gets the recent-conversation excerpt.
 // sessionFileUsable reports whether the session JSONL can be resumed.
 // Thin wrapper over sessionFileUsableReset for callers that don't care
 // whether an over-threshold reset just happened.
@@ -2107,9 +2087,8 @@ func sessionFileUsableReset(agentDir string, sessionID string, automatedTrigger 
 	}
 	// Once the prompt cache behind the session has gone cold, resuming
 	// buys nothing but a full-price re-write of the transcript, so the
-	// token threshold drops to the cold floor. Everything else — the
-	// interactive idle guard, the pre-reset diary summary — applies
-	// unchanged.
+	// token threshold drops to the cold floor. The interactive idle
+	// guard applies unchanged.
 	idle := time.Since(info.ModTime())
 	tokenThreshold := sessionResetThresholdTokens
 	cacheCold := idle >= sessionCacheColdIdle
@@ -2132,21 +2111,8 @@ func sessionFileUsableReset(agentDir string, sessionID string, automatedTrigger 
 		}
 	}
 
-	// Summarize the session into the agent's diary BEFORE we delete its
-	// JSONL. PreCompactSummarize reads the live session file (which we're
-	// about to remove), so ordering matters. If the summary fails we
-	// abort the reset — losing context silently would be worse than
-	// carrying a slightly-over-threshold session for one more turn.
-	if agentID != "" {
-		if err := preResetSummarize(agentID, "claude", path, logger); err != nil {
-			logger.Warn("pre-reset summary failed, keeping session to avoid context loss",
-				"path", path, "agent", agentID, "err", err)
-			return true, false
-		}
-	}
-
 	logger.Info("claude session context over threshold, resetting",
-		"path", path, "contextTokens", ctx,
+		"path", path, "agent", agentID, "contextTokens", ctx,
 		"threshold", tokenThreshold, "cacheCold", cacheCold,
 		"idle", idle, "automatedTrigger", automatedTrigger)
 	if err := os.Remove(path); err != nil {
@@ -2478,7 +2444,7 @@ func findSessionFile(projectDir string, sessionID string) string {
 		return ""
 	}
 
-	// Fallback for callers that don't have a session ID (e.g. loadSessionMessages).
+	// Fallback for callers that don't have a session ID.
 	entries, err := os.ReadDir(projectDir)
 	if err != nil {
 		return ""
@@ -2940,12 +2906,10 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 }
 
 // PrepareClaudeSettings writes .claude/settings.local.json with persona
-// override, the bash-capture PreToolUse hook (always installed), and
-// (when apiBase is available) a PreCompact hook that calls kojo's API to
-// save a conversation summary before Claude compacts context.
+// override and the bash-capture PreToolUse hook (always installed).
 // Called from Manager.Chat before backend.Chat to ensure settings are in
 // place before the Claude process reads them.
-func PrepareClaudeSettings(agentID, apiBase string, allowProtectedPaths []string, logger *slog.Logger) {
+func PrepareClaudeSettings(agentID string, allowProtectedPaths []string, logger *slog.Logger) {
 	dir := agentDir(agentID)
 	claudeDir := filepath.Join(dir, ".claude")
 	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
@@ -3003,43 +2967,9 @@ func PrepareClaudeSettings(agentID, apiBase string, allowProtectedPaths []string
     ]`, hookPath)
 	}
 
-	var preCompactBlock string
-	if apiBase != "" {
-		curlFlags := "-s"
-		if strings.HasPrefix(apiBase, "https://") {
-			curlFlags = "-sk"
-		}
-		// Hook payload: claude pipes a JSON object to stdin describing the
-		// triggering event. The fields kojo cares about are
-		// `transcript_path` (so we read the exact session being compacted
-		// instead of guessing) and `trigger` (manual vs auto, useful for
-		// telemetry but not yet used for branching). We pass that through
-		// verbatim with `--data-binary @-`. Older builds sent `-d '{}'`
-		// which dropped the payload, forcing the API to probe for the
-		// session file by mtime.
-		// $KOJO_AGENT_TOKEN is injected into the PTY by filterEnv. The
-		// auth listener requires it on every /api/v1/* call; without
-		// the X-Kojo-Token header the PreCompact hook would 403 from
-		// the agent perspective.
-		preCompactBlock = fmt.Sprintf(`    "PreCompact": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "curl %s -X POST '%s/api/v1/agents/%s/pre-compact' -H 'Content-Type: application/json' -H \"X-Kojo-Token: $KOJO_AGENT_TOKEN\" --data-binary @- --max-time 120"
-          }
-        ]
-      }
-    ]`, curlFlags, apiBase, agentID)
-	}
-
 	hookBlocks := []string{}
 	if bashHookBlock != "" {
 		hookBlocks = append(hookBlocks, bashHookBlock)
-	}
-	if preCompactBlock != "" {
-		hookBlocks = append(hookBlocks, preCompactBlock)
 	}
 
 	var settings string

@@ -669,7 +669,6 @@ func blockerAge(d time.Duration) string {
 //	mutating:ag_y(n=1)
 //	switching:ag_y
 //	notifying:ag_y(n=1)
-//	summarizing(n=1)
 //	oneShot:ag_z(id=7,key=groupdm:g_1,age=32m)
 //	profileGen:ag_w
 func (m *Manager) DrainBlockers() []string {
@@ -700,9 +699,6 @@ func (m *Manager) DrainBlockers() []string {
 	}
 	for id, n := range m.notifying {
 		out = append(out, fmt.Sprintf("notifying:%s(n=%d)", id, n))
-	}
-	if m.summarizing > 0 {
-		out = append(out, fmt.Sprintf("summarizing(n=%d)", m.summarizing))
 	}
 	m.busyMu.Unlock()
 
@@ -736,10 +732,7 @@ func (m *Manager) DrainBlockers() []string {
 // WaitAllChatsIdle polls until every concurrent write path across
 // ALL agents has drained, or ctx is cancelled. The daemon-wide
 // analogue of WaitChatIdle — same six checks, plus `switching`
-// (a §3.7 device switch must not be cut in half by a re-exec) and
-// the post-turn summarize counter (turnSummarizeAsync runs after
-// busy clears, and killing it mid-write would corrupt recent.md /
-// the cursor file).
+// (a §3.7 device switch must not be cut in half by a re-exec).
 //
 // Callers should SetQuiescing(true) first; otherwise a fresh turn
 // can start between the idle observation and whatever the caller
@@ -751,8 +744,7 @@ func (m *Manager) WaitAllChatsIdle(ctx context.Context) error {
 		idle := len(m.busy) == 0 && len(m.preparing) == 0 &&
 			len(m.editing) == 0 && len(m.resetting) == 0 &&
 			len(m.mutating) == 0 && len(m.switching) == 0 &&
-			len(m.notifying) == 0 &&
-			m.summarizing == 0
+			len(m.notifying) == 0
 		m.busyMu.Unlock()
 		if idle {
 			m.oneShotCancelsMu.Lock()

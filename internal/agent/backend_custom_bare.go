@@ -43,11 +43,6 @@ func (b *CustomBareBackend) Chat(ctx context.Context, agent *Agent, userMessage 
 	// bounded preformatted context instead, so use that fallback only when the
 	// structured replay is absent. Applying both would duplicate every prior
 	// turn in the request.
-	// No native session: every request starts from scratch, so the
-	// session-start diary rides every turn.
-	if opts.SessionStartContext != "" {
-		userMessage = injectRecentMessagesContext(userMessage, opts.SessionStartContext)
-	}
 	if len(opts.History) == 0 {
 		userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, false)
 	}

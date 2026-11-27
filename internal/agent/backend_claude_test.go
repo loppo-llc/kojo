@@ -950,60 +950,19 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		}
 	})
 
-	t.Run("invokes pre-reset summary hook before deleting session", func(t *testing.T) {
-		// Regression guard for the "agent didn't write MEMORY.md" failure
-		// mode: before we unlink the JSONL, we MUST call the summary hook
-		// so recent turns make it into the agent's diary. Skipping this
-		// would silently amputate context on every over-threshold reset.
+	t.Run("resets over-threshold idle session without summarizing", func(t *testing.T) {
+		// The pre-reset summarizer is gone: an over-threshold, idle
+		// session is simply unlinked.
 		entry := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":160000,"cache_creation_input_tokens":1000}}}`
 		os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644)
 		old := time.Now().Add(-2 * sessionResetMinIdleDuration)
 		os.Chtimes(sessionFile, old, old)
 
-		var calledAgent, calledTool string
-		orig := preResetSummarize
-		preResetSummarize = func(agentID, tool, _ string, _ *slog.Logger) error {
-			calledAgent = agentID
-			calledTool = tool
-			return nil
-		}
-		t.Cleanup(func() { preResetSummarize = orig })
-
-		if sessionFileUsable(aDir, sessionID, false, "ag_summary_probe", sessionResetMinIdleDuration, nil) {
+		if sessionFileUsable(aDir, sessionID, false, "ag_reset_probe", sessionResetMinIdleDuration, nil) {
 			t.Error("expected reset to proceed")
 		}
-		if calledAgent != "ag_summary_probe" {
-			t.Errorf("summary hook called with agent=%q, want ag_summary_probe", calledAgent)
-		}
-		if calledTool != "claude" {
-			t.Errorf("summary hook called with tool=%q, want claude", calledTool)
-		}
 		if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
-			t.Error("expected session file removed after successful summary")
-		}
-	})
-
-	t.Run("aborts reset when summary hook fails", func(t *testing.T) {
-		// If we can't capture a summary, deleting the JSONL would discard
-		// context with no breadcrumb. Safer to let the session run one
-		// more turn (claude's auto-compact still bounds growth) than to
-		// silently lose state.
-		entry := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":160000,"cache_creation_input_tokens":1000}}}`
-		os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644)
-		old := time.Now().Add(-2 * sessionResetMinIdleDuration)
-		os.Chtimes(sessionFile, old, old)
-
-		orig := preResetSummarize
-		preResetSummarize = func(_, _, _ string, _ *slog.Logger) error {
-			return fmt.Errorf("simulated summary failure")
-		}
-		t.Cleanup(func() { preResetSummarize = orig })
-
-		if !sessionFileUsable(aDir, sessionID, false, "ag_summary_fail", sessionResetMinIdleDuration, nil) {
-			t.Error("expected reset to be aborted when summary fails")
-		}
-		if _, err := os.Stat(sessionFile); err != nil {
-			t.Error("expected session file to be preserved when summary fails")
+			t.Error("expected session file removed")
 		}
 	})
 
@@ -1037,12 +996,6 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		if err := os.Chtimes(sessionFile, recent, recent); err != nil {
 			t.Fatalf("chtimes: %v", err)
 		}
-		// Stub the summary hook so the reset path can complete without
-		// spawning a real claude subprocess.
-		orig := preResetSummarize
-		preResetSummarize = func(_, _, _ string, _ *slog.Logger) error { return nil }
-		t.Cleanup(func() { preResetSummarize = orig })
-
 		if sessionFileUsable(aDir, sessionID, false, "ag_per_agent_idle", 1*time.Minute, nil) {
 			t.Error("expected reset under shorter per-agent idle window")
 		}
@@ -1113,8 +1066,8 @@ func TestPrepareClaudeSettings_BashCaptureHook(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	t.Run("apiBase empty installs PreToolUse only", func(t *testing.T) {
-		PrepareClaudeSettings(agentID, "", nil, logger)
+	t.Run("installs PreToolUse only", func(t *testing.T) {
+		PrepareClaudeSettings(agentID, nil, logger)
 
 		claudeDir := filepath.Join(agentDir(agentID), ".claude")
 		settingsPath := filepath.Join(claudeDir, "settings.local.json")
@@ -1148,7 +1101,7 @@ func TestPrepareClaudeSettings_BashCaptureHook(t *testing.T) {
 		}
 
 		// Settings JSON must contain PreToolUse pointing at hook script,
-		// and must NOT contain PreCompact (apiBase empty).
+		// and must NOT contain PreCompact (removed).
 		raw, err := os.ReadFile(settingsPath)
 		if err != nil {
 			t.Fatal(err)
@@ -1162,7 +1115,7 @@ func TestPrepareClaudeSettings_BashCaptureHook(t *testing.T) {
 			t.Errorf("PreToolUse missing from settings: %s", raw)
 		}
 		if _, ok := hooks["PreCompact"]; ok {
-			t.Errorf("PreCompact must not appear when apiBase empty: %s", raw)
+			t.Errorf("PreCompact must not appear: %s", raw)
 		}
 		if !strings.Contains(string(raw), hookPath) {
 			t.Errorf("hook path %q not embedded in settings: %s", hookPath, raw)
@@ -1183,27 +1136,6 @@ func TestPrepareClaudeSettings_BashCaptureHook(t *testing.T) {
 		}
 	})
 
-	t.Run("apiBase set installs both PreToolUse and PreCompact", func(t *testing.T) {
-		PrepareClaudeSettings(agentID, "https://kojo.example/api", nil, logger)
-
-		settingsPath := filepath.Join(agentDir(agentID), ".claude", "settings.local.json")
-		raw, err := os.ReadFile(settingsPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var parsed map[string]any
-		if err := json.Unmarshal(raw, &parsed); err != nil {
-			t.Fatalf("settings is not valid JSON: %v\n%s", err, raw)
-		}
-		hooks, _ := parsed["hooks"].(map[string]any)
-		if _, ok := hooks["PreToolUse"]; !ok {
-			t.Errorf("PreToolUse missing: %s", raw)
-		}
-		if _, ok := hooks["PreCompact"]; !ok {
-			t.Errorf("PreCompact missing: %s", raw)
-		}
-	})
-
 	t.Run("windows skips PreToolUse hook", func(t *testing.T) {
 		// Fresh agent dir to avoid carryover from previous subtests.
 		winAgentID := "ag_bash_capture_test_win"
@@ -1214,7 +1146,7 @@ func TestPrepareClaudeSettings_BashCaptureHook(t *testing.T) {
 		hostOS = "windows"
 		t.Cleanup(func() { hostOS = orig })
 
-		PrepareClaudeSettings(winAgentID, "https://kojo.example/api", nil, logger)
+		PrepareClaudeSettings(winAgentID, nil, logger)
 
 		claudeDir := filepath.Join(agentDir(winAgentID), ".claude")
 		hookPath := filepath.Join(claudeDir, "hooks", "bash-capture.sh")
@@ -1233,11 +1165,6 @@ func TestPrepareClaudeSettings_BashCaptureHook(t *testing.T) {
 		hooks, _ := parsed["hooks"].(map[string]any)
 		if _, ok := hooks["PreToolUse"]; ok {
 			t.Errorf("PreToolUse must not appear on windows: %s", raw)
-		}
-		// PreCompact still installs (curl-based, also POSIX-shell but
-		// matches existing kojo Windows assumption).
-		if _, ok := hooks["PreCompact"]; !ok {
-			t.Errorf("PreCompact missing: %s", raw)
 		}
 	})
 }
@@ -1520,21 +1447,4 @@ func TestSessionFileUsable_ColdCacheBoundaries(t *testing.T) {
 			}
 		})
 	}
-
-	t.Run("pre-reset summary gets the doomed file's path", func(t *testing.T) {
-		write(t, sessionColdResetFloorTokens+1, 2*time.Hour)
-		var got string
-		orig := preResetSummarize
-		preResetSummarize = func(_, _, transcriptPath string, _ *slog.Logger) error {
-			got = transcriptPath
-			return nil
-		}
-		t.Cleanup(func() { preResetSummarize = orig })
-		if usable, reset := sessionFileUsableReset(aDir, sessionID, false, "ag_cold_edge_test", sessionResetMinIdleDuration, nil); usable || !reset {
-			t.Errorf("usable,reset = %v,%v; want false,true", usable, reset)
-		}
-		if got != sessionFile {
-			t.Errorf("summary path = %q, want %q", got, sessionFile)
-		}
-	})
 }

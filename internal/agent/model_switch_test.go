@@ -812,3 +812,36 @@ func TestSyncModelSwitchSkill_FollowsBackend(t *testing.T) {
 		t.Errorf("skill kept for a backend without skills: %v", err)
 	}
 }
+
+func TestModelSwitchPrompt_ModelSwitchInfoToggle(t *testing.T) {
+	m := newTestManager(t)
+	id := "ag_switch_info"
+	p := &pendingModelSwitch{
+		agentID: id, token: "tok123", note: "next step",
+		from: ModelSwitchTarget{Tool: "claude", Model: "old-model", Effort: "low"},
+		to:   ModelSwitchTarget{Tool: "claude", Model: "new-model", Effort: "high"},
+	}
+	m.agents[id] = &Agent{ID: id}
+	on := m.modelSwitchPrompt(p)
+	if !strings.Contains(on, "old-model") || !strings.Contains(on, "new-model (effort high)") {
+		t.Fatalf("default prompt lost the targets: %q", on)
+	}
+	m.agents[id] = &Agent{ID: id, DisabledInjections: []string{InjectionModelSwitchInfo}}
+	off := m.modelSwitchPrompt(p)
+	if strings.Contains(off, "old-model") || strings.Contains(off, "new-model") || strings.Contains(off, "effort") {
+		t.Fatalf("disabled prompt still names the models: %q", off)
+	}
+	// The token binds the verifying turn and the note is the agent's own
+	// handoff; both must survive the toggle.
+	if !strings.Contains(off, modelSwitchTokenText("tok123")) || !strings.Contains(off, "next step") {
+		t.Fatalf("disabled prompt dropped token or note: %q", off)
+	}
+
+	back := modelSwitchRollbackPrompt(p, "boom", true)
+	if strings.Contains(back, "old-model") || strings.Contains(back, "new-model") || !strings.Contains(back, "boom") {
+		t.Fatalf("hidden rollback prompt: %q", back)
+	}
+	if shown := modelSwitchRollbackPrompt(p, "boom", false); !strings.Contains(shown, "new-model") || !strings.Contains(shown, "old-model") {
+		t.Fatalf("default rollback prompt lost the targets: %q", shown)
+	}
+}

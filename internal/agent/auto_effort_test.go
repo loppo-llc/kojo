@@ -37,7 +37,7 @@ func TestResolveTurnEffortOptOutStatic(t *testing.T) {
 		return "", nil
 	})
 	a := &Agent{Tool: "claude", Model: "sonnet", Effort: "high", AutoEffort: boolPtr(false)}
-	eff, src := resolveTurnEffort(context.Background(), a, "debug this crash", false, "", "", testLogger())
+	eff, src := resolveTurnEffort(context.Background(), a, "debug this crash", false, "", testLogger())
 	if eff != "high" || src != "static" {
 		t.Fatalf("got (%q,%q), want (high,static)", eff, src)
 	}
@@ -50,7 +50,7 @@ func TestResolveTurnEffortUnsupportedToolStatic(t *testing.T) {
 	})
 	for _, tool := range []string{"codex", "custom-bare", "custom-claude", "custom-codex"} {
 		a := &Agent{Tool: tool, Model: "gpt-5.5", Effort: "medium"}
-		eff, src := resolveTurnEffort(context.Background(), a, "hi", false, "", "", testLogger())
+		eff, src := resolveTurnEffort(context.Background(), a, "hi", false, "", testLogger())
 		if eff != "medium" || src != "static" {
 			t.Fatalf("tool %s: got (%q,%q), want (medium,static)", tool, eff, src)
 		}
@@ -63,13 +63,13 @@ func TestResolveTurnEffortSystemTurnRule(t *testing.T) {
 		return "", nil
 	})
 	a := &Agent{Tool: "claude", Model: "sonnet", Effort: "high"}
-	eff, src := resolveTurnEffort(context.Background(), a, "cron check-in", true, "", "", testLogger())
+	eff, src := resolveTurnEffort(context.Background(), a, "cron check-in", true, "", testLogger())
 	if eff != "low" || src != "rule" {
 		t.Fatalf("got (%q,%q), want (low,rule)", eff, src)
 	}
 	// Static already at/below low → keep static, no downgrade churn.
 	a2 := &Agent{Tool: "claude", Model: "sonnet", Effort: "low"}
-	eff, src = resolveTurnEffort(context.Background(), a2, "cron check-in", true, "", "", testLogger())
+	eff, src = resolveTurnEffort(context.Background(), a2, "cron check-in", true, "", testLogger())
 	if eff != "low" || src != "static" {
 		t.Fatalf("got (%q,%q), want (low,static)", eff, src)
 	}
@@ -92,7 +92,7 @@ func TestResolveTurnEffortHappyPath(t *testing.T) {
 	for _, c := range cases {
 		withFakeClassifier(t, fakeClassifierReturning(c.classifier))
 		a := &Agent{Tool: "claude", Model: "sonnet", Effort: c.static}
-		eff, src := resolveTurnEffort(context.Background(), a, "some question", false, "", "", testLogger())
+		eff, src := resolveTurnEffort(context.Background(), a, "some question", false, "", testLogger())
 		if eff != c.want || !strings.HasPrefix(src, "llm:") {
 			t.Fatalf("classifier %q static %q: got (%q,%q), want (%q,llm)", c.classifier, c.static, eff, src, c.want)
 		}
@@ -104,7 +104,7 @@ func TestResolveTurnEffortHighKeepsXhighCeiling(t *testing.T) {
 	withFakeClassifier(t, fakeClassifierReturning("high"))
 	for _, static := range []string{"xhigh", "max"} {
 		a := &Agent{Tool: "claude", Model: "opus", Effort: static}
-		eff, src := resolveTurnEffort(context.Background(), a, "hard multi-file refactor", false, "", "", testLogger())
+		eff, src := resolveTurnEffort(context.Background(), a, "hard multi-file refactor", false, "", testLogger())
 		if eff != static || !strings.HasPrefix(src, "llm:") {
 			t.Fatalf("static %s: got (%q,%q), want (%s,llm)", static, eff, src, static)
 		}
@@ -119,24 +119,24 @@ func TestResolveTurnEffortClassifierErrorHeuristic(t *testing.T) {
 	a := &Agent{Tool: "claude", Model: "sonnet", Effort: "high"}
 
 	// Short plain message → low.
-	eff, src := resolveTurnEffort(context.Background(), a, "thanks!", false, "", "", testLogger())
+	eff, src := resolveTurnEffort(context.Background(), a, "thanks!", false, "", testLogger())
 	if eff != "low" || src != "heuristic" {
 		t.Fatalf("short: got (%q,%q), want (low,heuristic)", eff, src)
 	}
 	// Long message → static (tagged "static" so the caller never
 	// mistakes the echoed old value for a classifier verdict).
 	long := strings.Repeat("な", 300)
-	eff, src = resolveTurnEffort(context.Background(), a, long, false, "", "", testLogger())
+	eff, src = resolveTurnEffort(context.Background(), a, long, false, "", testLogger())
 	if eff != "high" || src != "static" {
 		t.Fatalf("long: got (%q,%q), want (high,static)", eff, src)
 	}
 	// Short but contains a code fence → static.
-	eff, _ = resolveTurnEffort(context.Background(), a, "```go\npanic()\n```", false, "", "", testLogger())
+	eff, _ = resolveTurnEffort(context.Background(), a, "```go\npanic()\n```", false, "", testLogger())
 	if eff != "high" {
 		t.Fatalf("code fence: got %q, want high", eff)
 	}
 	// Short but contains a URL → static.
-	eff, _ = resolveTurnEffort(context.Background(), a, "read https://example.com/doc", false, "", "", testLogger())
+	eff, _ = resolveTurnEffort(context.Background(), a, "read https://example.com/doc", false, "", testLogger())
 	if eff != "high" {
 		t.Fatalf("url: got %q, want high", eff)
 	}
@@ -146,7 +146,7 @@ func TestResolveTurnEffortJunkOutputHeuristic(t *testing.T) {
 	requireClaudeInPath(t)
 	withFakeClassifier(t, fakeClassifierReturning("I think this is a medium difficulty task"))
 	a := &Agent{Tool: "claude", Model: "sonnet", Effort: "high"}
-	eff, src := resolveTurnEffort(context.Background(), a, "hey", false, "", "", testLogger())
+	eff, src := resolveTurnEffort(context.Background(), a, "hey", false, "", testLogger())
 	if eff != "low" || src != "heuristic" {
 		t.Fatalf("got (%q,%q), want (low,heuristic)", eff, src)
 	}
@@ -158,12 +158,12 @@ func TestResolveTurnEffortEmptyStaticTreatedAsHigh(t *testing.T) {
 	// downgrades, high verdict keeps the default untouched.
 	withFakeClassifier(t, fakeClassifierReturning("low"))
 	a := &Agent{Tool: "claude", Model: "sonnet", Effort: ""}
-	eff, src := resolveTurnEffort(context.Background(), a, "hi", false, "", "", testLogger())
+	eff, src := resolveTurnEffort(context.Background(), a, "hi", false, "", testLogger())
 	if eff != "low" || !strings.HasPrefix(src, "llm:") {
 		t.Fatalf("got (%q,%q), want (low,llm)", eff, src)
 	}
 	withFakeClassifier(t, fakeClassifierReturning("high"))
-	eff, _ = resolveTurnEffort(context.Background(), a, "hard task", false, "", "", testLogger())
+	eff, _ = resolveTurnEffort(context.Background(), a, "hard task", false, "", testLogger())
 	if eff != "high" {
 		t.Fatalf("got %q, want high", eff)
 	}
@@ -206,21 +206,13 @@ func TestIsAutoEffortEnabled(t *testing.T) {
 }
 
 func TestBuildEffortClassifierPromptCaps(t *testing.T) {
-	diary := strings.Repeat("あ", 1000)
 	msg := strings.Repeat("い", 3000)
-	p := buildEffortClassifierPrompt(diary, msg)
-	if strings.Count(p, "あ") != effortClassifierDiaryCap {
-		t.Fatalf("diary not capped: %d", strings.Count(p, "あ"))
-	}
+	p := buildEffortClassifierPrompt(msg)
 	if strings.Count(p, "い") != effortClassifierMessageCap {
 		t.Fatalf("message not capped: %d", strings.Count(p, "い"))
 	}
-	if !strings.Contains(p, "<message>") || !strings.Contains(p, "<recent-context>") {
-		t.Fatal("delimiters missing")
-	}
-	// Empty diary omits the context block entirely.
-	if strings.Contains(buildEffortClassifierPrompt("", "hi"), "recent-context") {
-		t.Fatal("empty diary must omit the context block")
+	if !strings.Contains(p, "<message>") || strings.Contains(p, "recent-context") {
+		t.Fatalf("unexpected prompt shape: %q", p[:40])
 	}
 }
 
@@ -252,7 +244,7 @@ func TestResolveTurnEffortJevPreferredOverCLI(t *testing.T) {
 		return "low", nil
 	})
 	a := &Agent{Tool: "claude", Model: "sonnet", Effort: "high"}
-	eff, src := resolveTurnEffort(context.Background(), a, "thanks", false, "diary tail", "ts-key", testLogger())
+	eff, src := resolveTurnEffort(context.Background(), a, "thanks", false, "ts-key", testLogger())
 	if eff != "low" || src != "jev:low" {
 		t.Fatalf("got (%q,%q), want (low,jev:low)", eff, src)
 	}
@@ -267,7 +259,7 @@ func TestResolveTurnEffortJevWorksWithoutClaudeCLI(t *testing.T) {
 		return "medium", nil
 	})
 	a := &Agent{Tool: "grok", Model: "grok-4", Effort: "high"}
-	eff, src := resolveTurnEffort(context.Background(), a, "write a haiku about cats", false, "", "ts-key", testLogger())
+	eff, src := resolveTurnEffort(context.Background(), a, "write a haiku about cats", false, "ts-key", testLogger())
 	if eff != "medium" || src != "jev:medium" {
 		t.Fatalf("got (%q,%q), want (medium,jev:medium)", eff, src)
 	}
@@ -280,7 +272,7 @@ func TestResolveTurnEffortJevErrorFallsBackToCLI(t *testing.T) {
 	})
 	withFakeClassifier(t, fakeClassifierReturning("medium"))
 	a := &Agent{Tool: "claude", Model: "sonnet", Effort: "high"}
-	eff, src := resolveTurnEffort(context.Background(), a, "some question", false, "", "ts-key", testLogger())
+	eff, src := resolveTurnEffort(context.Background(), a, "some question", false, "ts-key", testLogger())
 	if eff != "medium" || src != "llm:medium" {
 		t.Fatalf("got (%q,%q), want (medium,llm:medium)", eff, src)
 	}
@@ -292,13 +284,13 @@ func TestResolveTurnEffortJevErrorNoCLIUsesHeuristic(t *testing.T) {
 		return "", context.DeadlineExceeded
 	})
 	a := &Agent{Tool: "claude", Model: "sonnet", Effort: "high"}
-	eff, src := resolveTurnEffort(context.Background(), a, "ok", false, "", "ts-key", testLogger())
+	eff, src := resolveTurnEffort(context.Background(), a, "ok", false, "ts-key", testLogger())
 	if eff != "low" || src != "heuristic" {
 		t.Fatalf("got (%q,%q), want (low,heuristic)", eff, src)
 	}
 	// Without Jev configured and without a CLI the historical "stay
 	// static, don't guess" behavior is unchanged.
-	eff, src = resolveTurnEffort(context.Background(), a, "ok", false, "", "", testLogger())
+	eff, src = resolveTurnEffort(context.Background(), a, "ok", false, "", testLogger())
 	if eff != "high" || src != "static" {
 		t.Fatalf("no jev/no cli: got (%q,%q), want (high,static)", eff, src)
 	}
@@ -314,7 +306,7 @@ func TestResolveTurnEffortJevTimeoutSkipsCLI(t *testing.T) {
 		return "", nil
 	})
 	a := &Agent{Tool: "claude", Model: "sonnet", Effort: "high"}
-	eff, src := resolveTurnEffort(context.Background(), a, "ok", false, "", "ts-key", testLogger())
+	eff, src := resolveTurnEffort(context.Background(), a, "ok", false, "ts-key", testLogger())
 	if eff != "low" || src != "heuristic" {
 		t.Fatalf("got (%q,%q), want (low,heuristic)", eff, src)
 	}
@@ -332,7 +324,7 @@ func TestResolveTurnEffortJevCancelledTurnStaysStatic(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	a := &Agent{Tool: "claude", Model: "sonnet", Effort: "high"}
-	eff, src := resolveTurnEffort(ctx, a, "ok", false, "", "ts-key", testLogger())
+	eff, src := resolveTurnEffort(ctx, a, "ok", false, "ts-key", testLogger())
 	if eff != "high" || src != "static" {
 		t.Fatalf("got (%q,%q), want (high,static)", eff, src)
 	}
@@ -346,7 +338,7 @@ func TestResolveTurnEffortJevNotCalledWithoutKey(t *testing.T) {
 	})
 	withFakeClassifier(t, fakeClassifierReturning("low"))
 	a := &Agent{Tool: "claude", Model: "sonnet", Effort: "high"}
-	if eff, src := resolveTurnEffort(context.Background(), a, "hi", false, "", "", testLogger()); eff != "low" || src != "llm:low" {
+	if eff, src := resolveTurnEffort(context.Background(), a, "hi", false, "", testLogger()); eff != "low" || src != "llm:low" {
 		t.Fatalf("got (%q,%q), want (low,llm:low)", eff, src)
 	}
 }
@@ -443,14 +435,14 @@ func TestResolveTurnEffortGemini(t *testing.T) {
 	for _, c := range cases {
 		withFakeClassifier(t, fakeClassifierReturning(c.classifier))
 		a := &Agent{Tool: ToolGeminiAPI, Model: c.model, Effort: c.static}
-		eff, _ := resolveTurnEffort(context.Background(), a, "some question", false, "", "", testLogger())
+		eff, _ := resolveTurnEffort(context.Background(), a, "some question", false, "", testLogger())
 		if eff != c.want {
 			t.Fatalf("model %q static %q tier %q: got %q, want %q", c.model, c.static, c.classifier, eff, c.want)
 		}
 	}
 	// System turns pin gemini to low too.
 	a := &Agent{Tool: ToolGeminiAPI, Model: "gemini-4-argon", Effort: "high"}
-	if eff, src := resolveTurnEffort(context.Background(), a, "cron", true, "", "", testLogger()); eff != "low" || src != "rule" {
+	if eff, src := resolveTurnEffort(context.Background(), a, "cron", true, "", testLogger()); eff != "low" || src != "rule" {
 		t.Fatalf("system turn: got (%q,%q)", eff, src)
 	}
 }

@@ -904,11 +904,12 @@ const (
 	InjectionTodoAPI            = "todo_api"            // todo guide pointer + Active Todos in volatile context
 	InjectionAttachments        = "attachments"         // attachment staging pointer
 	InjectionStatus             = "status"              // Your Status section
-	InjectionDiaryNotes         = "diary_notes"         // Recent Activity block in volatile context
+	InjectionDiaryNotes         = "diary_notes"         // deprecated no-op: the diary block went with the pre-compaction summarizer; still accepted so stored configs validate
 	InjectionMemorySearch       = "memory_search"       // Relevant Memory block in volatile context
 	InjectionRecentConversation = "recent_conversation" // session-resume transcript fallback
 	InjectionPersonaAnchor      = "persona_anchor"      // persona anchor block appended after volatile context
 	InjectionCallUser           = "call_user"           // non-blocking "page the operator" contract
+	InjectionModelSwitchInfo    = "model_switch_info"   // model names + effort in the self model-switch notice turns
 )
 
 var validInjectionKeys = map[string]bool{
@@ -923,6 +924,7 @@ var validInjectionKeys = map[string]bool{
 	InjectionMemorySearch:       true,
 	InjectionRecentConversation: true,
 	InjectionPersonaAnchor:      true,
+	InjectionModelSwitchInfo:    true,
 	InjectionCallUser:           true,
 }
 

@@ -22,11 +22,6 @@ type idleResetPolicy struct {
 	coldFloorTokens int
 }
 
-// cliResetSummarize writes the pre-reset diary summary. A var for tests.
-var cliResetSummarize = func(agentID, tool string, logger *slog.Logger) error {
-	return preResetSummarize(agentID, tool, "", logger)
-}
-
 // idleAwareResetDue reports whether the stored session whose CLI log is at
 // logPath should be dropped before this turn. measure returns the context
 // size of the last model call in that log (ok=false: inconclusive, keep).
@@ -38,11 +33,8 @@ var cliResetSummarize = func(agentID, tool string, logger *slog.Logger) error {
 // session active within idleThreshold (<=0: sessionResetMinIdleDuration),
 // so a reset never lands mid-rally.
 //
-// For the main session (sessionKey "") the kojo transcript is summarized
-// into the diary first, and the reset is skipped if that fails. Keyed
-// sessions (Slack threads etc.) are not in the main transcript, so they
-// are dropped without a summary; the fresh session gets the caller's
-// bootstrap context like any new one.
+// The dropped session is not summarized; the fresh session gets the
+// caller's bootstrap context like any new one.
 func idleAwareResetDue(p idleResetPolicy, logPath string, measure func(string) (int, bool), sessionID, sessionKey string, automatedTrigger bool, agentID string, idleThreshold time.Duration, logger *slog.Logger) bool {
 	if logger == nil {
 		logger = slog.Default()
@@ -75,13 +67,6 @@ func idleAwareResetDue(p idleResetPolicy, logPath string, measure func(string) (
 			logger.Debug("session over threshold but recently active, keeping",
 				"tool", p.tool, "agent", agentID, "session", sessionID,
 				"contextTokens", ctx, "idle", idle, "idleThreshold", guard)
-			return false
-		}
-	}
-	if sessionKey == "" && agentID != "" {
-		if err := cliResetSummarize(agentID, p.tool, logger); err != nil {
-			logger.Warn("pre-reset summary failed, keeping session to avoid context loss",
-				"tool", p.tool, "agent", agentID, "session", sessionID, "err", err)
 			return false
 		}
 	}

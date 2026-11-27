@@ -177,7 +177,7 @@ func (s *Server) SetRestartTrigger(fn func() bool) {
 // handleSystemRestart POST /api/v1/system/restart
 //
 // Gracefully restarts the daemon: quiesce new chats → wait for every
-// in-flight turn (and post-turn summarizer) to drain → graceful
+// in-flight turn to drain → graceful
 // shutdown → re-exec the binary at os.Executable(). Because the
 // re-exec picks up whatever is on disk, `make build` + this endpoint
 // is a full deploy.

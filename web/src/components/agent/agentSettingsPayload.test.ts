@@ -206,9 +206,9 @@ describe("buildAgentSavePayload", () => {
   it("passes through disabledInjections verbatim", () => {
     expect(buildAgentSavePayload(baseState()).disabledInjections).toEqual([]);
     expect(
-      buildAgentSavePayload(baseState({ disabledInjections: ["memory_search", "diary_notes"] }))
+      buildAgentSavePayload(baseState({ disabledInjections: ["memory_search", "persona_anchor"] }))
         .disabledInjections,
-    ).toEqual(["memory_search", "diary_notes"]);
+    ).toEqual(["memory_search", "persona_anchor"]);
   });
 });
 

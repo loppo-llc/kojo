@@ -18,10 +18,7 @@ const effortClassifierSystemPrompt = "You classify how much reasoning effort an 
 
 // Input caps for the classifier prompt. Runes, not bytes, so Japanese
 // input isn't cut three times shorter than ASCII.
-const (
-	effortClassifierDiaryCap   = 500
-	effortClassifierMessageCap = 1500
-)
+const effortClassifierMessageCap = 1500
 
 // heuristicShortMessageRunes is the fallback cutoff: when the classifier
 // is unavailable, a short message with no code fence and no URL is
@@ -29,7 +26,7 @@ const (
 const heuristicShortMessageRunes = 200
 
 // classifyEffort is the LLM classification seam — swapped out by unit
-// tests (mirrors the generateSummary var in autosummary.go). The returned
+// tests. The returned
 // string is expected to be exactly "low", "medium" or "high".
 var classifyEffort = runClaudeEffortClassifier
 
@@ -70,9 +67,7 @@ var jevEffortCriteria = map[string]string{
 var classifyEffortJev = runJevEffortClassifier
 
 // runJevEffortClassifier asks Jev one Choice question over the current
-// message and reduces the returned distribution with pickEffortTier. Keep
-// historical diary context local: configuring a global classifier key must
-// not silently disclose an agent's activity log to a third party.
+// message and reduces the returned distribution with pickEffortTier.
 func runJevEffortClassifier(ctx context.Context, apiKey, userMessage string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, jevEffortTimeout)
 	defer cancel()
@@ -142,15 +137,6 @@ func rankEffort(effort string) int {
 	return effortRank["high"] // "" / unknown = model default ≈ high
 }
 
-// tailRunes returns the last n runes of s.
-func tailRunes(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[len(r)-n:])
-}
-
 // headRunes returns the first n runes of s.
 func headRunes(s string, n int) string {
 	r := []rune(s)
@@ -160,16 +146,10 @@ func headRunes(s string, n int) string {
 	return string(r[:n])
 }
 
-// buildEffortClassifierPrompt assembles the classifier's user prompt:
-// an optional recent-diary tail for context, then the user message,
-// clearly delimited so the classifier can't confuse the two.
-func buildEffortClassifierPrompt(recentDiary, userMessage string) string {
+// buildEffortClassifierPrompt wraps the (capped) user message in a
+// delimiter so the classifier can't mistake it for its own instructions.
+func buildEffortClassifierPrompt(userMessage string) string {
 	var sb strings.Builder
-	if d := strings.TrimSpace(recentDiary); d != "" {
-		sb.WriteString("<recent-context>\n")
-		sb.WriteString(tailRunes(d, effortClassifierDiaryCap))
-		sb.WriteString("\n</recent-context>\n\n")
-	}
 	sb.WriteString("<message>\n")
 	sb.WriteString(headRunes(userMessage, effortClassifierMessageCap))
 	sb.WriteString("\n</message>")
@@ -239,7 +219,7 @@ func toolSupportsAutoEffort(tool string) bool {
 // path). ctx bounds the classifier calls — derive it from the chat
 // context so an aborted turn kills the classifier too. Never returns an
 // error: any failure degrades to the agent's static Effort.
-func resolveTurnEffort(ctx context.Context, a *Agent, userMessage string, systemTurn bool, recentDiary string, jevKey string, logger *slog.Logger) (effort string, source string) {
+func resolveTurnEffort(ctx context.Context, a *Agent, userMessage string, systemTurn bool, jevKey string, logger *slog.Logger) (effort string, source string) {
 	if !a.IsAutoEffortEnabled() || !toolSupportsAutoEffort(a.Tool) {
 		return a.Effort, "static"
 	}
@@ -279,7 +259,7 @@ func resolveTurnEffort(ctx context.Context, a *Agent, userMessage string, system
 	if !classifierCLIAvailable() {
 		return heuristicOrStaticIfJev(a, userMessage, jevKey)
 	}
-	out, err := classifyEffort(ctx, buildEffortClassifierPrompt(recentDiary, userMessage))
+	out, err := classifyEffort(ctx, buildEffortClassifierPrompt(userMessage))
 	if err != nil {
 		// Our own deadline killing the CLI is expected degradation
 		// (the heuristic covers it), not an operational fault — log

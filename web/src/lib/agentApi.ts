@@ -242,11 +242,11 @@ export const CONTEXT_INJECTION_KEYS = [
   "todo_api",
   "attachments",
   "status",
-  "diary_notes",
   "memory_search",
   "recent_conversation",
   "persona_anchor",
   "call_user",
+  "model_switch_info",
 ] as const;
 
 export type ContextInjectionKey = (typeof CONTEXT_INJECTION_KEYS)[number];

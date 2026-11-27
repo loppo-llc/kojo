@@ -106,8 +106,8 @@ type TruncateMemoryResult struct {
 // rather over-trim than leave post-T entries in place.
 var diaryEntryHHMM = regexp.MustCompile(`^\s*-\s+(\d{2}):(\d{2})\b`)
 
-// diaryPreCompactSection matches the header autosummary.go writes when it
-// flushes a pre-compaction summary into a diary file. The format is
+// diaryPreCompactSection matches the header the removed pre-compaction
+// summarizer appended to diary files (older diaries still carry it). The format is
 // `## Pre-compaction summary (HH:MM)` — same minute-precision as bullets
 // so the same minutes-of-day comparison applies.
 var diaryPreCompactSection = regexp.MustCompile(`^##\s+Pre-compaction summary\s+\((\d{2}):(\d{2})\)\s*$`)
@@ -186,8 +186,7 @@ func (m *Manager) TruncateMemoryAt(agentID string, since time.Time) (*TruncateMe
 // CLI-side context matches
 // what the UI now shows.
 //
-// Unlike TruncateMemoryFromMessage this does NOT touch the daily diary or
-// the derived recent.md summary. Rewinding a conversation is not the same
+// Unlike TruncateMemoryFromMessage this does NOT touch the daily diary. Rewinding a conversation is not the same
 // as erasing what the agent wrote down about that day, and silently
 // deleting diary entries is the kind of collateral damage nobody clicking
 // "rewind" is asking for. Use TruncateMemoryFromMessage when the intent
@@ -203,7 +202,7 @@ func (m *Manager) RewindToMessage(agentID, msgID string) (*TruncateMemoryResult,
 
 // truncateOptions tunes how far a truncate reaches beyond the transcript.
 type truncateOptions struct {
-	// keepDiary leaves memory/YYYY-MM-DD.md (and the derived recent.md)
+	// keepDiary leaves memory/YYYY-MM-DD.md (and any legacy recent.md)
 	// alone. Set by RewindToMessage.
 	keepDiary bool
 }
@@ -383,10 +382,10 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 	res.DiaryFilesRemoved = dFiles
 
 	// 4. Drop memory/recent.md if anything diary-side actually changed.
-	//    recent.md is a derived rolling summary that PreCompactSummarize
-	//    rebuilds on the next fire; if we leave a stale copy in place
-	//    after dropping diary content, RecentDiarySummary will keep
-	//    injecting that removed text into the per-turn volatile context.
+	//    recent.md is the rolling summary older builds kept; it is no
+	//    longer injected or search-indexed, but memory sync still
+	//    mirrors it, so a copy left behind would carry the dropped
+	//    diary text into the DB.
 	//
 	//    Tombstone the matching memory_entries row too — scanMemoryDir
 	//    classifies memory/recent.md as (kind=topic, name=recent), so
@@ -398,8 +397,8 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 	//    explicitly here closes case (b).
 	if dEntries > 0 || dFiles > 0 {
 		memDir := filepath.Join(dir, "memory")
-		// scanMemoryDir collapses BOTH memory/recent.md (autosummary's
-		// own path) and memory/topics/recent.md (the canonical path
+		// scanMemoryDir collapses BOTH memory/recent.md (the old
+		// summarizer's path) and memory/topics/recent.md (the canonical path
 		// memoryEntryDiskPath hydrates a (topic, recent) row to) into
 		// the same natural key. Either copy left behind would let the
 		// next syncMemoryEntriesToDB upsert the stale body and undo our
@@ -1135,8 +1134,8 @@ func trimDiaryFileEntries(path string, sinceMinutes int) (int, error) {
 //
 //  1. `- HH:MM — ...` bullet lines (possibly with hanging-indent
 //     continuation lines following).
-//  2. `## Pre-compaction summary (HH:MM)` sections written by
-//     PreCompactSummarize. The whole section — header through to the
+//  2. `## Pre-compaction summary (HH:MM)` sections written by the
+//     removed summarizer. The whole section — header through to the
 //     next ATX heading or EOF — is dropped.
 //
 // Lines outside both shapes are passed through unchanged. Heading and

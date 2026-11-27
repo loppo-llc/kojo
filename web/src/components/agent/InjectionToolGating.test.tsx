@@ -98,11 +98,11 @@ const LABELS: Record<ContextInjectionKey, string> = {
   todo_api: "Todos",
   attachments: "Attachments",
   status: "Status",
-  diary_notes: "Diary Notes",
   memory_search: "Memory Search",
   recent_conversation: "Recent Conversation",
   persona_anchor: "Persona Anchor",
   call_user: "Call the User",
+  model_switch_info: "Model Switch Info",
 };
 
 const TOOL_ONLY = new Set<string>(TOOL_ONLY_INJECTION_KEYS);

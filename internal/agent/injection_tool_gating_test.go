@@ -113,6 +113,8 @@ func TestInjectionToolGating_MatchesWebToolOnlyList(t *testing.T) {
 		InjectionMemorySearch:       true,
 		InjectionRecentConversation: true,
 		InjectionPersonaAnchor:      true,
+		// Wake-turn wording only; never part of the system prompt.
+		InjectionModelSwitchInfo: true,
 	}
 	var unexpected []string
 	for _, key := range inertForBare {

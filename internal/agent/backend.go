@@ -94,13 +94,6 @@ type ChatOptions struct {
 	// turn) instead of the agent-wide keyed handler resolution.
 	KeyedSurface KeyedSessionSurface
 
-	// SessionStartContext is the recent-activity diary block. Like
-	// FreshSessionContext it is injected only when the turn does not resume
-	// a native session (fresh session or one-shot) — never per resumed turn,
-	// where the session already holds that history. See
-	// injectSessionContexts.
-	SessionStartContext string
-
 	// FreshSessionContext is a bounded transcript supplied by the response
 	// surface (WebUI main, WebUI thread, Slack, ...). Every backend prepends
 	// it only when no native session can be resumed and a fresh session is

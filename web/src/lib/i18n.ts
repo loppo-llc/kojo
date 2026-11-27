@@ -521,11 +521,6 @@ const messages = {
     ja: "エージェントのステータスブロック",
     en: "Agent status block",
   },
-  "settings.inj.diary_notes.label": { ja: "日誌ノート", en: "Diary Notes" },
-  "settings.inj.diary_notes.desc": {
-    ja: "最近の活動日誌 (セッション開始時・圧縮直後のみ)",
-    en: "Recent activity diary (session start and right after compaction only)",
-  },
   "settings.inj.memory_search.label": { ja: "メモリ検索", en: "Memory Search" },
   "settings.inj.memory_search.desc": {
     ja: "メモリ検索結果 (毎ターン)",
@@ -558,6 +553,14 @@ const messages = {
   "settings.inj.call_user.desc": {
     ja: "待機せずに操作者を呼ぶ API の手順 (一覧を強調表示)",
     en: "How to page the operator without waiting (highlights the row)",
+  },
+  "settings.inj.model_switch_info.label": {
+    ja: "モデル切替情報",
+    en: "Model Switch Info",
+  },
+  "settings.inj.model_switch_info.desc": {
+    ja: "自己モデル切替後の自動ターンにモデル名とエフォートを含める",
+    en: "Model names and effort in the auto turn after a self model switch",
   },
 
   // ── AgentSettings: card titles / descriptions ──

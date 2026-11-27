@@ -172,17 +172,17 @@ func TestSessionProviderFailureMetadata(t *testing.T) {
 	}
 }
 
-func TestHistoryAndSummaryKeepFailureNoticeButNotBanner(t *testing.T) {
+func TestHistoryKeepsFailureNoticeButNotBanner(t *testing.T) {
 	history := []chathistory.HistoryMessage{{IsBot: true, UserID: "bot", Text: diagnosticBanner + "\n\nUseful partial work."}, {UserID: "user", Text: "please continue"}}
 	fresh, resume := FormatOneShotHistoryContexts(history, "bot")
 	msgs := []*Message{{Role: "assistant", Content: diagnosticBanner + "\n\nUseful partial work."}, {Role: "user", Content: "please continue"}}
-	for name, text := range map[string]string{"fresh": fresh, "resume": resume, "recent": formatRecentMessagesContext(msgs), "summary": buildSummaryPrompt(msgs, "")} {
+	for name, text := range map[string]string{"fresh": fresh, "resume": resume, "recent": formatRecentMessagesContext(msgs)} {
 		if strings.Contains(text, diagnosticBanner) || strings.Contains(text, "req_test123") || !strings.Contains(text, backenddiag.HistoryNotice) || !strings.Contains(text, "Useful partial work.") {
 			t.Fatalf("%s still reinjects diagnostic or loses normal text: %s", name, text)
 		}
 	}
 	// Human-authored error reports remain literal user data.
-	for _, text := range []string{chathistory.FormatForInjection([]chathistory.HistoryMessage{{Text: diagnosticBanner}}, "bot", 10, 10000), formatRecentMessagesContext([]*Message{{Role: "user", Content: diagnosticBanner}}), buildSummaryPrompt([]*Message{{Role: "user", Content: diagnosticBanner}}, "")} {
+	for _, text := range []string{chathistory.FormatForInjection([]chathistory.HistoryMessage{{Text: diagnosticBanner}}, "bot", 10, 10000), formatRecentMessagesContext([]*Message{{Role: "user", Content: diagnosticBanner}})} {
 		if !strings.Contains(text, diagnosticBanner) {
 			t.Fatal("human error report was rewritten")
 		}
@@ -197,10 +197,6 @@ func TestRecoverDoesNotResurrectSyntheticAPIError(t *testing.T) {
 	write([]map[string]any{{"type": "user", "message": map[string]any{"content": "hi"}}, {"type": "assistant", "isApiErrorMessage": true, "message": map[string]any{"content": []map[string]string{{"type": "text", "text": diagnosticBanner}}}}})
 	if got := recoverFromSession(aid, "", slog.New(slog.NewTextHandler(io.Discard, nil))); got != "" {
 		t.Fatalf("recovered diagnostic as answer: %q", got)
-	}
-	msgs := loadSessionMessages(aid, "claude", "", 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if len(msgs) != 2 || msgs[1].Content != backenddiag.HistoryNotice {
-		t.Fatalf("summary input resurrected synthetic error: %+v", msgs)
 	}
 }
 

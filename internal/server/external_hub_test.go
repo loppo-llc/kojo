@@ -29,19 +29,16 @@ func pairedExternal(t *testing.T) (*Server, http.Handler, *agent.GroupDM, string
 		return ch, nil
 	})
 	// Member-change notifications to the kojo agents run async as real
-	// Manager.Chat turns (and post-turn summarize) that write into the
+	// Manager.Chat turns that write into the
 	// temp config dir. Drain them the way a restart does before the dir
 	// is removed: quiescing refuses notification goroutines that have
 	// not reached Chat yet (the check and the preparing counter are one
-	// atomic step), and WaitAllChatsIdle covers preparing, busy and
-	// summarizing. The notification turns also leave a real persistent
+	// atomic step), and WaitAllChatsIdle covers preparing and busy. The notification turns also leave a real persistent
 	// claude process behind when the CLI is installed; close those
 	// synchronously too. Registered after the Manager.Close cleanup, so
 	// it runs first.
 	t.Cleanup(func() {
 		srv.agents.SetQuiescing(true)
-		// Above the summarizer subprocess bound, so a slow summarize fails
-		// the test here instead of racing the TempDir removal.
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer cancel()
 		if err := srv.agents.WaitAllChatsIdle(ctx); err != nil {

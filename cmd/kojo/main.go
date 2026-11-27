@@ -1642,7 +1642,7 @@ func main() {
 
 		// get tailscale addresses for display. Display only — the agent
 		// API base is wired further below to the local auth listener so
-		// system prompts / PreCompact curl examples point Bearer-required.
+		// system prompt curl examples point Bearer-required.
 		fmt.Fprintf(os.Stderr, "\n  kojo v%s running at:\n\n", version)
 		lc, lcErr := tsServer.LocalClient()
 		if lcErr != nil {
@@ -1736,7 +1736,7 @@ func main() {
 		authAddr := authLn.Addr().String()
 		agentAPIBase := "http://" + authAddr
 		agent.SetKojoAPIBase(agentAPIBase)
-		// Group DM / PreCompact / system-prompt curl examples must hit
+		// Group DM / system-prompt curl examples must hit
 		// the auth listener so the agent's Bearer is honored. The
 		// Tailscale listener is for the user UI only.
 		groupDMMgr.SetAPIBase(agentAPIBase)

@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -84,7 +83,6 @@ func TestCodexRolloutUsable(t *testing.T) {
 }
 
 func TestCodexThreadResetDueRejectsSymlinkedRollout(t *testing.T) {
-	stubCLIResetSummary(t, nil)
 	target := writeCodexRollout(t, 4*time.Hour, codexTokenCount(300000))
 	link := filepath.Join(filepath.Dir(target), "rollout-2026-11-18T13-44-24-"+codexResetTID+".jsonl")
 	if err := os.Symlink(target, link); err != nil {
@@ -118,24 +116,21 @@ func TestDropCodexThreadRefForResetRechecksRef(t *testing.T) {
 
 func TestCodexThreadResetDue(t *testing.T) {
 	cases := []struct {
-		name       string
-		ctx        int
-		idle       time.Duration
-		automated  bool
-		goal       bool
-		summaryErr error
-		want       bool
+		name      string
+		ctx       int
+		idle      time.Duration
+		automated bool
+		goal      bool
+		want      bool
 	}{
 		{name: "warm large thread left to codex", ctx: 240000, idle: time.Hour, automated: true, want: false},
 		{name: "cold over floor", ctx: 120000, idle: 4 * time.Hour, automated: true, want: true},
 		{name: "cold under floor", ctx: 90000, idle: 4 * time.Hour, automated: true, want: false},
 		{name: "goal thread kept", ctx: 240000, idle: 4 * time.Hour, automated: true, goal: true, want: false},
-		{name: "summary failure keeps", ctx: 240000, idle: 4 * time.Hour, automated: true, summaryErr: errors.New("boom"), want: false},
 		{name: "interactive cold past guard", ctx: 240000, idle: 4 * time.Hour, want: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			stubCLIResetSummary(t, tc.summaryErr)
 			ref := &codexThreadRef{ThreadID: codexResetTID, RolloutPath: writeCodexRollout(t, tc.idle, codexTokenCount(tc.ctx))}
 			if tc.goal {
 				ref.Goal = &GoalBinding{}
@@ -157,7 +152,6 @@ func TestCodexChatStartsFreshThreadAfterColdReset(t *testing.T) {
 }
 
 func runCodexResetChat(t *testing.T, cold bool) {
-	stubCLIResetSummary(t, nil)
 	id, _ := setupCodexTransferTest(t)
 	dir := t.TempDir()
 	state := filepath.Join(dir, "state")

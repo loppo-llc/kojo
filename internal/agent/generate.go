@@ -74,9 +74,9 @@ const effortClassifierTimeout = 15 * time.Second
 
 // runClaudeEffortClassifier executes the one-shot effort-classification
 // prompt via claude CLI pinned to effortClassifierModel at low effort,
-// no tools. Modeled on runClaudeSummary, minus the pinned-rejection
-// retry: the caller has a cheap heuristic fallback, so a second (slower)
-// CLI invocation on the chat critical path is never worth it.
+// no tools. There is no retry on the default model: the caller has a
+// cheap heuristic fallback, so a second (slower) CLI invocation on the
+// chat critical path is never worth it.
 func runClaudeEffortClassifier(ctx context.Context, prompt string) (string, error) {
 	return runCLIGenerateTimeout(ctx, "claude", []string{
 		"-p",
@@ -96,72 +96,6 @@ func runClaude(prompt string) (string, error) {
 		"--system-prompt", "You are a helpful assistant. Follow the user's instructions exactly. Output only what is requested, with no preamble or commentary.",
 		"--tools", "",
 	}, "", prompt)
-}
-
-const (
-	// summaryModel / summaryEffort pin the conversation-summarization
-	// LLM to a cheap, fast configuration. Summaries fire per turn (see
-	// TurnSummarize) so cost matters more than depth; sonnet at low
-	// effort is plenty for bullet-point extraction. When the pinned
-	// model is unavailable (older CLI, no access) runClaudeSummary
-	// falls back to the default claude invocation.
-	summaryModel  = "claude-sonnet-5"
-	summaryEffort = "low"
-)
-
-// summaryFallbackWindow bounds the "pinned invocation was rejected
-// outright" heuristic in runClaudeSummary. Flag/model rejections fail in
-// well under this; anything slower already burned real inference time.
-const summaryFallbackWindow = 15 * time.Second
-
-// isPinnedRejection reports whether a failed pinned-model invocation
-// looks like "this CLI/account doesn't support the pinned model or the
-// --effort flag" — the only failure class worth retrying on the default
-// model. Requires BOTH a fast failure (rejections happen before any
-// inference) AND stderr that references the pinned flags/model, so an
-// auth error or transient API failure (which would fail identically on
-// the default model) doesn't trigger a double-cost retry.
-func isPinnedRejection(err error, elapsed time.Duration) bool {
-	if elapsed >= summaryFallbackWindow {
-		return false
-	}
-	var ee *exec.ExitError
-	if !errors.As(err, &ee) {
-		return false
-	}
-	s := strings.ToLower(string(ee.Stderr))
-	return strings.Contains(s, "--effort") ||
-		strings.Contains(s, "--model") ||
-		strings.Contains(s, "unknown option") ||
-		strings.Contains(s, summaryModel)
-}
-
-// runClaudeSummary executes a summarization prompt via claude CLI pinned
-// to summaryModel/summaryEffort. When the pinned invocation is rejected
-// outright (unknown --model / --effort on an older CLI, no access to the
-// pinned model — see isPinnedRejection), it falls back to the default
-// runClaude invocation so summarization never breaks just because the
-// cheap path is unavailable. Any other failure (timeout, auth, API
-// error) is NOT retried on the default model — that would double the
-// cost and latency of a failure that would recur anyway; the error
-// propagates and tryBackends moves on to the next backend.
-func runClaudeSummary(prompt string) (string, error) {
-	start := time.Now()
-	out, err := runCLIGenerate("claude", []string{
-		"-p",
-		"--setting-sources", "user",
-		"--system-prompt", "You are a helpful assistant. Follow the user's instructions exactly. Output only what is requested, with no preamble or commentary.",
-		"--tools", "",
-		"--model", summaryModel,
-		"--effort", summaryEffort,
-	}, "", prompt)
-	if err != nil {
-		if isPinnedRejection(err, time.Since(start)) {
-			return runClaude(prompt)
-		}
-		return "", err
-	}
-	return out, nil
 }
 
 // runCodex executes a prompt via codex CLI (stdin → -o output file).
@@ -234,38 +168,6 @@ var defaultBackends = []cliBackend{
 // generate runs prompt through available backends in default priority order: claude → codex.
 func generate(prompt string) (string, error) {
 	return tryBackends(defaultBackends, prompt)
-}
-
-// summaryBackends mirrors defaultBackends but routes claude through the
-// cheap pinned-model runner. Used by conversation summarization only.
-var summaryBackends = []cliBackend{
-	{"claude", runClaudeSummary},
-	{"codex", runCodex},
-}
-
-// generateSummaryWithPreferred runs prompt with the specified tool
-// first, then falls back to others, over the summary-tuned backend set
-// (cheap pinned model for claude).
-func generateSummaryWithPreferred(preferredTool string, prompt string) (string, error) {
-	return tryBackends(orderBackends(summaryBackends, preferredTool), prompt)
-}
-
-// orderBackends returns backends with the preferred tool moved to the
-// front, preserving the relative order of the rest.
-func orderBackends(backends []cliBackend, preferredTool string) []cliBackend {
-	ordered := make([]cliBackend, 0, len(backends))
-	for _, b := range backends {
-		if b.name == preferredTool {
-			ordered = append(ordered, b)
-			break
-		}
-	}
-	for _, b := range backends {
-		if b.name != preferredTool {
-			ordered = append(ordered, b)
-		}
-	}
-	return ordered
 }
 
 func tryBackends(backends []cliBackend, prompt string) (string, error) {

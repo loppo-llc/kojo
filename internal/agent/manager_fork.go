@@ -23,8 +23,7 @@ type ForkOptions struct {
 // Fork creates a new agent by deep-copying the source agent's metadata and
 // data files. Memory (MEMORY.md, memory/, persona, avatar) is always copied.
 // The transcript (agent_messages) and its derived state — the on-disk
-// memory index, the autosummary marker (kv: autosummary/<agentID>), and
-// tasks (cloned via cloneAgentTasks against agent_tasks) — are copied
+// memory index and tasks (cloned via cloneAgentTasks against agent_tasks) — are copied
 // only when IncludeTranscript is true. Tasks are cloned with fresh
 // per-row ids so the destination's primary keys don't collide with
 // the source's.
@@ -142,14 +141,7 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 			if m.tokenStore != nil {
 				m.tokenStore.RemoveAgentToken(fork.ID)
 			}
-			// kv has no FK on agents, so a copyMarker that landed
-			// before a later step failed leaves an orphan
-			// autosummary row. Wipe it as part of the same
-			// rollback that drops the dir + token; deleteMarker
-			// is idempotent (silent on ErrNotFound) so it's
-			// safe even when copyMarker never ran.
-			deleteMarker(fork.ID, m.logger)
-			// Same rationale for the avatar blob: blob_refs has
+			// blob_refs has
 			// no FK on agents, so a SaveAvatar that landed for
 			// the new fork before a later step failed would
 			// leave an orphan blob keyed by the half-created
@@ -194,16 +186,10 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 	if err := copyFileIfExists(filepath.Join(srcDir, "anchor.md"), filepath.Join(dstDir, "anchor.md")); err != nil {
 		return nil, fmt.Errorf("copy anchor.md: %w", err)
 	}
-	// memory/recent.md mirrors the last conversation's pre-compaction
-	// summary and is part of the transcript-derived short-term state,
-	// not the agent's long-term memory. When the caller opts out of
-	// transcript copy, drop this file so the fork starts with a clean
-	// short-term context. The append-only daily diary files are kept —
-	// they're the audit trail and not directly injected into prompts.
-	if !opts.IncludeTranscript {
-		if err := os.Remove(filepath.Join(dstDir, "memory", recentSummaryFile)); err != nil && !os.IsNotExist(err) {
-			return nil, fmt.Errorf("drop recent.md on fork: %w", err)
-		}
+	// memory/recent.md is the removed summarizer's rolling summary, not
+	// long-term memory: never carry it into a fork.
+	if err := os.Remove(filepath.Join(dstDir, "memory", recentSummaryFile)); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("drop recent.md on fork: %w", err)
 	}
 
 	// MEMORY.md may be absent on very old agents — ensure it exists so the
@@ -252,26 +238,14 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 	// replays every src row into the fork's per-agent seq sequence so
 	// the fork starts as a deep copy. The remaining derived state
 	// breaks down as: the FTS index dir is still on disk and is
-	// rsync-style copied below; the autosummary marker has moved to kv
-	// (autosummary/<agentID>) and is cloned via copyMarker; tasks live
-	// in agent_tasks and are cloned via cloneAgentTasks.
+	// rsync-style copied below; tasks live in agent_tasks and are cloned
+	// via cloneAgentTasks.
 	if opts.IncludeTranscript {
 		if err := copyTranscript(srcID, fork.ID); err != nil {
 			return nil, fmt.Errorf("copy messages: %w", err)
 		}
 		if err := copyDirIfExists(filepath.Join(srcDir, indexDir), filepath.Join(dstDir, indexDir)); err != nil {
 			return nil, fmt.Errorf("copy index: %w", err)
-		}
-		// autosummary marker now lives in kv (Phase 2c-2 slice 9).
-		// Read source via readMarker (kv first, legacy fallback so a
-		// pre-migration source still copies cleanly) and write the
-		// destination via writeMarker so it always lands in kv.
-		// Surface destination-write failures up to Fork (matching
-		// the v0 file-copy semantic — silently dropping the marker
-		// would leave the new agent summarising from scratch and
-		// the operator would never know).
-		if err := copyMarker(srcID, fork.ID, m.logger); err != nil {
-			return nil, fmt.Errorf("copy autosummary marker: %w", err)
 		}
 		if err := m.cloneAgentTasks(context.Background(), srcID, fork.ID); err != nil {
 			return nil, fmt.Errorf("copy tasks: %w", err)

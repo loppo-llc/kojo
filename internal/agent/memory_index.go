@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -273,20 +274,29 @@ func (idx *MemoryIndex) IndexFiles(agentID string) error {
 	entries, err := os.ReadDir(memDir)
 	if err == nil {
 		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			// recent.md is the old summarizer's rolling summary, not a
+			// diary; keep it out of search like the diary sections below.
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") || entry.Name() == recentSummaryFile {
 				continue
 			}
 			data, err := os.ReadFile(filepath.Join(memDir, entry.Name()))
 			if err != nil || len(data) == 0 {
 				continue
 			}
+			body := stripPreCompactSections(string(data))
+			if strings.TrimSpace(body) == "" {
+				continue
+			}
 			date := strings.TrimSuffix(entry.Name(), ".md")
-			w.insert("daily", string(data), date)
+			w.insert("daily", body, date)
 		}
 	}
 
 	idx.updateMeta("memory")
 	idx.updateMeta("daily")
+	if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "files_format", filesIndexFormat); err != nil {
+		idx.logger.Debug("failed to update files_format", "err", err)
+	}
 	return nil
 }
 
@@ -425,6 +435,12 @@ func (idx *MemoryIndex) IndexNewMessages(agentID string) {
 	idx.updateMeta("message")
 }
 
+// filesIndexFormat versions how IndexFiles turns files into chunks. Bump it
+// when that changes so indexes built by an older build are redone even
+// though no file changed. "2": pre-compaction summary sections are dropped
+// from diaries.
+const filesIndexFormat = "2"
+
 // IndexFilesIfStale re-indexes files only if they've changed since last index.
 func (idx *MemoryIndex) IndexFilesIfStale(agentID string) {
 	if !idx.filesStale(agentID) {
@@ -438,9 +454,13 @@ func (idx *MemoryIndex) filesStale(agentID string) bool {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	var lastIndexed string
+	var lastIndexed, format string
 	idx.db.QueryRow("SELECT indexed_at FROM index_meta WHERE source = 'memory'").Scan(&lastIndexed)
 	if lastIndexed == "" {
+		return true
+	}
+	idx.db.QueryRow("SELECT indexed_at FROM index_meta WHERE source = 'files_format'").Scan(&format)
+	if format != filesIndexFormat {
 		return true
 	}
 
@@ -847,6 +867,65 @@ func (idx *MemoryIndex) updateMeta(source string) {
 	if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, source, now); err != nil {
 		idx.logger.Debug("failed to update index meta", "source", source, "err", err)
 	}
+}
+
+// diaryDateHeading matches the `## YYYY-MM-DD` header agents put on their
+// own diary entries.
+var diaryDateHeading = regexp.MustCompile(`^##\s+\d{4}-\d{2}-\d{2}\b`)
+
+// diaryTopLevelEntry matches an unindented `- HH:MM` diary bullet. Unlike
+// diaryEntryHHMM it rejects indented bullets, which inside a summary can sit
+// in nested list items whose fences diaryFenceLine does not see.
+var diaryTopLevelEntry = regexp.MustCompile(`^-\s+\d{2}:\d{2}\b`)
+
+// stripPreCompactSections drops the `## Pre-compaction summary (HH:MM)`
+// sections older builds appended to diaries, so they no longer surface in
+// memory search: they were written by an external summarizer, not the agent,
+// and were the main way a wrong summary kept coming back.
+//
+// Their bodies carry their own `#` / `##` headings, so a section does not
+// end at the next heading. It ends at the next line outside a code fence
+// the agent itself would write — a `## YYYY-MM-DD` header or an unindented `- HH:MM`
+// bullet — or at another summary header. That can keep a summary tail that happens to contain such
+// a line, which is preferred over dropping the agent's own notes.
+func stripPreCompactSections(body string) string {
+	if !strings.Contains(body, "Pre-compaction summary") {
+		return body
+	}
+	var out strings.Builder
+	out.Grow(len(body))
+	dropping := false
+	openFence := "" // the delimiter run of the open code fence, "" outside one
+	for _, line := range strings.SplitAfter(body, "\n") {
+		bare := strings.TrimRight(line, "\r\n")
+		if m := diaryFenceLine.FindStringSubmatch(bare); m != nil {
+			// CommonMark: only a bare run of the same character, at
+			// least as long as the opener, closes the fence.
+			switch {
+			case openFence == "":
+				openFence = m[1]
+			case m[1][0] == openFence[0] && len(m[1]) >= len(openFence) &&
+				strings.TrimSpace(strings.TrimPrefix(strings.TrimLeft(bare, " \t"), m[1])) == "":
+				openFence = ""
+			}
+			if dropping {
+				continue
+			}
+		}
+		inFence := openFence != ""
+		if dropping {
+			if inFence || !(diaryDateHeading.MatchString(bare) || diaryTopLevelEntry.MatchString(bare) || diaryPreCompactSection.MatchString(bare)) {
+				continue
+			}
+			dropping = false
+		}
+		if !inFence && diaryPreCompactSection.MatchString(bare) {
+			dropping = true
+			continue
+		}
+		out.WriteString(line)
+	}
+	return out.String()
 }
 
 // splitSections splits markdown text by ## headings for granular indexing.

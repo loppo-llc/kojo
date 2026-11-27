@@ -8,8 +8,7 @@ import (
 )
 
 // MaxJSONLLineBytes caps the size of a single JSONL line read through
-// ScanJSONLLines below (autosummary.loadSessionMessages, the backend
-// stream scanners). Without a cap the per-line
+// ScanJSONLLines below (the backend stream scanners). Without a cap the per-line
 // accumulator buffer (filled across repeated ReadSlice+ErrBufferFull chunks
 // when a line exceeds bufio's default buffer) could grow without bound, so a
 // corrupted/adversarial extremely-long line could allocate arbitrarily large

@@ -215,19 +215,6 @@ func waitIdle(t *testing.T, m *Manager, id string) {
 	if err := m.WaitChatIdle(ctx, id); err != nil {
 		t.Fatalf("WaitChatIdle: %v", err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		m.busyMu.Lock()
-		active := m.summarizing
-		m.busyMu.Unlock()
-		if active == 0 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("summary did not stop")
-		}
-		time.Sleep(time.Millisecond)
-	}
 }
 
 func drainEvents(ch <-chan ChatEvent) {

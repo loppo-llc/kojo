@@ -286,11 +286,10 @@ func (m *Manager) acquireMemoryEdit(agentID string) (func(), error) {
 	}
 	if m.switching != nil && m.switching[agentID] {
 		// §3.7 device switch is mid-flight: refuse memory /
-		// persona / task edits so a cron-driven autosummary
-		// or scheduled memory hook doesn't write to source
-		// after the snapshot. The runtime caller (autosummary,
-		// notify) sees ErrAgentBusy and retries after the
-		// switch finishes.
+		// persona / task edits so a scheduled memory hook
+		// doesn't write to source after the snapshot. The
+		// runtime caller (notify) sees ErrAgentBusy and
+		// retries after the switch finishes.
 		m.busyMu.Unlock()
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: device switch in progress", ErrAgentBusy)

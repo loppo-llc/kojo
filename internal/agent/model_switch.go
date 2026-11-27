@@ -380,7 +380,7 @@ func (m *Manager) deliverModelSwitch(p *pendingModelSwitch) {
 		p.verifyKey = p.sessionKey
 	}
 	continued := p.continued
-	msg := modelSwitchPrompt(p)
+	msg := m.modelSwitchPrompt(p)
 	// The marker stays until the turn reaches its backend (bindModelSwitchTurn),
 	// so a restart before that point still resumes it.
 	m.modelSwitchMu.Unlock()
@@ -594,14 +594,36 @@ func (m *Manager) discardModelSwitch(p *pendingModelSwitch) bool {
 	return true
 }
 
-func modelSwitchPrompt(p *pendingModelSwitch) string {
-	msg := fmt.Sprintf(
-		"[System] Your model switch is complete: %s -> %s %s. This turn was auto-triggered and runs on the new model. Continue your pending work.",
-		p.from, p.to, modelSwitchTokenText(p.token))
+// modelSwitchPrompt is the wake turn after a self switch. The switch token
+// must stay in it (it binds the verifying turn); the model names and effort
+// are dropped when the agent disables InjectionModelSwitchInfo. Callers hold
+// modelSwitchMu, which already nests m.mu (see the Update call in
+// RequestModelSwitch), so the injection lookup is safe here.
+func (m *Manager) modelSwitchPrompt(p *pendingModelSwitch) string {
+	var msg string
+	if m.injectionDisabled(p.agentID, InjectionModelSwitchInfo) {
+		msg = fmt.Sprintf(
+			"[System] Your model switch is complete %s. This turn was auto-triggered and runs on the new model. Continue your pending work.",
+			modelSwitchTokenText(p.token))
+	} else {
+		msg = fmt.Sprintf(
+			"[System] Your model switch is complete: %s -> %s %s. This turn was auto-triggered and runs on the new model. Continue your pending work.",
+			p.from, p.to, modelSwitchTokenText(p.token))
+	}
 	if p.note != "" {
 		msg += "\n\nNote you left for this turn:\n" + p.note
 	}
 	return msg
+}
+
+// modelSwitchRollbackPrompt tells the agent its switch was reverted. With
+// hideInfo the model names and effort are left out; the failure reason stays.
+func modelSwitchRollbackPrompt(p *pendingModelSwitch, reason string, hideInfo bool) string {
+	if hideInfo {
+		return fmt.Sprintf("[System] Your model switch failed (%s), so kojo reverted you to the previous model. This turn was auto-triggered on the previous model.", reason)
+	}
+	return fmt.Sprintf("[System] Your model switch to %s failed (%s), so kojo reverted you to %s. This turn was auto-triggered on the previous model.",
+		p.to, reason, p.from)
 }
 
 // noteModelSwitchTurnEnd observes every finished turn. oneShotID is 0 for
@@ -635,7 +657,7 @@ func (m *Manager) noteModelSwitchTurnEnd(agentID, sessionKey string, oneShotID i
 	// A WebUI thread resumes through WakeThread, which keeps its native
 	// session; an adapter slot starts the arrival from a fresh one.
 	activate := p.stop == modelSwitchProceed && !strings.HasPrefix(sessionKey, webUIThreadKeyPrefix)
-	capability, prompt := p.capability, modelSwitchPrompt(p)
+	capability, prompt := p.capability, m.modelSwitchPrompt(p)
 	continueThread := m.modelSwitchContinue
 	m.modelSwitchMu.Unlock()
 
@@ -712,8 +734,7 @@ func (m *Manager) rollbackModelSwitch(p *pendingModelSwitch, reason string) {
 		reason = strings.ToValidUTF8(reason[:modelSwitchReasonLimit], "") + "..."
 	}
 	m.logger.Warn("model switch: reverted", "agent", p.agentID, "from", p.to.String(), "to", p.from.String(), "reason", reason)
-	msg := fmt.Sprintf("[System] Your model switch to %s failed (%s), so kojo reverted you to %s. This turn was auto-triggered on the previous model.",
-		p.to, reason, p.from)
+	msg := modelSwitchRollbackPrompt(p, reason, m.injectionDisabled(p.agentID, InjectionModelSwitchInfo))
 	if p.note != "" {
 		msg += "\n\nNote you left for the switched turn:\n" + p.note
 	}

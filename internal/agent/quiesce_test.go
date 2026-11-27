@@ -26,8 +26,6 @@ func TestDrainBlockers_ReportsEachBlockingItem(t *testing.T) {
 		oneShotSessions: map[string]map[int64]string{"ag_os": {7: "groupdm:g_1"}},
 		oneShotArmed:    map[string]map[int64]time.Time{"ag_os": {7: time.Now().Add(-32 * time.Minute)}},
 	}
-	m.summarizing = 1
-
 	got := strings.Join(m.DrainBlockers(), "\n")
 	wants := []string{
 		"busy:ag_busy(source=notification,age=4m)",
@@ -37,7 +35,6 @@ func TestDrainBlockers_ReportsEachBlockingItem(t *testing.T) {
 		"editing:ag_edit",
 		"resetting:ag_reset",
 		"switching:ag_sw",
-		"summarizing(n=1)",
 		"profileGen:ag_prof",
 		"oneShot:ag_os(id=7,key=groupdm:g_1,age=32m)",
 	}
@@ -91,21 +88,18 @@ func TestQuiescingRefusesNewChats(t *testing.T) {
 	m.releasePreparing("ag_x")
 }
 
-// TestWaitAllChatsIdle_DrainsBusyAndSummarizing: the daemon-wide idle
-// wait must block while any agent is busy or a post-turn summarizer is
-// in flight, and return once both clear.
-func TestWaitAllChatsIdle_DrainsBusyAndSummarizing(t *testing.T) {
+// TestWaitAllChatsIdle_DrainsBusy: the daemon-wide idle wait must block
+// while any agent is busy, and return once it clears.
+func TestWaitAllChatsIdle_DrainsBusy(t *testing.T) {
 	m := &Manager{
 		busy: map[string]busyEntry{
 			"ag_a": {cancel: func() {}},
 		},
 	}
-	m.summarizing = 1
-
 	short, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	if err := m.WaitAllChatsIdle(short); err == nil {
-		t.Fatal("WaitAllChatsIdle returned while busy + summarizing")
+		t.Fatal("WaitAllChatsIdle returned while busy")
 	}
 
 	done := make(chan error, 1)
@@ -115,9 +109,6 @@ func TestWaitAllChatsIdle_DrainsBusyAndSummarizing(t *testing.T) {
 
 	time.Sleep(150 * time.Millisecond)
 	m.clearBusy("ag_a")
-	m.busyMu.Lock()
-	m.summarizing = 0
-	m.busyMu.Unlock()
 
 	select {
 	case err := <-done:
